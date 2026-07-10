@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#07111f">
+  <title>CogniBoard — Sovereign AI Mission Control</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">본문으로 바로가기</a>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+  <div class="noise" aria-hidden="true"></div>
+
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#mission" data-view-link="mission" aria-label="CogniBoard 미션 컨트롤">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 48 48" role="img">
+            <path d="M24 4 40.5 13.5v19L24 42 7.5 32.5v-19Z" class="mark-frame"/>
+            <path d="M15 27.5 24 12l9 15.5-9 8Z" class="mark-core"/>
+            <circle cx="24" cy="24" r="3.5" class="mark-node"/>
+          </svg>
+        </span>
+        <span class="brand-copy">
+          <strong>CogniBoard</strong>
+          <small>SOVEREIGN AI MISSION CONTROL</small>
+        </span>
+      </a>
+
+      <div class="topbar-status" aria-label="시스템 상태">
+        <span class="status-pill status-local"><i></i>LOCAL ONLY</span>
+        <span class="status-pill"><span class="status-label">외부 호출</span><b>0</b></span>
+        <span class="status-pill"><span class="status-label">리듬</span><b id="rhythm-value">INFERENCE</b></span>
+        <span class="status-pill status-runtime" id="runtime-pill"><i></i><b id="runtime-label">READY</b></span>
+      </div>
+
+      <div class="topbar-actions">
+        <button class="icon-button text-button" type="button" data-action="tour" aria-label="3분 IR 가이드 시작">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7Z"/></svg>
+          <span>3분 IR 모드</span>
+        </button>
+        <button class="icon-button" type="button" data-action="shutdown" aria-label="데모 종료" title="데모 종료">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9m6.4-5.4a9 9 0 1 1-12.8 0"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <aside class="sidebar" aria-label="주요 화면">
+      <nav class="primary-nav">
+        <button class="nav-item is-active" type="button" data-view="mission" aria-current="page">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4Zm10 7h6v-9h-6ZM4 20h6v-3H4Zm10-13h6V4h-6Z"/></svg>
+          <span>미션 컨트롤</span>
+        </button>
+        <button class="nav-item" type="button" data-view="inference">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9M12 7v5l3 2m2-10 4 4m0-4-4 4"/></svg>
+          <span>라이브 검증</span>
+        </button>
+        <button class="nav-item" type="button" data-view="architecture">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 3 8l9 5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5"/></svg>
+          <span>시스템 설계</span>
+        </button>
+        <button class="nav-item" type="button" data-view="business">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10m6 10V4m6 16v-7m4 7H2"/></svg>
+          <span>사업 임팩트</span>
+        </button>
+        <button class="nav-item" type="button" data-view="evidence">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l3 3v15H6Zm3 6h6m-6 4h6m-6 4h4"/></svg>
+          <span>증빙 · 로드맵</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <span class="mini-kicker">GENESIS BUILD</span>
+        <strong>v0.1.0</strong>
+        <span>Air-gapped research runtime</span>
+      </div>
+    </aside>
+
+    <main id="main-content" class="main-stage" tabindex="-1">
+      <section class="view is-active" id="view-mission" data-view-panel="mission" aria-labelledby="mission-title">
+        <div class="hero-grid">
+          <article class="hero-card surface">
+            <div class="eyebrow"><span class="eyebrow-line"></span>SOVEREIGN INTELLIGENCE, ON DEVICE</div>
+            <h1 id="mission-title">보안 데이터는 밖으로 나가지 않습니다.<br><em>AI가 안으로 들어옵니다.</em></h1>
+            <p class="hero-lead">단 한 대의 PC에서 로컬 Gemma 4, 평형 기반 깊은 추론, 주·야간 자율 운영을 하나의 검증 가능한 런타임으로 연결합니다.</p>
+            <div class="hero-actions">
+              <button class="primary-button" type="button" data-action="run">
+                <span class="button-glow" aria-hidden="true"></span>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 9 6-9 6Z"/></svg>
+                실제 통합 검증 시작
+              </button>
+              <button class="secondary-button" type="button" data-view-jump="business">사업 가치 보기</button>
+            </div>
+            <div class="trust-row" aria-label="핵심 신뢰 요소">
+              <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v6c0 5 3.3 8 8 9 4.7-1 8-4 8-9V6Z"/></svg>100% 폐쇄망</span>
+              <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h4l2-5 4 10 2-5h4"/></svg>실제 GPU 측정</span>
+              <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>Fail-closed 안전장치</span>
+            </div>
+          </article>
+
+          <article class="proof-orbit surface" aria-labelledby="proof-orbit-title">
+            <div class="card-heading compact">
+              <div><span class="section-kicker">LIVE EVIDENCE</span><h2 id="proof-orbit-title">검증된 실행 스냅샷</h2></div>
+              <span class="evidence-badge measured">내부 실측</span>
+            </div>
+            <div class="orbit-visual" aria-hidden="true">
+              <div class="orbit orbit-a"><i></i><i></i><i></i></div>
+              <div class="orbit orbit-b"><i></i><i></i></div>
+              <div class="orbit-core"><span>CTS</span><b id="orbit-depth">100</b><small>DEPTH</small></div>
+              <div class="orbit-label label-gemma">LOCAL<br>GEMMA 4</div>
+              <div class="orbit-label label-deq">DEQ<br>EQUILIBRIUM</div>
+              <div class="orbit-label label-cfire">C-FIRE<br>SAFETY</div>
+            </div>
+            <div class="hardware-row">
+              <div><span>실측 장치</span><strong id="device-name">RTX 5090 Laptop GPU</strong></div>
+              <div><span>목표 장치</span><strong>RTX 4090 · 24GB</strong></div>
+            </div>
+          </article>
+        </div>
+
+        <div class="metric-grid" aria-label="핵심 검증 지표">
+          <article class="metric-card surface">
+            <div class="metric-top"><span>Peak VRAM</span><span class="evidence-badge measured">실측</span></div>
+            <div class="metric-value"><b id="metric-vram">14.8560</b><small>GiB</small></div>
+            <div class="meter"><progress id="vram-meter" max="16.7" value="14.856" aria-label="VRAM 사용량 14.856 GiB, 상한 16.7 GiB"></progress><span></span></div>
+            <div class="metric-foot"><span>방어선</span><strong>16.7 GiB 이하</strong></div>
+          </article>
+          <article class="metric-card surface">
+            <div class="metric-top"><span>CTS Depth</span><span class="evidence-badge measured">실측</span></div>
+            <div class="metric-value"><b id="metric-depth">100</b><small>/ 100</small></div>
+            <div class="depth-dots" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <div class="metric-foot"><span>고정 arena</span><strong id="metric-nodes">301 nodes</strong></div>
+          </article>
+          <article class="metric-card surface">
+            <div class="metric-top"><span>DEQ Residual</span><span class="evidence-badge measured">실측</span></div>
+            <div class="metric-value"><b id="metric-residual">0.003906</b><small>final</small></div>
+            <div class="threshold-line"><i></i><span>수렴 임계 0.005</span></div>
+            <div class="metric-foot"><span>Fallback</span><strong id="metric-fallback">미사용</strong></div>
+          </article>
+          <article class="metric-card surface">
+            <div class="metric-top"><span>Regression</span><span class="evidence-badge verified">검증</span></div>
+            <div class="metric-value"><b id="metric-tests">178</b><small>tests</small></div>
+            <div class="test-stack" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <div class="metric-foot"><span>Warnings as errors</span><strong>PASS</strong></div>
+          </article>
+        </div>
+
+        <article class="story-rail surface" aria-labelledby="story-title">
+          <div class="card-heading"><div><span class="section-kicker">P-S-S-D STORY</span><h2 id="story-title">문제에서 확장까지, 한 화면의 사업 논리</h2></div></div>
+          <div class="story-steps">
+            <button type="button" class="story-step is-active" data-story="problem"><span>01</span><strong>Problem</strong><small>클라우드 보안·비용과 KV-Cache Wall</small></button>
+            <button type="button" class="story-step" data-story="solution"><span>02</span><strong>Solution</strong><small>일체형 온디바이스 AI 운영체제</small></button>
+            <button type="button" class="story-step" data-story="scale"><span>03</span><strong>Scale-up</strong><small>Appliance + 오프라인 모듈 라이선스</small></button>
+            <button type="button" class="story-step" data-story="development"><span>04</span><strong>Defense</strong><small>IP · 표준 · 객관적 시험성적서</small></button>
+          </div>
+          <div class="story-detail" id="story-detail" aria-live="polite">
+            <span class="story-index">01 / PROBLEM</span>
+            <p>국방·신약·금융의 핵심 데이터는 클라우드에 보낼 수 없고, 자체 구축은 보안·최적화·전문인력이라는 숨은 비용을 남깁니다.</p>
+          </div>
+        </article>
+      </section>
+
+      <section class="view" id="view-inference" data-view-panel="inference" aria-labelledby="inference-title" hidden>
+        <div class="view-heading">
+          <div><span class="section-kicker">REAL GPU VALIDATION</span><h1 id="inference-title">라이브 추론 관제</h1><p>재현 가능한 동일 명령으로 로컬 모델 무결성부터 Depth 100까지 실제 검증합니다.</p></div>
+          <div class="view-actions">
+            <button class="secondary-button danger" type="button" data-action="cancel" disabled>검증 취소</button>
+            <button class="primary-button compact-button" type="button" data-action="run"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 9 6-9 6Z"/></svg>검증 시작</button>
+          </div>
+        </div>
+
+        <div class="inference-layout">
+          <article class="pipeline-card surface" aria-labelledby="pipeline-title">
+            <div class="card-heading compact"><div><span class="section-kicker">EXECUTION PIPELINE</span><h2 id="pipeline-title">실행 단계</h2></div><strong class="phase-status" id="phase-status">대기</strong></div>
+            <ol class="phase-list" id="phase-list">
+              <li data-phase="verify"><span><i></i></span><div><strong>Artifact integrity</strong><small>로컬 manifest · SHA-256 검증</small></div><b>01</b></li>
+              <li data-phase="model_load"><span><i></i></span><div><strong>Local Gemma load</strong><small>원격 코드·Hub 요청 차단</small></div><b>02</b></li>
+              <li data-phase="runtime_build"><span><i></i></span><div><strong>Genesis runtime</strong><small>Fast Weight · System 3/4 · BIO-HAMA</small></div><b>03</b></li>
+              <li data-phase="inference"><span><i></i></span><div><strong>DEQ + CTS search</strong><small>고정 301-node arena · Depth 100</small></div><b>04</b></li>
+              <li data-phase="postcheck"><span><i></i></span><div><strong>Safety postcheck</strong><small>VRAM · finite · residual · fallback</small></div><b>05</b></li>
+            </ol>
+
+            <div class="scenario-picker">
+              <span>검증 시나리오</span>
+              <div class="scenario-buttons" role="group" aria-label="검증 시나리오 선택">
+                <button type="button" class="is-selected" data-scenario="defense">국방 폐쇄망</button>
+                <button type="button" data-scenario="bio">신약 R&amp;D</button>
+                <button type="button" data-scenario="finance">금융 리스크</button>
+              </div>
+              <p id="scenario-copy">외부망이 단절된 지휘 환경에서 검증 가능한 깊은 추론 경로를 구성합니다.</p>
+            </div>
+          </article>
+
+          <article class="reactor-card surface" aria-labelledby="reactor-title">
+            <div class="card-heading compact"><div><span class="section-kicker">COGNITIVE REACTOR</span><h2 id="reactor-title">평형 탐색 코어</h2></div><span class="live-indicator" id="live-indicator"><i></i>STANDBY</span></div>
+            <div class="reactor" id="reactor" aria-label="CTS와 DEQ 실행 상태 시각화">
+              <svg class="reactor-svg" viewBox="0 0 620 420" role="img" aria-labelledby="reactor-svg-title reactor-svg-desc">
+                <title id="reactor-svg-title">Cogni-OS 인지 코어</title>
+                <desc id="reactor-svg-desc">로컬 Gemma 상태가 DEQ 평형 엔진을 거쳐 고정 크기 CTS 탐색으로 전달되는 구조</desc>
+                <defs>
+                  <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5de6ff" stop-opacity="0"/><stop offset=".5" stop-color="#5de6ff"/><stop offset="1" stop-color="#8c7cff" stop-opacity="0"/></linearGradient>
+                  <radialGradient id="coreGlow"><stop offset="0" stop-color="#8dfff0" stop-opacity=".95"/><stop offset=".35" stop-color="#4ed9f8" stop-opacity=".42"/><stop offset="1" stop-color="#4ed9f8" stop-opacity="0"/></radialGradient>
+                </defs>
+                <g class="grid-lines"><path d="M30 210h560M310 30v360"/><ellipse cx="310" cy="210" rx="230" ry="150"/><ellipse cx="310" cy="210" rx="166" ry="108"/></g>
+                <g class="beam-lines"><path d="M100 210h110M410 210h110M310 70v65M310 285v65"/></g>
+                <g class="tree-nodes">
+                  <circle cx="490" cy="150" r="6"/><circle cx="530" cy="180" r="4"/><circle cx="490" cy="270" r="6"/><circle cx="530" cy="240" r="4"/><circle cx="130" cy="155" r="5"/><circle cx="92" cy="188" r="4"/><circle cx="130" cy="265" r="5"/><circle cx="92" cy="232" r="4"/>
+                </g>
+                <circle class="core-glow" cx="310" cy="210" r="108" fill="url(#coreGlow)"/>
+                <circle class="core-ring ring-one" cx="310" cy="210" r="78"/>
+                <circle class="core-ring ring-two" cx="310" cy="210" r="57"/>
+                <path class="equilibrium-wave" d="M242 210c22-52 44 52 68 0s46 52 68 0"/>
+                <circle class="core-dot" cx="310" cy="210" r="13"/>
+              </svg>
+              <div class="reactor-readout"><span>REACHED DEPTH</span><strong id="reactor-depth">100</strong><small>/ 100</small></div>
+              <div class="reactor-chip chip-left"><span>LATENT</span><b>R<sup>64</sup></b></div>
+              <div class="reactor-chip chip-right"><span>ARENA</span><b>301</b></div>
+              <div class="reactor-chip chip-bottom"><span>RESIDUAL</span><b id="reactor-residual">3.906e-3</b></div>
+            </div>
+            <p class="visual-disclaimer"><span>시각화</span> 노드 이동은 실행 단계 표현이며, 수치는 검증 프로세스가 반환한 실측값만 표시합니다.</p>
+          </article>
+
+          <article class="telemetry-card surface" aria-labelledby="telemetry-title">
+            <div class="card-heading compact"><div><span class="section-kicker">BOUNDARY WATCH</span><h2 id="telemetry-title">안전 경계</h2></div></div>
+            <div class="telemetry-block">
+              <div class="telemetry-label"><span>VRAM ALLOCATED</span><b><em id="telemetry-vram">14.8560</em> / 16.7 GiB</b></div>
+              <div class="vram-visual"><progress class="vram-fill" id="telemetry-vram-fill" max="16.7" value="14.856" aria-label="VRAM 사용량 14.856 GiB, 상한 16.7 GiB"></progress><span class="vram-limit">LIMIT</span><div class="vram-grid"></div></div>
+            </div>
+            <dl class="telemetry-list">
+              <div><dt>Contraction</dt><dd>0.40</dd></div>
+              <div><dt>Spectral margin</dt><dd>&lt; 0.95</dd></div>
+              <div><dt>Finite check</dt><dd id="telemetry-finite" class="positive">PASS</dd></div>
+              <div><dt>Fallback</dt><dd id="telemetry-fallback">NOT USED</dd></div>
+              <div><dt>External API</dt><dd class="positive">BLOCKED</dd></div>
+            </dl>
+            <button class="text-link" type="button" data-action="toggle-log">원본 실행 로그 보기 <span>↗</span></button>
+          </article>
+        </div>
+
+        <article class="event-log surface" id="event-log" aria-labelledby="event-log-title" hidden>
+          <div class="card-heading compact"><div><span class="section-kicker">AUDIT TRAIL</span><h2 id="event-log-title">실행 이벤트</h2></div><span>bounded local log</span></div>
+          <ol id="event-list"><li><time>READY</time><span>검증 실행을 기다리고 있습니다.</span></li></ol>
+        </article>
+      </section>
+
+      <section class="view" id="view-architecture" data-view-panel="architecture" aria-labelledby="architecture-title" hidden>
+        <div class="view-heading">
+          <div><span class="section-kicker">AIR-GAPPED ARCHITECTURE</span><h1 id="architecture-title">문장은 경계에서 끝납니다.<br>내부에서는 텐서만 이동합니다.</h1><p>제어 평면과 GPU 인지 코어를 분리하고, 한 시점에 하나의 CUDA 소유자만 허용합니다.</p></div>
+          <span class="evidence-badge verified large">구성 검증</span>
+        </div>
+
+        <article class="architecture-map surface" aria-label="Cogni-OS 시스템 아키텍처">
+          <div class="arch-column flow-column">
+            <div class="arch-column-title"><span>CPU CONTROL PLANE</span><h2>Cogni-Flow</h2><p>설계 · 운영 · 진화</p></div>
+            <button class="arch-node" type="button" data-node="rhythm"><i class="node-icon">01</i><span><strong>Bio Rhythm</strong><small>Day / Night exclusion</small></span><b>STATE</b></button>
+            <button class="arch-node" type="button" data-node="router"><i class="node-icon">02</i><span><strong>BIO-HAMA</strong><small>인지 부하 메타 라우팅</small></span><b>ROUTE</b></button>
+            <button class="arch-node" type="button" data-node="aflow"><i class="node-icon">03</i><span><strong>AFlow</strong><small>bounded workflow search</small></span><b>PLAN</b></button>
+            <button class="arch-node" type="button" data-node="harness"><i class="node-icon">04</i><span><strong>Self-Harness</strong><small>검증 후 patch promotion</small></span><b>EVOLVE</b></button>
+          </div>
+
+          <div class="arch-boundary">
+            <span class="boundary-label">BOUNDED TENSOR BOUNDARY</span>
+            <div class="tensor-stream" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+            <div class="protocol-stack"><span>INFER</span><span>PAUSE</span><span>RESUME</span><span>STOP</span></div>
+            <div class="boundary-note"><strong>4× CPU Tensor</strong><small>numeric protocol · timeout · bounded queue</small></div>
+          </div>
+
+          <div class="arch-column core-column">
+            <div class="arch-column-title"><span>SINGLE GPU DATA PLANE</span><h2>Cogni-Core</h2><p>지각 · 평형 · 탐색</p></div>
+            <button class="arch-node accent-node" type="button" data-node="gemma"><i class="node-icon">G4</i><span><strong>Local Gemma 4</strong><small>feature backbone · no KV cache</small></span><b>LOAD</b></button>
+            <div class="core-cluster">
+              <button type="button" data-node="deq"><strong>DEQ</strong><small>Broyden equilibrium</small></button>
+              <button type="button" data-node="cts"><strong>CTS</strong><small>fixed arena search</small></button>
+              <button type="button" data-node="fast"><strong>Fast Weight</strong><small>bounded overlay</small></button>
+              <button type="button" data-node="swarm"><strong>System 4</strong><small>tensor swarm</small></button>
+              <button type="button" data-node="experts"><strong>System 3</strong><small>sparse experts</small></button>
+              <button type="button" data-node="ewc"><strong>FP-EWC</strong><small>stability guard</small></button>
+            </div>
+            <div class="core-safety"><span>C-FIRE</span><strong>L &lt; 0.95</strong><small>spectral safety projection</small></div>
+          </div>
+        </article>
+
+        <div class="architecture-foot-grid">
+          <article class="rhythm-card surface">
+            <div class="card-heading compact"><div><span class="section-kicker">BIOLOGICAL RHYTHM</span><h2>추론과 진화는 동시에 실행되지 않습니다</h2></div></div>
+            <div class="rhythm-track" aria-label="주간 추론과 야간 진화 상태 전이">
+              <span class="is-active"><i></i>Inference</span><b>→</b><span><i></i>Drain</span><b>→</b><span><i></i>Checkpoint</span><b>→</b><span class="night"><i></i>Evolution</span><b>→</b><span><i></i>Validate</span><b>→</b><span><i></i>Promote / Rollback</span>
+            </div>
+          </article>
+          <article class="node-detail surface" id="node-detail" aria-live="polite">
+            <span class="section-kicker">SELECT A MODULE</span>
+            <h2>안전한 마이크로서비스 경계</h2>
+            <p>GPU 모델은 worker 하나만 소유합니다. 요청과 응답은 고정된 텐서 프로토콜을 통과하며 문자열·JSON은 hot path에 들어가지 않습니다.</p>
+            <div><span>상태</span><strong>IMPLEMENTED + TESTED</strong></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-business" data-view-panel="business" aria-labelledby="business-title" hidden>
+        <div class="view-heading business-heading">
+          <div><span class="section-kicker">BEACHHEAD TO SCALE</span><h1 id="business-title">보안 때문에 AI를 포기한 시장부터<br><em>오프라인 모듈 경제로 확장합니다.</em></h1><p>제품은 설치 프로젝트가 아니라, 전원을 연결하면 작동하는 폐쇄망 AI Appliance로 포지셔닝합니다.</p></div>
+          <div class="market-badge"><span>LONG-TERM PUBLIC OPPORTUNITY</span><strong>약 1,000대</strong><small>사업계획 추산 · SOM 확정 전</small></div>
+        </div>
+
+        <div class="segment-grid" role="list" aria-label="핵심 고객군">
+          <article class="segment-card surface bio-segment" role="listitem">
+            <span class="segment-index">01 / PRIMARY</span><div class="segment-icon"><svg viewBox="0 0 48 48" aria-hidden="true"><path d="M17 5v13L7 37a4 4 0 0 0 4 6h26a4 4 0 0 0 4-6L31 18V5M14 29h20M14 5h20"/></svg></div>
+            <h2>바이오 · 신약 R&amp;D</h2><p>기밀 연구문서·코드·후보물질 IP를 외부로 보내지 않는 유상 PoC로 가장 빠른 고객 증거를 만듭니다.</p>
+            <ul><li>핵심 IP 비반출</li><li>8–12주 유상 PoC</li><li>연구소장·CISO 공동 검증</li></ul>
+          </article>
+          <article class="segment-card surface defense-segment" role="listitem">
+            <span class="segment-index">02 / STRATEGIC</span><div class="segment-icon"><svg viewBox="0 0 48 48" aria-hidden="true"><path d="M24 4 8 10v12c0 11 6.7 18.4 16 22 9.3-3.6 16-11 16-22V10Z"/><path d="m16 24 5 5 11-12"/></svg></div>
+            <h2>공공 · 국방 기술업무</h2><p>정비 매뉴얼·기술문서 지원부터 확장합니다. 안전 핵심 지휘 판단은 제품 범위에서 제외합니다.</p>
+            <ul><li>Air-gap 기본값</li><li>비안전결정형 PoC</li><li>조달 SI 협력 경로</li></ul>
+          </article>
+          <article class="segment-card surface" role="listitem">
+            <span class="segment-index">03 / EXPANSION</span><div class="segment-icon"><svg viewBox="0 0 48 48" aria-hidden="true"><path d="M5 37 17 25l8 7 18-21M32 11h11v11"/></svg></div>
+            <h2>금융 · 트레이딩</h2><p>클라우드 왕복 없이 내부 텐서 경로로 연결되는 저지연 의사결정 인프라를 지향합니다.</p>
+            <ul><li>로컬 데이터 처리</li><li>텐서 다이렉트 결합</li><li>6.3ms 설계 목표</li></ul>
+          </article>
+        </div>
+
+        <div class="business-grid">
+          <article class="comparison-card surface" aria-labelledby="comparison-title">
+            <div class="card-heading"><div><span class="section-kicker">WHY BUY, NOT BUILD</span><h2 id="comparison-title">대체재의 숨은 비용을 제품으로 제거합니다</h2></div></div>
+            <div class="comparison-table" role="table" aria-label="대체재 비교">
+              <div class="comparison-row header" role="row"><span role="columnheader">구매 기준</span><span role="columnheader">퍼블릭 클라우드</span><span role="columnheader">사내 오픈소스 구축</span><span role="columnheader">Cogni-OS</span></div>
+              <div class="comparison-row" role="row"><strong role="cell">핵심 데이터 비반출</strong><span role="cell" class="negative">구조적 제약</span><span role="cell" class="neutral">추가 설계 필요</span><span role="cell" class="positive">기본값</span></div>
+              <div class="comparison-row" role="row"><strong role="cell">초기 통합 복잡도</strong><span role="cell" class="neutral">낮음</span><span role="cell" class="negative">매우 높음</span><span role="cell" class="positive">Appliance</span></div>
+              <div class="comparison-row" role="row"><strong role="cell">전문 AI 운영 인력</strong><span role="cell" class="neutral">외부 의존</span><span role="cell" class="negative">상시 필요</span><span role="cell" class="positive">최소화 목표</span></div>
+              <div class="comparison-row" role="row"><strong role="cell">클라우드 종량 비용</strong><span role="cell" class="negative">지속 발생</span><span role="cell" class="positive">없음</span><span role="cell" class="positive">없음</span></div>
+              <div class="comparison-row" role="row"><strong role="cell">검증·감사 경로</strong><span role="cell" class="neutral">사업자 의존</span><span role="cell" class="neutral">직접 구축</span><span role="cell" class="positive">제품 내장</span></div>
+            </div>
+            <p class="table-note">비용 절감 배율은 시장 리서치와 공인 벤치마크 확보 후 정량화합니다. 현재 화면은 비용 항목 구조만 비교합니다.</p>
+          </article>
+
+          <article class="revenue-card surface" aria-labelledby="revenue-title">
+            <div class="card-heading"><div><span class="section-kicker">J-CURVE MODEL</span><h2 id="revenue-title">일시 매출에서 반복 매출로</h2></div><span class="evidence-badge planned">사업계획</span></div>
+            <div class="revenue-curve" aria-hidden="true">
+              <svg viewBox="0 0 480 230"><defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5de6ff" stop-opacity=".35"/><stop offset="1" stop-color="#5de6ff" stop-opacity="0"/></linearGradient></defs><path class="axis" d="M38 18v174h420"/><path class="curve-area" d="M40 151c80 12 112 11 158-5 62-22 87-92 154-105 39-8 64-5 104-22v173H40Z" fill="url(#area)"/><path class="curve-line" d="M40 151c80 12 112 11 158-5 62-22 87-92 154-105 39-8 64-5 104-22"/><circle cx="105" cy="158" r="5"/><circle cx="230" cy="128" r="5"/><circle cx="354" cy="40" r="5"/></svg>
+              <span class="curve-label label-appliance"><b>01</b>Appliance<br>일시 매출</span>
+              <span class="curve-label label-plugin"><b>02</b>연간 라이선스<br>유지보수</span>
+              <span class="curve-label label-global"><b>03</b>표준·IP 기반<br>글로벌 확장</span>
+            </div>
+            <div class="plugin-list"><span>서명된 오프라인 모듈</span><span>현장 보안 업데이트</span><span>운영 SLA · 유지보수</span></div>
+          </article>
+        </div>
+
+        <article class="buying-proof surface">
+          <div><span class="section-kicker">THE BUYING LOGIC</span><h2>“무료 모델”이 아니라 <em>검증된 폐쇄망 운영 결과</em>를 판매합니다.</h2></div>
+          <div class="proof-items"><span><b>01</b>설치·보안·최적화 통합</span><span><b>02</b>실측 가능한 메모리 경계</span><span><b>03</b>ISO·시험성적서·감사 로그</span></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-evidence" data-view-panel="evidence" aria-labelledby="evidence-title" hidden>
+        <div class="view-heading">
+          <div><span class="section-kicker">FACT-BOOK &amp; EXECUTION</span><h1 id="evidence-title">주장보다 먼저, 증빙의 상태를 공개합니다.</h1><p>심사위원이 실측·구현·목표·계획을 한눈에 구분하도록 모든 지표에 증거 등급을 붙였습니다.</p></div>
+          <button class="secondary-button" type="button" data-action="toggle-log">실행 로그 열기</button>
+        </div>
+
+        <div class="evidence-summary">
+          <article class="evidence-score surface"><div class="score-ring"><strong>4</strong><span>증거 등급</span></div><div><span class="section-kicker">EVIDENCE TAXONOMY</span><h2>표시 기준 자체가 신뢰 설계입니다</h2><p>숫자가 좋아 보이는 것보다, 어디까지 검증했는지가 더 중요합니다.</p></div></article>
+          <div class="evidence-legend surface">
+            <span><i class="legend-measured"></i><strong>내부 실측</strong><small>현재 장치에서 실행 측정</small></span>
+            <span><i class="legend-verified"></i><strong>구성 검증</strong><small>코드·테스트로 확인</small></span>
+            <span><i class="legend-target"></i><strong>설계 목표</strong><small>향후 공인시험으로 확정</small></span>
+            <span><i class="legend-plan"></i><strong>사업계획</strong><small>근거·출처 보강 예정</small></span>
+          </div>
+        </div>
+
+        <div class="ledger-roadmap-grid">
+          <article class="evidence-ledger surface" aria-labelledby="ledger-title">
+            <div class="card-heading"><div><span class="section-kicker">EVIDENCE LEDGER</span><h2 id="ledger-title">핵심 주장 검증 현황</h2></div></div>
+            <div class="ledger-list">
+              <div><span class="ledger-status measured">실측</span><p><strong>Gemma 4 + CTS Depth 100</strong><small>실제 로컬 모델 · 301 node · finite</small></p><b>PASS</b></div>
+              <div><span class="ledger-status measured">실측</span><p><strong id="ledger-vram">Peak VRAM 14.8560 GiB</strong><small>현재 RTX 5090 Laptop · 상한 16.7 GiB</small></p><b>PASS</b></div>
+              <div><span class="ledger-status verified">검증</span><p><strong>회귀 테스트 178개</strong><small>warning-as-error · Ruff · format</small></p><b>PASS</b></div>
+              <div><span class="ledger-status verified">검증</span><p><strong>주·야간 상호 배제</strong><small>inference/evolution state machine</small></p><b>PASS</b></div>
+              <div><span class="ledger-status target">목표</span><p><strong>컨텍스트 길이별 메모리 비교</strong><small>추론 깊이와 별도 축 · baseline 공인시험 필요</small></p><b>PENDING</b></div>
+              <div><span class="ledger-status target">목표</span><p><strong>System 4 통신 6.3ms</strong><small>RTX 4090 조건 · 공인시험 전</small></p><b>PENDING</b></div>
+              <div><span class="ledger-status plan">계획</span><p><strong>SOM 약 1,000대</strong><small>망분리 필수 부대 기준 · 근거표 별첨 예정</small></p><b>RESEARCH</b></div>
+            </div>
+          </article>
+
+          <article class="roadmap-card surface" aria-labelledby="roadmap-title">
+            <div class="card-heading"><div><span class="section-kicker">3-YEAR EXECUTION</span><h2 id="roadmap-title">검증 → 실증 → 표준 → 글로벌</h2></div><span class="evidence-badge planned">계획서</span></div>
+            <ol class="roadmap">
+              <li class="is-current"><span>1–2Q</span><div><strong>검증과 보호</strong><p>공인 벤치마크 의뢰 · ISO/IEC 42001 TF · O(1) DEQ 특허</p></div></li>
+              <li><span>3–4Q</span><div><strong>PoC와 첫 제품</strong><p>국방·신약 핵심 기관 2곳 · Appliance 1차 생산</p></div></li>
+              <li><span>YEAR 2</span><div><strong>양산과 연간 라이선스</strong><p>조달 등록 · 서명된 오프라인 모듈 · 현장 운영 SLA</p></div></li>
+              <li><span>YEAR 3</span><div><strong>글로벌 진출</strong><p>PCT · ISO 기반 방산·신약 수출</p></div></li>
+            </ol>
+          </article>
+        </div>
+
+        <div class="evidence-bottom-grid">
+          <article class="budget-card surface">
+            <div class="card-heading compact"><div><span class="section-kicker">2M KRW ALLOCATION</span><h2>초기 자금은 Fact-book에 집중</h2></div><span class="evidence-badge planned">사업계획</span></div>
+            <div class="budget-content"><div class="budget-donut"><span><strong>200</strong><small>만원</small></span></div><div class="budget-legend"><span><i class="budget-a"></i><b>80만원</b>시각화 · UI/UX · 영상</span><span><i class="budget-b"></i><b>80만원</b>공인 벤치마크 · 리서치</span><span><i class="budget-c"></i><b>40만원</b>특허 보정 · ISO 기초</span></div></div>
+          </article>
+          <article class="moat-card surface">
+            <div class="card-heading compact"><div><span class="section-kicker">DEFENSIBILITY</span><h2>기술 + 표준 + 조달의 3중 방어</h2></div></div>
+            <div class="moat-stack"><div><span>IP 01</span><strong>등록특허 제10-2973709호</strong><small>자율 자기진화 소프트웨어 · 사업계획서 기재</small></div><div><span>IP 02</span><strong>O(1) DEQ 지속학습 특허</strong><small>19개 청구항 · 변리사 검토 단계</small></div><div><span>STD</span><strong>ISO/IEC 42001</strong><small>공공 조달·대기업 납품 신뢰 기준</small></div></div>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <aside class="evidence-rail" aria-labelledby="rail-title">
+      <div class="rail-heading"><span class="section-kicker">EVIDENCE RAIL</span><h2 id="rail-title">실행 무결성</h2></div>
+      <div class="rail-seal"><svg viewBox="0 0 84 84" aria-hidden="true"><circle cx="42" cy="42" r="36"/><path d="m25 43 11 11 24-27"/></svg><span><strong id="rail-verdict">VERIFIED</strong><small id="rail-time">최근 검증 기록</small></span></div>
+      <dl class="rail-details">
+        <div><dt>Model</dt><dd>Gemma 4 e4b</dd></div>
+        <div><dt>Manifest</dt><dd id="rail-files">6 files</dd></div>
+        <div><dt>Runtime</dt><dd>Genesis v0.1.0</dd></div>
+        <div><dt>Network</dt><dd class="positive">BLOCKED</dd></div>
+        <div><dt>KV cache</dt><dd>DISABLED</dd></div>
+      </dl>
+      <div class="rail-divider"></div>
+      <div class="rail-proof">
+        <span>측정 환경</span><strong id="rail-device">RTX 5090 Laptop GPU</strong><small>현재 실측은 목표 RTX 4090 결과가 아닙니다.</small>
+      </div>
+      <div class="rail-proof">
+        <span>메모리 주장 범위</span><strong>고정 용량 CTS 작업 텐서</strong><small>모델 가중치·로그·외부 데이터까지 포함한 전체 시스템 O(1) 주장이 아닙니다.</small>
+      </div>
+      <button class="rail-button" type="button" data-view-jump="evidence">전체 Fact-book 보기 <span>→</span></button>
+    </aside>
+  </div>
+
+  <div class="tour-panel" id="tour-panel" role="dialog" aria-modal="false" aria-labelledby="tour-title" hidden>
+    <div class="tour-progress"><progress id="tour-progress" max="6" value="1" aria-label="IR 가이드 진행률"></progress></div>
+    <span class="tour-count" id="tour-count">01 / 05</span>
+    <div><span class="section-kicker" id="tour-kicker">WHY NOW</span><h2 id="tour-title">보안 때문에 AI를 포기하는 시장</h2><p id="tour-copy">국방·신약 고객은 데이터를 클라우드로 보낼 수 없고, 자체 구축은 숨은 비용을 만듭니다.</p></div>
+    <div class="tour-actions"><button type="button" data-action="tour-close">종료</button><button type="button" data-action="tour-prev">이전</button><button class="primary-button" type="button" data-action="tour-next">다음 <span>→</span></button></div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden><i></i><span></span></div>
+  <div class="shutdown-screen" id="shutdown-screen" hidden><div><span class="brand-mark large" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M24 4 40.5 13.5v19L24 42 7.5 32.5v-19Z" class="mark-frame"/><path d="M15 27.5 24 12l9 15.5-9 8Z" class="mark-core"/></svg></span><h1>CogniBoard를 안전하게 종료했습니다.</h1><p>이 창을 닫아도 됩니다.</p></div></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

@@ -2,7 +2,7 @@
 
 기준일: 2026-07-10  
 소스 버전: `0.1.0`  
-구현 규모: Python 60개 파일, 12,259줄, 테스트 파일 27개
+구현 규모: Python 67개 파일, 14,510줄, 테스트 파일 30개
 
 ## 1. 최종 판정
 
@@ -14,8 +14,8 @@ tensor-only 프로세스 경계까지 코드와 테스트로 연결했습니다.
 최종 자동 검증 결과는 다음과 같습니다.
 
 - Ruff 정적 검사: 통과
-- Ruff format 검사: 60개 파일 통과
-- 회귀 테스트: **154개 통과**
+- Ruff format 검사: 67개 파일 통과
+- 회귀 테스트: **178개 통과**
 - Python warning을 error로 승격한 실행: 통과
 - wheel build: 통과
 - 소스 트리 밖 임시 환경에서 설치형 `doctor`: 통과
@@ -92,7 +92,7 @@ python -m ruff format --check cogni_core cogni_flow cogni_os tests scripts
 python -W error -m unittest discover -s tests
 ```
 
-결과: `Ran 154 tests ... OK`.
+결과: `178 tests passed`.
 
 ## 5. 실제 Gemma 4 측정
 
@@ -144,6 +144,28 @@ Broyden latent transition으로 CTS를 실행했습니다.
 프로세스 전체의 가장 높은 관측값은 모델 load gate의 14.8955 GiB로, 16.7 GiB
 상한보다 약 1.80 GiB 낮습니다. 이 수치는 prompt 길이와 현재 software stack에
 대한 측정이며 RTX 4090 결과로 간주할 수는 없습니다.
+
+### CogniBoard 그래픽 데모 E2E
+
+localhost 전용 CogniBoard에서 `국방 폐쇄망` 시나리오 버튼을 눌러 GUI → 인증된
+control plane → 단일 CUDA subprocess → sentinel JSONL evidence → UI 갱신의 전체
+경로를 검증했습니다. 기존 짧은 기본 prompt와 다른 입력이므로 별도 측정으로
+기록합니다.
+
+- 상태: `VERIFIED`
+- load: **39.006 s**
+- integrated inference: **5.552 s**
+- requested/reached depth: **100/100**
+- nodes: **301/301**
+- search allocation telemetry: **21,158,489 bytes**
+- 마지막 transition residual: `0.0039062500`
+- fallback: 미사용
+- finite: 통과
+- peak VRAM: **14.8621 GiB**
+
+이 차이는 prompt와 실행 조건에 따른 측정 변동입니다. reasoning depth에 대한
+bounded working set 검증은 context length 불변성을 자동으로 증명하지 않으므로,
+두 축은 향후 공인 비교시험에서 별도로 측정합니다.
 
 ## 6. 절대 규칙별 판정
 

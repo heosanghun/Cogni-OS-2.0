@@ -22,6 +22,7 @@ from cogni_core.search import ContractiveBroydenTransition  # noqa: E402
 from cogni_os.artifacts import verify_artifact_manifest  # noqa: E402
 from cogni_os.config import load_config  # noqa: E402
 from cogni_os.factory import build_genesis_runtime  # noqa: E402
+from cogni_demo.protocol import EventEmitter  # noqa: E402
 
 
 def _hidden_size(model: object) -> int:
@@ -42,22 +43,31 @@ def main() -> int:
     parser.add_argument("--prompt", default="Cogni-OS integrated depth validation")
     parser.add_argument("--workspace-mib", type=int, default=512)
     parser.add_argument("--vram-limit-gib", type=float, default=16.7)
+    parser.add_argument(
+        "--event-stream",
+        action="store_true",
+        help="add versioned sentinel JSONL events while retaining legacy output",
+    )
     args = parser.parse_args()
     if args.workspace_mib <= 0:
         parser.error("--workspace-mib must be positive")
 
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    events = EventEmitter(args.event_stream)
+    events.phase("verifying", 5)
     verified = verify_artifact_manifest(args.model, args.manifest)
     if not torch.cuda.is_available():
         raise RuntimeError("integrated Gemma 4 validation requires a CUDA device")
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
+    events.phase("loading_model", 15)
     started = perf_counter()
     model, tokenizer = load_local_gemma(args.model, vram_limit_gib=args.vram_limit_gib)
     load_seconds = perf_counter() - started
     hidden_size = _hidden_size(model)
+    events.phase("building_runtime", 65)
     runtime = build_genesis_runtime(
         LocalGemmaFeatureBackbone(model),
         load_config(),
@@ -85,6 +95,7 @@ def main() -> int:
         logits[-1] = 40.0
         return logits, state.float().mean()
 
+    events.phase("running_inference", 75)
     started = perf_counter()
     result = runtime.infer(
         input_ids,
@@ -102,6 +113,7 @@ def main() -> int:
     )
     telemetry = result.search.telemetry
     info = transition.last_info
+    events.phase("postcheck", 95)
     if not finite:
         raise RuntimeError("integrated runtime produced a non-finite latent")
     if peak_gib > args.vram_limit_gib:
@@ -118,21 +130,41 @@ def main() -> int:
     if info is None or not info.converged:
         raise RuntimeError("final CTS transition did not converge")
 
-    print(f"verified_files={len(verified.files)}")
-    print(f"model_class={type(model).__name__}")
-    print(f"hidden_size={hidden_size}")
-    print(f"load_seconds={load_seconds:.3f}")
-    print(f"inference_seconds={inference_seconds:.3f}")
-    print(f"requested_depth={runtime.search_engine.config.max_depth}")
-    print(f"reached_depth={telemetry.max_depth_reached}")
-    print(f"nodes_used={telemetry.nodes_used}")
-    print(f"node_capacity={telemetry.node_capacity}")
-    print(f"search_allocated_bytes={telemetry.allocated_bytes}")
-    print(f"transition_converged={info.converged}")
-    print(f"transition_residual={info.residual:.10f}")
-    print(f"transition_used_fallback={info.used_fallback}")
-    print(f"peak_vram_gib={peak_gib:.4f}")
-    print(f"finite={finite}")
+    metrics = {
+        "verified_files": len(verified.files),
+        "model_class": type(model).__name__,
+        "hidden_size": hidden_size,
+        "load_seconds": load_seconds,
+        "inference_seconds": inference_seconds,
+        "requested_depth": runtime.search_engine.config.max_depth,
+        "reached_depth": telemetry.max_depth_reached,
+        "nodes_used": telemetry.nodes_used,
+        "node_capacity": telemetry.node_capacity,
+        "search_allocated_bytes": telemetry.allocated_bytes,
+        "transition_converged": info.converged,
+        "transition_residual": info.residual,
+        "transition_used_fallback": info.used_fallback,
+        "peak_vram_gib": peak_gib,
+        "vram_limit_gib": args.vram_limit_gib,
+        "finite": finite,
+        "device": torch.cuda.get_device_properties(0).name,
+    }
+    print(f"verified_files={metrics['verified_files']}")
+    print(f"model_class={metrics['model_class']}")
+    print(f"hidden_size={metrics['hidden_size']}")
+    print(f"load_seconds={metrics['load_seconds']:.3f}")
+    print(f"inference_seconds={metrics['inference_seconds']:.3f}")
+    print(f"requested_depth={metrics['requested_depth']}")
+    print(f"reached_depth={metrics['reached_depth']}")
+    print(f"nodes_used={metrics['nodes_used']}")
+    print(f"node_capacity={metrics['node_capacity']}")
+    print(f"search_allocated_bytes={metrics['search_allocated_bytes']}")
+    print(f"transition_converged={metrics['transition_converged']}")
+    print(f"transition_residual={metrics['transition_residual']:.10f}")
+    print(f"transition_used_fallback={metrics['transition_used_fallback']}")
+    print(f"peak_vram_gib={metrics['peak_vram_gib']:.4f}")
+    print(f"finite={metrics['finite']}")
+    events.result(metrics)
     return 0
 
 

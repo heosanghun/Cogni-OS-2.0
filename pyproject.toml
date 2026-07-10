@@ -18,9 +18,10 @@ cogni-os = "cogni_os.cli:main"
 testpaths = ["tests"]
 
 [tool.setuptools]
-packages = ["cogni_core", "cogni_flow", "cogni_os"]
+packages = ["cogni_core", "cogni_demo", "cogni_flow", "cogni_os"]
 
 [tool.setuptools.package-data]
+cogni_demo = ["static/*.html", "static/*.css", "static/*.js"]
 cogni_os = ["default.toml"]
 
 [tool.ruff]

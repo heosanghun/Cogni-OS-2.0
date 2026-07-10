@@ -16,6 +16,18 @@ day/night exclusion, AFlow, and a fail-closed Self-Harness control plane.
 python -m unittest discover -s tests -v
 ```
 
+## Windows double-click demo
+
+Double-click `Run-CogniOS-Demo.cmd` from the repository root. The launcher
+verifies Python 3.11+, CUDA-enabled PyTorch, Transformers, the local model, and
+the artifact manifest before running the integrated Gemma 4 + CTS depth-100
+demo. The result window remains open so the final VRAM and convergence report
+can be inspected.
+
+The default local model path is `C:\Project\cognios\gemma4-e4b`. Set
+`COGNI_OS_MODEL_DIR` before launching to select another verified local path.
+All Hugging Face network access and telemetry are disabled by the launcher.
+
 The CUDA gate is skipped only when CUDA is unavailable. It reports a real failure when a CUDA
 device exists but peak active allocation grows by more than 8 MiB between depth 8 and depth 64.
 
@@ -25,7 +37,7 @@ This is a bounded research runtime, not a claim of AGI or O(1) total system
 memory. Solver history and CTS working tensors are fixed-capacity; model weights,
 expert banks, logs, and external data remain separately budgeted resources. On
 the attached RTX 5090 Laptop GPU, the verified local Gemma artifact plus the
-integrated depth-100/301-node runtime reached a 14.8604 GiB inference peak. The
+integrated depth-100/301-node runtime reached a 14.8560 GiB inference peak. The
 RTX 4090 target still requires the same hardware gate.
 
 Reference implementations reviewed during development are kept under `work/upstream/` and are

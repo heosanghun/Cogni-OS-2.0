@@ -1,0 +1,67 @@
+[project]
+name = "Cogni-OS 2.0"
+codename = "Genesis"
+offline = true
+
+[hardware]
+vram_limit_gib = 16.7
+device = "cuda"
+
+[deq]
+tolerance = 1.0e-5
+max_iter = 80
+history = 16
+spectral_margin = 0.95
+fallback_damping = 0.35
+fallback_steps = 128
+
+[cts]
+width = 3
+max_depth = 100
+max_nodes = 301
+latent_capacity = 256
+
+[fast_weights]
+rank = 8
+bottleneck_dim = 64
+internal_dim = 128
+max_operator_norm = 0.10
+session_capacity = 16
+
+[fp_ewc]
+strength = 10000.0
+spectral_margin = 0.95
+
+[swarm]
+agents = 28
+sensory_agents = 11
+constraint_agents = 7
+state_dim = 64
+local_margin = 0.90
+coupling_scale = 0.05
+
+[experts]
+max_experts = 8
+initial_experts = 1
+top_k = 2
+novelty_threshold = 0.8
+spectral_margin = 0.90
+max_parameter_gib = 8.0
+
+[meta_router]
+num_modules = 8
+hidden_dim = 64
+strategic_top_k = 4
+tactical_top_k = 2
+reactive_top_k = 3
+
+[aflow]
+max_nodes = 16
+max_edges = 32
+max_actions = 32
+max_iterations = 32
+max_archive_entries = 64
+
+[flow]
+patch_timeout_seconds = 180
+require_kernel_sandbox_for_production = true

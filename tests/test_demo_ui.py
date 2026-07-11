@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from html.parser import HTMLParser
 from pathlib import Path
 import re
 import unittest
@@ -7,6 +8,28 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "cogni_demo" / "static"
+
+
+class DOMAuditParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.ids: list[str] = []
+        self.references: list[tuple[str, str]] = []
+        self.buttons: list[dict[str, str]] = []
+        self.panels: list[dict[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        values = dict(attrs)
+        identifier = values.get("id")
+        if identifier:
+            self.ids.append(identifier)
+        for attribute in ("aria-controls", "aria-describedby", "aria-labelledby"):
+            for reference in values.get(attribute, "").split():
+                self.references.append((attribute, reference))
+        if tag == "button":
+            self.buttons.append(values)
+        if "data-view-panel" in values:
+            self.panels.append(values)
 
 
 class TestCogniBoardUI(unittest.TestCase):
@@ -35,7 +58,14 @@ class TestCogniBoardUI(unittest.TestCase):
         panels = set(re.findall(r'data-view-panel="([a-z]+)"', html))
         self.assertEqual(
             navigation,
-            {"mission", "inference", "architecture", "business", "evidence"},
+            {
+                "assistant",
+                "mission",
+                "inference",
+                "architecture",
+                "business",
+                "evidence",
+            },
         )
         self.assertEqual(navigation, panels)
         for label in ("내부 실측", "구성 검증", "설계 목표", "사업계획"):
@@ -43,6 +73,135 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn('data-action="fullscreen"', html)
         self.assertIn("<strong>Moat</strong>", html)
         self.assertNotIn("<strong>Defense</strong>", html)
+        for action in ("agent-send", "agent-cancel", "agent-reset", "evolution-run"):
+            self.assertIn(f'data-action="{action}"', html)
+
+    def test_ai_workspace_accessibility_contract_is_complete(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        parser = DOMAuditParser()
+        parser.feed(html)
+        self.assertEqual(len(parser.ids), len(set(parser.ids)), "duplicate DOM id")
+        identifiers = set(parser.ids)
+        for attribute, reference in parser.references:
+            with self.subTest(attribute=attribute, reference=reference):
+                self.assertIn(reference, identifiers)
+        for button in parser.buttons:
+            with self.subTest(
+                button=button.get("data-action") or button.get("data-view")
+            ):
+                self.assertEqual(button.get("type"), "button")
+
+        self.assertEqual(
+            [
+                panel["data-view-panel"]
+                for panel in parser.panels
+                if "hidden" not in panel
+            ],
+            ["assistant"],
+        )
+        self.assertIn('class="skip-link" href="#main-content"', html)
+        self.assertRegex(
+            html,
+            r'id="chat-transcript"[^>]*role="log"[^>]*aria-live="polite"'
+            r'[^>]*aria-relevant="additions text"[^>]*tabindex="0"',
+        )
+        self.assertRegex(
+            html,
+            r'id="agent-heading-state"[^>]*role="status"[^>]*aria-live="polite"',
+        )
+        self.assertIn('aria-keyshortcuts="Control+Enter Meta+Enter"', html)
+        self.assertIn('id="agent-char-count" for="agent-input"', html)
+        self.assertRegex(
+            html, r'data-agent-mode="chat"[^>]*aria-pressed="true"[^>]*disabled'
+        )
+        self.assertRegex(html, r'id="agent-input"[^>]*maxlength="4096"[^>]*disabled')
+
+    def test_ai_workspace_uses_xss_safe_bounded_dom_rendering(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        for forbidden in (
+            r"\.innerHTML\b",
+            r"\.outerHTML\b",
+            r"insertAdjacentHTML",
+            r"document\.write",
+            r"\beval\s*\(",
+            r"new\s+Function\b",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotRegex(script, forbidden)
+        self.assertIn("content.textContent = message.content", script)
+        self.assertIn("message.content.slice(0, MAX_AGENT_MESSAGE_CHARS)", script)
+        self.assertIn('includes(message.role) ? message.role : "assistant"', script)
+        self.assertIn("messages.slice(-MAX_AGENT_DOM_MESSAGES)", script)
+        self.assertIn("VIEW_IDS.has(initial)", script)
+        self.assertNotIn('$(`[data-view-panel="${initial}"]`)', script)
+
+    def test_streaming_cancelling_and_compute_button_states_fail_closed(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+        self.assertIn("item.dataset.messageId = message.key", script)
+        self.assertIn(
+            'item.setAttribute("aria-busy", String(message.streaming))', script
+        )
+        self.assertIn(
+            "transcript.scrollTop = nearBottom ? transcript.scrollHeight : priorScrollTop",
+            script,
+        )
+        self.assertNotIn('nearBottom || ui.agentStatus === "generating"', script)
+        self.assertIn(
+            'ui.agentStatus === "cancelling" || ui.agentCancelPending', script
+        )
+        self.assertIn("agentRequestPending", script)
+        self.assertIn("validationRequestPending", script)
+        self.assertIn("evolutionRequestPending", script)
+        self.assertIn("updateControlStates", script)
+        self.assertIn('data-action="agent-send"', html)
+        self.assertIn('data-action="agent-cancel"', html)
+        self.assertIn('.agent-heading-state[data-state="cancelling"]', stylesheet)
+
+    def test_api_error_copy_and_connection_recovery_are_actionable(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        for code in (
+            "AGENT_UNAVAILABLE",
+            "AUTH_REQUIRED",
+            "COMPUTE_BUSY",
+            "EVOLUTION_UNAVAILABLE",
+            "NO_ACTIVE_AGENT_TURN",
+        ):
+            self.assertIn(f"{code}:", script)
+        self.assertIn('error.code = "CONNECTION_LOST"', script)
+        self.assertIn("describeApiError", script)
+        self.assertIn("agentConnectionLost", script)
+        self.assertIn("validationConnectionLost", script)
+        self.assertIn("로컬 AI 연결이 복구되었습니다.", script)
+        self.assertIn("검증 제어 연결이 복구되었습니다.", script)
+
+    def test_responsive_workspace_has_no_global_horizontal_scroll_contract(
+        self,
+    ) -> None:
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+        self.assertEqual(stylesheet.count("{"), stylesheet.count("}"))
+        for query in (
+            "@media (min-width: 1181px) and (max-height: 820px)",
+            "@media (max-width: 900px)",
+            "@media (max-width: 620px)",
+        ):
+            self.assertIn(query, stylesheet)
+        self.assertRegex(
+            stylesheet,
+            r"(?s)\.main-stage\s*\{[^}]*overflow-x:\s*hidden;"
+            r"[^}]*overflow-y:\s*auto;",
+        )
+        self.assertIn("grid-template-columns: repeat(6, minmax(0, 1fr));", stylesheet)
+        self.assertRegex(
+            stylesheet,
+            r"(?s)\.chat-workspace\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*hidden;",
+        )
+        self.assertRegex(
+            stylesheet,
+            r"(?s)\.chat-bubble p\s*\{[^}]*overflow-wrap:\s*anywhere;"
+            r"[^}]*white-space:\s*pre-wrap;",
+        )
 
     def test_live_audit_trail_accumulates_and_presentation_flow_is_complete(
         self,
@@ -74,11 +233,18 @@ class TestCogniBoardUI(unittest.TestCase):
     def test_double_click_and_operator_launchers_have_separate_roles(self) -> None:
         graphical = (ROOT / "Run-CogniOS-Demo.cmd").read_text(encoding="utf-8")
         diagnostic = (ROOT / "Run-CogniOS-CLI.cmd").read_text(encoding="utf-8")
+        native = (ROOT / "launcher" / "CogniBoardLauncher.cs").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("cogni_demo.server", graphical)
         self.assertNotIn("validate_gemma4_runtime.py", graphical)
         self.assertIn("validate_gemma4_runtime.py", diagnostic)
         self.assertIn("HF_HUB_OFFLINE", graphical)
         self.assertIn("HF_HUB_OFFLINE", diagnostic)
+        self.assertIn("cogni_demo.server", native)
+        self.assertIn("CreateNoWindow = true", native)
+        self.assertIn("HF_HUB_OFFLINE", native)
+        self.assertNotIn("validate_gemma4_runtime.py", native)
 
 
 if __name__ == "__main__":

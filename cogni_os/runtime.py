@@ -292,11 +292,13 @@ class GenesisRuntime:
         with self.rhythm.inference_slot():
             return self.meta_router(state, available_mask)
 
-    def expert_step(self, z: Tensor, x: Tensor) -> ExpertOutput:
+    def expert_step(
+        self, z: Tensor, x: Tensor, *, track_usage: bool = True
+    ) -> ExpertOutput:
         if self.experts is None:
             raise RuntimeError("System3 expert pool is not configured")
         with self.rhythm.inference_slot(), self.vram_guard.enforce():
-            return self.experts(z, x, track_usage=True)
+            return self.experts(z, x, track_usage=track_usage)
 
     def recruit_expert(self, observations: Tensor):
         if self.experts is None:

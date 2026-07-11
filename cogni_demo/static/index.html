@@ -17,7 +17,7 @@
 
   <div class="app-shell">
     <header class="topbar">
-      <a class="brand" href="#mission" data-view-link="mission" aria-label="CogniBoard 미션 컨트롤">
+      <a class="brand" href="#assistant" data-view-link="assistant" aria-label="CogniBoard AI 워크스페이스">
         <span class="brand-mark" aria-hidden="true">
           <svg viewBox="0 0 48 48" role="img">
             <path d="M24 4 40.5 13.5v19L24 42 7.5 32.5v-19Z" class="mark-frame"/>
@@ -54,7 +54,11 @@
 
     <aside class="sidebar" aria-label="주요 화면">
       <nav class="primary-nav">
-        <button class="nav-item is-active" type="button" data-view="mission" aria-current="page">
+        <button class="nav-item is-active" type="button" data-view="assistant" aria-current="page">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4Zm4 5h.01M12 10h.01M16 10h.01"/></svg>
+          <span>AI 워크스페이스</span>
+        </button>
+        <button class="nav-item" type="button" data-view="mission">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4Zm10 7h6v-9h-6ZM4 20h6v-3H4Zm10-13h6V4h-6Z"/></svg>
           <span>미션 컨트롤</span>
         </button>
@@ -78,13 +82,92 @@
 
       <div class="sidebar-foot">
         <span class="mini-kicker">GENESIS BUILD</span>
-        <strong>v0.1.0</strong>
+        <strong>v0.2.0</strong>
         <span>Air-gapped research runtime</span>
       </div>
     </aside>
 
     <main id="main-content" class="main-stage" tabindex="-1">
-      <section class="view is-active" id="view-mission" data-view-panel="mission" aria-labelledby="mission-title">
+      <section class="view is-active" id="view-assistant" data-view-panel="assistant" aria-labelledby="assistant-title">
+        <div class="assistant-heading">
+          <div>
+            <span class="section-kicker">COGNI AGENT · LOCAL GEMMA 4 E4B</span>
+            <h1 id="assistant-title">대화하고, 실행하고,<br><em>스스로 검증합니다.</em></h1>
+            <p>모든 대화와 작업은 이 PC 안에서 처리됩니다. 소스 변경은 격리 회귀 테스트를 통과하기 전까지 실제 코드에 반영되지 않습니다.</p>
+          </div>
+          <div class="agent-heading-state" id="agent-heading-state" data-state="offline" role="status" aria-live="polite" aria-atomic="true">
+            <i></i><span><small>COGNI AGENT</small><strong id="agent-status-label">CONNECTING</strong></span>
+          </div>
+        </div>
+
+        <div class="assistant-layout">
+          <article class="chat-workspace surface" aria-labelledby="chat-title" aria-busy="false">
+            <div class="chat-toolbar">
+              <div><span class="section-kicker">SOVEREIGN CONVERSATION</span><h2 id="chat-title">로컬 AI 대화</h2></div>
+              <div class="chat-toolbar-actions">
+                <button class="micro-button" type="button" data-action="agent-reset" aria-controls="chat-transcript" aria-label="대화 기록 초기화" disabled>새 대화</button>
+                <button class="micro-button danger" type="button" data-action="agent-cancel" aria-controls="chat-transcript" aria-label="현재 요청 중단" disabled>중단</button>
+              </div>
+            </div>
+
+            <div class="chat-transcript" id="chat-transcript" role="log" aria-live="polite" aria-relevant="additions text" aria-atomic="false" aria-busy="false" aria-label="Cogni Agent 대화 기록" tabindex="0">
+              <div class="chat-empty" id="chat-empty">
+                <span class="brand-mark large" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M24 4 40.5 13.5v19L24 42 7.5 32.5v-19Z" class="mark-frame"/><path d="M15 27.5 24 12l9 15.5-9 8Z" class="mark-core"/><circle cx="24" cy="24" r="3.5" class="mark-node"/></svg></span>
+                <strong>무엇을 함께 해결할까요?</strong>
+                <p>일반 대화는 대화 모드로, 프로젝트 파일 조회·검색·테스트·결과 저장은 작업 모드로 요청하세요.</p>
+              </div>
+            </div>
+
+            <div class="agent-quick-prompts" aria-label="빠른 시작">
+              <button type="button" data-agent-prompt="현재 Cogni-OS의 상태와 할 수 있는 일을 설명해 주세요." data-agent-mode-value="chat" aria-controls="agent-input" disabled>시스템 설명</button>
+              <button type="button" data-agent-prompt="/list" data-agent-mode-value="task" aria-controls="agent-input" disabled>프로젝트 목록</button>
+              <button type="button" data-agent-prompt="/status" data-agent-mode-value="task" aria-controls="agent-input" disabled>변경 상태</button>
+              <button type="button" data-agent-prompt="/help" data-agent-mode-value="task" aria-controls="agent-input" disabled>작업 명령</button>
+            </div>
+
+            <div class="chat-composer">
+              <div class="agent-mode-switch" role="group" aria-label="요청 처리 모드">
+                <button class="is-selected" type="button" data-agent-mode="chat" aria-pressed="true" disabled><i></i>대화</button>
+                <button type="button" data-agent-mode="task" aria-pressed="false" disabled><i></i>로컬 작업</button>
+              </div>
+              <textarea id="agent-input" maxlength="4096" rows="3" placeholder="메시지를 입력하세요. Ctrl+Enter로 전송" aria-label="Cogni Agent에게 보낼 메시지" aria-describedby="agent-char-count" disabled></textarea>
+              <div class="composer-foot">
+                <span><i></i>외부 전송 0 · <output id="agent-char-count" for="agent-input">0 / 4,096자</output></span>
+                <button class="primary-button compact-button" type="button" data-action="agent-send" aria-controls="chat-transcript" aria-keyshortcuts="Control+Enter Meta+Enter" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 17 8-17 8 4-8Z"/></svg><span data-agent-send-label>보내기</span></button>
+              </div>
+            </div>
+          </article>
+
+          <aside class="agent-side-stack" aria-label="Cogni Agent 실행 상태">
+            <article class="agent-runtime-card surface">
+              <div class="card-heading compact"><div><span class="section-kicker">COGNI-CORE ROUTE</span><h2>인지 파이프라인</h2></div><span class="evidence-badge verified" id="agent-core-badge" role="status">대기</span></div>
+              <div class="core-route" aria-label="대화 요청 처리 경로">
+                <div data-agent-module="gemma"><span>01</span><p><strong>Gemma 4 e4b</strong><small>로컬 생성 백본</small></p><b>LOCAL</b></div>
+                <div data-agent-module="router"><span>02</span><p><strong>BIO-HAMA</strong><small>부하·불확실성 라우팅</small></p><b>READY</b></div>
+                <div data-agent-module="swarm"><span>03</span><p><strong>System 4 · 3</strong><small>텐서 결합·전문가 자문</small></p><b>GATED</b></div>
+                <div data-agent-module="cts"><span>04</span><p><strong>DEQ · CTS</strong><small>bounded 숙고 경로</small></p><b>READY</b></div>
+                <div data-agent-module="fast"><span>05</span><p><strong>System 1.5</strong><small>검증된 세션 Fast Weight</small></p><b>GATED</b></div>
+              </div>
+              <div class="agent-core-foot"><span>System 2.5</span><strong>야간 FP-EWC · C-FIRE &lt; 0.95</strong></div>
+            </article>
+
+            <article class="task-policy-card surface">
+              <div class="card-heading compact"><div><span class="section-kicker">LOCAL TOOL POLICY</span><h2>작업 권한</h2></div><span class="evidence-badge verified">ALLOWLIST</span></div>
+              <div class="policy-grid"><span>읽기</span><b>프로젝트 내부</b><span>쓰기</span><b>outputs/agent-workspace</b><span>명령</span><b>고정 pytest · git status</b><span>소스 수정</span><b>Self-Harness 전용</b></div>
+              <p>임의 셸, 네트워크, 경로 탈출, 검증 전 소스 덮어쓰기는 차단됩니다.</p>
+            </article>
+
+            <article class="evolution-card surface">
+              <div class="card-heading compact"><div><span class="section-kicker">SELF-HARNESS</span><h2>자가 거울치료</h2></div><span class="evidence-badge planned" id="evolution-badge" role="status">감시 중</span></div>
+              <div class="evolution-cycle" aria-label="Self-Harness 진화 단계"><span>실패 수집</span><i>→</i><span>제안</span><i>→</i><span>격리 검증</span><i>→</i><span>승격·롤백</span></div>
+              <dl class="evolution-facts"><div><dt>실패 큐</dt><dd id="evolution-failures">0</dd></div><div><dt>마지막 주기</dt><dd id="evolution-last-run">아직 없음</dd></div><div><dt>격리 실행기</dt><dd id="evolution-sandbox">확인 중</dd></div></dl>
+              <button class="secondary-button full-width" type="button" data-action="evolution-run" aria-controls="evolution-badge" disabled><span data-evolution-label>제안 전용 야간 주기 실행</span></button>
+            </article>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" id="view-mission" data-view-panel="mission" aria-labelledby="mission-title" hidden>
         <div class="hero-grid">
           <article class="hero-card surface">
             <div class="eyebrow"><span class="eyebrow-line"></span>SOVEREIGN INTELLIGENCE, ON DEVICE</div>
@@ -190,9 +273,9 @@
             <div class="scenario-picker">
               <span>검증 시나리오</span>
               <div class="scenario-buttons" role="group" aria-label="검증 시나리오 선택">
-                <button type="button" class="is-selected" data-scenario="defense">국방 폐쇄망</button>
-                <button type="button" data-scenario="bio">신약 R&amp;D</button>
-                <button type="button" data-scenario="finance">금융 리스크</button>
+                <button type="button" class="is-selected" data-scenario="defense" aria-pressed="true" aria-controls="scenario-copy">국방 폐쇄망</button>
+                <button type="button" data-scenario="bio" aria-pressed="false" aria-controls="scenario-copy">신약 R&amp;D</button>
+                <button type="button" data-scenario="finance" aria-pressed="false" aria-controls="scenario-copy">금융 리스크</button>
               </div>
               <p id="scenario-copy">외부망이 단절된 지휘 환경에서 검증 가능한 깊은 추론 경로를 구성합니다.</p>
             </div>
@@ -419,7 +502,7 @@
       <dl class="rail-details">
         <div><dt>Model</dt><dd>Gemma 4 e4b</dd></div>
         <div><dt>Manifest</dt><dd id="rail-files">6 files</dd></div>
-        <div><dt>Runtime</dt><dd>Genesis v0.1.0</dd></div>
+        <div><dt>Runtime</dt><dd>Genesis v0.2.0</dd></div>
         <div><dt>Network</dt><dd class="positive">BLOCKED</dd></div>
         <div><dt>KV cache</dt><dd>DISABLED</dd></div>
       </dl>

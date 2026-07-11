@@ -7,6 +7,8 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
+from hashlib import sha256
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,6 +40,8 @@ from cogni_demo.protocol import (
     parse_event_line,
     validate_terminal_metrics,
 )
+from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError
+from cogni_os.artifacts import verify_artifact_manifest
 
 
 MAX_REQUEST_BODY_BYTES = 8 * 1024
@@ -104,6 +108,14 @@ class JobAlreadyRunningError(DemoServerError):
 
 
 class NoActiveJobError(DemoServerError):
+    pass
+
+
+class ComputeBusyError(DemoServerError):
+    """Raised before a second local workload can acquire the GPU owner slot."""
+
+
+class EvolutionAlreadyRunningError(DemoServerError):
     pass
 
 
@@ -484,10 +496,14 @@ class JobManager:
         launch_factory: LaunchFactory,
         *,
         max_runtime_seconds: float = 20 * 60,
+        availability_check: Callable[[], bool] | None = None,
     ) -> None:
         if max_runtime_seconds <= 0:
             raise ValueError("max_runtime_seconds must be positive")
+        if availability_check is not None and not callable(availability_check):
+            raise TypeError("availability_check must be callable")
         self._launch_factory = launch_factory
+        self.availability_check = availability_check
         self.max_runtime_seconds = float(max_runtime_seconds)
         self._condition = Condition(RLock())
         self._status = "ready"
@@ -543,6 +559,8 @@ class JobManager:
         with self._condition:
             if self._status in _ACTIVE_STATUSES:
                 raise JobAlreadyRunningError("a validation job is already active")
+            if self.availability_check is not None and not self.availability_check():
+                raise JobAlreadyRunningError("local compute is owned by another mode")
             job_id = secrets.token_hex(16)
             self._cancel_event = Event()
             self._active_job = job_id
@@ -878,6 +896,238 @@ class JobManager:
             pass
 
 
+class EvolutionController:
+    """Run one cooperative Self-Harness cycle without blocking an HTTP worker."""
+
+    def __init__(
+        self,
+        harness: Any,
+        *,
+        availability_check: Callable[[], bool] | None = None,
+    ) -> None:
+        if not callable(getattr(harness, "tick", None)):
+            raise TypeError("harness must provide tick()")
+        if availability_check is not None and not callable(availability_check):
+            raise TypeError("availability_check must be callable")
+        self.harness = harness
+        self.availability_check = availability_check
+        self._condition = Condition(RLock())
+        self._active = False
+        self._sequence = 0
+        self._job_id: str | None = None
+        self._status = "ready"
+        self._last_run: str | None = None
+        self._last_result: dict[str, Any] | None = None
+        self._error: dict[str, str] | None = None
+        self._thread: Thread | None = None
+        self._stopped = False
+
+    @property
+    def is_active(self) -> bool:
+        with self._condition:
+            return self._active
+
+    def snapshot(self) -> dict[str, Any]:
+        status = getattr(self.harness, "status", None)
+        promotion_mode = getattr(status, "promotion_mode", "unknown")
+        if isinstance(promotion_mode, Enum):
+            promotion_mode = promotion_mode.value
+        with self._condition:
+            return {
+                "running": self._active,
+                "status": self._status,
+                "seq": self._sequence,
+                "job_id": self._job_id,
+                "last_run": self._last_run,
+                "last_result": deepcopy(self._last_result),
+                "error": deepcopy(self._error),
+                "sandbox": str(promotion_mode),
+                "promotion_enabled": bool(getattr(status, "promotion_enabled", False)),
+                "blocked_reason": getattr(status, "blocked_reason", None),
+                "pending_proposals": int(getattr(status, "pending_proposals", 0) or 0),
+                "failures": self._failure_count(),
+                "daemon_running": bool(getattr(status, "running", False)),
+            }
+
+    def start(self) -> str:
+        with self._condition:
+            if self._stopped:
+                raise RuntimeError("evolution controller is stopped")
+            if self._active:
+                raise EvolutionAlreadyRunningError("an evolution cycle is active")
+            if self.availability_check is not None and not self.availability_check():
+                raise ComputeBusyError("local compute is owned by another mode")
+            job_id = secrets.token_hex(12)
+            self._active = True
+            self._job_id = job_id
+            self._status = "running"
+            self._error = None
+            self._sequence += 1
+            thread = Thread(
+                target=self._run,
+                args=(job_id,),
+                name=f"cogni-evolution-{job_id[:8]}",
+                daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+            return job_id
+
+    def shutdown(self, timeout: float = 30.0) -> None:
+        if timeout <= 0:
+            raise ValueError("shutdown timeout must be positive")
+        with self._condition:
+            self._stopped = True
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+        if thread is None or not thread.is_alive():
+            stop = getattr(self.harness, "stop", None)
+            if callable(stop):
+                stop()
+
+    def _run(self, job_id: str) -> None:
+        try:
+            tick = self.harness.tick()
+            result = self._tick_payload(tick)
+            status = "succeeded" if result.get("decision") == "ran" else "skipped"
+            error = None
+        except BaseException as exc:
+            result = None
+            status = "failed"
+            error = {
+                "code": type(exc).__name__,
+                "message": (str(exc) or "evolution cycle failed")[:512],
+            }
+        with self._condition:
+            if self._job_id != job_id:
+                return
+            self._active = False
+            self._status = status
+            self._last_result = result
+            self._last_run = datetime.now(timezone.utc).isoformat()
+            self._error = error
+            self._sequence += 1
+            self._condition.notify_all()
+
+    def _failure_count(self) -> int:
+        """Read only the bounded SQLite count; never materialize failure text."""
+
+        logdb = getattr(self.harness, "logdb", None)
+        connect = getattr(logdb, "_connect", None)
+        if not callable(connect):
+            return 0
+        try:
+            with connect() as database:
+                row = database.execute("SELECT COUNT(*) FROM failures").fetchone()
+            count = 0 if row is None else int(row[0])
+            maximum = int(getattr(logdb, "max_failure_records", 100_000))
+            return max(0, min(count, maximum, 100_000))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _tick_payload(tick: Any) -> dict[str, Any]:
+        decision = getattr(tick, "decision", "unknown")
+        if isinstance(decision, Enum):
+            decision = decision.value
+        payload: dict[str, Any] = {
+            "decision": str(decision),
+            "idle_for": float(getattr(tick, "idle_for", 0.0)),
+        }
+        report = getattr(tick, "result", None)
+        if report is not None:
+            payload["report"] = {
+                "clusters": int(getattr(report, "clusters", 0)),
+                "proposals": int(getattr(report, "proposals", 0)),
+                "promoted": bool(getattr(report, "promoted", False)),
+                "target": getattr(report, "target", None),
+            }
+        return payload
+
+
+class _ServiceBackedPatchModel:
+    """HF-shaped adapter that reuses the sole resident ModelService worker."""
+
+    device = "cpu"
+
+    def __init__(self, service: Any, tokenizer: Any) -> None:
+        self.service = service
+        self.tokenizer = tokenizer
+
+    def eval(self) -> _ServiceBackedPatchModel:
+        return self
+
+    def generate(self, **kwargs: Any) -> Any:
+        import torch
+
+        input_ids = kwargs.get("input_ids")
+        requested = kwargs.get("max_new_tokens")
+        if (
+            not isinstance(input_ids, torch.Tensor)
+            or input_ids.ndim != 2
+            or input_ids.shape[0] != 1
+        ):
+            raise ValueError("patch generation requires one bounded token sequence")
+        if kwargs.get("use_cache") is not False or kwargs.get("do_sample") is not False:
+            raise ValueError("patch generation must be deterministic and cache-free")
+        if (
+            not isinstance(requested, int)
+            or isinstance(requested, bool)
+            or requested <= 0
+        ):
+            raise ValueError("max_new_tokens must be a positive integer")
+        for name, value in kwargs.items():
+            if name in {"use_cache", "do_sample", "max_new_tokens"}:
+                continue
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"patch model argument {name} must be a tensor")
+        prompt = self.tokenizer.decode(
+            input_ids[0].detach().cpu().tolist(),
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError("patch prompt could not be decoded")
+        generated = self.service.generate(prompt, max_new_tokens=requested).token_ids
+        generated = generated.detach().to(
+            device=input_ids.device, dtype=input_ids.dtype
+        )
+        return torch.cat((input_ids, generated.unsqueeze(0)), dim=-1)
+
+
+def _write_product_checkpoint(project_root: Path) -> None:
+    """Persist a bounded source digest checkpoint before an evolution cycle."""
+
+    relative_paths = (
+        "cogni_agent/manager.py",
+        "cogni_core/search.py",
+        "cogni_flow/production.py",
+    )
+    files: dict[str, str] = {}
+    for relative in relative_paths:
+        path = (project_root / relative).resolve(strict=True)
+        if not path.is_file() or not path.is_relative_to(project_root):
+            raise RuntimeError("checkpoint source escaped the project root")
+        files[relative] = sha256(path.read_bytes()).hexdigest()
+    state = project_root / ".cogni_state" / "self_harness"
+    state.mkdir(parents=True, exist_ok=True)
+    target = state / "pre-evolution-checkpoint.json"
+    temporary = state / "pre-evolution-checkpoint.json.tmp"
+    temporary.write_text(
+        json.dumps(
+            {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "files": files,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temporary, target)
+
+
 class DemoHTTPServer(ThreadingHTTPServer):
     """HTTP server that refuses non-loopback binding at construction."""
 
@@ -889,6 +1139,8 @@ class DemoHTTPServer(ThreadingHTTPServer):
         manager: JobManager,
         asset_directory: str | Path,
         *,
+        agent_manager: Any | None = None,
+        evolution_manager: EvolutionController | Any | None = None,
         port: int = DEFAULT_PORT,
         token: str | None = None,
         watchdog_timeout: float | None = DEFAULT_WATCHDOG_SECONDS,
@@ -896,6 +1148,8 @@ class DemoHTTPServer(ThreadingHTTPServer):
         if not 0 <= int(port) <= 65535:
             raise ValueError("port must be in [0, 65535]")
         self.manager = manager
+        self.agent_manager = agent_manager
+        self.evolution_manager = evolution_manager
         self.asset_directory = Path(asset_directory).resolve(strict=True)
         if not self.asset_directory.is_dir():
             raise ValueError("asset_directory must be a directory")
@@ -908,10 +1162,23 @@ class DemoHTTPServer(ThreadingHTTPServer):
             None if watchdog_timeout is None else float(watchdog_timeout)
         )
         self._lifecycle_lock = RLock()
+        self._compute_lock = RLock()
         self._watchdog_stop = Event()
         self._watchdog_thread: Thread | None = None
         self._last_state_poll = monotonic()
         self._shutdown_requested = False
+        self._components_shutdown = False
+        self.manager.availability_check = self._validation_compute_available
+        if self.agent_manager is not None and hasattr(
+            self.agent_manager, "availability_check"
+        ):
+            self.agent_manager.availability_check = self._agent_compute_available
+        if self.evolution_manager is not None and hasattr(
+            self.evolution_manager, "availability_check"
+        ):
+            self.evolution_manager.availability_check = (
+                self._evolution_compute_available
+            )
         super().__init__(("127.0.0.1", int(port)), DemoRequestHandler)
 
     @property
@@ -953,6 +1220,58 @@ class DemoHTTPServer(ThreadingHTTPServer):
         self.start_watchdog()
         super().serve_forever(poll_interval=poll_interval)
 
+    def start_validation(self, prompt: str) -> str:
+        """Acquire the sole CUDA slot and start the existing validation worker."""
+
+        with self._compute_lock:
+            if self._agent_active() or self._evolution_active():
+                raise ComputeBusyError("agent or evolution owns local compute")
+            if self.agent_manager is not None:
+                # A resident but idle chat model still owns the model VRAM.
+                # Stop it before the validation child is allowed to load Gemma.
+                self.agent_manager.stop_model()
+            return self.manager.start(prompt)
+
+    def start_agent_turn(self, message: str, mode: str) -> str:
+        with self._compute_lock:
+            if self.agent_manager is None:
+                raise RuntimeError("agent manager is unavailable")
+            if self.manager.is_active or self._evolution_active():
+                raise ComputeBusyError("validation or evolution owns local compute")
+            return self.agent_manager.start_turn(message, mode)
+
+    def start_evolution(self) -> str:
+        with self._compute_lock:
+            if self.evolution_manager is None:
+                raise RuntimeError("evolution manager is unavailable")
+            if self.manager.is_active or self._agent_active():
+                raise ComputeBusyError("validation or agent owns local compute")
+            return self.evolution_manager.start()
+
+    def _agent_active(self) -> bool:
+        return bool(
+            self.agent_manager is not None
+            and getattr(self.agent_manager, "is_active", False)
+        )
+
+    def _evolution_active(self) -> bool:
+        return bool(
+            self.evolution_manager is not None
+            and getattr(self.evolution_manager, "is_active", False)
+        )
+
+    def _validation_compute_available(self) -> bool:
+        with self._compute_lock:
+            return not self._agent_active() and not self._evolution_active()
+
+    def _agent_compute_available(self) -> bool:
+        with self._compute_lock:
+            return not self.manager.is_active and not self._evolution_active()
+
+    def _evolution_compute_available(self) -> bool:
+        with self._compute_lock:
+            return not self.manager.is_active and not self._agent_active()
+
     def request_shutdown(self) -> None:
         with self._lifecycle_lock:
             if self._shutdown_requested:
@@ -961,14 +1280,30 @@ class DemoHTTPServer(ThreadingHTTPServer):
             self._watchdog_stop.set()
 
         def stop() -> None:
-            self.manager.shutdown()
+            self.shutdown_components()
             self.shutdown()
 
         Thread(target=stop, name="cogni-demo-shutdown", daemon=True).start()
 
     def server_close(self) -> None:
         self._watchdog_stop.set()
+        self.shutdown_components()
         super().server_close()
+
+    def shutdown_components(self) -> None:
+        with self._lifecycle_lock:
+            if self._components_shutdown:
+                return
+            self._components_shutdown = True
+        self.manager.shutdown()
+        if self.evolution_manager is not None:
+            shutdown = getattr(self.evolution_manager, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+        if self.agent_manager is not None:
+            shutdown = getattr(self.agent_manager, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
 
 
 class DemoRequestHandler(BaseHTTPRequestHandler):
@@ -998,6 +1333,9 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/state":
             self._state(parsed.query)
+            return
+        if parsed.path == "/api/agent/state":
+            self._agent_state(parsed.query)
             return
         asset = _STATIC_ASSETS.get(parsed.path)
         if asset is None or parsed.query:
@@ -1032,6 +1370,10 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             "/api/run",
             "/api/cancel",
             "/api/shutdown",
+            "/api/agent/chat",
+            "/api/agent/cancel",
+            "/api/agent/reset",
+            "/api/evolution/run",
         }:
             self._json_error(HTTPStatus.NOT_FOUND, "NOT_FOUND")
             return
@@ -1043,8 +1385,8 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
                 return
             try:
-                job_id = self.server.manager.start(body.get("prompt", ""))
-            except JobAlreadyRunningError:
+                job_id = self.server.start_validation(body.get("prompt", ""))
+            except (JobAlreadyRunningError, AgentBusyError, ComputeBusyError):
                 self._json_error(HTTPStatus.CONFLICT, "JOB_ALREADY_RUNNING")
                 return
             except (TypeError, ValueError):
@@ -1053,6 +1395,28 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             self._json(
                 HTTPStatus.ACCEPTED,
                 {"job_id": job_id, **self.server.manager.snapshot()},
+            )
+            return
+        if parsed.path == "/api/agent/chat":
+            if self.server.agent_manager is None:
+                self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AGENT_UNAVAILABLE")
+                return
+            if not set(body) <= {"message", "mode"} or "message" not in body:
+                self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
+                return
+            try:
+                turn_id = self.server.start_agent_turn(
+                    body["message"], body.get("mode", "chat")
+                )
+            except (AgentBusyError, ComputeBusyError):
+                self._json_error(HTTPStatus.CONFLICT, "COMPUTE_BUSY")
+                return
+            except (TypeError, ValueError):
+                self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
+                return
+            self._json(
+                HTTPStatus.ACCEPTED,
+                {"turn_id": turn_id, **self.server.agent_manager.snapshot()},
             )
             return
         if body:
@@ -1065,6 +1429,44 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 self._json_error(HTTPStatus.CONFLICT, "NO_ACTIVE_JOB")
                 return
             self._json(HTTPStatus.ACCEPTED, self.server.manager.snapshot())
+            return
+        if parsed.path == "/api/agent/cancel":
+            if self.server.agent_manager is None:
+                self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AGENT_UNAVAILABLE")
+                return
+            try:
+                self.server.agent_manager.cancel()
+            except NoActiveAgentTurnError:
+                self._json_error(HTTPStatus.CONFLICT, "NO_ACTIVE_AGENT_TURN")
+                return
+            self._json(HTTPStatus.ACCEPTED, self.server.agent_manager.snapshot())
+            return
+        if parsed.path == "/api/agent/reset":
+            if self.server.agent_manager is None:
+                self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AGENT_UNAVAILABLE")
+                return
+            try:
+                self.server.agent_manager.reset()
+            except AgentBusyError:
+                self._json_error(HTTPStatus.CONFLICT, "AGENT_BUSY")
+                return
+            self._json(HTTPStatus.OK, self.server.agent_manager.snapshot())
+            return
+        if parsed.path == "/api/evolution/run":
+            if self.server.evolution_manager is None:
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "EVOLUTION_UNAVAILABLE"
+                )
+                return
+            try:
+                job_id = self.server.start_evolution()
+            except (EvolutionAlreadyRunningError, ComputeBusyError):
+                self._json_error(HTTPStatus.CONFLICT, "COMPUTE_BUSY")
+                return
+            self._json(
+                HTTPStatus.ACCEPTED,
+                {"job_id": job_id, **self.server.evolution_manager.snapshot()},
+            )
             return
         self._json(HTTPStatus.ACCEPTED, {"status": "shutting_down"})
         self.server.request_shutdown()
@@ -1127,6 +1529,30 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.OK, state)
 
+    def _agent_state(self, query: str) -> None:
+        manager = self.server.agent_manager
+        if manager is None:
+            self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AGENT_UNAVAILABLE")
+            return
+        values = parse_qs(query, keep_blank_values=True)
+        if not values:
+            self.server.touch_authenticated_state_poll()
+            self._json(HTTPStatus.OK, manager.snapshot())
+            return
+        if set(values) != {"after"} or len(values["after"]) != 1:
+            self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_QUERY")
+            return
+        try:
+            after = int(values["after"][0])
+            if after < 0:
+                raise ValueError
+            self.server.touch_authenticated_state_poll()
+            state = manager.wait_snapshot(after)
+        except (TypeError, ValueError):
+            self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_QUERY")
+            return
+        self._json(HTTPStatus.OK, state)
+
     def _read_json_body(self) -> dict[str, Any] | None:
         if self.headers.get_content_type() != "application/json":
             self._json_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "JSON_REQUIRED")
@@ -1175,6 +1601,85 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
 
 
+def _build_product_controls(
+    project_root: Path,
+    model_path: str | Path,
+    manifest_path: str | Path,
+    validator: JobManager,
+) -> tuple[Any, EvolutionController]:
+    """Build lazy local chat, bounded tools, and proposal-only Self-Harness."""
+
+    # Chat can load the resident model without launching the validation worker.
+    # Verify the exact local artifact set before constructing any product
+    # component so this path cannot bypass the signed manifest boundary.
+    verify_artifact_manifest(model_path, manifest_path)
+
+    from cogni_agent.manager import AgentManager
+    from cogni_agent.model_service import ModelService
+    from cogni_agent.tools import WorkspaceToolExecutor
+    from cogni_flow.production import (
+        ProductionHarnessConfig,
+        PromotionMode,
+        build_production_self_harness,
+    )
+
+    service = ModelService.for_local_gemma(
+        model_path,
+        vram_limit_gib=16.7,
+        max_input_tokens=4_096,
+        max_new_tokens=512,
+        max_prompt_chars=32_000,
+        max_response_chars=32_000,
+    )
+    patch_model = _ServiceBackedPatchModel(service, service.tokenizer)
+    config = ProductionHarnessConfig(
+        allowed_roots=("cogni_agent", "cogni_core", "cogni_flow"),
+        idle_seconds=0.0,
+        promotion_mode=PromotionMode.PROPOSAL_ONLY,
+    )
+    target_allowlist = {
+        (
+            "RuntimeError",
+            "agent_runtime",
+            "agent_manager",
+        ): "cogni_agent/manager.py"
+    }
+    harness = build_production_self_harness(
+        project_root,
+        patch_model,
+        service.tokenizer,
+        target_allowlist,
+        lambda: _write_product_checkpoint(project_root),
+        config=config,
+    )
+    try:
+        harness.start()
+        evolution = EvolutionController(harness)
+
+        def capture_failure(code: str, message: str) -> None:
+            harness.capture_exception(
+                f"agent-{code}"[:128],
+                RuntimeError(f"{code}: {message}"[:512]),
+                verifier_code="agent_runtime",
+                mechanism="agent_manager",
+            )
+
+        agent = AgentManager(
+            service,
+            WorkspaceToolExecutor(project_root),
+            failure_sink=capture_failure,
+            evolution_snapshot=evolution.snapshot,
+            availability_check=lambda: not validator.is_active,
+        )
+        return agent, evolution
+    except BaseException:
+        try:
+            harness.stop()
+        finally:
+            service.stop()
+        raise
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m cogni_demo.server")
     project_root = Path(__file__).resolve().parents[1]
@@ -1201,8 +1706,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     manager = JobManager(
         production_launch_factory(project_root, args.model, args.manifest)
     )
+    agent_manager, evolution_manager = _build_product_controls(
+        project_root, args.model, args.manifest, manager
+    )
     try:
-        server = DemoHTTPServer(manager, args.assets, port=args.port)
+        server = DemoHTTPServer(
+            manager,
+            args.assets,
+            agent_manager=agent_manager,
+            evolution_manager=evolution_manager,
+            port=args.port,
+        )
     except OSError:
         # A concurrent launcher may bind the fixed port just before publishing
         # its atomic session document. Wait briefly and reuse it; never start a
@@ -1217,7 +1731,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 if not args.no_browser:
                     open_graphical_app(existing.bootstrap_url)
+                evolution_manager.shutdown()
+                agent_manager.shutdown()
+                manager.shutdown()
                 return 0
+        evolution_manager.shutdown()
+        agent_manager.shutdown()
+        manager.shutdown()
+        raise
+    except BaseException:
+        evolution_manager.shutdown()
+        agent_manager.shutdown()
+        manager.shutdown()
         raise
 
     metadata = SessionMetadata(
@@ -1229,7 +1754,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         write_session_metadata(metadata, session_path)
     except BaseException:
-        manager.shutdown()
         server.server_close()
         raise
     print(f"demo_url={server.origin}/", flush=True)
@@ -1240,7 +1764,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        manager.shutdown()
         server.server_close()
         remove_session_metadata(session_path, expected=metadata)
     return 0
@@ -1251,8 +1774,10 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "ComputeBusyError",
     "DemoHTTPServer",
     "DemoServerError",
+    "EvolutionController",
     "INITIAL_METRICS",
     "JobAlreadyRunningError",
     "JobManager",

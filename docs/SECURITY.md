@@ -3,7 +3,11 @@
 ## Enforced in this repository
 
 - local-path-only model loading;
+- SHA-256 manifest verification before the chat worker can load the model;
 - offline environment flags;
+- one spawned CUDA/model owner, bounded tensor IPC, and one outstanding decode;
+- deterministic, cache-free decoding with bounded input/output/token queues;
+- allowlisted workspace tools with no arbitrary shell or network operation;
 - no network-capable imports in candidate patches;
 - no `eval`, `exec`, `compile`, or dynamic imports in candidate patches;
 - mutable-surface allowlist and traversal protection;
@@ -17,6 +21,24 @@
 - process-only sandbox runners are rejected before candidate execution;
 - evolution task lifetime counters prevent inference resumption during proposal,
   validation, promotion, or workflow search.
+- proposal-only Self-Harness is the default product mode;
+- journaled promotion preserves file mode, rechecks the base digest immediately
+  before replacement, health-checks a fresh snapshot, and refuses rollback over
+  an unknown live digest.
+
+### Local agent and task boundary
+
+The graphical AI workspace talks only to a loopback HTTP server authenticated
+with a per-process HttpOnly cookie. Exact routes, Origin/Host validation, a
+restrictive CSP, bounded bodies, and a static-asset allowlist prevent the UI
+from becoming a general file or network server. The server serializes live
+validation, chat, and evolution so only one compute mode can be active.
+
+Chat history is held in a bounded single-session LRU store. A user turn is
+transactional: cancellation or failure removes the uncommitted turn. Task mode
+accepts only typed commands for bounded listing, reading, searching, testing,
+status inspection, and output-artifact saving. Source trees are read-only to
+task mode; source changes flow only through Self-Harness.
 
 ## Phase 4 control-plane boundaries
 
@@ -71,11 +93,13 @@ object is offline.
 ## Deployment responsibility
 
 `SubprocessSandbox` is retained only as a development diagnostic runner and is
-**never accepted by `SafeHarnessPatcher`**. Candidate execution and promotion
-fail closed unless an injected `SandboxRunner` explicitly represents a
-kernel-isolated offline VM, Windows Sandbox, container runtime, or equivalent
-filesystem/network boundary. The marker is a deployment trust boundary; its
-implementation must be independently audited.
+**never accepted by `SafeHarnessPatcher`**. A marker or class name is not proof
+of isolation. Candidate execution and promotion fail closed unless an injected
+runner presents evidence explicitly trusted by the operator. The attestation
+must cover runner identity, separate-kernel execution, network isolation,
+host-filesystem isolation, ephemeral staging, and the SHA-256 digests of the
+exact regression and health-check argv sequences. Its implementation and
+evidence must be independently audited.
 
 Model artifacts should be mirrored into an offline store and accompanied by hashes, licenses, tokenizer files, configuration, and provenance. No runtime component is permitted to download missing artifacts.
 
@@ -85,6 +109,6 @@ The local tensor service has no network socket and uses a bounded numeric/tensor
 protocol. For a real CUDA deployment, the model factory must load the verified
 artifact **inside the single worker**. Constructing a GPU model in the parent and
 passing it into a Windows-spawn worker can duplicate VRAM and violates the
-single-owner invariant. Current automated service tests use a CPU toy module;
-the real Gemma model was measured through the in-process runtime gate to avoid
-creating a second GPU owner.
+single-owner invariant. Automated protocol tests use injected CPU toy modules;
+the standalone agent validation script exercises the same spawned production
+worker with the verified local Gemma artifact.

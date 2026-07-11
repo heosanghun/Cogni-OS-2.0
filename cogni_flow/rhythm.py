@@ -42,7 +42,11 @@ _ALLOWED: dict[SystemMode, set[SystemMode]] = {
         SystemMode.ROLLING_BACK,
     },
     SystemMode.PROMOTING: {SystemMode.INFERENCE, SystemMode.ROLLING_BACK},
-    SystemMode.ROLLING_BACK: {SystemMode.INFERENCE, SystemMode.SAFE_MODE},
+    SystemMode.ROLLING_BACK: {
+        SystemMode.EVOLUTION,
+        SystemMode.INFERENCE,
+        SystemMode.SAFE_MODE,
+    },
     SystemMode.SAFE_MODE: {SystemMode.INFERENCE},
 }
 

@@ -14,6 +14,8 @@ class EvolutionReport:
     proposals: int
     promoted: bool
     target: str | None
+    proposal_only: bool = False
+    blocked_reason: str | None = None
 
 
 class SelfHarness:
@@ -26,12 +28,15 @@ class SelfHarness:
         patcher: SafeHarnessPatcher,
         proposer: Callable[[WeaknessCluster], Iterable[PatchProposal]],
         checkpoint: Callable[[], None],
+        *,
+        proposal_only_reason: str | None = None,
     ) -> None:
         self.rhythm = rhythm
         self.logdb = logdb
         self.patcher = patcher
         self.proposer = proposer
         self.checkpoint = checkpoint
+        self.proposal_only_reason = proposal_only_reason
 
     def run_night_cycle(self, since: float = 0.0) -> EvolutionReport:
         self.rhythm.enter_evolution(self.checkpoint)
@@ -47,6 +52,14 @@ class SelfHarness:
                 for cluster in clusters:
                     for proposal in self.proposer(cluster):
                         proposal_count += 1
+                        if self.proposal_only_reason is not None:
+                            self.patcher.validate_proposal(proposal)
+                            self.logdb.audit(
+                                "candidate",
+                                proposal.relative_path,
+                                "proposal_only",
+                            )
+                            continue
                         result = self.patcher.validate_and_promote(proposal)
                         self.logdb.audit(
                             "candidate",
@@ -63,10 +76,22 @@ class SelfHarness:
             if promoted_target is not None:
                 self.rhythm.resume_inference("validated patch promoted")
                 return EvolutionReport(
-                    len(clusters), proposal_count, True, promoted_target
+                    len(clusters),
+                    proposal_count,
+                    True,
+                    promoted_target,
+                    False,
+                    None,
                 )
             self.rhythm.resume_inference("no candidate passed validation")
-            return EvolutionReport(len(clusters), proposal_count, False, None)
+            return EvolutionReport(
+                len(clusters),
+                proposal_count,
+                False,
+                None,
+                self.proposal_only_reason is not None,
+                self.proposal_only_reason,
+            )
         except Exception as exc:
             self.logdb.audit("cycle_error", "self_harness", type(exc).__name__)
             if self.rhythm.mode in {SystemMode.VALIDATING, SystemMode.PROMOTING}:

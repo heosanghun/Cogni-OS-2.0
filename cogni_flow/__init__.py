@@ -7,6 +7,13 @@ from .daemon import FailureCaptureDaemon
 from .harness import SafeHarnessPatcher
 from .local_proposer import LocalGemmaPatchProposer, ResolvedPatchTarget
 from .logdb import LogDB
+from .production import (
+    ProductionHarnessConfig,
+    ProductionSelfHarness,
+    PromotionMode,
+    RunnerAttestation,
+    build_production_self_harness,
+)
 from .scheduler import IdleNightScheduler
 
 __all__ = [
@@ -15,10 +22,15 @@ __all__ = [
     "FailureCaptureDaemon",
     "IdleNightScheduler",
     "LocalGemmaPatchProposer",
+    "ProductionHarnessConfig",
+    "ProductionSelfHarness",
+    "PromotionMode",
     "ResolvedPatchTarget",
     "RhythmController",
     "SafeHarnessPatcher",
     "SelfHarness",
     "SystemMode",
+    "RunnerAttestation",
     "WorkflowSpec",
+    "build_production_self_harness",
 ]

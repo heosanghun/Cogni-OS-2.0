@@ -20,13 +20,21 @@ Natural language, source code, paths, JSON, and subprocess results never enter t
 
 1. `RhythmController.inference_slot()` prevents evolution from starting.
 2. `VRAMGuard` performs admission control against the configured 16.7 GiB envelope.
-3. The offline backbone produces latent input states.
-4. PUCT CTS performs fixed-width, bounded-node latent search.
-5. A bounded latent bottleneck compiles only converged states into low-rank
+3. One resident spawned worker owns both the verified local Gemma model and the
+   Cogni-Core runtime. The browser and HTTP control plane never own CUDA.
+4. A bounded multi-turn controller renders the prompt locally and sends only
+   CPU `int64` tensors across the worker boundary.
+5. BIO-HAMA routes the turn, the offline backbone produces latent states, and
+   PUCT CTS plus DEQ performs fixed-width, bounded-node latent search.
+6. System 4 and System 3 produce detached advisory telemetry. They cannot alter
+   Gemma logits or decoded answer tokens.
+7. Deterministic Gemma decoding runs with `use_cache=False` and streams bounded
+   token tensors back to the controller.
+8. A bounded latent bottleneck compiles only converged states into low-rank
    Fast Weight overlays. External held-out quality, composed operator norm, and
    Near-OOD gates must all pass; overlays remain session-only.
-6. PCAS can select a precompiled topology without changing parameters.
-7. Failures are appended to the local LogDB.
+9. PCAS can select a precompiled topology without changing parameters.
+10. Failures are appended to the local LogDB.
 
 ## Night path
 
@@ -41,7 +49,14 @@ Natural language, source code, paths, JSON, and subprocess results never enter t
 6. Static air-gap and AST policy checks run before execution.
 7. Each candidate is tested only by a kernel-isolated runner over a staging copy;
    process-only runners are rejected before execution.
-8. Only a passing candidate is atomically promoted; otherwise the original remains untouched.
+8. By default the production assembly is proposal-only, so candidate source is
+   never installed.
+9. Promotion requires an operator-allowlisted runner attestation proving a
+   separate kernel, no network, no host-filesystem access, an ephemeral
+   workspace, and exact command digests.
+10. A passing candidate is journaled, atomically promoted, health-checked in a
+    fresh isolated snapshot, and digest-verified rollback is automatic on
+    failure. Unknown live-file digests are never overwritten.
 
 ## Memory claims
 

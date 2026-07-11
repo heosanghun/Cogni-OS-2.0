@@ -6,9 +6,10 @@ This repository starts from three executable gates before integrating a large la
 2. CUDA active memory must remain flat as CTS depth grows at fixed width;
 3. non-contractive transitions must hard-stop or enter an explicit damped fallback.
 
-The gates now pass, and the repository includes fixed-arena CTS, Fast Weight,
-FP-EWC, bounded sparse experts, System4-style tensor swarms, BIO-HAMA routing,
-day/night exclusion, AFlow, and a fail-closed Self-Harness control plane.
+The gates now pass, and the repository includes a resident local Gemma chat
+worker, fixed-arena CTS, Fast Weight, FP-EWC, bounded sparse experts,
+System4-style tensor swarms, BIO-HAMA routing, day/night exclusion, bounded
+workspace tools, AFlow, and a fail-closed Self-Harness control plane.
 
 ## Run
 
@@ -18,14 +19,38 @@ python -m unittest discover -s tests -v
 
 ## Windows double-click demo
 
-Double-click `Run-CogniOS-Demo.cmd` from the repository root. The launcher
-verifies Python 3.11+, CUDA-enabled PyTorch, Transformers, the local model, and
-the artifact manifest before opening **CogniBoard**, a loopback-only graphical
-mission-control interface. Its five views connect the customer problem,
-measured evidence, live Gemma 4 + CTS validation, architecture, business model,
-and execution roadmap. Selecting `실제 통합 검증 시작` launches the existing
+Double-click `CogniBoard.exe` from the repository root for the console-free
+experience, or use `Run-CogniOS-Demo.cmd` as the transparent diagnostic
+launcher. The CMD launcher performs an explicit Python/CUDA dependency
+preflight; the native launcher locates the same local runtime without showing a
+console. The server verifies the local model artifact manifest before opening
+**CogniBoard**, a loopback-only graphical
+mission-control interface. Its six views connect a real local AI workspace,
+the customer problem, measured evidence, live Gemma 4 + CTS validation,
+architecture, business model, and execution roadmap. Selecting
+`실제 통합 검증 시작` launches the existing
 Depth-100 worker as the sole CUDA owner; the UI never reimplements or simulates
 the validation path.
+
+The default `AI 워크스페이스` view supports bounded multi-turn conversation and
+token streaming from the verified local Gemma artifact. Every chat turn runs
+the advisory Cogni-Core route in this order:
+
+`BIO-HAMA → Gemma feature backbone + DEQ/CTS → System 4 → System 3 → Gemma decode`
+
+The final answer is produced only by deterministic base Gemma decoding with
+`use_cache=False`; untrained Fast Weight overlays remain gated, and FP-EWC is
+reserved for the evolution path. Task mode exposes only `/help`, `/list`,
+`/read`, `/search`, `/status`, `/test`, and `/save`. It never exposes arbitrary
+shell, network, or unrestricted source writes.
+
+Self-Harness records bounded runtime failures and can generate local patch
+proposals during an exclusive evolution cycle. Source promotion is disabled by
+default. It becomes possible only when an operator supplies an explicitly
+trusted, kernel-isolated runner attestation covering network isolation, host
+filesystem isolation, an ephemeral workspace, and the exact regression and
+health-check command digests. Promotion then uses a digest-verified backup
+journal, atomic replacement, post-promotion health checking, and rollback.
 
 `Run-CogniOS-CLI.cmd` retains the console diagnostic flow for operators. The
 graphical server binds only to `127.0.0.1`, serves an exact local asset allowlist,
@@ -55,6 +80,9 @@ not imported at runtime. In particular: `Cognitive-Tree-Search`, `System1.5_2605
 See [architecture](docs/ARCHITECTURE.md), [security model](docs/SECURITY.md), and
 [validation gates](docs/VALIDATION.md) before connecting a large local backbone or enabling
 autonomous patch promotion.
+
+한국어 실행·대화·작업·Self-Harness 안내는
+[CogniBoard AI 워크스페이스 사용 안내](docs/AGENT_WORKSPACE_KO.md)를 참고하십시오.
 
 The verified local Gemma 4 procedure and measured hardware results are documented in
 [Gemma 4 integration](docs/GEMMA4.md).

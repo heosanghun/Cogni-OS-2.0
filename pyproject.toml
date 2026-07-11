@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cogni-os"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.11"
 dependencies = ["torch>=2.5"]
 
@@ -18,7 +18,7 @@ cogni-os = "cogni_os.cli:main"
 testpaths = ["tests"]
 
 [tool.setuptools]
-packages = ["cogni_core", "cogni_demo", "cogni_flow", "cogni_os"]
+packages = ["cogni_agent", "cogni_core", "cogni_demo", "cogni_flow", "cogni_os"]
 
 [tool.setuptools.package-data]
 cogni_demo = ["static/*.html", "static/*.css", "static/*.js", "static/*.svg"]

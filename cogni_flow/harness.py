@@ -391,6 +391,24 @@ class SafeHarnessPatcher:
         self.timeout_seconds = timeout_seconds
         self.require_kernel_isolation = require_kernel_isolation
 
+    def validate_proposal(self, proposal: PatchProposal) -> Path:
+        """Validate an inert proposal without executing or promoting it.
+
+        Proposal-only deployments use this gate to retain the same mutable
+        surface, syntax, and stale-base protections as autonomous promotion.
+        It deliberately performs no candidate execution and no filesystem
+        mutation.
+        """
+
+        relative = self.policy.validate(proposal)
+        target = (self.project_root / relative).resolve()
+        if self.project_root not in target.parents:
+            raise ValueError("resolved patch target escaped project root")
+        current = target.read_bytes() if target.exists() else b""
+        if sha256(current).hexdigest() != proposal.base_sha256:
+            raise RuntimeError("base file changed since proposal generation")
+        return target
+
     def validate_and_promote(self, proposal: PatchProposal) -> PromotionResult:
         if self.rhythm.mode != SystemMode.EVOLUTION:
             raise RuntimeError("patching is allowed only during evolution mode")
@@ -403,13 +421,8 @@ class SafeHarnessPatcher:
                 "candidate execution requires a kernel-isolated SandboxRunner"
             )
         with self.rhythm.evolution_slot():
-            relative = self.policy.validate(proposal)
-            target = (self.project_root / relative).resolve()
-            if self.project_root not in target.parents:
-                raise ValueError("resolved patch target escaped project root")
-            current = target.read_bytes() if target.exists() else b""
-            if sha256(current).hexdigest() != proposal.base_sha256:
-                raise RuntimeError("base file changed since proposal generation")
+            target = self.validate_proposal(proposal)
+            relative = target.relative_to(self.project_root)
 
             self.rhythm.transition(
                 SystemMode.VALIDATING, f"validating {relative.as_posix()}"

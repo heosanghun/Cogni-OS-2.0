@@ -3,3 +3,6 @@
 ab234f6d8d1bc3ee58dd3d45370a4dc4319d20c920a7c3b82d7e58e969967ada  Cogni-OS-2-Genesis-v0.2.0-source.zip
 9df5a518b123215e0ba37e67ff1946bedb0443f90d7e1a329469db802a968fe7  CogniBoard-v0.2.0.exe
 c9cae4001f77fa432204108a2a3072371c09c541d26bdc6fcde5ff51158b8f13  cogni_os-0.2.0-py3-none-any.whl
+85160337c6dd357b3844a434bc35fcf34ae7769d7a8337d57da1455adcbd3734  Cogni-OS-2-Genesis-v0.2.1-source.zip
+6ab76ab36830a6ffa4c3155843b4378f2e6809562206c0f1968e1345adae05c7  CogniBoard-v0.2.1.exe
+d4a95fbc6d1f64fc6aa187cf0ab7bbd9c0f26daf3106294390bbad34972efa41  cogni_os-0.2.1-py3-none-any.whl

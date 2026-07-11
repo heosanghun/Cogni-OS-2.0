@@ -145,6 +145,7 @@ class TestDemoHTTPControlPlane(unittest.TestCase):
         (assets / "index.html").write_text("<main>Cogni</main>", encoding="utf-8")
         (assets / "app.css").write_text("body{}", encoding="utf-8")
         (assets / "app.js").write_text("void 0", encoding="utf-8")
+        (assets / "favicon.svg").write_text("<svg/>", encoding="utf-8")
         self.manager = manager_for("success")
         self.server = DemoHTTPServer(
             self.manager,
@@ -225,6 +226,16 @@ class TestDemoHTTPControlPlane(unittest.TestCase):
         response = connection.getresponse()
         self.assertEqual(response.read(), b"void 0")
         self.assertEqual(response.status, 200)
+        connection.close()
+
+        connection = self._connection()
+        connection.request(
+            "GET", "/assets/favicon.svg", headers={"Cookie": self.cookie}
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.read(), b"<svg/>")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Content-Type"), "image/svg+xml")
         connection.close()
 
         connection = self._connection()

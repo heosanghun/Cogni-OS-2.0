@@ -1,2 +1,2 @@
-f1a5e2372a28cc663c60bb9ee06c5681764400b04f916fc6450403ac7d7477c8  Cogni-OS-2-Genesis-source.zip
-e753a0cb7f4726a17b975175d0f1071a5ec32b33009c52adecf7d05a7f69f0b9  cogni_os-0.1.0-py3-none-any.whl
+6ed8694e8df510aff3b9a19e535b34dd84f271f7e56fe142bec51f53354648b3  Cogni-OS-2-Genesis-source.zip
+56f9ea7e810c525c53f82fb85c3c0842d74ec24cd02b3f213cfa108b81d14a30  cogni_os-0.1.0-py3-none-any.whl

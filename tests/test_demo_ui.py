@@ -24,6 +24,10 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertNotRegex(html, r"(?i)<style\b|\sstyle\s*=")
         self.assertNotRegex(html, r"(?i)\son[a-z]+\s*=")
         self.assertIsNone(re.search(r"(?is)<script(?![^>]*\bsrc=)[^>]*>", html))
+        favicon = STATIC / "favicon.svg"
+        self.assertTrue(favicon.is_file())
+        self.assertLessEqual(favicon.stat().st_size, 2 * 1024 * 1024)
+        self.assertIn('rel="icon" type="image/svg+xml"', html)
 
     def test_navigation_and_evidence_taxonomy_are_complete(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
@@ -36,6 +40,25 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertEqual(navigation, panels)
         for label in ("내부 실측", "구성 검증", "설계 목표", "사업계획"):
             self.assertIn(label, html)
+        self.assertIn('data-action="fullscreen"', html)
+        self.assertIn("<strong>Moat</strong>", html)
+        self.assertNotIn("<strong>Defense</strong>", html)
+
+    def test_live_audit_trail_accumulates_and_presentation_flow_is_complete(
+        self,
+    ) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+        self.assertIn("eventHistory", script)
+        self.assertIn("new Map(ui.eventHistory", script)
+        self.assertIn("time.dateTime = event.timestamp", script)
+        self.assertIn("document.fullscreenElement", script)
+        self.assertIn("runValidation();", script)
+        self.assertIn("01 / 06", html)
+        self.assertIn("tour-progress progress[value]", stylesheet)
+        self.assertIn("실행 이벤트 보기", html)
+        self.assertNotIn("원본 실행 로그 보기", html)
 
     def test_business_claims_preserve_integrity_boundaries(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")

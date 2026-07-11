@@ -17,11 +17,14 @@ const PHASE_TO_DOM = {
 };
 const PHASE_LABELS = {
   ready: "대기",
+  starting: "검증 준비",
+  worker_started: "로컬 worker 시작",
   verifying: "무결성 검증",
   loading_model: "로컬 모델 적재",
   building_runtime: "런타임 구성",
   running_inference: "Depth 100 탐색",
   postcheck: "안전 조건 확인",
+  complete: "검증 완료",
   succeeded: "검증 완료",
   failed: "검증 실패",
   cancelling: "취소 중",
@@ -93,6 +96,8 @@ const ui = {
   pollStopped: false,
   tourIndex: 0,
   toastTimer: null,
+  eventHistory: [],
+  eventRunStartSeq: -1,
 };
 
 function $(selector, root = document) {
@@ -212,6 +217,10 @@ function updateMetrics(metrics = {}) {
   if (typeof metrics.device === "string" && metrics.device) {
     setText("#device-name", metrics.device);
     setText("#rail-device", metrics.device);
+    const compactDevice = $("#device-name");
+    const railDevice = $("#rail-device");
+    if (compactDevice) compactDevice.title = metrics.device;
+    if (railDevice) railDevice.title = metrics.device;
   }
   if (typeof metrics.measured_at === "string") {
     const date = new Date(metrics.measured_at);
@@ -243,15 +252,45 @@ function updatePhases(state) {
 }
 
 function renderEvents(events = []) {
-  if (!Array.isArray(events) || !events.length) return;
+  if (!Array.isArray(events)) return;
+  const incoming = events
+    .filter((event) => event && typeof event === "object" && Number.isInteger(event.seq))
+    .sort((left, right) => left.seq - right.seq);
+  const newestStart = [...incoming]
+    .reverse()
+    .find((event) => event.status === "starting" && event.stage === "starting");
+  if (newestStart && newestStart.seq > ui.eventRunStartSeq) {
+    ui.eventRunStartSeq = newestStart.seq;
+    ui.eventHistory = [];
+  }
+  const merged = new Map(ui.eventHistory.map((event) => [event.seq, event]));
+  incoming.forEach((event) => {
+    if (ui.eventRunStartSeq < 0 || event.seq >= ui.eventRunStartSeq) merged.set(event.seq, event);
+  });
+  ui.eventHistory = [...merged.values()]
+    .sort((left, right) => left.seq - right.seq)
+    .slice(-16);
+  if (!ui.eventHistory.length) return;
   const list = $("#event-list");
   if (!list) return;
   const fragment = document.createDocumentFragment();
-  events.slice(-16).forEach((event) => {
+  ui.eventHistory.forEach((event) => {
     const item = document.createElement("li");
     const time = document.createElement("time");
     const message = document.createElement("span");
-    time.textContent = String(event.seq ?? "—").padStart(3, "0");
+    const timestamp = typeof event.timestamp === "string" ? new Date(event.timestamp) : null;
+    if (timestamp && !Number.isNaN(timestamp.valueOf())) {
+      time.dateTime = event.timestamp;
+      time.textContent = timestamp.toLocaleTimeString("ko-KR", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      });
+    } else {
+      time.textContent = `#${String(event.seq).padStart(3, "0")}`;
+    }
+    time.title = `event #${String(event.seq).padStart(3, "0")}`;
     const stage = event.stage || event.kind || "event";
     message.textContent = event.message || `${PHASE_LABELS[stage] || stage} · ${event.progress ?? "—"}%`;
     item.append(time, message);
@@ -271,7 +310,13 @@ function updateState(state) {
   renderEvents(state.events || []);
 
   const active = ACTIVE_STATUSES.has(state.status);
-  $$('[data-action="run"]').forEach((button) => { button.disabled = active; });
+  const rerun = ["succeeded", "failed", "cancelled"].includes(state.status);
+  $$('[data-action="run"]').forEach((button) => {
+    button.disabled = active;
+    button.setAttribute("aria-busy", String(active));
+    const label = $("[data-run-label]", button);
+    if (label) label.textContent = active ? "검증 중" : rerun ? "다시 검증" : button.dataset.readyLabel;
+  });
   $$('[data-action="cancel"]').forEach((button) => { button.disabled = !active || state.status === "cancelling"; });
   document.body.classList.toggle("runtime-active", active);
 
@@ -362,6 +407,25 @@ async function shutdownDemo() {
   $("#shutdown-screen").hidden = false;
 }
 
+function updateFullscreenState() {
+  const button = $('[data-action="fullscreen"]');
+  if (!button) return;
+  const active = Boolean(document.fullscreenElement);
+  button.setAttribute("aria-pressed", String(active));
+  button.setAttribute("aria-label", active ? "발표 전체화면 종료" : "발표 전체화면 시작");
+  button.title = active ? "전체화면 종료 (Esc)" : "발표 전체화면";
+  document.body.classList.toggle("fullscreen-active", active);
+}
+
+async function toggleFullscreen() {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else await document.documentElement.requestFullscreen();
+  } catch (_) {
+    showToast("이 브라우저에서는 전체화면을 시작할 수 없습니다.", "warning");
+  }
+}
+
 async function pollState() {
   if (ui.pollStopped) return;
   const path = ui.lastSeq >= 0 ? `/api/state?after=${ui.lastSeq}` : "/api/state";
@@ -387,7 +451,7 @@ function updateTour() {
   const previous = $('[data-action="tour-prev"]');
   if (previous) previous.disabled = ui.tourIndex === 0;
   const next = $('[data-action="tour-next"]');
-  if (next) next.textContent = ui.tourIndex === TOUR.length - 1 ? "완료" : "다음 →";
+  if (next) next.textContent = ui.tourIndex === TOUR.length - 1 ? "실제 검증 시작" : "다음 →";
 }
 
 function openTour() {
@@ -406,7 +470,7 @@ function closeTour() {
 function nextTour() {
   if (ui.tourIndex >= TOUR.length - 1) {
     closeTour();
-    showToast("IR 가이드를 완료했습니다. 실제 검증을 실행해 보세요.", "success");
+    runValidation();
     return;
   }
   ui.tourIndex += 1;
@@ -463,6 +527,7 @@ function bindActions() {
   $$('[data-action="run"]').forEach((button) => button.addEventListener("click", runValidation));
   $$('[data-action="cancel"]').forEach((button) => button.addEventListener("click", cancelValidation));
   $$('[data-action="shutdown"]').forEach((button) => button.addEventListener("click", shutdownDemo));
+  $$('[data-action="fullscreen"]').forEach((button) => button.addEventListener("click", toggleFullscreen));
   $$('[data-action="toggle-log"]').forEach((button) => button.addEventListener("click", () => {
     const log = $("#event-log");
     log.hidden = !log.hidden;
@@ -494,6 +559,8 @@ function init() {
   bindArchitecture();
   bindActions();
   bindKeyboard();
+  document.addEventListener("fullscreenchange", updateFullscreenState);
+  updateFullscreenState();
   pollState();
 }
 

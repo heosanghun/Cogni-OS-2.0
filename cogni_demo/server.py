@@ -59,6 +59,7 @@ _STATIC_ASSETS = {
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/assets/app.css": ("app.css", "text/css; charset=utf-8"),
     "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/assets/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }
 _CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self'; "

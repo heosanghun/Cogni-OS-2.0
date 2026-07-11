@@ -21,7 +21,7 @@ testpaths = ["tests"]
 packages = ["cogni_core", "cogni_demo", "cogni_flow", "cogni_os"]
 
 [tool.setuptools.package-data]
-cogni_demo = ["static/*.html", "static/*.css", "static/*.js"]
+cogni_demo = ["static/*.html", "static/*.css", "static/*.js", "static/*.svg"]
 cogni_os = ["default.toml"]
 
 [tool.ruff]

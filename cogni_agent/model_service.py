@@ -27,6 +27,10 @@ from cogni_os.config import load_config
 from cogni_os.factory import build_genesis_runtime
 
 from .protocol import (
+    FINISH_CANCELLED,
+    FINISH_ERROR,
+    FINISH_LENGTH,
+    FINISH_STOP,
     HARD_MAX_INPUT_TOKENS,
     HARD_MAX_NEW_TOKENS,
     STATUS_BASE_MUTATED,
@@ -42,11 +46,19 @@ from .protocol import (
     parse_request,
     parse_response,
 )
+from .prompting import reserved_stop_sequences
 
 
 HARD_MAX_PROMPT_CHARS = 64_000
 HARD_MAX_RESPONSE_CHARS = 64_000
 DEFAULT_RESPONSE_QUEUE_SIZE = 64
+
+_FINISH_REASON_NAMES = {
+    FINISH_STOP: "stop",
+    FINISH_LENGTH: "length",
+    FINISH_CANCELLED: "cancelled",
+    FINISH_ERROR: "error",
+}
 
 
 class ModelServiceError(RuntimeError):
@@ -84,6 +96,7 @@ class GenerationChunk:
     generated_total: int
     final: bool
     cancelled: bool = False
+    finish_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +104,7 @@ class GenerationResult:
     request_id: int
     token_ids: Tensor
     text: str
+    finish_reason: str
 
 
 @dataclass(frozen=True)
@@ -275,32 +289,64 @@ def _model_device(model: nn.Module) -> torch.device:
 
 
 class _GenerationStoppingCriteria:
-    def __init__(self, cancel_event: Any, stop_token_ids: Tensor) -> None:
+    def __init__(
+        self,
+        cancel_event: Any,
+        stop_token_ids: Tensor,
+        stop_sequences: Tensor | None = None,
+    ) -> None:
         self.cancel_event = cancel_event
         self.stop_token_ids = tuple(map(int, stop_token_ids.tolist()))
+        sequences = (
+            torch.empty((0, 0), dtype=torch.int64)
+            if stop_sequences is None
+            else torch.as_tensor(stop_sequences, dtype=torch.int64)
+        )
+        self.stop_sequences = tuple(
+            tuple(int(value) for value in row.tolist() if int(value) >= 0)
+            for row in sequences
+        )
+        self.cancel_observed = False
+        self.stop_observed = False
 
     def __call__(self, input_ids: Tensor, _scores: Any, **_kwargs: Any) -> Tensor:
         batch = int(input_ids.shape[0]) if input_ids.ndim else 1
+        cancelled_now = bool(self.cancel_event.is_set())
+        self.cancel_observed = self.cancel_observed or cancelled_now
         cancelled = torch.full(
             (batch,),
-            bool(self.cancel_event.is_set()),
+            cancelled_now,
             dtype=torch.bool,
             device=input_ids.device,
         )
-        if not self.stop_token_ids or input_ids.ndim != 2 or input_ids.shape[1] == 0:
+        if input_ids.ndim != 2 or input_ids.shape[1] == 0:
             return cancelled
-        stop_ids = torch.tensor(
-            self.stop_token_ids, dtype=input_ids.dtype, device=input_ids.device
+        reached_stop = torch.zeros(
+            (batch,), dtype=torch.bool, device=input_ids.device
         )
-        reached_stop = (input_ids[:, -1, None] == stop_ids[None, :]).any(dim=1)
+        if self.stop_token_ids:
+            stop_ids = torch.tensor(
+                self.stop_token_ids, dtype=input_ids.dtype, device=input_ids.device
+            )
+            reached_stop |= (input_ids[:, -1, None] == stop_ids[None, :]).any(
+                dim=1
+            )
+        for sequence in self.stop_sequences:
+            if not sequence or input_ids.shape[1] < len(sequence):
+                continue
+            expected = torch.tensor(
+                sequence, dtype=input_ids.dtype, device=input_ids.device
+            )
+            reached_stop |= (input_ids[:, -len(sequence) :] == expected).all(dim=1)
+        self.stop_observed = self.stop_observed or bool(reached_stop.any())
         return cancelled | reached_stop
 
 
-def _stopping_criteria(cancel_event: Any, stop_token_ids: Tensor) -> Any:
+def _stopping_criteria(criteria: _GenerationStoppingCriteria) -> Any:
     # Transformers accepts a list-like custom criteria collection and merges
     # it into its own StoppingCriteriaList. Keeping this object dependency-free
     # avoids importing the optional runtime for injected/fake model workers.
-    return [_GenerationStoppingCriteria(cancel_event, stop_token_ids)]
+    return [criteria]
 
 
 class _TensorResponseStreamer:
@@ -449,6 +495,7 @@ def _worker_main(
     cancel_event: Any,
     ready_event: Any,
     failed_event: Any,
+    reserved_sequences: Tensor,
     max_input_tokens: int,
     core_workspace_bytes: int,
 ) -> None:
@@ -492,7 +539,13 @@ def _worker_main(
             cancel_event,
         )
         status = STATUS_OK
+        finish_reason = FINISH_ERROR
         remaining = torch.empty(0, dtype=torch.int64)
+        stop_criteria = _GenerationStoppingCriteria(
+            cancel_event,
+            request.stop_token_ids,
+            reserved_sequences,
+        )
         stage = "request"
         try:
             input_ids = request.input_ids.to(device)
@@ -528,9 +581,7 @@ def _worker_main(
                         do_sample=False,
                         use_cache=False,
                         streamer=streamer,
-                        stopping_criteria=_stopping_criteria(
-                            cancel_event, request.stop_token_ids
-                        ),
+                        stopping_criteria=_stopping_criteria(stop_criteria),
                     )
             stage = "token_postcheck"
             generated = _generated_suffix(output, request.input_ids)
@@ -545,14 +596,32 @@ def _worker_main(
                 remaining = generated[emitted.numel() :].contiguous()
             else:
                 remaining = generated
-            status = STATUS_CANCELLED if cancel_event.is_set() else STATUS_OK
+            if status == STATUS_CANCELLED or stop_criteria.cancel_observed:
+                status = STATUS_CANCELLED
+                finish_reason = FINISH_CANCELLED
+            else:
+                status = STATUS_OK
+                stopped_by_token = bool(
+                    generated.numel()
+                    and request.stop_token_ids.numel()
+                    and bool((generated[-1] == request.stop_token_ids).any())
+                )
+                finish_reason = (
+                    FINISH_STOP
+                    if stopped_by_token
+                    or stop_criteria.stop_observed
+                    or generated.numel() < request.max_new_tokens
+                    else FINISH_LENGTH
+                )
         except BaseException as error:
             _debug_worker_error(stage, error)
             status = STATUS_MODEL_ERROR
+            finish_reason = FINISH_ERROR
             remaining = torch.empty(0, dtype=torch.int64)
 
         if _parameter_signature(model) != base_signature:
             status = STATUS_BASE_MUTATED
+            finish_reason = FINISH_ERROR
             remaining = torch.empty(0, dtype=torch.int64)
         total = len(streamer.emitted) + int(remaining.numel())
         try:
@@ -564,6 +633,7 @@ def _worker_main(
                     remaining,
                     generated_total=total,
                     final=True,
+                    finish_reason=finish_reason,
                 ),
             )
         except BaseException:
@@ -652,6 +722,7 @@ class ModelService:
         self._cancel_event: Any = None
         self._ready_event: Any = None
         self._failed_event: Any = None
+        self._reserved_stop_sequences = reserved_stop_sequences(tokenizer)
 
     @classmethod
     def for_local_gemma(
@@ -706,6 +777,7 @@ class ModelService:
                     self._cancel_event,
                     self._ready_event,
                     self._failed_event,
+                    self._reserved_stop_sequences,
                     self.max_input_tokens,
                     self.core_workspace_bytes,
                 ),
@@ -737,6 +809,7 @@ class ModelService:
             raise ServiceBusyError("one generation request is already active")
         completed = False
         request_id = 0
+        observed_total = 0
         try:
             input_ids, attention_mask = self._tokenize(prompt)
             requested = (
@@ -789,27 +862,43 @@ class ModelService:
                     ) from exc
                 if frame.request_id != request_id:
                     raise WorkerExecutionError("worker response ownership changed")
+                expected_total = observed_total + int(frame.token_ids.numel())
+                if frame.generated_total != expected_total:
+                    raise WorkerExecutionError(
+                        "worker response token count is not monotonic"
+                    )
+                observed_total = expected_total
                 if frame.status == STATUS_OK:
                     chunk = GenerationChunk(
-                        request_id,
-                        frame.token_ids,
-                        frame.generated_total,
-                        frame.final,
-                        False,
+                        request_id=request_id,
+                        token_ids=frame.token_ids,
+                        generated_total=frame.generated_total,
+                        final=frame.final,
+                        cancelled=False,
+                        finish_reason=(
+                            _FINISH_REASON_NAMES.get(frame.finish_reason)
+                            if frame.final
+                            else None
+                        ),
                     )
                     yield chunk
                     if frame.final:
                         completed = True
                         return
+                    # The timeout measures time spent waiting for the worker,
+                    # not time the caller spends rendering a yielded chunk.
+                    # Reset it only after the consumer asks for the next chunk.
+                    deadline = monotonic() + wait_seconds
                     continue
                 if frame.status == STATUS_CANCELLED:
                     completed = True
                     yield GenerationChunk(
-                        request_id,
-                        frame.token_ids,
-                        frame.generated_total,
-                        True,
-                        True,
+                        request_id=request_id,
+                        token_ids=frame.token_ids,
+                        generated_total=frame.generated_total,
+                        final=True,
+                        cancelled=True,
+                        finish_reason="cancelled",
                     )
                     return
                 if frame.status == STATUS_BASE_MUTATED:
@@ -840,6 +929,7 @@ class ModelService:
         chunks: list[Tensor] = []
         request_id = 0
         cancelled = False
+        finish_reason: str | None = None
         for chunk in self.iter_generate_tokens(
             prompt,
             max_new_tokens=max_new_tokens,
@@ -850,6 +940,8 @@ class ModelService:
             if chunk.token_ids.numel():
                 chunks.append(chunk.token_ids)
             cancelled = cancelled or chunk.cancelled
+            if chunk.final:
+                finish_reason = chunk.finish_reason
         tokens = torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.int64)
         if tokens.numel() > self.max_new_tokens:
             raise WorkerExecutionError("worker exceeded the aggregate token budget")
@@ -862,7 +954,9 @@ class ModelService:
         )
         if not isinstance(text, str) or len(text) > self.max_response_chars:
             raise RequestLimitError("decoded response exceeds its character bound")
-        return GenerationResult(request_id, tokens, text)
+        if finish_reason not in {"stop", "length"}:
+            raise WorkerExecutionError("generation completed without a finish reason")
+        return GenerationResult(request_id, tokens, text, finish_reason)
 
     def cancel(self, request_id: int | None = None) -> bool:
         with self._state_lock:

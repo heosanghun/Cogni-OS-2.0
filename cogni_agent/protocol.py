@@ -14,7 +14,7 @@ import torch
 from torch import Tensor
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 OP_GENERATE = 1
 OP_STOP = 2
@@ -25,9 +25,17 @@ STATUS_INVALID_REQUEST = 2
 STATUS_MODEL_ERROR = 3
 STATUS_BASE_MUTATED = 4
 
+# Terminal generation cause.  This travels in the fourth tensor so the
+# controller never confuses a token-budget cut with a real model stop.
+FINISH_NONE = 0
+FINISH_STOP = 1
+FINISH_LENGTH = 2
+FINISH_CANCELLED = 3
+FINISH_ERROR = 4
+
 HARD_MAX_INPUT_TOKENS = 8_192
 HARD_MAX_NEW_TOKENS = 2_048
-HARD_MAX_STOP_TOKENS = 64
+HARD_MAX_STOP_TOKENS = 128
 
 TensorMessage: TypeAlias = tuple[Tensor, Tensor, Tensor, Tensor]
 
@@ -52,6 +60,7 @@ class ResponseFrame:
     token_ids: Tensor
     generated_total: int
     final: bool
+    finish_reason: int
 
 
 def _cpu_i64(value: Tensor, name: str, *, ndim: int) -> Tensor:
@@ -167,6 +176,7 @@ def make_response(
     *,
     generated_total: int = 0,
     final: bool,
+    finish_reason: int | None = None,
 ) -> TensorMessage:
     if (
         not isinstance(request_id, int)
@@ -192,12 +202,43 @@ def make_response(
         raise TensorProtocolError("response tokens exceed their hard bound")
     if not final and status != STATUS_OK:
         raise TensorProtocolError("only successful response chunks may be non-terminal")
+    if finish_reason is None:
+        if not final:
+            finish_reason = FINISH_NONE
+        elif status == STATUS_OK:
+            finish_reason = FINISH_STOP
+        elif status == STATUS_CANCELLED:
+            finish_reason = FINISH_CANCELLED
+        else:
+            finish_reason = FINISH_ERROR
+    if finish_reason not in {
+        FINISH_NONE,
+        FINISH_STOP,
+        FINISH_LENGTH,
+        FINISH_CANCELLED,
+        FINISH_ERROR,
+    }:
+        raise TensorProtocolError("response finish reason is unsupported")
+    if not final and finish_reason != FINISH_NONE:
+        raise TensorProtocolError("non-terminal chunks cannot have a finish reason")
+    if final and finish_reason == FINISH_NONE:
+        raise TensorProtocolError("terminal responses require a finish reason")
+    if status == STATUS_OK and final and finish_reason not in {
+        FINISH_STOP,
+        FINISH_LENGTH,
+    }:
+        raise TensorProtocolError("successful terminal response has invalid finish reason")
+    if status == STATUS_CANCELLED and finish_reason != FINISH_CANCELLED:
+        raise TensorProtocolError("cancelled response has invalid finish reason")
+    if status not in {STATUS_OK, STATUS_CANCELLED} and finish_reason != FINISH_ERROR:
+        raise TensorProtocolError("failed response has invalid finish reason")
     header = torch.tensor(
         [PROTOCOL_VERSION, status, request_id, int(bool(final))],
         dtype=torch.int64,
     )
     counters = torch.tensor([generated_total], dtype=torch.int64)
-    return header, tokens.clone(), counters, _empty()
+    reason = torch.tensor([finish_reason], dtype=torch.int64)
+    return header, tokens.clone(), counters, reason
 
 
 def parse_response(message: object) -> ResponseFrame:
@@ -206,8 +247,8 @@ def parse_response(message: object) -> ResponseFrame:
     header = _cpu_i64(message[0], "response header", ndim=1)
     tokens = _cpu_i64(message[1], "response token_ids", ndim=1)
     counters = _cpu_i64(message[2], "response counters", ndim=1)
-    reserved = _cpu_i64(message[3], "response reserved field", ndim=1)
-    if header.shape != (4,) or counters.shape != (1,) or reserved.numel():
+    reason = _cpu_i64(message[3], "response finish reason", ndim=1)
+    if header.shape != (4,) or counters.shape != (1,) or reason.shape != (1,):
         raise TensorProtocolError("response tensor shapes are invalid")
     version, status, request_id, final = map(int, header.tolist())
     if version != PROTOCOL_VERSION or final not in {0, 1}:
@@ -219,6 +260,7 @@ def parse_response(message: object) -> ResponseFrame:
         tokens,
         generated_total=int(counters.item()),
         final=bool(final),
+        finish_reason=int(reason.item()),
     )
     return ResponseFrame(
         request_id=request_id,
@@ -226,11 +268,17 @@ def parse_response(message: object) -> ResponseFrame:
         token_ids=checked[1],
         generated_total=int(checked[2].item()),
         final=bool(final),
+        finish_reason=int(checked[3].item()),
     )
 
 
 __all__ = [
     "GenerationRequest",
+    "FINISH_CANCELLED",
+    "FINISH_ERROR",
+    "FINISH_LENGTH",
+    "FINISH_NONE",
+    "FINISH_STOP",
     "HARD_MAX_INPUT_TOKENS",
     "HARD_MAX_NEW_TOKENS",
     "HARD_MAX_STOP_TOKENS",

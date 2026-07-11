@@ -1,11 +1,13 @@
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from threading import Thread
-from time import sleep
+from queue import Queue
+from threading import Event, Thread
+from time import monotonic, sleep
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -21,6 +23,13 @@ from cogni_agent.model_service import (
     load_local_tokenizer,
 )
 from cogni_agent.core_pipeline import CoreTurnRequest
+from cogni_agent.protocol import (
+    FINISH_CANCELLED,
+    FINISH_LENGTH,
+    STATUS_CANCELLED,
+    STATUS_OK,
+    make_response,
+)
 
 
 class FakeTokenizer:
@@ -140,6 +149,12 @@ class RecordingTokenizerClass:
         return FakeTokenizer()
 
 
+class _AliveProcess:
+    @staticmethod
+    def is_alive():
+        return True
+
+
 def service_for(
     *,
     delay=0.0,
@@ -174,16 +189,22 @@ class TestResidentModelService(unittest.TestCase):
             self.assertIsNotNone(service.worker_pid)
             self.assertNotEqual(service.worker_pid, parent_pid)
         self.assertTrue(chunks[-1].final)
+        self.assertEqual(chunks[-1].finish_reason, "length")
         self.assertEqual(
             torch.cat([chunk.token_ids for chunk in chunks]).tolist(),
             [101, 102, 103, 104],
         )
+        observed = 0
+        for chunk in chunks:
+            observed += int(chunk.token_ids.numel())
+            self.assertEqual(chunk.generated_total, observed)
 
     def test_text_boundary_decodes_only_after_tensor_worker_response(self):
         with service_for() as service:
             result = service.generate("hi", max_new_tokens=3)
         self.assertEqual(result.token_ids.tolist(), [101, 102, 103])
         self.assertEqual(result.text, "101 102 103")
+        self.assertEqual(result.finish_reason, "length")
 
     def test_core_pipeline_runs_before_authoritative_base_generation(self):
         with service_for(
@@ -193,6 +214,7 @@ class TestResidentModelService(unittest.TestCase):
             result = service.generate("core first", max_new_tokens=2)
         self.assertEqual(result.token_ids.tolist(), [101, 102])
         self.assertEqual(result.text, "101 102")
+        self.assertEqual(result.finish_reason, "length")
 
     def test_core_failure_blocks_base_answer_instead_of_silent_fallback(self):
         with service_for(
@@ -210,6 +232,115 @@ class TestResidentModelService(unittest.TestCase):
                 stop_token_ids=torch.tensor([102], dtype=torch.int64),
             )
         self.assertEqual(result.token_ids.tolist(), [101, 102])
+        self.assertEqual(result.finish_reason, "stop")
+
+    def test_early_model_stop_and_token_budget_have_distinct_reasons(self):
+        with service_for() as service:
+            stopped = service.generate("early stop", max_new_tokens=8)
+            limited = service.generate("length", max_new_tokens=3)
+        self.assertEqual(stopped.token_ids.tolist(), [101, 102, 103, 104])
+        self.assertEqual(stopped.finish_reason, "stop")
+        self.assertEqual(limited.token_ids.tolist(), [101, 102, 103])
+        self.assertEqual(limited.finish_reason, "length")
+
+    def test_cancelled_terminal_chunk_preserves_its_finish_reason(self):
+        service = service_for(delay=0.15)
+        chunks = []
+        errors = []
+
+        def run():
+            try:
+                chunks.extend(
+                    service.iter_generate_tokens("cancel chunks", max_new_tokens=8)
+                )
+            except BaseException as exc:  # asserted below
+                errors.append(exc)
+
+        try:
+            service.start()
+            worker = Thread(target=run)
+            worker.start()
+            for _ in range(100):
+                if service.active_request_id is not None:
+                    break
+                sleep(0.01)
+            self.assertTrue(service.cancel(service.active_request_id))
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(chunks[-1].final)
+            self.assertTrue(chunks[-1].cancelled)
+            self.assertEqual(chunks[-1].finish_reason, "cancelled")
+        finally:
+            service.stop()
+
+    def test_idle_timeout_resets_after_each_healthy_worker_frame(self):
+        with service_for(delay=0.12) as service:
+            started = monotonic()
+            result = service.generate("healthy stream", max_new_tokens=4, timeout=0.25)
+            elapsed = monotonic() - started
+        self.assertGreater(elapsed, 0.25)
+        self.assertEqual(result.finish_reason, "length")
+
+    def test_consumer_render_time_does_not_count_as_worker_idle_time(self):
+        with service_for(delay=0.01) as service:
+            stream = service.iter_generate_tokens(
+                "slow renderer", max_new_tokens=4, timeout=0.1
+            )
+            first = next(stream)
+            sleep(0.2)
+            chunks = [first, *stream]
+        self.assertEqual(chunks[-1].finish_reason, "length")
+        self.assertEqual(chunks[-1].generated_total, 4)
+
+    def test_stalled_worker_still_expires_the_idle_timeout(self):
+        with service_for(delay=0.4) as service:
+            with self.assertRaises(TimeoutError):
+                list(
+                    service.iter_generate_tokens(
+                        "stalled stream", max_new_tokens=4, timeout=0.15
+                    )
+                )
+
+    def test_controller_rejects_non_monotonic_generated_total(self):
+        service = service_for()
+        service._process = _AliveProcess()
+        service._request_queue = Queue()
+        service._response_queue = Queue()
+        service._cancel_event = Event()
+        service._response_queue.put(
+            make_response(
+                1,
+                STATUS_OK,
+                torch.tensor([101], dtype=torch.int64),
+                generated_total=1,
+                final=False,
+            )
+        )
+        service._response_queue.put(
+            make_response(
+                1,
+                STATUS_OK,
+                torch.tensor([102], dtype=torch.int64),
+                generated_total=1,
+                final=True,
+                finish_reason=FINISH_LENGTH,
+            )
+        )
+        # The controller drains to a valid terminal frame after rejecting the
+        # corrupt counter, just as it would for an untrusted worker failure.
+        service._response_queue.put(
+            make_response(
+                1,
+                STATUS_CANCELLED,
+                generated_total=1,
+                final=True,
+                finish_reason=FINISH_CANCELLED,
+            )
+        )
+        with patch.object(service, "start", return_value=service):
+            with self.assertRaisesRegex(WorkerExecutionError, "not monotonic"):
+                list(service.iter_generate_tokens("counter", max_new_tokens=2))
 
     def test_cooperative_cancellation_interrupts_the_active_request(self):
         service = service_for(delay=0.15)

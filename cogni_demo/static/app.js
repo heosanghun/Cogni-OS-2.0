@@ -12,7 +12,7 @@ const AGENT_ACTIVE_STATUSES = new Set([
 const AGENT_STATUSES = new Set(["offline", "starting", "loading", "ready", "generating", "executing", "cancelling", "succeeded", "cancelled", "failed"]);
 const VIEW_IDS = new Set(["assistant", "mission", "inference", "architecture", "business", "evidence"]);
 const MAX_AGENT_DOM_MESSAGES = 32;
-const MAX_AGENT_MESSAGE_CHARS = 4096;
+const MAX_AGENT_RESPONSE_CHARS = 8192;
 const API_ERROR_COPY = {
   AGENT_UNAVAILABLE: "로컬 AI 서비스가 준비되지 않았습니다. 잠시 후 다시 시도해 주세요.",
   AGENT_BUSY: "현재 AI 요청이 끝난 뒤 다시 시도해 주세요.",
@@ -158,7 +158,7 @@ function $$(selector, root = document) {
 function setText(selector, value) {
   const element = $(selector);
   if (element && value !== undefined && value !== null) {
-    element.textContent = String(value).slice(0, MAX_AGENT_MESSAGE_CHARS);
+    element.textContent = String(value).slice(0, MAX_AGENT_RESPONSE_CHARS);
   }
 }
 
@@ -499,10 +499,35 @@ function createAgentMessageElement() {
   bubble.className = "chat-bubble";
   const header = document.createElement("header");
   const author = document.createElement("strong");
+  const meta = document.createElement("span");
+  meta.className = "chat-message-meta";
+  const completion = document.createElement("span");
+  completion.className = "chat-completion-status";
+  completion.setAttribute("role", "status");
   const time = document.createElement("time");
   const content = document.createElement("p");
-  header.append(author, time);
-  bubble.append(header, content);
+  const continueButton = document.createElement("button");
+  continueButton.className = "chat-continue-button";
+  continueButton.type = "button";
+  continueButton.textContent = "이어서 작성";
+  continueButton.hidden = true;
+  continueButton.addEventListener("click", () => {
+    ui.agentMode = "chat";
+    $$('[data-agent-mode]').forEach((candidate) => {
+      const selected = candidate.dataset.agentMode === "chat";
+      candidate.classList.toggle("is-selected", selected);
+      candidate.setAttribute("aria-pressed", String(selected));
+    });
+    const input = $("#agent-input");
+    if (input) {
+      input.value = "계속 이어서 답해주세요.";
+      updateAgentCharacterCount();
+      input.focus();
+    }
+  });
+  meta.append(completion, time);
+  header.append(author, meta);
+  bubble.append(header, content, continueButton);
   item.append(avatar, bubble);
   return item;
 }
@@ -535,9 +560,19 @@ function renderAgentConversation(messages = []) {
     normalized.push({
       key,
       role,
-      content: message.content.slice(0, MAX_AGENT_MESSAGE_CHARS),
+      content: message.content.slice(0, MAX_AGENT_RESPONSE_CHARS),
       createdAt: typeof message.created_at === "string" ? message.created_at.slice(0, 128) : "",
       streaming: message.streaming === true,
+      finishReason: ["stop", "length", "cancelled", "error", "tool"].includes(message.finish_reason)
+        ? message.finish_reason
+        : null,
+      continuations: Number.isInteger(message.continuations)
+        ? Math.max(0, Math.min(2, message.continuations))
+        : 0,
+      truncated: message.truncated === true,
+      generatedTokens: Number.isInteger(message.generated_tokens)
+        ? Math.max(0, Math.min(1536, message.generated_tokens))
+        : 0,
     });
   });
 
@@ -558,6 +593,7 @@ function renderAgentConversation(messages = []) {
     existing.delete(message.key);
     item.dataset.messageId = message.key;
     item.classList.toggle("is-streaming", message.streaming);
+    item.classList.toggle("is-truncated", message.truncated);
     item.setAttribute("aria-busy", String(message.streaming));
     const role = message.role;
     item.dataset.role = role;
@@ -569,8 +605,26 @@ function renderAgentConversation(messages = []) {
     time.textContent = formatAgentTime(message.createdAt);
     if (time.textContent) time.dateTime = message.createdAt;
     else time.removeAttribute("datetime");
+    const completion = $(".chat-completion-status", item);
+    if (completion) {
+      let completionCopy = "";
+      if (role === "assistant" && message.streaming) completionCopy = "작성 중";
+      else if (role === "assistant" && message.truncated) completionCopy = "길이 한계 · 이어서 가능";
+      else if (role === "assistant" && message.finishReason) {
+        completionCopy = message.continuations
+          ? `자동 이어쓰기 ${message.continuations}회 · 완료`
+          : "완료";
+      }
+      completion.textContent = completionCopy;
+      completion.hidden = !completionCopy;
+      completion.title = message.generatedTokens
+        ? `생성 ${message.generatedTokens.toLocaleString("ko-KR")} 토큰`
+        : "";
+    }
     const content = $(".chat-bubble p", item);
     content.textContent = message.content;
+    const continueButton = $(".chat-continue-button", item);
+    if (continueButton) continueButton.hidden = role !== "assistant" || !message.truncated || message.streaming;
     transcript.append(item);
   });
   existing.forEach((item) => item.remove());

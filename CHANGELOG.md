@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.1 — 2026-07-11
+
+- replaced the missing-template transcript fallback with a pinned text-only
+  Gemma 4 turn contract and exactly one BOS token;
+- added EOS/EOT/tool and reserved-token quarantine stops, structured public
+  response parsing, and protocol-v2 terminal finish reasons;
+- increased the bounded answer envelope to 512 tokens per request and 1,536
+  tokens per turn, with up to two same-turn continuations only after `length`;
+- changed generation timeout handling from one absolute deadline to a resettable
+  worker-idle deadline;
+- batched streaming renders, flushed empty terminal frames, and exposed
+  completion/truncation metadata plus an explicit continue action in CogniBoard;
+- pooled the advisory Gemma embedding to a fixed-size CTS root so conversation
+  length no longer multiplies the 301-node arena allocation;
+- added a real-GPU three-turn completion validator. On the attached RTX 5090
+  Laptop GPU all three turns ended with `stop`, no truncation, no role leakage,
+  no public control tokens, and a clean worker shutdown.
+
 ## 0.2.0 — 2026-07-11
 
 - added the CogniBoard local AI workspace and native Windows launcher;

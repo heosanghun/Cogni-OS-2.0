@@ -380,7 +380,13 @@ class GemmaDEQBackboneAdapter(nn.Module):
 
 
 class LocalGemmaFeatureBackbone(nn.Module):
-    """Expose a loaded local Gemma model as a cache-free latent feature module."""
+    """Expose one fixed-size, cache-free latent per local Gemma request.
+
+    CTS preallocates one state tensor per arena node. Passing the full
+    ``[batch, sequence, hidden]`` activation would therefore multiply its VRAM
+    by conversation length. Attention-weighted pooling here keeps the CTS root
+    ``[batch, hidden]`` and its arena allocation independent of token count.
+    """
 
     def __init__(self, model: nn.Module):
         super().__init__()
@@ -396,11 +402,51 @@ class LocalGemmaFeatureBackbone(nn.Module):
         return self
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        attention_mask = kwargs.get("attention_mask")
+        input_ids = args[0] if args else kwargs.get("input_ids")
+        embedding_getter = getattr(self.model, "get_input_embeddings", None)
+        if (
+            isinstance(input_ids, Tensor)
+            and input_ids.ndim == 2
+            and not torch.is_floating_point(input_ids)
+            and callable(embedding_getter)
+        ):
+            embeddings = embedding_getter()(input_ids)
+            if not isinstance(embeddings, Tensor) or embeddings.ndim != 3:
+                raise DecoderLayerContractError(
+                    "local Gemma token embedding must have [batch, sequence, hidden] shape"
+                )
+            if (
+                isinstance(attention_mask, Tensor)
+                and tuple(attention_mask.shape) == tuple(embeddings.shape[:2])
+            ):
+                weights = attention_mask.to(
+                    device=embeddings.device, dtype=embeddings.dtype
+                ).unsqueeze(-1)
+                return (embeddings * weights).sum(dim=1) / weights.sum(
+                    dim=1
+                ).clamp_min(1)
+            return embeddings.mean(dim=1)
         kwargs["use_cache"] = False
         kwargs["output_hidden_states"] = True
         kwargs["return_dict"] = True
         output = self.model(*args, **kwargs)
-        return extract_hidden_states(output)
+        hidden = extract_hidden_states(output)
+        if hidden.ndim < 2:
+            raise DecoderLayerContractError(
+                "local Gemma hidden state must preserve batch and feature axes"
+            )
+        if hidden.ndim == 2:
+            return hidden
+        if (
+            hidden.ndim == 3
+            and isinstance(attention_mask, Tensor)
+            and tuple(attention_mask.shape) == tuple(hidden.shape[:2])
+        ):
+            weights = attention_mask.to(device=hidden.device, dtype=hidden.dtype)
+            weights = weights.unsqueeze(-1)
+            return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
+        return hidden.flatten(1, -2).mean(dim=1)
 
 
 def find_decoder_layers(model: nn.Module) -> nn.ModuleList:

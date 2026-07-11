@@ -16,12 +16,18 @@ worker가 살아 있는 동안에는 재적재하지 않고 토큰을 순차 표
 
 대화는 다음 실제 경로를 거칩니다.
 
-1. bounded 멀티턴 기록과 로컬 chat template
+1. bounded 멀티턴 기록과 고정된 Gemma 4 native turn contract
 2. BIO-HAMA 인지 라우팅
 3. Gemma feature backbone과 DEQ/CTS Depth 100
 4. System 4 텐서 swarm과 System 3 bounded expert 관측
 5. `use_cache=False`, deterministic Gemma 답변 생성
 6. CPU `int64` 토큰 텐서 스트리밍과 대화 commit
+
+응답은 모델이 실제 종료 토큰을 낸 경우에만 `완료`로 기록합니다. 512토큰
+세그먼트가 길이 경계에서 끝나면 동일한 model turn에서 최대 두 번 자동으로
+이어 쓰며, 총 1,536토큰 상한에 도달하면 `길이 한계`를 명시합니다. CogniBoard는
+종료 사유와 이어쓰기 횟수를 답변 아래에 표시합니다. 입력은 4,096자, 공개 출력은
+8,192자로 서로 분리되어 있습니다.
 
 System 4와 System 3는 현재 advisory-only입니다. 검증되지 않은 보조 모듈이
 Gemma의 답변 토큰을 바꾸지 못합니다. Fast Weight는 외부 품질·OOD·스펙트럼
@@ -58,6 +64,16 @@ symlink/junction, 바이너리, 과대 파일, 소스 확장자 저장은 거부
 atomic replace, 별도 health snapshot, SHA-256 rollback을 모두 통과해야 합니다.
 
 ## 재현 검증
+
+대화 완결성 3턴 검증:
+
+```powershell
+python scripts\validate_agent_completion.py `
+  --model C:\Project\cognios\gemma4-e4b `
+  --manifest config\gemma4-e4b.manifest.toml
+```
+
+단일 Cogni-Core 경로 검증:
 
 ```powershell
 python scripts\validate_agent_runtime.py `

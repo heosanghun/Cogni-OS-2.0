@@ -199,9 +199,41 @@ class TestGemmaDEQBackboneAdapter(unittest.TestCase):
         model = _FeatureModel()
         wrapper = LocalGemmaFeatureBackbone(model)
         result = wrapper(torch.zeros(1, 2, 3), use_cache=True)
-        self.assertTrue(torch.equal(result, torch.ones(1, 2, 3)))
+        self.assertTrue(torch.equal(result, torch.ones(1, 3)))
         self.assertFalse(model.last_kwargs["use_cache"])
         self.assertTrue(model.last_kwargs["output_hidden_states"])
+
+    def test_local_feature_backbone_masked_pool_is_sequence_bounded(self) -> None:
+        model = _FeatureModel()
+        wrapper = LocalGemmaFeatureBackbone(model)
+        result = wrapper(
+            torch.zeros(1, 4, 3),
+            attention_mask=torch.tensor([[1, 1, 0, 0]]),
+        )
+        self.assertEqual(tuple(result.shape), (1, 3))
+        self.assertTrue(torch.equal(result, torch.ones(1, 3)))
+
+    def test_local_integer_tokens_use_embeddings_without_full_decoder(self) -> None:
+        class EmbeddingOnlyModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = type("Config", (), {"use_cache": True})()
+                self.embedding = nn.Embedding(16, 4)
+                nn.init.ones_(self.embedding.weight)
+
+            def get_input_embeddings(self):
+                return self.embedding
+
+            def forward(self, *_args, **_kwargs):
+                raise AssertionError("advisory CTS must not run the full decoder")
+
+        wrapper = LocalGemmaFeatureBackbone(EmbeddingOnlyModel())
+        result = wrapper(
+            torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=torch.tensor([[1, 1, 0, 0]]),
+        )
+        self.assertEqual(tuple(result.shape), (1, 4))
+        self.assertTrue(torch.equal(result, torch.ones(1, 4)))
 
     def test_shape_change_is_rejected(self) -> None:
         adapter = GemmaDEQBackboneAdapter(_BadShapeLayer(), DEQConfig(max_iter=2))

@@ -14,6 +14,10 @@ request id, payload/result, and status. The bounded queues carry no JSON,
 strings, exception objects, or network traffic. PAUSE/RESUME opcodes align the
 worker with the day/night controller.
 
+The local generation protocol is version 2. Its fourth response tensor carries
+a closed terminal reason (`stop`, `length`, `cancelled`, or `error`), so a
+token-budget boundary cannot be committed as a successful model stop.
+
 Natural language, source code, paths, JSON, and subprocess results never enter the Cogni-Core hot path. Core modules exchange tensors and fixed Python dataclasses whose fields are tensors or bounded numeric metadata. Cogni-Flow may use structured control data because it is outside the sub-millisecond tensor path.
 
 ## Day path
@@ -24,12 +28,15 @@ Natural language, source code, paths, JSON, and subprocess results never enter t
    Cogni-Core runtime. The browser and HTTP control plane never own CUDA.
 4. A bounded multi-turn controller renders the prompt locally and sends only
    CPU `int64` tensors across the worker boundary.
-5. BIO-HAMA routes the turn, the offline backbone produces latent states, and
-   PUCT CTS plus DEQ performs fixed-width, bounded-node latent search.
+5. BIO-HAMA routes the turn. The local Gemma embedding is attention-pooled to
+   one fixed-size advisory latent before PUCT CTS plus DEQ performs
+   fixed-width, bounded-node search; CTS arena storage does not scale with the
+   conversation sequence length.
 6. System 4 and System 3 produce detached advisory telemetry. They cannot alter
    Gemma logits or decoded answer tokens.
 7. Deterministic Gemma decoding runs with `use_cache=False` and streams bounded
-   token tensors back to the controller.
+   token tensors back to the controller. Native Gemma 4 EOT and quarantined
+   reserved markers are stopped before public decode.
 8. A bounded latent bottleneck compiles only converged states into low-rank
    Fast Weight overlays. External held-out quality, composed operator norm, and
    Near-OOD gates must all pass; overlays remain session-only.

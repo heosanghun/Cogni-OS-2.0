@@ -3,6 +3,10 @@ import unittest
 import torch
 
 from cogni_agent.protocol import (
+    FINISH_CANCELLED,
+    FINISH_LENGTH,
+    FINISH_NONE,
+    FINISH_STOP,
     HARD_MAX_INPUT_TOKENS,
     STATUS_CANCELLED,
     STATUS_OK,
@@ -76,6 +80,7 @@ class TestAgentTensorProtocol(unittest.TestCase):
         )
         self.assertFalse(chunk.final)
         self.assertEqual(chunk.token_ids.tolist(), [4, 5])
+        self.assertEqual(chunk.finish_reason, FINISH_NONE)
         terminal = parse_response(
             make_response(
                 9,
@@ -86,8 +91,48 @@ class TestAgentTensorProtocol(unittest.TestCase):
         )
         self.assertTrue(terminal.final)
         self.assertEqual(terminal.status, STATUS_CANCELLED)
+        self.assertEqual(terminal.finish_reason, FINISH_CANCELLED)
         with self.assertRaises(TensorProtocolError):
             make_response(9, STATUS_CANCELLED, final=False)
+
+    def test_terminal_stop_length_and_cancel_reasons_round_trip(self) -> None:
+        cases = (
+            (STATUS_OK, FINISH_STOP),
+            (STATUS_OK, FINISH_LENGTH),
+            (STATUS_CANCELLED, FINISH_CANCELLED),
+        )
+        for status, reason in cases:
+            with self.subTest(status=status, reason=reason):
+                frame = parse_response(
+                    make_response(
+                        11,
+                        status,
+                        torch.tensor([7], dtype=torch.int64),
+                        generated_total=1,
+                        final=True,
+                        finish_reason=reason,
+                    )
+                )
+                self.assertTrue(frame.final)
+                self.assertEqual(frame.status, status)
+                self.assertEqual(frame.finish_reason, reason)
+
+    def test_finish_reason_status_pairs_are_fail_closed(self) -> None:
+        invalid = (
+            (STATUS_OK, True, FINISH_CANCELLED),
+            (STATUS_CANCELLED, True, FINISH_STOP),
+            (STATUS_OK, False, FINISH_LENGTH),
+        )
+        for status, final, reason in invalid:
+            with self.subTest(status=status, final=final, reason=reason):
+                with self.assertRaises(TensorProtocolError):
+                    make_response(
+                        3,
+                        status,
+                        generated_total=0,
+                        final=final,
+                        finish_reason=reason,
+                    )
 
 
 if __name__ == "__main__":

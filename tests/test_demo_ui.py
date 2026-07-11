@@ -129,7 +129,7 @@ class TestCogniBoardUI(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotRegex(script, forbidden)
         self.assertIn("content.textContent = message.content", script)
-        self.assertIn("message.content.slice(0, MAX_AGENT_MESSAGE_CHARS)", script)
+        self.assertIn("message.content.slice(0, MAX_AGENT_RESPONSE_CHARS)", script)
         self.assertIn('includes(message.role) ? message.role : "assistant"', script)
         self.assertIn("messages.slice(-MAX_AGENT_DOM_MESSAGES)", script)
         self.assertIn("VIEW_IDS.has(initial)", script)
@@ -158,6 +158,23 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn('data-action="agent-send"', html)
         self.assertIn('data-action="agent-cancel"', html)
         self.assertIn('.agent-heading-state[data-state="cancelling"]', stylesheet)
+
+    def test_answer_completion_and_truncation_are_visible_and_actionable(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+        for field in (
+            "finish_reason",
+            "continuations",
+            "truncated",
+            "generated_tokens",
+        ):
+            self.assertIn(field, script)
+        self.assertIn("자동 이어쓰기 ${message.continuations}회 · 완료", script)
+        self.assertIn("길이 한계 · 이어서 가능", script)
+        self.assertIn("계속 이어서 답해주세요.", script)
+        self.assertIn(".chat-completion-status", stylesheet)
+        self.assertIn(".chat-message.is-truncated", stylesheet)
+        self.assertIn(".chat-continue-button", stylesheet)
 
     def test_api_error_copy_and_connection_recovery_are_actionable(self) -> None:
         script = (STATIC / "app.js").read_text(encoding="utf-8")

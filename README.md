@@ -44,6 +44,22 @@ reserved for the evolution path. Task mode exposes only `/help`, `/list`,
 `/read`, `/search`, `/status`, `/test`, and `/save`. It never exposes arbitrary
 shell, network, or unrestricted source writes.
 
+Gemma 4 chat uses the native `<|turn>` / `<turn|>` contract even when the local
+artifact mirror has no serialized chat template. EOS, end-of-turn, tool handoff,
+and quarantined reserved markers are stopped at token boundaries. A 512-token
+segment that ends by length is continued in the same open model turn, up to a
+hard 1,536-token aggregate; only a real stop is recorded as complete. The UI
+publishes the finish reason, continuation count, and any hard-limit truncation
+instead of silently treating a cut sentence as success.
+
+Run the real-model multi-turn regression with:
+
+```powershell
+python scripts\validate_agent_completion.py `
+  --model C:\Project\cognios\gemma4-e4b `
+  --manifest config\gemma4-e4b.manifest.toml
+```
+
 Self-Harness records bounded runtime failures and can generate local patch
 proposals during an exclusive evolution cycle. Source promotion is disabled by
 default. It becomes possible only when an operator supplies an explicitly

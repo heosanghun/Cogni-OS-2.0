@@ -37,6 +37,9 @@ class TestConfig(unittest.TestCase):
             ),
             original.replace("latent_capacity = 256", "latent_capacity = 999"),
             original.replace("max_operator_norm = 0.10", "max_operator_norm = 0.99"),
+            original.replace("agents = 28", "agents = 27"),
+            original.replace("global_margin = 0.95", "global_margin = 1.0"),
+            original.replace("session_capacity = 16", "session_capacity = 0", 1),
         )
         with tempfile.TemporaryDirectory() as directory:
             for index, source in enumerate(unsafe_variants):

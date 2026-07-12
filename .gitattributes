@@ -1,4 +1,5 @@
 *.cmd text eol=crlf
-release/*.exe export-ignore
-release/*.whl export-ignore
-release/*.zip export-ignore
+*.exe export-ignore
+*.whl export-ignore
+*.zip export-ignore
+release/SHA256SUMS.txt export-ignore

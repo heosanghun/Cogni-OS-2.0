@@ -10,13 +10,31 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from hashlib import sha256
 import os
 from pathlib import Path
+import re
 from secrets import token_hex
 import shutil
 import subprocess
 import sys
 from time import monotonic
+
+from cogni_flow.task_plan import (
+    CapabilityToken,
+    ExpectedArtifact,
+    RiskTier,
+    TaskAction,
+    TaskActionKind,
+    TaskBudget,
+    TaskExecutionError,
+    TaskPlanError,
+    TaskPlanExecutor,
+    TaskPlanResult,
+    TaskVerifier,
+    TypedTaskPlan,
+    VerifierKind,
+)
 
 
 MAX_REQUEST_CHARS = 4_096
@@ -64,11 +82,106 @@ HELP_TEXT = """안전한 로컬 작업 명령
 /read <상대파일>                 bounded 파일 읽기
 /search <검색어> [--in <경로>]   프로젝트 텍스트 검색
 /status                          Git 변경 상태 읽기
-/test [tests/파일.py]            고정 pytest 명령 실행
+/test [tests/파일.py]            신뢰 개발자 opt-in에서만 고정 pytest 실행
 /save <파일명> 다음 줄부터 내용   outputs/agent-workspace에 결과 저장
 
-임의 셸 명령과 소스 직접 쓰기는 허용되지 않습니다. 코드 변경은 Self-Harness의
-격리 회귀·승격 절차를 거쳐야 합니다."""
+동일한 작업을 “프로젝트 상태를 보여주세요”, “docs 폴더의 파일 목록을
+보여주세요”, “README.md 파일을 읽어주세요”, “전체 테스트를 실행해주세요”처럼
+명확한 자연어로 요청할 수도 있습니다. 모호한 자연어는 실행하지 않고 도움말을
+표시합니다. 임의 셸 명령과 소스 직접 쓰기는 허용되지 않습니다. 코드 변경은
+Self-Harness의 제안 전용 T2 staging을 거쳐야 합니다."""
+
+
+_SAFE_NATURAL_PATH = r"[A-Za-z0-9_.\-/]+"
+
+
+def _parse_natural_task(text: str) -> ToolRequest | None:
+    """Compile a deliberately small, deterministic natural-language grammar.
+
+    This is not a model planner.  A full-string match must identify exactly one
+    allowlisted operation and every path remains subject to the typed-plan path
+    verifier.  Ambiguous prose returns ``None`` without issuing capability.
+    """
+
+    exact = {
+        "프로젝트 상태를 보여줘": ToolRequest("status"),
+        "프로젝트 상태를 보여주세요": ToolRequest("status"),
+        "변경 상태를 보여줘": ToolRequest("status"),
+        "변경 상태를 보여주세요": ToolRequest("status"),
+        "전체 테스트를 실행해줘": ToolRequest("test"),
+        "전체 테스트를 실행해주세요": ToolRequest("test"),
+        "프로젝트 파일 목록을 보여줘": ToolRequest("list", "."),
+        "프로젝트 파일 목록을 보여주세요": ToolRequest("list", "."),
+        "show project status": ToolRequest("status"),
+        "run all tests": ToolRequest("test"),
+        "list project files": ToolRequest("list", "."),
+    }
+    normalized = " ".join(text.split())
+    direct = exact.get(normalized.casefold())
+    if direct is not None:
+        return direct
+
+    patterns: tuple[tuple[str, str], ...] = (
+        (
+            "list",
+            rf"(?P<path>{_SAFE_NATURAL_PATH})\s*(?:폴더|디렉터리)(?:의)?\s*"
+            r"파일\s*목록(?:을)?\s*(?:보여\s*줘|보여주세요|조회해줘|조회해주세요)",
+        ),
+        (
+            "read",
+            rf"(?P<path>{_SAFE_NATURAL_PATH})\s*파일(?:의)?\s*(?:내용(?:을)?\s*)?"
+            r"(?:읽어\s*줘|읽어주세요|보여\s*줘|보여주세요)",
+        ),
+        (
+            "test",
+            r"(?P<path>tests/[A-Za-z0-9_.\-/]+\.py)\s*(?:파일(?:의)?\s*)?"
+            r"테스트(?:를)?\s*(?:실행해줘|실행해주세요|돌려줘|돌려주세요)",
+        ),
+        (
+            "list_en",
+            rf"(?:list|show)(?: the)? files in (?P<path>{_SAFE_NATURAL_PATH})",
+        ),
+        (
+            "read_en",
+            rf"(?:read|show)(?: the)? file (?P<path>{_SAFE_NATURAL_PATH})",
+        ),
+        (
+            "test_en",
+            r"run(?: the)? test (?P<path>tests/[A-Za-z0-9_.\-/]+\.py)",
+        ),
+    )
+    for operation, pattern in patterns:
+        match = re.fullmatch(pattern, normalized, flags=re.IGNORECASE)
+        if match is None:
+            continue
+        mapped = operation.removesuffix("_en")
+        return ToolRequest(mapped, match.group("path"))
+
+    korean_search = re.fullmatch(
+        rf"(?:(?P<scope>{_SAFE_NATURAL_PATH})\s*(?:에서|안에서)\s*)?"
+        r"[\"“](?P<query>[^\"”\r\n]{1,256})[\"”]\s*"
+        r"(?:검색해줘|검색해주세요|찾아줘|찾아주세요)",
+        normalized,
+    )
+    if korean_search is not None:
+        return ToolRequest(
+            "search",
+            korean_search.group("query").strip(),
+            korean_search.group("scope") or ".",
+        )
+    english_search = re.fullmatch(
+        rf"(?:search|find) [\"](?P<query>[^\"\r\n]{{1,256}})[\"]"
+        rf"(?: in (?P<scope>{_SAFE_NATURAL_PATH}))?",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if english_search is not None:
+        return ToolRequest(
+            "search",
+            english_search.group("query").strip(),
+            english_search.group("scope") or ".",
+        )
+    return None
 
 
 def parse_tool_request(message: str) -> ToolRequest | None:
@@ -91,7 +204,7 @@ def parse_tool_request(message: str) -> ToolRequest | None:
     }
     text = aliases.get(text, text)
     if not text.startswith("/"):
-        return None
+        return _parse_natural_task(text)
 
     first_line, separator, remainder = text.partition("\n")
     command, _, raw_argument = first_line.partition(" ")
@@ -139,6 +252,7 @@ class WorkspaceToolExecutor:
         project_root: str | Path,
         *,
         timeout_seconds: int = 180,
+        allow_trusted_tests: bool = False,
     ) -> None:
         root = Path(project_root).resolve(strict=True)
         if not root.is_dir():
@@ -148,6 +262,11 @@ class WorkspaceToolExecutor:
         self.project_root = root
         self.output_root = root / "outputs" / "agent-workspace"
         self.timeout_seconds = int(timeout_seconds)
+        self.allow_trusted_tests = bool(allow_trusted_tests)
+        self.task_executor = TaskPlanExecutor(
+            root,
+            help_text=HELP_TEXT,
+        )
 
     def _resolve(self, raw: str, *, require_file: bool = False) -> Path:
         candidate = Path(raw or ".")
@@ -175,24 +294,12 @@ class WorkspaceToolExecutor:
         if not isinstance(request, ToolRequest):
             raise TypeError("request must be ToolRequest")
         started = monotonic()
-        artifact: str | None = None
         try:
-            if request.operation == "help":
-                output = HELP_TEXT
-            elif request.operation == "list":
-                output = self._list(request.argument)
-            elif request.operation == "read":
-                output = self._read(request.argument)
-            elif request.operation == "search":
-                output = self._search(request.argument, request.scope)
-            elif request.operation == "status":
-                output = self._status()
-            elif request.operation == "test":
-                output = self._test(request.argument)
-            elif request.operation == "save":
-                output, artifact = self._save(request.argument, request.content)
-            else:
-                raise ToolPolicyError("operation is not on the fixed allowlist")
+            plan = self.plan(request)
+            capability = self.task_executor.authorize(plan)
+            result = self.task_executor.execute(plan, capability)
+            output = "\n".join(item.output for item in result.action_results)
+            artifact = result.artifacts[0].path if result.artifacts else None
             return ToolResult(
                 request.operation,
                 True,
@@ -204,6 +311,8 @@ class WorkspaceToolExecutor:
             OSError,
             UnicodeError,
             subprocess.SubprocessError,
+            TaskExecutionError,
+            TaskPlanError,
             ToolPolicyError,
         ) as exc:
             return ToolResult(
@@ -212,6 +321,117 @@ class WorkspaceToolExecutor:
                 f"{type(exc).__name__}: {str(exc)[:512]}",
                 monotonic() - started,
             )
+
+    def plan(self, request: ToolRequest) -> TypedTaskPlan:
+        """Compile one explicit slash command into an immutable typed plan.
+
+        This is deliberately deterministic.  Free-form model output is never
+        converted into task authority at this boundary.
+        """
+
+        if not isinstance(request, ToolRequest):
+            raise TypeError("request must be ToolRequest")
+        operation = request.operation
+        action_id = f"{operation}-1"
+        expected_artifacts: tuple[ExpectedArtifact, ...] = ()
+        risk = RiskTier.T0
+        timeout = 30.0
+        cpu_seconds = 30.0
+        ram_bytes = 256 * 1024**2
+        verifier = TaskVerifier(VerifierKind.ALL_ACTIONS)
+
+        if operation == "help":
+            action = TaskAction(action_id, TaskActionKind.HELP)
+            allowed_paths = (".",)
+        elif operation == "status":
+            action = TaskAction(action_id, TaskActionKind.STATUS)
+            allowed_paths = (".",)
+        elif operation == "list":
+            action = TaskAction(action_id, TaskActionKind.LIST, path=request.argument)
+            allowed_paths = (request.argument,)
+        elif operation == "read":
+            action = TaskAction(action_id, TaskActionKind.READ, path=request.argument)
+            allowed_paths = (request.argument,)
+        elif operation == "search":
+            action = TaskAction(
+                action_id,
+                TaskActionKind.SEARCH,
+                path=request.scope,
+                query=request.argument,
+            )
+            allowed_paths = (request.scope,)
+        elif operation == "test":
+            if not self.allow_trusted_tests:
+                raise ToolPolicyError(
+                    "project test execution is gated; this runtime has no OS-level "
+                    "process-tree and network sandbox attestation"
+                )
+            target = request.argument or "tests"
+            action = TaskAction(
+                action_id,
+                TaskActionKind.RUN_TEST,
+                path=target,
+                argv=(sys.executable, "-m", "pytest", target, "-q"),
+            )
+            allowed_paths = (target,)
+            risk = RiskTier.T1
+            timeout = float(self.timeout_seconds)
+            cpu_seconds = float(self.timeout_seconds)
+            ram_bytes = 2 * 1024**3
+            verifier = TaskVerifier(VerifierKind.PYTEST_PASS)
+        elif operation == "save":
+            path = f"outputs/agent-workspace/{request.argument}"
+            digest = sha256(request.content.encode("utf-8")).hexdigest()
+            action = TaskAction(
+                action_id,
+                TaskActionKind.WRITE_ARTIFACT,
+                path=path,
+                content=request.content,
+            )
+            allowed_paths = (path,)
+            expected_artifacts = (ExpectedArtifact(path, digest),)
+            risk = RiskTier.T1
+            timeout = 10.0
+            cpu_seconds = 5.0
+            verifier = TaskVerifier(VerifierKind.ARTIFACT_SHA256)
+        else:
+            raise ToolPolicyError("operation is not on the fixed allowlist")
+
+        seed = "\x1f".join(
+            (operation, request.argument, request.scope, request.content)
+        ).encode("utf-8")
+        plan_id = "tool-" + sha256(seed).hexdigest()[:20]
+        return TypedTaskPlan(
+            plan_id=plan_id,
+            objective=f"Execute explicit local /{operation} task",
+            actions=(action,),
+            allowed_paths=allowed_paths,
+            required_inputs=(),
+            expected_artifacts=expected_artifacts,
+            verifier=verifier,
+            budget=TaskBudget(
+                time_seconds=timeout,
+                cpu_seconds=cpu_seconds,
+                ram_bytes=ram_bytes,
+                vram_bytes=0,
+                max_output_bytes=MAX_RESULT_CHARS,
+            ),
+            risk_tier=risk,
+        )
+
+    def authorize_plan(
+        self, plan: TypedTaskPlan, *, ttl_seconds: float = 30.0
+    ) -> CapabilityToken:
+        """Issue one exact, short-lived, single-use local capability."""
+
+        return self.task_executor.authorize(plan, ttl_seconds=ttl_seconds)
+
+    def execute_plan(
+        self, plan: TypedTaskPlan, capability: CapabilityToken
+    ) -> TaskPlanResult:
+        """Public typed-plan API; no natural-language/model parsing occurs."""
+
+        return self.task_executor.execute(plan, capability)
 
     def _list(self, raw: str) -> str:
         directory = self._resolve(raw)

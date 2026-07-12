@@ -9,20 +9,96 @@ from cogni_core.adaptation import (
     OverlayAcceptanceGate,
 )
 from cogni_core.experts import BoundedSparseImplicitExperts, ExpertConfig
+from cogni_core.expert_lifecycle import ExpertCandidateLifecycle
 from cogni_core.fast_weights import (
     FastWeightBackboneWrapper,
     FastWeightProgrammer,
     ResidualBottleneckAdapter,
 )
+from cogni_core.fast_weight_safety import load_verified_fast_weight_checkpoint
 from cogni_core.meta_router import BioHAMAMetaRouter, MetaRouterConfig
-from cogni_core.resources import VRAMGuard, module_storage_bytes
+from cogni_core.resources import VRAMGuard
 from cogni_core.routing import ContrastiveSessionRouter
 from cogni_core.search import BoundedPUCTSearch, PUCTConfig
 from cogni_core.swarm import SwarmConfig, TensorSwarm
+from cogni_core.swarm_sessions import SwarmSessionStateCache
 from cogni_flow.rhythm import RhythmController
 
 from .config import CogniConfig
 from .runtime import GenesisRuntime
+
+
+def _backbone_placement(
+    backbone: nn.Module,
+    requested_device: str,
+) -> tuple[torch.device, torch.dtype]:
+    """Resolve one materialized device and floating dtype for the runtime.
+
+    A configured CUDA runtime may fall back to CPU only when CUDA is genuinely
+    unavailable and the supplied backbone is already on CPU.  The factory
+    never moves a caller-owned backbone implicitly.
+    """
+
+    tensors = tuple(backbone.parameters()) + tuple(backbone.buffers())
+    devices = {tensor.device for tensor in tensors}
+    if any(device.type == "meta" for device in devices):
+        raise RuntimeError("backbone tensors must be materialized before runtime build")
+    if len(devices) > 1:
+        rendered = ", ".join(sorted(str(device) for device in devices))
+        raise RuntimeError(f"backbone spans multiple devices: {rendered}")
+
+    cuda_available = torch.cuda.is_available()
+    effective_type = "cuda" if requested_device == "cuda" and cuda_available else "cpu"
+    if devices:
+        backbone_device = next(iter(devices))
+        if backbone_device.type != effective_type:
+            fallback = (
+                " (CUDA unavailable; CPU fallback required)"
+                if not cuda_available
+                else ""
+            )
+            raise RuntimeError(
+                "backbone device does not match configured runtime device: "
+                f"backbone={backbone_device}, runtime={effective_type}{fallback}"
+            )
+    elif effective_type == "cuda":
+        backbone_device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        backbone_device = torch.device("cpu")
+
+    floating = next(
+        (tensor for tensor in tensors if tensor.is_floating_point()),
+        None,
+    )
+    backbone_dtype = torch.float32 if floating is None else floating.dtype
+    return backbone_device, backbone_dtype
+
+
+def _target_storage_bytes(module: nn.Module, dtype: torch.dtype) -> int:
+    target_element_size = torch.empty((), dtype=dtype).element_size()
+    return sum(
+        tensor.numel()
+        * (target_element_size if tensor.is_floating_point() else tensor.element_size())
+        for tensor in (*module.parameters(), *module.buffers())
+    )
+
+
+def _assert_module_placement(
+    module: nn.Module,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    name: str,
+) -> None:
+    for tensor in (*module.parameters(), *module.buffers()):
+        if tensor.device != device:
+            raise RuntimeError(
+                f"{name} placement mismatch: expected {device}, got {tensor.device}"
+            )
+        if tensor.is_floating_point() and tensor.dtype != dtype:
+            raise RuntimeError(
+                f"{name} dtype mismatch: expected {dtype}, got {tensor.dtype}"
+            )
 
 
 def build_genesis_runtime(
@@ -31,16 +107,15 @@ def build_genesis_runtime(
     *,
     input_dim: int,
     state_dim: int,
+    fast_weight_checkpoint: str | None = None,
+    fast_weight_checkpoint_sha256: str | None = None,
+    _allow_test_fast_weight_fixture: bool = False,
 ) -> GenesisRuntime:
     """Construct the bounded local runtime from validated TOML configuration."""
     hardware = config.section("hardware")
     requested_device = str(hardware["device"])
-    device = (
-        requested_device
-        if requested_device != "cuda" or torch.cuda.is_available()
-        else "cpu"
-    )
-    guard = VRAMGuard(float(hardware["vram_limit_gib"]), device)
+    backbone_device, backbone_dtype = _backbone_placement(backbone, requested_device)
+    guard = VRAMGuard(float(hardware["vram_limit_gib"]), backbone_device)
     # Reject a caller that already loaded the backbone beyond the envelope
     # before constructing any auxiliary CUDA module.
     guard.assert_within_limit()
@@ -80,19 +155,21 @@ def build_genesis_runtime(
         rank=rank,
         max_operator_norm=overlay_budget,
     )
-
-    try:
-        first_parameter = next(backbone.parameters())
-    except StopIteration:
-        backbone_device = torch.device(device)
-        backbone_dtype = torch.float32
-    else:
-        backbone_device = first_parameter.device
-        backbone_dtype = (
-            first_parameter.dtype
-            if first_parameter.is_floating_point()
-            else torch.float32
+    if (fast_weight_checkpoint is None) != (fast_weight_checkpoint_sha256 is None):
+        raise ValueError(
+            "Fast Weight checkpoint path and SHA-256 must be supplied together"
         )
+    verified_fast_weight = None
+    if fast_weight_checkpoint is not None:
+        assert fast_weight_checkpoint_sha256 is not None
+        verified_fast_weight = load_verified_fast_weight_checkpoint(
+            programmer,
+            adapter,
+            fast_weight_checkpoint,
+            expected_sha256=fast_weight_checkpoint_sha256,
+            allow_test_fixture=_allow_test_fast_weight_fixture,
+        )
+
     wrapped_backbone = FastWeightBackboneWrapper(backbone, adapter, programmer)
 
     search = BoundedPUCTSearch(
@@ -107,6 +184,9 @@ def build_genesis_runtime(
             ancestor_k=min(3, int(cts["latent_capacity"])),
         )
     )
+    session_router = ContrastiveSessionRouter(
+        max_sessions=int(fast["session_capacity"])
+    )
     sessions = FastWeightSessionCache(
         wrapped_backbone,
         gate=OverlayAcceptanceGate(
@@ -114,6 +194,13 @@ def build_genesis_runtime(
             composed_operator_norm_budget=composed_budget,
         ),
         max_sessions=int(fast["session_capacity"]),
+        on_sessions_removed=session_router.discard_many,
+        feature_enabled=verified_fast_weight is not None,
+        trusted_programmer_sha256=(
+            None
+            if verified_fast_weight is None
+            else verified_fast_weight.programmer_evidence.checkpoint_sha256
+        ),
     )
     domains = FixedPointDomainLifecycle(
         strength=float(fp["strength"]),
@@ -129,7 +216,18 @@ def build_genesis_runtime(
             constraint_agents=int(swarm_cfg["constraint_agents"]),
             local_margin=float(swarm_cfg["local_margin"]),
             coupling_scale=float(swarm_cfg["coupling_scale"]),
+            global_margin=float(swarm_cfg["global_margin"]),
+            operating_margin=float(swarm_cfg["operating_margin"]),
+            cold_steps=int(swarm_cfg["cold_steps"]),
+            warm_steps=int(swarm_cfg["warm_steps"]),
+            residual_tolerance=float(swarm_cfg["residual_tolerance"]),
+            certificate_power_iterations=int(swarm_cfg["certificate_power_iterations"]),
         )
+    )
+    swarm_sessions = SwarmSessionStateCache(
+        max_sessions=int(swarm_cfg["session_capacity"]),
+        ttl_seconds=float(swarm_cfg["session_ttl_seconds"]),
+        max_state_bytes=int(swarm_cfg["session_max_state_mib"]) * 1024**2,
     )
     experts = BoundedSparseImplicitExperts(
         ExpertConfig(
@@ -153,16 +251,49 @@ def build_genesis_runtime(
             reactive_top_k=int(meta_cfg["reactive_top_k"]),
         )
     )
+    # Keep answer-bearing adapter/programmer tensors aligned with the Gemma
+    # backbone, but retain the safety/control plane in FP32.  System 3/4 use
+    # spectral norms and pseudo-inverses that PyTorch deliberately rejects for
+    # BF16 on CUDA; silently casting those certificates down would invalidate
+    # them.  CoreTurnPipeline owns the detached dtype boundary into these
+    # modules.
+    answer_modules = (adapter, programmer)
+    control_modules = (swarm, experts, meta_router)
     auxiliary_bytes = sum(
-        module_storage_bytes(module)
-        for module in (adapter, programmer, swarm, experts, meta_router)
-    )
+        _target_storage_bytes(module, backbone_dtype) for module in answer_modules
+    ) + sum(_target_storage_bytes(module, torch.float32) for module in control_modules)
     with guard.enforce(auxiliary_bytes):
-        adapter.to(device=backbone_device, dtype=backbone_dtype)
-        programmer.to(device=backbone_device, dtype=backbone_dtype)
-        swarm = swarm.to(device)
-        experts = experts.to(device)
-        meta_router = meta_router.to(device)
+        for module in answer_modules:
+            module.to(device=backbone_device, dtype=backbone_dtype)
+        for module in control_modules:
+            module.to(device=backbone_device, dtype=torch.float32)
+        # Casting a certified FP32 matrix to BF16 can move its exact spectral
+        # norm across the strict budget.  Re-project and post-certify on the
+        # actual answer-plane dtype before the first tensor operation.
+        adapter.c_fire_()
+    for name, module in (
+        ("adapter", adapter),
+        ("programmer", programmer),
+    ):
+        _assert_module_placement(
+            module,
+            device=backbone_device,
+            dtype=backbone_dtype,
+            name=name,
+        )
+    for name, module in (
+        ("swarm", swarm),
+        ("experts", experts),
+        ("meta_router", meta_router),
+    ):
+        _assert_module_placement(
+            module,
+            device=backbone_device,
+            dtype=torch.float32,
+            name=name,
+        )
+    experts.assert_phase8_profile()
+    expert_lifecycle = ExpertCandidateLifecycle(experts)
     return GenesisRuntime(
         wrapped_backbone,
         search,
@@ -171,11 +302,12 @@ def build_genesis_runtime(
         sessions=sessions,
         domains=domains,
         swarm=swarm,
-        session_router=ContrastiveSessionRouter(
-            max_sessions=int(fast["session_capacity"])
-        ),
+        swarm_sessions=swarm_sessions,
+        session_router=session_router,
         experts=experts,
+        expert_lifecycle=expert_lifecycle,
         meta_router=meta_router,
         fast_weight_programmer=programmer,
+        verified_fast_weight=verified_fast_weight,
         fast_weight_target=FastWeightBackboneWrapper.TARGET_MODULE,
     )

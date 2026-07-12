@@ -4,12 +4,15 @@ from dataclasses import dataclass
 from enum import Enum
 from threading import Lock, RLock
 from time import monotonic
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .aflow import WorkflowSpec
 from .cycle import SelfHarness
 from .orchestrator import WorkflowEvolutionCoordinator
 from .rhythm import RhythmController, SystemMode
+
+if TYPE_CHECKING:
+    from .aflow_research import ResearchWorkflowCoordinator
 
 
 class ScheduleDecision(str, Enum):
@@ -82,6 +85,24 @@ class IdleNightScheduler:
         idle_seconds: float,
         clock: Callable[[], float] = monotonic,
     ) -> IdleNightScheduler:
+        return cls(
+            coordinator.rhythm,
+            lambda: coordinator.run(initial),
+            idle_seconds=idle_seconds,
+            clock=clock,
+        )
+
+    @classmethod
+    def for_research_workflow(
+        cls,
+        coordinator: ResearchWorkflowCoordinator,
+        initial: WorkflowSpec,
+        *,
+        idle_seconds: float,
+        clock: Callable[[], float] = monotonic,
+    ) -> IdleNightScheduler:
+        """Schedule one archive-only Phase-10 workflow research cycle."""
+
         return cls(
             coordinator.rhythm,
             lambda: coordinator.run(initial),

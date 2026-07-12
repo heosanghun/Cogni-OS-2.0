@@ -81,6 +81,102 @@ class _FeatureModel(nn.Module):
         )()
 
 
+class _CausalTextOutput:
+    def __init__(
+        self,
+        hidden: Tensor,
+        *,
+        past_key_values: object | None = None,
+        include_hidden_states: bool = False,
+    ):
+        self.last_hidden_state = hidden
+        self.hidden_states = (hidden,) if include_hidden_states else None
+        self.past_key_values = past_key_values
+        self.shared_kv_states = None
+
+
+class _FakeCausalTextModel(nn.Module):
+    """Small causal decoder whose hidden at t depends only on tokens <= t."""
+
+    def __init__(self, failure: str | None = None) -> None:
+        super().__init__()
+        self.config = type("Config", (), {"use_cache": True})()
+        self.failure = failure
+        self.calls: list[dict[str, object]] = []
+        self.last_hidden: Tensor | None = None
+        self.last_output: _CausalTextOutput | None = None
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor | None = None,
+        use_cache: bool = True,
+        output_hidden_states: bool = False,
+        return_dict: bool = False,
+        **kwargs,
+    ):
+        self.calls.append(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "use_cache": use_cache,
+                "output_hidden_states": output_hidden_states,
+                "return_dict": return_dict,
+                **kwargs,
+            }
+        )
+        tokens = input_ids.to(dtype=torch.float32)
+        hidden = torch.stack(
+            (tokens.cumsum(dim=1), (tokens + 1.0).cumsum(dim=1)), dim=-1
+        )
+        if self.failure == "shape":
+            hidden = hidden[:, :-1]
+        elif self.failure == "nonfinite":
+            hidden = hidden.clone()
+            hidden[0, 0, 0] = float("nan")
+        self.last_hidden = hidden
+        if self.failure == "tuple":
+            return (hidden,)
+        past = object() if self.failure == "cache" else None
+        self.last_output = _CausalTextOutput(
+            hidden,
+            past_key_values=past,
+            include_hidden_states=output_hidden_states,
+        )
+        return self.last_output
+
+
+class _FakeConditionalGemma(nn.Module):
+    """Top-level conditional model that must never run in contextual mode."""
+
+    def __init__(
+        self, lower: _FakeCausalTextModel, *, doubly_nested: bool = False
+    ) -> None:
+        super().__init__()
+        self.config = type("Config", (), {"use_cache": True})()
+        self.lm_head = nn.Linear(2, 8, bias=False)
+        self.embedding = nn.Embedding(32, 2)
+        self.embedding_calls = 0
+        self.forward_calls = 0
+        self.model = nn.Module()
+        if doubly_nested:
+            self.model.model = nn.Module()
+            self.model.model.language_model = lower
+        else:
+            self.model.language_model = lower
+
+    def get_input_embeddings(self):
+        self.embedding_calls += 1
+        return self.embedding
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def forward(self, *_args, **_kwargs):
+        self.forward_calls += 1
+        raise AssertionError("contextual mode must not create top-level LM logits")
+
+
 class _ResidualLayer(nn.Module):
     def forward(self, hidden_states: Tensor) -> Tensor:
         return hidden_states + 0.2 * torch.tanh(hidden_states)
@@ -234,6 +330,95 @@ class TestGemmaDEQBackboneAdapter(unittest.TestCase):
         )
         self.assertEqual(tuple(result.shape), (1, 4))
         self.assertTrue(torch.equal(result, torch.ones(1, 4)))
+
+    def test_contextual_tokens_use_lower_causal_model_without_shortcuts(self) -> None:
+        lower = _FakeCausalTextModel()
+        model = _FakeConditionalGemma(lower)
+        wrapper = LocalGemmaFeatureBackbone(model, contextual_tokens=True)
+
+        result = wrapper(
+            torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            attention_mask=torch.ones(2, 3, dtype=torch.long),
+        )
+
+        self.assertEqual(tuple(result.shape), (2, 2))
+        self.assertEqual(model.embedding_calls, 0)
+        self.assertEqual(model.forward_calls, 0)
+        self.assertEqual(len(lower.calls), 1)
+        self.assertFalse(lower.calls[0]["use_cache"])
+        self.assertFalse(lower.calls[0]["output_hidden_states"])
+        self.assertTrue(lower.calls[0]["return_dict"])
+        self.assertIsNotNone(lower.last_output)
+        self.assertIsNone(lower.last_output.hidden_states)
+        self.assertFalse(model.config.use_cache)
+        self.assertFalse(lower.config.use_cache)
+
+    def test_contextual_decoder_hidden_is_prefix_invariant(self) -> None:
+        lower = _FakeCausalTextModel()
+        wrapper = LocalGemmaFeatureBackbone(
+            _FakeConditionalGemma(lower), contextual_tokens=True
+        )
+        wrapper(torch.tensor([[1, 2, 3, 4], [1, 2, 9, 8]]))
+
+        self.assertIsNotNone(lower.last_hidden)
+        hidden = lower.last_hidden
+        self.assertTrue(torch.equal(hidden[0, :2], hidden[1, :2]))
+        self.assertFalse(torch.equal(hidden[0, 2:], hidden[1, 2:]))
+
+    def test_contextual_tokens_pool_the_last_valid_token(self) -> None:
+        lower = _FakeCausalTextModel()
+        wrapper = LocalGemmaFeatureBackbone(
+            _FakeConditionalGemma(lower), contextual_tokens=True
+        )
+        result = wrapper(
+            torch.tensor([[5, 7, 19, 23], [0, 0, 3, 4]]),
+            attention_mask=torch.tensor([[1, 1, 0, 0], [0, 0, 1, 1]]),
+        )
+
+        hidden = lower.last_hidden
+        self.assertIsNotNone(hidden)
+        expected = hidden[torch.arange(2), torch.tensor([1, 3])]
+        self.assertTrue(torch.equal(result, expected))
+        self.assertFalse(torch.equal(result, hidden.mean(dim=1)))
+
+    def test_contextual_tokens_find_doubly_nested_lower_text_model(self) -> None:
+        lower = _FakeCausalTextModel()
+        model = _FakeConditionalGemma(lower, doubly_nested=True)
+        result = LocalGemmaFeatureBackbone(model, contextual_tokens=True)(
+            input_ids=torch.tensor([[2, 4]])
+        )
+
+        self.assertEqual(tuple(result.shape), (1, 2))
+        self.assertEqual(len(lower.calls), 1)
+        self.assertEqual(model.forward_calls, 0)
+
+    def test_contextual_tokens_reject_unproven_top_level_fallback(self) -> None:
+        with self.assertRaises(DecoderLayerContractError):
+            LocalGemmaFeatureBackbone(_FeatureModel(), contextual_tokens=True)
+
+    def test_contextual_tokens_fail_closed_on_invalid_decoder_output(self) -> None:
+        for failure in ("cache", "shape", "nonfinite", "tuple"):
+            with self.subTest(failure=failure):
+                wrapper = LocalGemmaFeatureBackbone(
+                    _FakeConditionalGemma(_FakeCausalTextModel(failure)),
+                    contextual_tokens=True,
+                )
+                with self.assertRaises(DecoderLayerContractError):
+                    wrapper(torch.tensor([[1, 2, 3]]))
+
+    def test_contextual_tokens_reject_cache_float_and_empty_mask(self) -> None:
+        wrapper = LocalGemmaFeatureBackbone(
+            _FakeConditionalGemma(_FakeCausalTextModel()), contextual_tokens=True
+        )
+        with self.assertRaises(DecoderLayerContractError):
+            wrapper(torch.tensor([[1, 2]]), past_key_values=object())
+        with self.assertRaises(DecoderLayerContractError):
+            wrapper(torch.tensor([[1.0, 2.0]]))
+        with self.assertRaises(DecoderLayerContractError):
+            wrapper(
+                torch.tensor([[1, 2]]),
+                attention_mask=torch.zeros(1, 2, dtype=torch.long),
+            )
 
     def test_shape_change_is_rejected(self) -> None:
         adapter = GemmaDEQBackboneAdapter(_BadShapeLayer(), DEQConfig(max_iter=2))

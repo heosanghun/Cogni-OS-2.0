@@ -82,7 +82,7 @@
 
       <div class="sidebar-foot">
         <span class="mini-kicker">GENESIS BUILD</span>
-        <strong>v0.2.1</strong>
+        <strong>v0.3.0</strong>
         <span>Air-gapped research runtime</span>
       </div>
     </aside>
@@ -114,7 +114,8 @@
               <div class="chat-empty" id="chat-empty">
                 <span class="brand-mark large" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M24 4 40.5 13.5v19L24 42 7.5 32.5v-19Z" class="mark-frame"/><path d="M15 27.5 24 12l9 15.5-9 8Z" class="mark-core"/><circle cx="24" cy="24" r="3.5" class="mark-node"/></svg></span>
                 <strong>무엇을 함께 해결할까요?</strong>
-                <p>일반 대화는 대화 모드로, 프로젝트 파일 조회·검색·테스트·결과 저장은 작업 모드로 요청하세요.</p>
+                <p>일반 대화는 대화 모드로, 프로젝트 파일 조회·검색·결과 저장은 작업 모드로 요청하세요. pytest는 OS 격리 증거가 있는 신뢰 개발자 opt-in에서만 실행됩니다.</p>
+                <button class="chat-empty-action" type="button" data-action="agent-focus" aria-controls="agent-input" disabled>메시지 입력하기</button>
               </div>
             </div>
 
@@ -153,14 +154,14 @@
 
             <article class="task-policy-card surface">
               <div class="card-heading compact"><div><span class="section-kicker">LOCAL TOOL POLICY</span><h2>작업 권한</h2></div><span class="evidence-badge verified">ALLOWLIST</span></div>
-              <div class="policy-grid"><span>읽기</span><b>프로젝트 내부</b><span>쓰기</span><b>outputs/agent-workspace</b><span>명령</span><b>고정 pytest · git status</b><span>소스 수정</span><b>Self-Harness 전용</b></div>
+              <div class="policy-grid"><span>읽기</span><b>프로젝트 내부</b><span>쓰기</span><b>outputs/agent-workspace</b><span>명령</span><b>git status · pytest 기본 차단</b><span>소스 수정</span><b>금지 · T2 제안만 저장</b></div>
               <p>임의 셸, 네트워크, 경로 탈출, 검증 전 소스 덮어쓰기는 차단됩니다.</p>
             </article>
 
             <article class="evolution-card surface">
               <div class="card-heading compact"><div><span class="section-kicker">SELF-HARNESS</span><h2>자가 거울치료</h2></div><span class="evidence-badge planned" id="evolution-badge" role="status">감시 중</span></div>
-              <div class="evolution-cycle" aria-label="Self-Harness 진화 단계"><span>실패 수집</span><i>→</i><span>제안</span><i>→</i><span>격리 검증</span><i>→</i><span>승격·롤백</span></div>
-              <dl class="evolution-facts"><div><dt>실패 큐</dt><dd id="evolution-failures">0</dd></div><div><dt>마지막 주기</dt><dd id="evolution-last-run">아직 없음</dd></div><div><dt>격리 실행기</dt><dd id="evolution-sandbox">확인 중</dd></div></dl>
+              <div class="evolution-cycle" aria-label="Self-Harness 제안 전용 단계"><span>실패·성공 증거</span><i>→</i><span>K≥3 후보</span><i>→</i><span>정책 검사</span><i>→</i><span>검토 대기</span></div>
+              <dl class="evolution-facts"><div><dt>영속 실패 증거</dt><dd id="evolution-failures">0</dd></div><div><dt>증거 수집률</dt><dd id="evolution-coverage">100%</dd></div><div><dt>검토 대기 후보</dt><dd id="evolution-proposals">0</dd></div><div><dt>자동 승격</dt><dd id="evolution-sandbox">차단</dd></div></dl>
               <button class="secondary-button full-width" type="button" data-action="evolution-run" aria-controls="evolution-badge" disabled><span data-evolution-label>제안 전용 야간 주기 실행</span></button>
             </article>
           </aside>
@@ -182,27 +183,27 @@
               <button class="secondary-button" type="button" data-view-jump="business">사업 가치 보기</button>
             </div>
             <div class="trust-row" aria-label="핵심 신뢰 요소">
-              <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v6c0 5 3.3 8 8 9 4.7-1 8-4 8-9V6Z"/></svg>100% 폐쇄망</span>
-              <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h4l2-5 4 10 2-5h4"/></svg>실제 GPU 측정</span>
+              <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v6c0 5 3.3 8 8 9 4.7-1 8-4 8-9V6Z"/></svg>앱 외부 호출 비활성</span>
+              <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h4l2-5 4 10 2-5h4"/></svg>검증 실행 후 GPU 측정</span>
               <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>Fail-closed 안전장치</span>
             </div>
           </article>
 
           <article class="proof-orbit surface" aria-labelledby="proof-orbit-title">
             <div class="card-heading compact">
-              <div><span class="section-kicker">LIVE EVIDENCE</span><h2 id="proof-orbit-title">검증된 실행 스냅샷</h2></div>
-              <span class="evidence-badge measured">내부 실측</span>
+              <div><span class="section-kicker">LIVE EVIDENCE</span><h2 id="proof-orbit-title">현재 프로세스 실행 스냅샷</h2></div>
+              <span class="evidence-badge planned" data-live-evidence-badge>미검증</span>
             </div>
             <div class="orbit-visual" aria-hidden="true">
               <div class="orbit orbit-a"><i></i><i></i><i></i></div>
               <div class="orbit orbit-b"><i></i><i></i></div>
-              <div class="orbit-core"><span>CTS</span><b id="orbit-depth">100</b><small>DEPTH</small></div>
+              <div class="orbit-core"><span>CTS</span><b id="orbit-depth">—</b><small>DEPTH</small></div>
               <div class="orbit-label label-gemma">LOCAL<br>GEMMA 4</div>
               <div class="orbit-label label-deq">DEQ<br>EQUILIBRIUM</div>
               <div class="orbit-label label-cfire">C-FIRE<br>SAFETY</div>
             </div>
             <div class="hardware-row">
-              <div><span>실측 장치</span><strong id="device-name">RTX 5090 Laptop GPU</strong></div>
+              <div><span>실측 장치</span><strong id="device-name">실행 전 미측정</strong></div>
               <div><span>목표 장치</span><strong>RTX 4090 · 24GB</strong></div>
             </div>
           </article>
@@ -210,28 +211,28 @@
 
         <div class="metric-grid" aria-label="핵심 검증 지표">
           <article class="metric-card surface">
-            <div class="metric-top"><span>Peak VRAM</span><span class="evidence-badge measured">실측</span></div>
-            <div class="metric-value"><b id="metric-vram">14.8560</b><small>GiB</small></div>
-            <div class="meter"><progress id="vram-meter" max="16.7" value="14.856" aria-label="VRAM 사용량 14.856 GiB, 상한 16.7 GiB"></progress><span></span></div>
+            <div class="metric-top"><span>Peak VRAM</span><span class="evidence-badge planned" data-live-evidence-badge>미검증</span></div>
+            <div class="metric-value"><b id="metric-vram">—</b><small>GiB</small></div>
+            <div class="meter"><progress id="vram-meter" max="16.7" value="0" aria-label="현재 프로세스 VRAM 검증 전"></progress><span></span></div>
             <div class="metric-foot"><span>방어선</span><strong>16.7 GiB 이하</strong></div>
           </article>
           <article class="metric-card surface">
-            <div class="metric-top"><span>CTS Depth</span><span class="evidence-badge measured">실측</span></div>
-            <div class="metric-value"><b id="metric-depth">100</b><small>/ 100</small></div>
+            <div class="metric-top"><span>CTS Depth</span><span class="evidence-badge planned" data-live-evidence-badge>미검증</span></div>
+            <div class="metric-value"><b id="metric-depth">—</b><small>/ 100</small></div>
             <div class="depth-dots" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-            <div class="metric-foot"><span>고정 arena</span><strong id="metric-nodes">301 nodes</strong></div>
+            <div class="metric-foot"><span>고정 arena</span><strong id="metric-nodes">검증 전</strong></div>
           </article>
           <article class="metric-card surface">
-            <div class="metric-top"><span>DEQ Residual</span><span class="evidence-badge measured">실측</span></div>
-            <div class="metric-value"><b id="metric-residual">0.003906</b><small>final</small></div>
+            <div class="metric-top"><span>DEQ Residual</span><span class="evidence-badge planned" data-live-evidence-badge>미검증</span></div>
+            <div class="metric-value"><b id="metric-residual">—</b><small>max</small></div>
             <div class="threshold-line"><i></i><span>수렴 임계 0.005</span></div>
-            <div class="metric-foot"><span>Fallback</span><strong id="metric-fallback">미사용</strong></div>
+            <div class="metric-foot"><span>Fallback</span><strong id="metric-fallback">미측정</strong></div>
           </article>
           <article class="metric-card surface">
-            <div class="metric-top"><span>Release QA</span><span class="evidence-badge verified">별도 검증</span></div>
-            <div class="metric-value"><b id="metric-tests">178</b><small>tests</small></div>
+            <div class="metric-top"><span>Release QA</span><span class="evidence-badge planned">증거 필요</span></div>
+            <div class="metric-value"><b id="metric-tests">—</b><small>evidence</small></div>
             <div class="test-stack" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
-            <div class="metric-foot"><span>릴리스 스냅샷</span><strong>PASS</strong></div>
+            <div class="metric-foot"><span>릴리스 스냅샷</span><strong>미연결</strong></div>
           </article>
         </div>
 
@@ -302,10 +303,10 @@
                 <path class="equilibrium-wave" d="M242 210c22-52 44 52 68 0s46 52 68 0"/>
                 <circle class="core-dot" cx="310" cy="210" r="13"/>
               </svg>
-              <div class="reactor-readout"><span>REACHED DEPTH</span><strong id="reactor-depth">100</strong><small>/ 100</small></div>
+              <div class="reactor-readout"><span>REACHED DEPTH</span><strong id="reactor-depth">—</strong><small>/ 100</small></div>
               <div class="reactor-chip chip-left"><span>LATENT</span><b>R<sup>64</sup></b></div>
               <div class="reactor-chip chip-right"><span>ARENA</span><b>301</b></div>
-              <div class="reactor-chip chip-bottom"><span>RESIDUAL</span><b id="reactor-residual">3.906e-3</b></div>
+              <div class="reactor-chip chip-bottom"><span>RESIDUAL</span><b id="reactor-residual">—</b></div>
             </div>
             <p class="visual-disclaimer"><span>시각화</span> 노드 이동은 실행 단계 표현이며, 수치는 검증 프로세스가 반환한 실측값만 표시합니다.</p>
           </article>
@@ -313,15 +314,15 @@
           <article class="telemetry-card surface" aria-labelledby="telemetry-title">
             <div class="card-heading compact"><div><span class="section-kicker">BOUNDARY WATCH</span><h2 id="telemetry-title">안전 경계</h2></div></div>
             <div class="telemetry-block">
-              <div class="telemetry-label"><span>VRAM ALLOCATED</span><b><em id="telemetry-vram">14.8560</em> / 16.7 GiB</b></div>
-              <div class="vram-visual"><progress class="vram-fill" id="telemetry-vram-fill" max="16.7" value="14.856" aria-label="VRAM 사용량 14.856 GiB, 상한 16.7 GiB"></progress><span class="vram-limit">LIMIT</span><div class="vram-grid"></div></div>
+              <div class="telemetry-label"><span>VRAM ALLOCATED</span><b><em id="telemetry-vram">—</em> / 16.7 GiB</b></div>
+              <div class="vram-visual"><progress class="vram-fill" id="telemetry-vram-fill" max="16.7" value="0" aria-label="현재 프로세스 VRAM 검증 전"></progress><span class="vram-limit">LIMIT</span><div class="vram-grid"></div></div>
             </div>
             <dl class="telemetry-list">
               <div><dt>Contraction</dt><dd>0.40</dd></div>
               <div><dt>Spectral margin</dt><dd>&lt; 0.95</dd></div>
-              <div><dt>Finite check</dt><dd id="telemetry-finite" class="positive">PASS</dd></div>
-              <div><dt>Fallback</dt><dd id="telemetry-fallback">NOT USED</dd></div>
-              <div><dt>External API</dt><dd class="positive">BLOCKED</dd></div>
+              <div><dt>Finite check</dt><dd id="telemetry-finite">미측정</dd></div>
+              <div><dt>Fallback</dt><dd id="telemetry-fallback">미측정</dd></div>
+              <div><dt>App external calls</dt><dd class="positive">DISABLED</dd></div>
             </dl>
             <button class="text-link" type="button" data-action="toggle-log">실행 이벤트 보기 <span>↗</span></button>
           </article>
@@ -345,7 +346,7 @@
             <button class="arch-node" type="button" data-node="rhythm"><i class="node-icon">01</i><span><strong>Bio Rhythm</strong><small>Day / Night exclusion</small></span><b>STATE</b></button>
             <button class="arch-node" type="button" data-node="router"><i class="node-icon">02</i><span><strong>BIO-HAMA</strong><small>인지 부하 메타 라우팅</small></span><b>ROUTE</b></button>
             <button class="arch-node" type="button" data-node="aflow"><i class="node-icon">03</i><span><strong>AFlow</strong><small>bounded workflow search</small></span><b>PLAN</b></button>
-            <button class="arch-node" type="button" data-node="harness"><i class="node-icon">04</i><span><strong>Self-Harness</strong><small>검증 후 patch promotion</small></span><b>EVOLVE</b></button>
+            <button class="arch-node" type="button" data-node="harness"><i class="node-icon">04</i><span><strong>Self-Harness</strong><small>evidence-linked proposal ledger</small></span><b>PROPOSE</b></button>
           </div>
 
           <div class="arch-boundary">
@@ -374,7 +375,7 @@
           <article class="rhythm-card surface">
             <div class="card-heading compact"><div><span class="section-kicker">BIOLOGICAL RHYTHM</span><h2>추론과 진화는 동시에 실행되지 않습니다</h2></div></div>
             <div class="rhythm-track" aria-label="주간 추론과 야간 진화 상태 전이">
-              <span class="is-active"><i></i>Inference</span><b>→</b><span><i></i>Drain</span><b>→</b><span><i></i>Checkpoint</span><b>→</b><span class="night"><i></i>Evolution</span><b>→</b><span><i></i>Validate</span><b>→</b><span><i></i>Promote / Rollback</span>
+              <span class="is-active"><i></i>Inference</span><b>→</b><span><i></i>Drain</span><b>→</b><span><i></i>Checkpoint</span><b>→</b><span class="night"><i></i>Proposal</span><b>→</b><span><i></i>Policy Check</span><b>→</b><span><i></i>Archive / Review</span>
             </div>
           </article>
           <article class="node-detail surface" id="node-detail" aria-live="polite">
@@ -462,9 +463,9 @@
           <article class="evidence-ledger surface" aria-labelledby="ledger-title">
             <div class="card-heading"><div><span class="section-kicker">EVIDENCE LEDGER</span><h2 id="ledger-title">핵심 주장 검증 현황</h2></div></div>
             <div class="ledger-list">
-              <div><span class="ledger-status measured">실측</span><p><strong>Gemma 4 + CTS Depth 100</strong><small>실제 로컬 모델 · 301 node · finite</small></p><b>PASS</b></div>
-              <div><span class="ledger-status measured">실측</span><p><strong id="ledger-vram">Peak VRAM 14.8560 GiB</strong><small>현재 RTX 5090 Laptop · 상한 16.7 GiB</small></p><b>PASS</b></div>
-              <div><span class="ledger-status verified">검증</span><p><strong>회귀 테스트 178개</strong><small>별도 릴리스 스냅샷 · warning-as-error · Ruff · format</small></p><b>PASS</b></div>
+              <div><span class="ledger-status planned" data-live-evidence-status>검증 전</span><p><strong>Gemma 4 + CTS V2 Depth 100</strong><small data-live-cts-copy>현재 프로세스 라이브 검증 대기</small></p><b data-live-evidence-result>PENDING</b></div>
+              <div><span class="ledger-status planned" data-live-evidence-status>검증 전</span><p><strong id="ledger-vram">Peak VRAM — GiB</strong><small data-live-vram-copy>현재 프로세스 라이브 검증 대기 · 상한 16.7 GiB</small></p><b data-live-evidence-result>PENDING</b></div>
+              <div><span class="ledger-status planned">증거</span><p><strong>릴리스 회귀 게이트</strong><small>실행 시점의 별도 증거 스냅샷 · Ruff · 전체 테스트</small></p><b>FACT-BOOK</b></div>
               <div><span class="ledger-status verified">검증</span><p><strong>주·야간 상호 배제</strong><small>inference/evolution state machine</small></p><b>PASS</b></div>
               <div><span class="ledger-status target">목표</span><p><strong>컨텍스트 길이별 메모리 비교</strong><small>추론 깊이와 별도 축 · baseline 공인시험 필요</small></p><b>PENDING</b></div>
               <div><span class="ledger-status target">목표</span><p><strong>System 4 통신 6.3ms</strong><small>RTX 4090 조건 · 공인시험 전</small></p><b>PENDING</b></div>
@@ -498,17 +499,17 @@
 
     <aside class="evidence-rail" aria-labelledby="rail-title">
       <div class="rail-heading"><span class="section-kicker">EVIDENCE RAIL</span><h2 id="rail-title">실행 무결성</h2></div>
-      <div class="rail-seal"><svg viewBox="0 0 84 84" aria-hidden="true"><circle cx="42" cy="42" r="36"/><path class="seal-check" d="m25 43 11 11 24-27"/><path class="seal-fail" d="m29 29 26 26m0-26L29 55"/><rect class="seal-stop" x="30" y="30" width="24" height="24" rx="3"/></svg><span><strong id="rail-verdict">VERIFIED</strong><small id="rail-time">최근 검증 기록</small></span></div>
+      <div class="rail-seal" data-state="ready"><svg viewBox="0 0 84 84" aria-hidden="true"><circle cx="42" cy="42" r="36"/><path class="seal-check" d="m25 43 11 11 24-27"/><path class="seal-fail" d="m29 29 26 26m0-26L29 55"/><rect class="seal-stop" x="30" y="30" width="24" height="24" rx="3"/></svg><span><strong id="rail-verdict">NOT VERIFIED</strong><small id="rail-time">현재 프로세스 검증 전</small></span></div>
       <dl class="rail-details">
         <div><dt>Model</dt><dd>Gemma 4 e4b</dd></div>
-        <div><dt>Manifest</dt><dd id="rail-files">6 files</dd></div>
-        <div><dt>Runtime</dt><dd>Genesis v0.2.1</dd></div>
-        <div><dt>Network</dt><dd class="positive">BLOCKED</dd></div>
+        <div><dt>Manifest</dt><dd id="rail-files">—</dd></div>
+        <div><dt>Runtime</dt><dd>Genesis v0.3.0</dd></div>
+        <div><dt>App external calls</dt><dd class="positive">DISABLED</dd></div>
         <div><dt>KV cache</dt><dd>DISABLED</dd></div>
       </dl>
       <div class="rail-divider"></div>
       <div class="rail-proof">
-        <span>측정 환경</span><strong id="rail-device">RTX 5090 Laptop GPU</strong><small>현재 실측은 목표 RTX 4090 결과가 아닙니다.</small>
+        <span>측정 환경</span><strong id="rail-device">실행 전 미측정</strong><small>라이브 검증 전에는 과거 장치 수치를 표시하지 않습니다.</small>
       </div>
       <div class="rail-proof">
         <span>메모리 주장 범위</span><strong>고정 용량 CTS 작업 텐서</strong><small>모델 가중치·로그·외부 데이터까지 포함한 전체 시스템 O(1) 주장이 아닙니다.</small>

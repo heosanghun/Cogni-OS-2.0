@@ -36,6 +36,7 @@ const PHASE_ORDER = [
   "loading_model",
   "building_runtime",
   "running_inference",
+  "validating_decode_bridge",
   "postcheck",
 ];
 const PHASE_TO_DOM = {
@@ -43,6 +44,7 @@ const PHASE_TO_DOM = {
   loading_model: "model_load",
   building_runtime: "runtime_build",
   running_inference: "inference",
+  validating_decode_bridge: "inference",
   postcheck: "postcheck",
 };
 const PHASE_LABELS = {
@@ -53,6 +55,7 @@ const PHASE_LABELS = {
   loading_model: "로컬 모델 적재",
   building_runtime: "런타임 구성",
   running_inference: "Depth 100 탐색",
+  validating_decode_bridge: "CTS 인과 브릿지 검증",
   postcheck: "안전 조건 확인",
   complete: "검증 완료",
   succeeded: "검증 완료",
@@ -99,20 +102,20 @@ const STORY = {
 const NODE_COPY = {
   rhythm: ["Bio Rhythm", "추론과 진화의 GPU 점유를 시간으로 분리합니다. 활성 추론이 끝나기 전에는 야간 변경 작업이 시작되지 않습니다.", "IMPLEMENTED + TESTED"],
   router: ["BIO-HAMA Meta Router", "인지 부하와 불확실성을 고정 크기 텐서로 계산해 전략·전술·반응 모듈 예산을 조절합니다.", "IMPLEMENTED + TESTED"],
-  aflow: ["AFlow", "실행 권한이 없는 bounded workflow 후보를 탐색합니다. 생성 payload는 검증 전까지 inert 상태입니다.", "IMPLEMENTED + TESTED"],
-  harness: ["Self-Harness", "실패 수집 → 제안 → 정책 검사 → 격리 회귀 테스트 → 승격 또는 롤백으로 변경을 통제합니다.", "FAIL-CLOSED"],
-  gemma: ["Local Gemma 4", "검증된 로컬 경로와 manifest만 허용합니다. Hub ID·URL·remote code·KV cache는 거부됩니다.", "MEASURED"],
-  deq: ["DEQ Equilibrium", "제한 이력 Broyden solver가 고정점 잔차를 계산하고, 미수렴·비유한 상태를 성공으로 표시하지 않습니다.", "MEASURED"],
-  cts: ["Cognitive Tree Search", "Depth가 커져도 사전 할당된 301-node arena와 bounded ancestor bank 안에서 탐색합니다.", "MEASURED"],
-  fast: ["Fast Weight", "수렴된 상태를 bounded 저랭크 세션 overlay로 컴파일하며 원본 모델 가중치는 변경하지 않습니다.", "IMPLEMENTED + TESTED"],
-  swarm: ["System 4", "내부 hot path에서 자연어 직렬화를 거치지 않고 연속 텐서를 결합합니다. 6.3ms는 아직 설계 목표입니다.", "TARGET PENDING"],
-  experts: ["System 3", "사전 할당된 expert pool 안에서 novelty를 측정하고 무제한 동적 생성을 금지합니다.", "IMPLEMENTED + TESTED"],
+  aflow: ["AFlow", "봉인된 held-in/held-out 평가로 bounded workflow 후보를 탐색합니다. 결과는 production에 설치되지 않고 연구 archive에만 남습니다.", "RESEARCH ARCHIVE ONLY"],
+  harness: ["Self-Harness", "성공 invariant와 실패 trace를 영속 저장하고, 서로 다른 K≥3 후보를 정책 검사 후 검토 대기 상태로 보존합니다. 실행·소스 수정·자동 승격 API는 없습니다.", "PROPOSAL ONLY"],
+  gemma: ["Local Gemma 4", "검증된 로컬 경로와 manifest만 허용합니다. Hub ID·URL·remote code·KV cache는 거부됩니다.", "LIVE VALIDATION REQUIRED"],
+  deq: ["DEQ Equilibrium", "제한 이력 Broyden solver가 고정점 잔차를 계산하고, 미수렴·비유한 상태를 성공으로 표시하지 않습니다.", "LIVE VALIDATION REQUIRED"],
+  cts: ["Cognitive Tree Search", "Depth가 커져도 사전 할당된 301-node arena와 bounded ancestor bank 안에서 탐색합니다.", "LIVE VALIDATION REQUIRED"],
+  fast: ["Fast Weight", "수렴된 상태를 bounded 저랭크 세션 overlay로 컴파일하며 원본 모델 가중치는 변경하지 않습니다. 실제 학습 checkpoint가 없으면 항상 꺼진 상태입니다.", "GATED · ARTIFACT REQUIRED"],
+  swarm: ["System 4", "28개 에이전트가 연속 텐서를 결합합니다. 지연 수치는 별도 현재 프로세스 벤치마크 증거가 연결되기 전에는 표시하지 않습니다.", "ADVISORY · BENCHMARK REQUIRED"],
+  experts: ["System 3", "8-slot top-2 pool에서 신규성 보정, C-FIRE, held-out, routed Fisher, canary, 독립 검증 순으로만 승격합니다.", "ADVISORY UNTIL ATTESTED"],
   ewc: ["FP-EWC", "고정점 민감도를 matrix-free 방식으로 추정하고 C-FIRE 재투영으로 업데이트 후 안정성을 확인합니다.", "IMPLEMENTED + TESTED"],
 };
 
 const TOUR = [
   { view: "mission", kicker: "WHY NOW", title: "보안 때문에 AI를 포기하는 시장", copy: "국방·신약 고객은 데이터를 클라우드로 보낼 수 없고, 자체 구축은 숨은 비용을 만듭니다." },
-  { view: "mission", kicker: "PROOF, NOT PROMISE", title: "한 대의 범용 GPU에서 실제로 측정", copy: "현재 장비의 Depth 100, VRAM, 잔차, 회귀 테스트를 공개하고 목표 RTX 4090과 구분합니다." },
+  { view: "mission", kicker: "PROOF, NOT PROMISE", title: "현재 프로세스에서 직접 재검증", copy: "검증 실행이 성공한 뒤에만 현재 장비의 Depth, VRAM, 잔차를 공개하고 목표 RTX 4090과 구분합니다." },
   { view: "inference", kicker: "LIVE VALIDATION", title: "같은 명령으로 다시 검증", copy: "manifest 검증부터 로컬 Gemma 적재, DEQ·CTS, 사후 안전 점검까지 실제 이벤트만 시각화합니다." },
   { view: "architecture", kicker: "DEFENSIBLE ARCHITECTURE", title: "텐서 경계와 주·야간 안전 제어", copy: "GPU 소유자는 하나뿐이며, 추론과 진화가 동시에 실행되지 않도록 상태 기계가 차단합니다." },
   { view: "business", kicker: "BEACHHEAD TO SCALE", title: "Appliance에서 오프라인 모듈 경제로", copy: "비안전결정형 유상 PoC로 시작해 제품 공급, 연간 라이선스, 현장 유지보수로 반복 매출을 확장합니다." },
@@ -222,6 +225,49 @@ function setRuntimeStatus(status, stage) {
 }
 
 function updateMetrics(metrics = {}) {
+  const live = metrics.evidence_kind === "live_runtime_validation";
+  $$('[data-live-evidence-badge]').forEach((badge) => {
+    badge.textContent = live ? "현재 실측" : "미검증";
+    badge.classList.toggle("measured", live);
+    badge.classList.toggle("planned", !live);
+  });
+  $$('[data-live-evidence-status]').forEach((status) => {
+    status.textContent = live ? "실측" : "검증 전";
+    status.classList.toggle("measured", live);
+    status.classList.toggle("planned", !live);
+  });
+  $$('[data-live-evidence-result]').forEach((result) => {
+    result.textContent = live ? "PASS" : "PENDING";
+  });
+  if (!live) {
+    setText("#metric-vram", "—");
+    setText("#telemetry-vram", "—");
+    setText("#ledger-vram", "Peak VRAM — GiB");
+    setText("#metric-depth", "—");
+    setText("#orbit-depth", "—");
+    setText("#reactor-depth", "—");
+    setText("#metric-nodes", "검증 전");
+    setText("#metric-residual", "—");
+    setText("#reactor-residual", "—");
+    setText("#metric-fallback", "미측정");
+    setText("#telemetry-fallback", "미측정");
+    setText("#telemetry-finite", "미측정");
+    $("#telemetry-finite")?.classList.remove("positive");
+    setText("#rail-files", "—");
+    setText("#device-name", "실행 전 미측정");
+    setText("#rail-device", "실행 전 미측정");
+    setText("[data-live-cts-copy]", "현재 프로세스 라이브 검증 대기");
+    setText("[data-live-vram-copy]", "현재 프로세스 라이브 검증 대기 · 상한 16.7 GiB");
+    for (const selector of ["#vram-meter", "#telemetry-vram-fill"]) {
+      const meter = $(selector);
+      if (meter) {
+        meter.max = 16.7;
+        meter.value = 0;
+        meter.setAttribute("aria-label", "현재 프로세스 VRAM 검증 전");
+      }
+    }
+    return;
+  }
   if (finiteNumber(metrics.peak_vram_gib)) {
     const vram = metrics.peak_vram_gib;
     const limit = finiteNumber(metrics.vram_limit_gib) ? metrics.vram_limit_gib : 16.7;
@@ -250,6 +296,7 @@ function updateMetrics(metrics = {}) {
   if (Number.isInteger(metrics.nodes_used)) {
     const capacity = Number.isInteger(metrics.node_capacity) ? metrics.node_capacity : metrics.nodes_used;
     setText("#metric-nodes", `${metrics.nodes_used} / ${capacity} nodes`);
+    setText("[data-live-cts-copy]", `현재 프로세스 실측 · ${metrics.nodes_used}/${capacity} node · finite`);
   }
   if (finiteNumber(metrics.transition_residual)) {
     setText("#metric-residual", metrics.transition_residual.toFixed(6));
@@ -273,6 +320,7 @@ function updateMetrics(metrics = {}) {
     const railDevice = $("#rail-device");
     if (compactDevice) compactDevice.title = metrics.device.slice(0, 256);
     if (railDevice) railDevice.title = metrics.device.slice(0, 256);
+    setText("[data-live-vram-copy]", `${metrics.device.slice(0, 96)} · 상한 16.7 GiB`);
   }
   if (typeof metrics.measured_at === "string") {
     const date = new Date(metrics.measured_at);
@@ -285,11 +333,16 @@ function updatePhases(state) {
   const succeeded = state.status === "succeeded";
   const failed = state.status === "failed";
   $$("#phase-list li").forEach((item) => {
-    const eventStage = Object.keys(PHASE_TO_DOM).find((key) => PHASE_TO_DOM[key] === item.dataset.phase);
-    const index = PHASE_ORDER.indexOf(eventStage);
-    item.classList.toggle("is-complete", succeeded || (stageIndex >= 0 && index < stageIndex));
-    item.classList.toggle("is-active", ACTIVE_STATUSES.has(state.status) && index === stageIndex);
-    item.classList.toggle("is-failed", failed && index === stageIndex);
+    const indices = Object.keys(PHASE_TO_DOM)
+      .filter((key) => PHASE_TO_DOM[key] === item.dataset.phase)
+      .map((key) => PHASE_ORDER.indexOf(key))
+      .filter((index) => index >= 0);
+    const first = indices.length ? Math.min(...indices) : -1;
+    const last = indices.length ? Math.max(...indices) : -1;
+    const isCurrent = stageIndex >= first && stageIndex <= last && first >= 0;
+    item.classList.toggle("is-complete", succeeded || (stageIndex >= 0 && last < stageIndex));
+    item.classList.toggle("is-active", ACTIVE_STATUSES.has(state.status) && isCurrent);
+    item.classList.toggle("is-failed", failed && isCurrent);
   });
   setText("#phase-status", PHASE_LABELS[state.stage] || PHASE_LABELS[state.status] || "대기");
   const reactor = $("#reactor");
@@ -413,7 +466,7 @@ function updateControlStates() {
   if (reset) reset.disabled = agentUnavailable || agentBusy;
   const input = $("#agent-input");
   if (input) input.disabled = agentUnavailable || agentBusy;
-  $$('[data-agent-mode], [data-agent-prompt]').forEach((button) => {
+  $$('[data-agent-mode], [data-agent-prompt], [data-action="agent-focus"]').forEach((button) => {
     button.disabled = agentUnavailable || agentBusy;
   });
   const chatBusy = agentBusy || ui.agentConnectionLost;
@@ -443,6 +496,7 @@ function updateState(state) {
   if (!state || typeof state !== "object") return;
   const prior = ui.lastStatus;
   const status = VALIDATION_STATUSES.has(state.status) ? state.status : "failed";
+  const hasLiveEvidence = state.metrics?.evidence_kind === "live_runtime_validation";
   ui.lastStatus = status;
   if (Number.isInteger(state.seq)) ui.lastSeq = Math.max(ui.lastSeq, state.seq);
   setRuntimeStatus(status, state.stage);
@@ -459,21 +513,22 @@ function updateState(state) {
 
   if (active) {
     setText("#rail-verdict", "LIVE RUNNING");
-    setText("#rail-time", "이전 실측값 표시 · 완료 후 교체");
+    setText("#rail-time", hasLiveEvidence ? "직전 현재 프로세스 실측 유지 · 완료 후 교체" : "현재 실측 생성 중");
   } else if (status === "succeeded") {
     setText("#rail-verdict", "VERIFIED");
     if (prior !== "succeeded") showToast("실제 GPU 통합 검증을 통과했습니다.", "success");
   } else if (status === "failed") {
     setText("#rail-verdict", "NEW RUN FAILED");
-    setText("#rail-time", "이전 실측값 유지 · 실패 로그 확인");
+    setText("#rail-time", hasLiveEvidence ? "직전 현재 프로세스 실측 유지 · 실패 로그 확인" : "유효한 현재 프로세스 실측 없음");
     const error = state.error?.message || state.error?.code || "검증 프로세스가 실패했습니다.";
     if (prior !== "failed") showToast(error, "error");
   } else if (status === "cancelled" && prior !== "cancelled") {
     setText("#rail-verdict", "RUN CANCELLED");
-    setText("#rail-time", "이전 실측값 유지");
+    setText("#rail-time", hasLiveEvidence ? "직전 현재 프로세스 실측 유지" : "유효한 현재 프로세스 실측 없음");
     showToast("검증을 취소하고 GPU worker를 정리했습니다.", "warning");
   } else if (status === "ready") {
-    setText("#rail-verdict", "VERIFIED");
+    setText("#rail-verdict", hasLiveEvidence ? "VERIFIED" : "NOT VERIFIED");
+    if (!hasLiveEvidence) setText("#rail-time", "현재 프로세스 검증 전");
   }
 }
 
@@ -573,6 +628,9 @@ function renderAgentConversation(messages = []) {
       generatedTokens: Number.isInteger(message.generated_tokens)
         ? Math.max(0, Math.min(1536, message.generated_tokens))
         : 0,
+      generationMode: ["cogni_core", "quality_fallback"].includes(message.generation_mode)
+        ? message.generation_mode
+        : null,
     });
   });
 
@@ -611,9 +669,13 @@ function renderAgentConversation(messages = []) {
       if (role === "assistant" && message.streaming) completionCopy = "작성 중";
       else if (role === "assistant" && message.truncated) completionCopy = "길이 한계 · 이어서 가능";
       else if (role === "assistant" && message.finishReason) {
-        completionCopy = message.continuations
-          ? `자동 이어쓰기 ${message.continuations}회 · 완료`
-          : "완료";
+        if (message.generationMode === "quality_fallback") {
+          completionCopy = "품질 안전 응답 · 완료";
+        } else {
+          completionCopy = message.continuations
+            ? `자동 이어쓰기 ${message.continuations}회 · 완료`
+            : "완료";
+        }
       }
       completion.textContent = completionCopy;
       completion.hidden = !completionCopy;
@@ -650,13 +712,34 @@ function updateAgentCore(core = {}) {
 
 function updateEvolutionState(evolution = {}) {
   if (!evolution || typeof evolution !== "object") return;
-  if (Number.isInteger(evolution.failures)) setText("#evolution-failures", evolution.failures);
+  const evidenceFailures = Number.isInteger(evolution.evidence_failures)
+    ? evolution.evidence_failures
+    : evolution.failures;
+  if (Number.isInteger(evidenceFailures)) setText("#evolution-failures", evidenceFailures);
+  if (Number.isFinite(evolution.evidence_capture_ratio)) {
+    const ratio = Math.max(0, Math.min(1, evolution.evidence_capture_ratio));
+    setText("#evolution-coverage", `${(ratio * 100).toFixed(ratio === 1 ? 0 : 1)}%`);
+  }
+  const pending = Number.isInteger(evolution.pending_proposals)
+    ? evolution.pending_proposals
+    : evolution.rich_pending_proposals;
+  if (Number.isInteger(pending)) setText("#evolution-proposals", pending);
+  const unreviewable = Number.isInteger(evolution.unreviewable_proposals)
+    ? Math.max(0, evolution.unreviewable_proposals)
+    : 0;
   if (typeof evolution.last_run === "string" && evolution.last_run) {
     setText("#evolution-last-run", formatAgentTime(evolution.last_run) || evolution.last_run);
   }
-  if (typeof evolution.sandbox === "string") setText("#evolution-sandbox", evolution.sandbox);
+  if (typeof evolution.promotion_enabled === "boolean") {
+    setText("#evolution-sandbox", evolution.promotion_enabled ? "독립 검증 필요" : "차단 · 제안 전용");
+  }
   const badge = $("#evolution-badge");
-  if (badge && typeof evolution.status === "string") badge.textContent = evolution.status.slice(0, 64);
+  if (badge) {
+    const degraded = evolution.integrity_degraded === true || unreviewable > 0;
+    badge.dataset.integrity = degraded ? "degraded" : "healthy";
+    if (degraded) badge.textContent = `무결성 제외 ${unreviewable}`;
+    else if (typeof evolution.status === "string") badge.textContent = evolution.status.slice(0, 64);
+  }
   if (typeof evolution.running === "boolean") {
     ui.evolutionRunning = evolution.running;
   }
@@ -798,7 +881,7 @@ async function runEvolutionCycle() {
   try {
     const state = await api("/api/evolution/run", { method: "POST", body: {} });
     updateEvolutionState(state.evolution || state);
-    showToast("Self-Harness 안전 주기를 시작했습니다.");
+    showToast("Self-Harness 제안 전용 증거 주기를 시작했습니다.");
   } catch (error) {
     showToast(describeApiError(error, "Self-Harness 주기를 시작하지 못했습니다."), "error");
   } finally {
@@ -1054,6 +1137,15 @@ function bindActions() {
   $('[data-action="agent-cancel"]')?.addEventListener("click", cancelAgentTurn);
   $('[data-action="agent-reset"]')?.addEventListener("click", resetAgentConversation);
   $('[data-action="evolution-run"]')?.addEventListener("click", runEvolutionCycle);
+  $("#chat-transcript")?.addEventListener("click", (event) => {
+    const trigger = event.target.closest('[data-action="agent-focus"]');
+    if (!trigger || trigger.disabled) return;
+    const input = $("#agent-input");
+    if (!input || input.disabled) return;
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    input.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "nearest" });
+    input.focus({ preventScroll: true });
+  });
   $$('[data-agent-mode]').forEach((button) => button.addEventListener("click", () => {
     ui.agentMode = button.dataset.agentMode;
     $$('[data-agent-mode]').forEach((candidate) => {

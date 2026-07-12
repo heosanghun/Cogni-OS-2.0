@@ -2,7 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Windows.Forms;
+
+[assembly: AssemblyTitle("CogniBoard")]
+[assembly: AssemblyDescription("Cogni-OS 2.0 Genesis local sovereign AI control")]
+[assembly: AssemblyCompany("Cogni-OS")]
+[assembly: AssemblyProduct("Cogni-OS 2.0 Genesis")]
+[assembly: AssemblyVersion("0.3.0.0")]
+[assembly: AssemblyFileVersion("0.3.0.0")]
 
 internal static class CogniBoardLauncher
 {
@@ -40,6 +48,7 @@ internal static class CogniBoardLauncher
             }
 
             PythonCommand python = FindPython();
+            RunPreflight(python, projectRoot);
             ProcessStartInfo start = new ProcessStartInfo
             {
                 FileName = python.Executable,
@@ -62,6 +71,13 @@ internal static class CogniBoardLauncher
             if (launched == null)
             {
                 throw new InvalidOperationException("Python runtime did not start.");
+            }
+            if (launched.WaitForExit(1500))
+            {
+                throw new InvalidOperationException(
+                    "CogniBoard backend exited during startup. Run "
+                    + "Run-CogniOS-Demo.cmd to inspect the diagnostic log."
+                );
             }
             return 0;
         }
@@ -135,6 +151,53 @@ internal static class CogniBoardLauncher
         throw new FileNotFoundException(
             "Python 3.11+ was not found. Install the project runtime or set COGNI_OS_PYTHON."
         );
+    }
+
+    private static void RunPreflight(PythonCommand python, string projectRoot)
+    {
+        ProcessStartInfo start = new ProcessStartInfo
+        {
+            FileName = python.Executable,
+            Arguments = JoinArguments(
+                python.Prefix,
+                "-c",
+                "import sys,torch,transformers,cogni_demo.server;"
+                + "assert sys.version_info >= (3,11);"
+                + "assert torch.cuda.is_available()"
+            ),
+            WorkingDirectory = projectRoot,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        SetOfflineEnvironment(start);
+        using (Process process = Process.Start(start))
+        {
+            if (process == null)
+            {
+                throw new InvalidOperationException("Python preflight did not start.");
+            }
+            if (!process.WaitForExit(30000))
+            {
+                process.Kill();
+                process.WaitForExit();
+                throw new TimeoutException("Python/CUDA preflight exceeded 30 seconds.");
+            }
+            string standardError = process.StandardError.ReadToEnd().Trim();
+            if (process.ExitCode != 0)
+            {
+                string detail = standardError.Length == 0
+                    ? "Python 3.11+, CUDA PyTorch, Transformers, or Cogni-OS is unavailable."
+                    : standardError;
+                if (detail.Length > 1500)
+                {
+                    detail = detail.Substring(0, 1500);
+                }
+                throw new InvalidOperationException("Runtime preflight failed:\n" + detail);
+            }
+        }
     }
 
     private static string FindOnPath(string fileName)

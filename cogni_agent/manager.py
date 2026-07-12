@@ -15,9 +15,25 @@ from typing import Any, Protocol
 
 import torch
 
+from cogni_flow.rhythm import RhythmController
+
 from .conversation import BoundedConversationStore
-from .model_service import GenerationCancelled, ModelServiceError
+from .fact_grounding import RuntimeFactGrounder
+from .model_service import (
+    GenerationCancelled,
+    ModelServiceError,
+    truncate_repeated_tokens,
+)
 from .prompting import decode_response, render_chat_prompt, stop_token_ids
+from .response_quality import (
+    QualityAction,
+    QualityCode,
+    ResponseQualityError,
+    inspect_response,
+    normalize_exact_sentence_response,
+    requested_exact_sentence_count,
+    response_contract_satisfied,
+)
 from .tools import HELP_TEXT, ToolPolicyError, WorkspaceToolExecutor, parse_tool_request
 
 
@@ -28,8 +44,10 @@ MAX_AGENT_RESPONSE_CHARS = 8_192
 HARD_MAX_REQUEST_TOKENS = 512
 HARD_MAX_TOTAL_TOKENS = 1_536
 HARD_MAX_CONTINUATIONS = 2
+INTERACTIVE_MAX_INPUT_TOKENS = 2_048
 DEFAULT_SHORT_RESPONSE_TOKENS = 256
 DEFAULT_DETAILED_RESPONSE_TOKENS = 384
+DEFAULT_CONCISE_RESPONSE_TOKENS = 192
 CONTINUATION_RESPONSE_TOKENS = 512
 STREAM_RENDER_TOKEN_INTERVAL = 8
 STREAM_RENDER_SECONDS = 0.05
@@ -45,16 +63,56 @@ SYSTEM_PROMPT = """당신은 Cogni-OS 2.0의 로컬 AI 동료입니다.
 모든 처리는 폐쇄망 PC 안에서 수행됩니다. 확인되지 않은 성능·사실·실행 결과를
 만들어내지 말고, 실제 도구 실행 결과와 설계 목표를 구분하십시오. 간결하고
 정확한 한국어로 답하되 사용자가 다른 언어로 말하면 그 언어를 따르십시오.
+같은 문장이나 문단을 반복하지 말고 필요한 내용은 한 번만 말하십시오.
+Runtime Fact-book은 내부 사실 제약이며 그 원문 블록을 답변에 복사하지 마십시오.
+사용자가 문장·항목 수를 지정하면 서론과 결론을 덧붙이지 말고 그 수를 지키십시오.
 임의 셸·네트워크·무검증 소스 수정 권한이 없으며, 작업 모드는 별도 허용 목록을
 통해서만 실행된다는 점을 숨기지 마십시오.
 답변 본문에 USER:, ASSISTANT:, SYSTEM: 같은 역할 표기를 출력하지 마십시오.
-요청 범위가 넓으면 핵심부터 구조화하고, 문장을 끝맺은 뒤 턴 종료 토큰으로
-종료하십시오. 길이 경계에서 이어 쓸 때는 앞부분을 반복하지 마십시오."""
+요청 범위가 넓으면 핵심부터 구조화하고, 마지막 문장을 자연스럽게 끝내십시오.
+요청한 문장·항목·장단점 개수를 초과하지 마십시오. 길이 경계에서 이어 쓸 때는
+앞부분을 반복하지 마십시오."""
 
 CONTINUATION_DIRECTIVE = """직전 답변이 생성 길이 경계에서 중단되었습니다.
 이미 작성한 부분을 반복하거나 요약하지 말고 바로 다음 내용부터 이어 쓰십시오.
 진행 중이던 문장을 자연스럽게 완성하고 전체 답변을 끝맺으십시오.
 USER:, ASSISTANT:, SYSTEM: 같은 역할 표기는 출력하지 마십시오."""
+
+QUALITY_REPAIR_DIRECTIVE = "앞 답변은 요청 형식을 충족하지 못했습니다. 원래 질문에 대한 수정 답변만 작성하세요."
+
+SAFE_QUALITY_FALLBACK = (
+    "로컬 모델의 답변 후보가 품질 검증을 통과하지 못했습니다. 이번에는 "
+    "추측해서 답하지 않았습니다. 표현을 바꿔 다시 요청해 주세요."
+)
+_QUALITY_FALLBACK_MARKER = "로컬 모델의 답변 후보가 품질 검증을 통과하지 못했습니다."
+_FALLBACK_ROLE_RE = re.compile(
+    r"(?i)(?:^|\s)(?:user|assistant|system|model|tool|사용자|시스템)\s*:\s*"
+)
+_FALLBACK_CONTROL_RE = re.compile(r"<[^<>\r\n]{0,128}>|\[[^\[\]\r\n]{0,128}\]")
+
+
+def safe_quality_fallback(message: str) -> str:
+    """Create one bounded, request-specific, non-authoritative safety reply."""
+
+    excerpt = _FALLBACK_CONTROL_RE.sub(" ", str(message))
+    excerpt = _FALLBACK_ROLE_RE.sub(" ", excerpt)
+    excerpt = re.sub(r"[\r\n\t]+", " ", excerpt)
+    excerpt = re.sub(r"\s+", " ", excerpt).strip(" \"'“”‘’")
+    if not excerpt:
+        return SAFE_QUALITY_FALLBACK
+    if len(excerpt) > 42:
+        excerpt = excerpt[:42].rstrip() + "…"
+    return (
+        f"요청하신 ‘{excerpt}’에 대해 {_QUALITY_FALLBACK_MARKER} "
+        "이번에는 추측해서 답하지 않았습니다. 표현을 바꿔 다시 요청해 주세요."
+    )
+
+
+def _is_quality_fallback(text: str) -> bool:
+    return _QUALITY_FALLBACK_MARKER in text and text.endswith(
+        "표현을 바꿔 다시 요청해 주세요."
+    )
+
 
 _DETAILED_INTENT_TERMS = (
     "모두",
@@ -78,6 +136,11 @@ _CONTINUE_REQUEST_RE = re.compile(
     r"이어서(?:\s*답(?:변)?(?:해|해주세요|해줘)?)?|이어(?:\s*)?줘|continue|go\s+on)\s*[.!?~]*\s*$",
     re.IGNORECASE,
 )
+_CONCISE_INTENT_RE = re.compile(
+    r"(?:[한두세네다섯여섯일곱여덟아홉열1-9]\s*문장|"
+    r"핵심만|간결(?:하게)?|짧게|\d+\s*개\s*이내|이내로)",
+    re.IGNORECASE,
+)
 _LEADING_ASSISTANT_RE = re.compile(
     r"\A\s*(?:(?:(?:<start_of_turn>|<\|start_of_turn\|>|<\|turn>)\s*)"
     r"(?:assistant|model)\s*:?\s*|(?:assistant|model|어시스턴트)\s*:\s*)",
@@ -88,7 +151,7 @@ _ROLE_BOUNDARY_RE = re.compile(
     r"(?:user|assistant|model|system|tool|사용자|어시스턴트|시스템)[ \t]*:[ \t]*"
 )
 _TURN_TOKEN_RE = re.compile(
-    r"(?:<end_of_turn>|<\|end_of_turn\|>|<\|eot_id\|>|<turn\|>)",
+    r"(?:<end_of_turn>|<\|end_of_turn\|>|<\|eot_id\|>|<turn\|>|\[턴\s*종료\])",
     re.IGNORECASE,
 )
 _TURN_START_BOUNDARY_RE = re.compile(
@@ -98,6 +161,20 @@ _TURN_START_BOUNDARY_RE = re.compile(
 _RESERVED_OUTPUT_RE = re.compile(
     r"(?:<unused\d+>|\[multimodal\]|<\|(?:image|audio|endoftext|startoftext)\|>)",
     re.IGNORECASE,
+)
+_FACTBOOK_ECHO_RE = re.compile(r"(?im)^[ \t]*\[Runtime Fact-book:")
+_QUALITY_REPAIR_ECHO_RE = re.compile(
+    r"앞 답변은 요청 형식을 충족하지 못했습니다|"
+    r"원래 질문에 대한 수정 답변만 작성하세요|"
+    r"사용자 질문에 처음부터 다시 답하되|"
+    r"사용자가 문장 수를 지정했다면"
+)
+_SENTENCE_UNIT_RE = re.compile(
+    r".+?(?:[.!?。！？]+(?=\s|$)|\n{2,}|$)",
+    re.DOTALL,
+)
+_STRUCTURED_REPEAT_RE = re.compile(
+    r"(?m)^\s*(?:```|\||[-*+]\s+|\d+[.)]\s+)",
 )
 
 
@@ -134,6 +211,7 @@ class GenerationBackend(Protocol):
 FailureSink = Callable[[str, str], None]
 EvolutionSnapshot = Callable[[], Mapping[str, Any]]
 AvailabilityCheck = Callable[[], bool]
+TurnFinish = tuple[str, str, int]
 
 
 class AgentManager:
@@ -144,7 +222,7 @@ class AgentManager:
         model_service: GenerationBackend,
         tool_executor: WorkspaceToolExecutor,
         *,
-        session_id: str = "primary",
+        session_id: str | None = None,
         max_new_tokens: int = HARD_MAX_REQUEST_TOKENS,
         max_total_new_tokens: int | None = None,
         max_continuations: int = HARD_MAX_CONTINUATIONS,
@@ -152,6 +230,8 @@ class AgentManager:
         failure_sink: FailureSink | None = None,
         evolution_snapshot: EvolutionSnapshot | None = None,
         availability_check: AvailabilityCheck | None = None,
+        fact_grounder: RuntimeFactGrounder | None = None,
+        rhythm: RhythmController | None = None,
     ) -> None:
         if not callable(getattr(model_service, "iter_generate_tokens", None)):
             raise TypeError("model_service must provide tensor generation")
@@ -169,9 +249,30 @@ class AgentManager:
             raise ValueError("max_continuations must be in [0, 2]")
         if not isinstance(system_prompt, str) or not 1 <= len(system_prompt) <= 8_192:
             raise ValueError("system_prompt must be bounded text")
+        if fact_grounder is not None and not isinstance(
+            fact_grounder, RuntimeFactGrounder
+        ):
+            raise TypeError("fact_grounder must be a RuntimeFactGrounder or None")
+        if rhythm is not None and not isinstance(rhythm, RhythmController):
+            raise TypeError("rhythm must be a RhythmController or None")
+        selected_session = (
+            f"conversation-{secrets.token_hex(12)}"
+            if session_id is None
+            else session_id
+        )
+        if (
+            not isinstance(selected_session, str)
+            or not 1 <= len(selected_session) <= 64
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                for character in selected_session
+            )
+        ):
+            raise ValueError("session_id must be a bounded ASCII identifier")
         self.model_service = model_service
         self.tool_executor = tool_executor
-        self.session_id = session_id
+        self.session_id = selected_session
         self.max_new_tokens = int(max_new_tokens)
         self.max_total_new_tokens = int(max_total_new_tokens)
         self.max_continuations = int(max_continuations)
@@ -179,6 +280,8 @@ class AgentManager:
         self.failure_sink = failure_sink
         self.evolution_snapshot = evolution_snapshot
         self.availability_check = availability_check
+        self.fact_grounder = fact_grounder
+        self.rhythm = rhythm if rhythm is not None else RhythmController()
         self.conversations = BoundedConversationStore(
             max_sessions=1,
             max_turns=24,
@@ -252,8 +355,12 @@ class AgentManager:
         with self._condition:
             if self._status in ACTIVE_AGENT_STATUSES:
                 raise AgentBusyError("another agent turn is active")
-            if self.availability_check is not None and not self.availability_check():
-                raise AgentBusyError("the GPU is reserved by another system mode")
+            availability = self.availability_check
+        if availability is not None and not availability():
+            raise AgentBusyError("the GPU is reserved by another system mode")
+        with self._condition:
+            if self._status in ACTIVE_AGENT_STATUSES:
+                raise AgentBusyError("another agent turn is active")
             turn_id = secrets.token_hex(12)
             resume_truncated = mode == "chat" and self._resume_requested_locked(text)
             user_sequence = self.conversations.begin_user_turn(self.session_id, text)
@@ -287,6 +394,7 @@ class AgentManager:
             if self._status in ACTIVE_AGENT_STATUSES:
                 raise AgentBusyError("cannot reset an active agent turn")
             self.conversations.clear(self.session_id)
+            self.session_id = f"conversation-{secrets.token_hex(12)}"
             self._messages.clear()
             self._error = None
             self._completion = self._completion_state()
@@ -317,21 +425,27 @@ class AgentManager:
         resume_truncated: bool,
     ) -> None:
         try:
-            if mode == "task":
-                self._run_task(turn_id, user_sequence, message)
-            else:
-                self._run_chat(
-                    turn_id,
-                    user_sequence,
-                    message,
-                    resume_truncated=resume_truncated,
-                )
+            with self.rhythm.inference_slot():
+                if mode == "task":
+                    finish = self._run_task(turn_id, user_sequence, message)
+                else:
+                    finish = self._run_chat(
+                        turn_id,
+                        user_sequence,
+                        message,
+                        resume_truncated=resume_truncated,
+                    )
+            if finish is not None:
+                with self._condition:
+                    self._finish_locked(turn_id, *finish)
         except GenerationCancelled:
             self._finish_cancelled(turn_id, user_sequence)
         except BaseException as exc:
             self._finish_failed(turn_id, user_sequence, exc)
 
-    def _run_task(self, turn_id: str, user_sequence: int, message: str) -> None:
+    def _run_task(
+        self, turn_id: str, user_sequence: int, message: str
+    ) -> TurnFinish | None:
         with self._condition:
             if self._active_turn != turn_id:
                 return
@@ -359,7 +473,7 @@ class AgentManager:
                 state="complete",
                 finish_reason="tool",
             )
-            self._finish_locked(turn_id, "succeeded", "complete", 100)
+        return "succeeded", "complete", 100
 
     def _run_chat(
         self,
@@ -368,7 +482,14 @@ class AgentManager:
         message: str,
         *,
         resume_truncated: bool,
-    ) -> None:
+    ) -> TurnFinish | None:
+        if self.fact_grounder is not None and not resume_truncated:
+            grounded = self.fact_grounder.answer(message)
+            if grounded is None:
+                previous = self._previous_assistant_content()
+                grounded = self.fact_grounder.answer_followup(message, previous)
+            if grounded is not None:
+                return self._run_grounded_answer(turn_id, user_sequence, grounded)
         with self._condition:
             if self._active_turn != turn_id:
                 return
@@ -394,6 +515,10 @@ class AgentManager:
         request_budget = budget.first_request
         finish_reason = "stop"
         char_truncated = False
+        repetition_boundary = False
+        quality_boundary = False
+        generation_mode = "cogni_core"
+        quality_repair_attempts = 0
         with self._condition:
             self._core = self._core_state(active=("gemma", "router", "swarm", "cts"))
             self._transition_locked("generating", "decode", 55)
@@ -416,18 +541,29 @@ class AgentManager:
                     received_tokens += int(chunk.token_ids.numel())
                 render_due = bool(request_tokens) and (
                     chunk.final
-                    or received_tokens - rendered_tokens
-                    >= STREAM_RENDER_TOKEN_INTERVAL
+                    or received_tokens - rendered_tokens >= STREAM_RENDER_TOKEN_INTERVAL
                     or monotonic() - rendered_at >= STREAM_RENDER_SECONDS
                 )
                 if render_due:
-                    segment, segment_role_boundary = self._clean_model_text(
-                        self._decode(request_tokens)
-                    )
+                    decoded, token_repetition = self._decode(request_tokens)
+                    if continuations == 0:
+                        decoded, _user_echo = self._strip_leading_user_echo(
+                            decoded, message
+                        )
+                    segment, segment_role_boundary = self._clean_model_text(decoded)
                     role_boundary = role_boundary or segment_role_boundary
+                    repetition_boundary = repetition_boundary or token_repetition
                     merged = self._merge_response(response_before_request, segment)
+                    merged, segment_repetition = self._trim_repeated_text(merged)
+                    repetition_boundary = repetition_boundary or segment_repetition
                     response, clipped = self._clip_response(merged)
                     char_truncated = char_truncated or clipped
+                    quality = inspect_response(response, final=False)
+                    if quality.should_stop_generation:
+                        cut = quality.recommended_cut_index
+                        if cut is not None:
+                            response = response[:cut].rstrip()
+                        quality_boundary = True
                     made_progress = made_progress or response != response_before_request
                     with self._condition:
                         self._update_message(
@@ -461,13 +597,74 @@ class AgentManager:
                     rendered_at = monotonic()
                 if chunk.final:
                     request_reason = self._chunk_finish_reason(chunk)
+                    chunk_mode = getattr(chunk, "generation_mode", "cogni_core")
+                    if chunk_mode != "cogni_core":
+                        raise ModelServiceError(
+                            "worker returned an unattested generation mode"
+                        )
 
             total_generated += request_generated
-            finish_reason = "stop" if role_boundary else request_reason
+            finish_reason = (
+                "stop"
+                if role_boundary or repetition_boundary or quality_boundary
+                else request_reason
+            )
             remaining = budget.total - total_generated
+            terminal_quality = inspect_response(response, final=True)
+            response_contract_incomplete = not response_contract_satisfied(
+                message, response
+            )
+            if response_contract_incomplete or (
+                terminal_quality.recommended_action is QualityAction.CONTINUE
+            ):
+                normalized = normalize_exact_sentence_response(message, response)
+                if normalized is not None:
+                    response = normalized
+                    terminal_quality = inspect_response(response, final=True)
+                    response_contract_incomplete = False
+                    finish_reason = "stop"
+            cross_turn_echo = self._has_cross_turn_sentence_echo(response)
+            bounded_repair_needed = (
+                not response.strip()
+                or response_contract_incomplete
+                or cross_turn_echo
+                or (
+                    budget.max_continuations == 0
+                    and terminal_quality.recommended_action is QualityAction.CONTINUE
+                )
+            )
+            if bounded_repair_needed and quality_repair_attempts < 2 and remaining > 0:
+                quality_repair_attempts += 1
+                discarded_candidate = response
+                isolate_repair = cross_turn_echo or (
+                    response_contract_incomplete
+                    and requested_exact_sentence_count(message) is not None
+                )
+                response = ""
+                request_budget = min(
+                    DEFAULT_CONCISE_RESPONSE_TOKENS,
+                    self.max_new_tokens,
+                    remaining,
+                )
+                prompt = self._build_quality_repair_prompt(
+                    message,
+                    discarded_candidate,
+                    isolate_history=isolate_repair,
+                )
+                repetition_boundary = False
+                quality_boundary = False
+                with self._condition:
+                    self._transition_locked("generating", "repairing", self._progress)
+                continue
+            quality_needs_continuation = (
+                finish_reason == "stop"
+                and terminal_quality.recommended_action is QualityAction.CONTINUE
+            )
             can_continue = (
-                finish_reason == "length"
+                (finish_reason == "length" or quality_needs_continuation)
                 and not role_boundary
+                and not repetition_boundary
+                and not quality_boundary
                 and not char_truncated
                 and made_progress
                 and continuations < budget.max_continuations
@@ -481,17 +678,74 @@ class AgentManager:
                 CONTINUATION_RESPONSE_TOKENS,
                 remaining,
             )
-            prompt = self._build_continuation_prompt(response)
+            if quality_needs_continuation:
+                incomplete_start = min(
+                    finding.start
+                    for finding in terminal_quality.findings
+                    if finding.code is QualityCode.INCOMPLETE_KOREAN_CLAUSE
+                )
+                response = self._complete_prefix(response, cutoff=incomplete_start)
+                prompt = (
+                    self._build_continuation_prompt(response)
+                    if response
+                    else self._build_quality_repair_prompt(message, response)
+                )
+                with self._condition:
+                    self._update_message(
+                        message_id,
+                        response,
+                        streaming=True,
+                        finish_reason=None,
+                        continuations=continuations,
+                        truncated=False,
+                        generated_tokens=total_generated,
+                    )
+            else:
+                prompt = self._build_continuation_prompt(response)
             with self._condition:
                 self._transition_locked("generating", "continuing", self._progress)
 
         response = response.strip()
+        truncated = char_truncated or finish_reason == "length"
+        if not truncated:
+            if repetition_boundary or quality_boundary:
+                response = self._complete_prefix(response)
+            final_quality = inspect_response(response, final=True)
+            if final_quality.should_stop_generation:
+                cut = final_quality.recommended_cut_index
+                response = self._complete_prefix(response, cutoff=cut)
+                final_quality = inspect_response(response, final=True)
+            if final_quality.recommended_action is not QualityAction.ACCEPT:
+                response = safe_quality_fallback(message)
+                finish_reason = "stop"
+                truncated = False
+                generation_mode = "quality_fallback"
+            elif not response_contract_satisfied(message, response):
+                response = safe_quality_fallback(message)
+                finish_reason = "stop"
+                truncated = False
+                generation_mode = "quality_fallback"
+            elif self._has_cross_turn_sentence_echo(response):
+                response = safe_quality_fallback(message)
+                finish_reason = "stop"
+                truncated = False
+                generation_mode = "quality_fallback"
         if not response:
-            raise ModelServiceError("local model produced an empty response")
+            response = safe_quality_fallback(message)
+            finish_reason = "stop"
+            truncated = False
+            generation_mode = "quality_fallback"
+        if generation_mode == "quality_fallback" and self.failure_sink is not None:
+            try:
+                self.failure_sink(
+                    "ResponseQualityError",
+                    "All bounded generation candidates failed the response-quality gate",
+                )
+            except Exception:
+                pass
         self.conversations.commit_assistant_turn(
             self.session_id, user_sequence, response
         )
-        truncated = char_truncated or finish_reason == "length"
         final_stage = "truncated" if truncated else "complete"
         with self._condition:
             self._update_message(
@@ -502,6 +756,7 @@ class AgentManager:
                 continuations=continuations,
                 truncated=truncated,
                 generated_tokens=total_generated,
+                generation_mode=generation_mode,
             )
             self._completion = self._completion_state(
                 state=final_stage,
@@ -509,13 +764,85 @@ class AgentManager:
                 continuations=continuations,
                 truncated=truncated,
                 generated_tokens=total_generated,
+                generation_mode=generation_mode,
             )
             self._core = self._core_state()
-            self._finish_locked(turn_id, "succeeded", final_stage, 100)
+        return "succeeded", final_stage, 100
+
+    def _run_grounded_answer(
+        self,
+        turn_id: str,
+        user_sequence: int,
+        answer: str,
+    ) -> TurnFinish | None:
+        """Publish a verified Fact-book answer without acquiring the model."""
+
+        with self._condition:
+            if self._active_turn != turn_id:
+                return
+            self._core = self._core_state(active=("factbook",))
+            self._transition_locked("executing", "factbook", 50)
+        if self._cancel_event.is_set():
+            raise GenerationCancelled("fact lookup cancelled")
+        response, clipped = self._clip_response(answer.strip())
+        quality = inspect_response(response, final=True)
+        if clipped or quality.recommended_action is not QualityAction.ACCEPT:
+            raise ResponseQualityError("Runtime Fact-book produced an unsafe answer")
+        self.conversations.commit_assistant_turn(
+            self.session_id, user_sequence, response
+        )
+        with self._condition:
+            self._append_message(
+                "assistant",
+                response,
+                streaming=False,
+                finish_reason="stop",
+                continuations=0,
+                truncated=False,
+                generated_tokens=0,
+            )
+            self._completion = self._completion_state(
+                state="complete",
+                finish_reason="stop",
+            )
+            self._core = self._core_state()
+        return "succeeded", "complete", 100
+
+    def _previous_assistant_content(self) -> str:
+        messages = self.conversations.snapshot(self.session_id).as_messages()
+        for item in reversed(messages):
+            if item["role"] == "assistant":
+                return item["content"]
+        return ""
+
+    @staticmethod
+    def _substantive_sentence_keys(text: str) -> frozenset[str]:
+        keys: set[str] = set()
+        for match in _SENTENCE_UNIT_RE.finditer(text[:MAX_AGENT_RESPONSE_CHARS]):
+            key = re.sub(r"\s+", " ", match.group(0)).strip()
+            key = re.sub(r"^(?:[-*+]\s+|\d{1,4}[.)]\s+)", "", key)
+            key = key.rstrip(" .!?。！？").casefold()
+            if len(key) >= 24:
+                keys.add(key)
+        return frozenset(keys)
+
+    def _has_cross_turn_sentence_echo(self, response: str) -> bool:
+        current = self._substantive_sentence_keys(response)
+        if not current:
+            return False
+        messages = self.conversations.snapshot(self.session_id).as_messages()
+        for item in messages:
+            if item["role"] != "assistant" or _is_quality_fallback(item["content"]):
+                continue
+            overlap = current & self._substantive_sentence_keys(item["content"])
+            if len(overlap) >= 2:
+                return True
+            if len(current) == 1 and overlap and len(next(iter(current))) >= 96:
+                return True
+        return False
 
     def _build_prompt(self, *, resume_truncated: bool = False) -> str:
-        snapshot = self.conversations.snapshot(self.session_id)
-        messages = list(snapshot.as_messages())
+        messages = self._model_messages()
         if resume_truncated and messages and messages[-1]["role"] == "user":
             messages[-1] = {"role": "user", "content": CONTINUATION_DIRECTIVE}
         return self._render_bounded_prompt(messages)
@@ -523,27 +850,85 @@ class AgentManager:
     def _build_continuation_prompt(self, response: str) -> str:
         """Continue the same open model turn without adding transcript roles."""
 
-        messages = list(self.conversations.snapshot(self.session_id).as_messages())
+        messages = self._model_messages()
         return self._render_bounded_prompt(
             messages,
             partial_assistant=response,
         )
+
+    def _build_quality_repair_prompt(
+        self,
+        message: str,
+        discarded_candidate: str = "",
+        *,
+        isolate_history: bool = False,
+    ) -> str:
+        """Retry one discarded fragment without adding a fake transcript turn."""
+
+        messages = self._model_messages()
+        if isolate_history and messages and messages[-1]["role"] == "user":
+            messages = [messages[-1]]
+        candidate = discarded_candidate.strip()[:MAX_AGENT_RESPONSE_CHARS]
+        if candidate:
+            messages.extend(
+                (
+                    {"role": "assistant", "content": candidate},
+                    {
+                        "role": "user",
+                        "content": QUALITY_REPAIR_DIRECTIVE,
+                    },
+                )
+            )
+        elif messages and messages[-1]["role"] == "user":
+            messages[-1] = {
+                "role": "user",
+                "content": messages[-1]["content"] + "\n" + QUALITY_REPAIR_DIRECTIVE,
+            }
+        return self._render_bounded_prompt(messages, system_prompt=self.system_prompt)
+
+    def _model_messages(self) -> list[dict[str, str]]:
+        """Exclude failed-quality exchanges from future model conditioning.
+
+        The fallback remains visible in the UI and audit history, but teaching it
+        back to the model caused later turns to copy the exact same safety text.
+        Removing the complete failed exchange preserves role alternation while
+        preventing that cross-turn echo loop.
+        """
+
+        messages = list(self.conversations.snapshot(self.session_id).as_messages())
+        retained: list[dict[str, str]] = []
+        for item in messages:
+            if (
+                item["role"] == "assistant"
+                and _is_quality_fallback(item["content"])
+                and retained
+                and retained[-1]["role"] == "user"
+            ):
+                retained.pop()
+                continue
+            retained.append(item)
+        return retained
 
     def _render_bounded_prompt(
         self,
         messages: list[dict[str, str]],
         *,
         partial_assistant: str | None = None,
+        system_prompt: str | None = None,
     ) -> str:
         """Drop only oldest complete exchanges until the model input fits."""
 
         retained = list(messages)
         tokenizer = self.model_service.tokenizer
-        token_limit = int(getattr(self.model_service, "max_input_tokens", 4_096))
+        token_limit = min(
+            int(getattr(self.model_service, "max_input_tokens", 4_096)),
+            INTERACTIVE_MAX_INPUT_TOKENS,
+        )
+        prompt_context = self.system_prompt if system_prompt is None else system_prompt
         while True:
             rendered = render_chat_prompt(
                 tokenizer,
-                self.system_prompt,
+                prompt_context,
                 retained,
                 partial_assistant=partial_assistant,
             )
@@ -565,7 +950,8 @@ class AgentManager:
                 retained = retained[2:]
                 continue
             raise ModelServiceError(
-                "the current chat turn exceeds the 4,096-token local context bound"
+                f"the current chat turn exceeds the {token_limit:,}-token "
+                "interactive context bound"
             )
 
     def _generation_stream(self, prompt: str, max_new_tokens: int) -> Any:
@@ -574,28 +960,49 @@ class AgentManager:
                 prompt,
                 max_new_tokens=max_new_tokens,
                 stop_token_ids=self._response_stop_ids,
+                conversation_id=self.session_id,
             )
         except TypeError:
-            # Only lightweight injected legacy backends omit the v2 keyword.
-            return self.model_service.iter_generate_tokens(
-                prompt,
-                max_new_tokens=max_new_tokens,
-            )
+            try:
+                # Lightweight injected v2 backends may not expose the
+                # production conversation capability keyword.
+                return self.model_service.iter_generate_tokens(
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    stop_token_ids=self._response_stop_ids,
+                )
+            except TypeError:
+                # Only legacy test backends omit both v2 keywords.
+                return self.model_service.iter_generate_tokens(
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                )
 
-    def _decode(self, chunks: list[torch.Tensor]) -> str:
+    def _decode(self, chunks: list[torch.Tensor]) -> tuple[str, bool]:
         if not chunks:
-            return ""
+            return "", False
         tokens = torch.cat(chunks)
-        return decode_response(
-            self.model_service.tokenizer,
-            tokens,
-            self._response_stop_ids,
+        public_tokens, repeated = truncate_repeated_tokens(tokens)
+        return (
+            decode_response(
+                self.model_service.tokenizer,
+                public_tokens,
+                self._response_stop_ids,
+            ),
+            repeated,
         )
 
     def _response_budget(
         self, message: str, *, resume_truncated: bool
     ) -> ResponseBudget:
         lowered = message.casefold()
+        if not resume_truncated and _CONCISE_INTENT_RE.search(message) is not None:
+            concise = min(self.max_new_tokens, DEFAULT_CONCISE_RESPONSE_TOKENS)
+            return ResponseBudget(
+                first_request=max(1, concise),
+                total=min(self.max_total_new_tokens, max(1, concise * 3)),
+                max_continuations=0,
+            )
         detail_score = sum(term in lowered for term in _DETAILED_INTENT_TERMS)
         if resume_truncated or detail_score >= 2 or len(message) >= 600:
             first = self.max_new_tokens
@@ -619,6 +1026,21 @@ class AgentManager:
         return "stop"
 
     @staticmethod
+    def _strip_leading_user_echo(text: str, message: str) -> tuple[str, bool]:
+        """Remove one exact whitespace-normalized restatement of the user turn."""
+
+        words = message.split()
+        if len(words) < 4 or len(message.strip()) < 12:
+            return text, False
+        pattern = re.compile(
+            r"\A\s*" + r"\s+".join(re.escape(word) for word in words) + r"\s*"
+        )
+        matched = pattern.match(text)
+        if matched is None:
+            return text, False
+        return text[matched.end() :].lstrip(), True
+
+    @staticmethod
     def _clean_model_text(text: str) -> tuple[str, bool]:
         """Remove model headers and stop at the next generated chat role."""
 
@@ -628,9 +1050,18 @@ class AgentManager:
         turn_start = _TURN_START_BOUNDARY_RE.search(normalized)
         role_marker = _ROLE_BOUNDARY_RE.search(normalized)
         reserved = _RESERVED_OUTPUT_RE.search(normalized)
+        factbook_echo = _FACTBOOK_ECHO_RE.search(normalized)
+        repair_echo = _QUALITY_REPAIR_ECHO_RE.search(normalized)
         boundaries = [
             match.start()
-            for match in (turn_token, turn_start, role_marker, reserved)
+            for match in (
+                turn_token,
+                turn_start,
+                role_marker,
+                reserved,
+                factbook_echo,
+                repair_echo,
+            )
             if match is not None
         ]
         if boundaries:
@@ -650,7 +1081,7 @@ class AgentManager:
             addition = addition[len(base) :].lstrip()
             if not addition:
                 return base
-        overlap_limit = min(len(base), len(addition), 512)
+        overlap_limit = min(len(base), len(addition), 2_048)
         overlap = 0
         for size in range(overlap_limit, 7, -1):
             if base.endswith(addition[:size]):
@@ -666,6 +1097,92 @@ class AgentManager:
         else:
             separator = ""
         return base + separator + addition
+
+    @staticmethod
+    def _trim_repeated_text(text: str) -> tuple[str, bool]:
+        """Remove only exact, adjacent sentence-block cycles.
+
+        Long blocks are cut on their second copy; short blocks need three
+        copies. Code fences, tables, and explicit list items are excluded so
+        meaningful structured repetition is preserved.
+        """
+
+        if len(text) < 6:
+            return text, False
+        units: list[tuple[str, int, int]] = []
+        for match in _SENTENCE_UNIT_RE.finditer(text):
+            normalized = re.sub(r"\s+", " ", match.group(0)).strip()
+            normalized = normalized.rstrip(" .!?。！？")
+            if normalized:
+                units.append((normalized, match.start(), match.end()))
+        if len(units) < 2:
+            return text, False
+        maximum = min(16, len(units) // 2)
+        for block_size in range(maximum, 0, -1):
+            for first in range(0, len(units) - block_size * 2 + 1):
+                pattern = tuple(unit[0] for unit in units[first : first + block_size])
+                pattern_chars = len(" ".join(pattern))
+                copies = 2 if pattern_chars >= 24 else 3
+                if first + block_size * copies > len(units):
+                    continue
+                if any(
+                    tuple(
+                        unit[0]
+                        for unit in units[
+                            first + copy * block_size : first + (copy + 1) * block_size
+                        ]
+                    )
+                    != pattern
+                    for copy in range(1, copies)
+                ):
+                    continue
+                raw_block = text[units[first][1] : units[first + block_size - 1][2]]
+                if _STRUCTURED_REPEAT_RE.search(raw_block):
+                    continue
+                second_start = units[first + block_size][1]
+                return text[:second_start].rstrip(), True
+        return text, False
+
+    @staticmethod
+    def _complete_prefix(text: str, cutoff: int | None = None) -> str:
+        """Return only a quality-clean prefix ending at an observed boundary."""
+
+        limit = len(text) if cutoff is None else max(0, min(len(text), cutoff))
+        candidate = text[:limit].rstrip()
+        if (
+            cutoff is None
+            and candidate
+            and inspect_response(candidate, final=True).recommended_action
+            is QualityAction.ACCEPT
+        ):
+            return candidate
+        boundaries = list(
+            re.finditer(r"(?:[.!?。！？]+(?=\s|$)|\n{2,})", text[:limit])
+        )[-64:]
+        for boundary in reversed(boundaries):
+            candidate = text[: boundary.end()].rstrip()
+            if (
+                candidate
+                and inspect_response(candidate, final=True).recommended_action
+                is QualityAction.ACCEPT
+            ):
+                return candidate
+        return ""
+
+    @staticmethod
+    def _close_repetition_boundary(text: str) -> str:
+        """Finish a token-cycle cut without inventing new answer content."""
+
+        value = text.rstrip()
+        if not value or value.endswith((".", "!", "?", "。", "！", "？")):
+            return value
+        if value.endswith((",", ";", ":", "，", "；", "：", "-", "—")):
+            boundary = max(
+                value.rfind(mark) for mark in (".", "!", "?", "。", "！", "？")
+            )
+            if boundary >= 0 and len(value) - boundary <= 256:
+                return value[: boundary + 1].rstrip()
+        return value + "."
 
     @staticmethod
     def _clip_response(text: str) -> tuple[str, bool]:
@@ -779,6 +1296,7 @@ class AgentManager:
         continuations: int = 0,
         truncated: bool = False,
         generated_tokens: int = 0,
+        generation_mode: str | None = None,
     ) -> None:
         with self._condition:
             for message in self._messages:
@@ -789,6 +1307,13 @@ class AgentManager:
                     message["continuations"] = max(0, int(continuations))
                     message["truncated"] = bool(truncated)
                     message["generated_tokens"] = max(0, int(generated_tokens))
+                    if generation_mode is not None:
+                        if generation_mode not in {
+                            "cogni_core",
+                            "quality_fallback",
+                        }:
+                            raise ValueError("generation_mode is invalid")
+                        message["generation_mode"] = generation_mode
                     return
             raise RuntimeError("streaming message ownership was lost")
 
@@ -813,13 +1338,21 @@ class AgentManager:
         continuations: int = 0,
         truncated: bool = False,
         generated_tokens: int = 0,
+        generation_mode: str | None = None,
     ) -> dict[str, Any]:
+        if generation_mode not in {
+            None,
+            "cogni_core",
+            "quality_fallback",
+        }:
+            raise ValueError("generation_mode is invalid")
         return {
             "state": state,
             "finish_reason": finish_reason,
             "continuations": max(0, int(continuations)),
             "truncated": bool(truncated),
             "generated_tokens": max(0, int(generated_tokens)),
+            "generation_mode": generation_mode,
         }
 
     @staticmethod

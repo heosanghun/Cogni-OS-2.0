@@ -11,6 +11,7 @@ PHASES = (
     ("loading_model", 15),
     ("building_runtime", 65),
     ("running_inference", 75),
+    ("validating_decode_bridge", 88),
     ("postcheck", 95),
 )
 
@@ -34,6 +35,23 @@ def metrics() -> dict:
         "transition_converged": True,
         "transition_residual": 0.00390625,
         "transition_used_fallback": False,
+        "cts_protocol_version": "SearchRequestV2",
+        "safe_for_decode": True,
+        "unsafe_silent_fallbacks": 0,
+        "linear_solve_fallbacks": 0,
+        "solver_rank": 16,
+        "solver_history_peak": 16,
+        "solver_failures": 0,
+        "failed_edges": 0,
+        "q_zero_backups": 0,
+        "mac_budget": 1000,
+        "mac_reserved": 900,
+        "act_applied": 301,
+        "trace_digest": "a" * 64,
+        "causal_bridge_answer_bearing": True,
+        "causal_bridge_bias_nonzero": True,
+        "causal_bridge_bias_max": 0.04980469,
+        "conditioned_generated_tokens": 1,
         "peak_vram_gib": 14.856,
         "vram_limit_gib": 16.7,
         "finite": True,
@@ -50,7 +68,7 @@ def main() -> int:
         print(SENTINEL + "{", flush=True)
         return 0
     if mode == "hang":
-        emit({"v": 1, "seq": 1, "kind": "phase", "stage": "verifying", "progress": 5})
+        emit({"v": 2, "seq": 1, "kind": "phase", "stage": "verifying", "progress": 5})
         sleep(60)
         return 0
     if mode == "stderr_flood":
@@ -63,7 +81,7 @@ def main() -> int:
         sequence += 1
         emit(
             {
-                "v": 1,
+                "v": 2,
                 "seq": sequence,
                 "kind": "phase",
                 "stage": stage,
@@ -75,7 +93,7 @@ def main() -> int:
     if mode == "over_vram":
         result["peak_vram_gib"] = 17.0
     event = {
-        "v": 1,
+        "v": 2,
         "seq": sequence,
         "kind": "result",
         "stage": "complete",

@@ -75,14 +75,18 @@ def _token_id(tokenizer: Any, token: str) -> int | None:
 def is_gemma4_tokenizer(tokenizer: Any) -> bool:
     """Return True only when the tokenizer exposes the required turn tokens."""
 
-    return all(_token_id(tokenizer, token) is not None for token in _REQUIRED_CONTROL_TOKENS)
+    return all(
+        _token_id(tokenizer, token) is not None for token in _REQUIRED_CONTROL_TOKENS
+    )
 
 
 def _neutralize_control_tokens(text: str, tokenizer: Any) -> str:
     if not isinstance(text, str) or not text:
         raise PromptContractError("chat content must be non-empty text")
     if any(ord(character) < 32 and character not in "\t\r\n" for character in text):
-        raise PromptContractError("chat content contains unsupported control characters")
+        raise PromptContractError(
+            "chat content contains unsupported control characters"
+        )
     candidates = list(_KNOWN_CONTROL_TOKENS)
     extra = getattr(tokenizer, "all_special_tokens", ())
     if isinstance(extra, (list, tuple)):

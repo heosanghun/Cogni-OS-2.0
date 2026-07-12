@@ -39,6 +39,15 @@ constraint_agents = 7
 state_dim = 64
 local_margin = 0.90
 coupling_scale = 0.05
+global_margin = 0.95
+operating_margin = 0.78
+cold_steps = 64
+warm_steps = 32
+residual_tolerance = 1.0e-4
+certificate_power_iterations = 16
+session_capacity = 16
+session_ttl_seconds = 900.0
+session_max_state_mib = 64
 
 [experts]
 max_experts = 8

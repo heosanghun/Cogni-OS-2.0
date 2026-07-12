@@ -12,6 +12,7 @@ class TestValidationScriptBootstrap(unittest.TestCase):
     def test_readme_direct_commands_import_checkout_from_any_working_directory(self):
         root = Path(__file__).resolve().parents[1]
         scripts = (
+            "validate_agent_completion.py",
             "validate_gemma4.py",
             "validate_gemma4_deq.py",
             "validate_gemma4_runtime.py",
@@ -41,6 +42,35 @@ class TestValidationScriptBootstrap(unittest.TestCase):
                         msg=completed.stdout + completed.stderr,
                     )
                     self.assertIn("usage:", completed.stdout.lower())
+
+    def test_agent_completion_checks_reject_repeated_sentences(self):
+        from scripts.validate_agent_completion import _answer_checks
+
+        state = {"status": "succeeded", "stage": "complete"}
+        answer = {
+            "content": "한 번만 자연스럽게 설명하고 끝냅니다.",
+            "finish_reason": "stop",
+            "truncated": False,
+        }
+        self.assertTrue(all(_answer_checks(answer, state).values()))
+        answer["content"] = (
+            "같은 문장을 반복해서 출력하면 안 됩니다. "
+            "같은 문장을 반복해서 출력하면 안 됩니다"
+        )
+        self.assertFalse(_answer_checks(answer, state)["no_repeated_sentence"])
+
+    def test_agent_completion_checks_reject_empty_list_and_underfilled_request(self):
+        from scripts.validate_agent_completion import _answer_checks
+
+        state = {"status": "succeeded", "stage": "complete"}
+        answer = {
+            "content": "원칙은 다음과 같습니다:\n\n1.",
+            "finish_reason": "stop",
+            "truncated": False,
+        }
+        checks = _answer_checks(answer, state, "원칙을 두 문장으로 설명하세요.")
+        self.assertFalse(checks["korean_complete"])
+        self.assertFalse(checks["request_contract_fulfilled"])
 
 
 if __name__ == "__main__":

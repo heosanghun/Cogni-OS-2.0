@@ -107,6 +107,41 @@ def load_config(path: str | Path | None = None) -> CogniConfig:
     if int(fast["session_capacity"]) < 1:
         raise ValueError("fast_weights.session_capacity must be positive")
 
+    swarm = data["swarm"]
+    partition = (
+        int(swarm["agents"]),
+        int(swarm["sensory_agents"]),
+        int(swarm["constraint_agents"]),
+    )
+    if partition != (28, 11, 7):
+        raise ValueError(
+            "certified swarm requires 28 agents: 11 sensory, 10 reasoning, 7 constraint"
+        )
+    local_margin = float(swarm["local_margin"])
+    coupling_scale = float(swarm["coupling_scale"])
+    global_margin = float(swarm["global_margin"])
+    operating_margin = float(swarm["operating_margin"])
+    if not 0.0 < coupling_scale < local_margin < global_margin < 1.0:
+        raise ValueError("swarm local/coupling/global margins are inconsistent")
+    if not 0.0 < operating_margin < global_margin:
+        raise ValueError("swarm operating_margin must be inside global_margin")
+    cold_steps = int(swarm["cold_steps"])
+    warm_steps = int(swarm["warm_steps"])
+    if not 3 <= warm_steps <= cold_steps:
+        raise ValueError(
+            "swarm solver budgets must satisfy 3 <= warm_steps <= cold_steps"
+        )
+    if not 0.0 < float(swarm["residual_tolerance"]) < 1.0:
+        raise ValueError("swarm residual_tolerance must be in (0, 1)")
+    if int(swarm["certificate_power_iterations"]) < 2:
+        raise ValueError("swarm certificate_power_iterations must be at least two")
+    if int(swarm["session_capacity"]) < 1:
+        raise ValueError("swarm.session_capacity must be positive")
+    if float(swarm["session_ttl_seconds"]) <= 0.0:
+        raise ValueError("swarm.session_ttl_seconds must be positive")
+    if int(swarm["session_max_state_mib"]) < 1:
+        raise ValueError("swarm.session_max_state_mib must be positive")
+
     if data["flow"].get("require_kernel_sandbox_for_production") is not True:
         raise ValueError("flow kernel sandbox requirement cannot be disabled")
     return CogniConfig(data)

@@ -68,6 +68,13 @@ class VRAMGuard:
             )
         free_bytes, _ = torch.cuda.mem_get_info(self.device)
         if estimated_additional_bytes > free_bytes:
+            # PyTorch may retain unused allocator blocks after a long decode.
+            # They count as unavailable physical memory even though no live
+            # tensor owns them. Release only that cache and re-measure once;
+            # live allocations remain protected by the hard limit above.
+            torch.cuda.empty_cache()
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        if estimated_additional_bytes > free_bytes:
             raise ResourceBudgetExceeded(
                 f"VRAM admission rejected by physical free memory: "
                 f"free={free_bytes}, requested={estimated_additional_bytes}"

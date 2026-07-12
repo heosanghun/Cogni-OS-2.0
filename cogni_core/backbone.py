@@ -379,6 +379,75 @@ class GemmaDEQBackboneAdapter(nn.Module):
         return (result,) if self._returns_tuple else result
 
 
+_TEXT_MODEL_PATHS = (
+    "model.model.language_model.model",
+    "model.language_model.model",
+    "model.model.language_model",
+    "model.language_model",
+    "language_model.model",
+    "language_model",
+    "model.model",
+    "model",
+)
+
+
+def _module_at_path(root: nn.Module, path: str) -> nn.Module | None:
+    node: Any = root
+    if not path:
+        return root
+    for component in path.split("."):
+        node = getattr(node, component, None)
+        if node is None:
+            return None
+    return node if isinstance(node, nn.Module) else None
+
+
+def _owns_language_model_head(module: nn.Module) -> bool:
+    if isinstance(getattr(module, "lm_head", None), nn.Module):
+        return True
+    getter = getattr(module, "get_output_embeddings", None)
+    if not callable(getter):
+        return False
+    try:
+        return isinstance(getter(), nn.Module)
+    except Exception as exc:
+        raise DecoderLayerContractError(
+            "could not prove that contextual text model has no output head"
+        ) from exc
+
+
+def _find_contextual_text_model_path(model: nn.Module) -> str:
+    """Find an explicit head-less text stack without calling top-level logits."""
+
+    top_level_has_head: bool | None = None
+    for path in _TEXT_MODEL_PATHS:
+        candidate = _module_at_path(model, path)
+        if candidate is None:
+            continue
+        # ``.model`` is the lower text stack on causal-LM wrappers, but an
+        # arbitrary head-less container may also expose that name. Only use
+        # this generic fallback when the root is provably the headed wrapper.
+        if path in {"model", "model.model"}:
+            if top_level_has_head is None:
+                top_level_has_head = _owns_language_model_head(model)
+            if not top_level_has_head:
+                continue
+        if type(candidate).forward is nn.Module.forward:
+            continue
+        if _owns_language_model_head(candidate):
+            continue
+        return path
+    raise DecoderLayerContractError(
+        "could not locate a head-less lower Gemma text model for contextual tokens"
+    )
+
+
+def _output_field(output: Any, name: str) -> Any:
+    if isinstance(output, Mapping):
+        return output.get(name)
+    return getattr(output, name, None)
+
+
 class LocalGemmaFeatureBackbone(nn.Module):
     """Expose one fixed-size, cache-free latent per local Gemma request.
 
@@ -388,13 +457,30 @@ class LocalGemmaFeatureBackbone(nn.Module):
     ``[batch, hidden]`` and its arena allocation independent of token count.
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, *, contextual_tokens: bool = False):
         super().__init__()
+        if not isinstance(model, nn.Module):
+            raise TypeError("model must be a torch.nn.Module")
+        if not isinstance(contextual_tokens, bool):
+            raise TypeError("contextual_tokens must be bool")
         self.model = model
+        self.contextual_tokens = contextual_tokens
+        self._contextual_text_model_path = (
+            _find_contextual_text_model_path(model) if contextual_tokens else None
+        )
         self.model.eval()
-        config = getattr(self.model, "config", None)
-        if config is not None and hasattr(config, "use_cache"):
-            config.use_cache = False
+        configured_modules = [self.model]
+        if self._contextual_text_model_path is not None:
+            contextual_model = _module_at_path(
+                self.model, self._contextual_text_model_path
+            )
+            if contextual_model is None:  # path was checked immediately above
+                raise DecoderLayerContractError("contextual text model disappeared")
+            configured_modules.append(contextual_model)
+        for configured in configured_modules:
+            config = getattr(configured, "config", None)
+            if config is not None and hasattr(config, "use_cache"):
+                config.use_cache = False
 
     def train(self, mode: bool = True) -> LocalGemmaFeatureBackbone:
         super().train(mode)
@@ -402,6 +488,8 @@ class LocalGemmaFeatureBackbone(nn.Module):
         return self
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        if self.contextual_tokens:
+            return self._forward_contextual_tokens(*args, **kwargs)
         attention_mask = kwargs.get("attention_mask")
         input_ids = args[0] if args else kwargs.get("input_ids")
         embedding_getter = getattr(self.model, "get_input_embeddings", None)
@@ -416,16 +504,15 @@ class LocalGemmaFeatureBackbone(nn.Module):
                 raise DecoderLayerContractError(
                     "local Gemma token embedding must have [batch, sequence, hidden] shape"
                 )
-            if (
-                isinstance(attention_mask, Tensor)
-                and tuple(attention_mask.shape) == tuple(embeddings.shape[:2])
-            ):
+            if isinstance(attention_mask, Tensor) and tuple(
+                attention_mask.shape
+            ) == tuple(embeddings.shape[:2]):
                 weights = attention_mask.to(
                     device=embeddings.device, dtype=embeddings.dtype
                 ).unsqueeze(-1)
-                return (embeddings * weights).sum(dim=1) / weights.sum(
-                    dim=1
-                ).clamp_min(1)
+                return (embeddings * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(
+                    1
+                )
             return embeddings.mean(dim=1)
         kwargs["use_cache"] = False
         kwargs["output_hidden_states"] = True
@@ -447,6 +534,143 @@ class LocalGemmaFeatureBackbone(nn.Module):
             weights = weights.unsqueeze(-1)
             return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
         return hidden.flatten(1, -2).mean(dim=1)
+
+    def _forward_contextual_tokens(self, *args: Any, **kwargs: Any) -> Tensor:
+        if len(args) > 1:
+            raise DecoderLayerContractError(
+                "contextual token mode accepts only one positional input_ids tensor"
+            )
+        call_kwargs = dict(kwargs)
+        if args and "input_ids" in call_kwargs:
+            raise DecoderLayerContractError("input_ids were supplied twice")
+        input_ids = args[0] if args else call_kwargs.pop("input_ids", None)
+        if (
+            not isinstance(input_ids, Tensor)
+            or input_ids.ndim != 2
+            or input_ids.shape[0] == 0
+            or input_ids.shape[1] == 0
+            or torch.is_floating_point(input_ids)
+            or torch.is_complex(input_ids)
+        ):
+            raise DecoderLayerContractError(
+                "contextual input_ids must be a non-empty integer [batch, sequence] tensor"
+            )
+
+        for name in ("past_key_value", "past_key_values", "cache", "kv_cache"):
+            supplied = call_kwargs.pop(name, None)
+            if supplied is not None:
+                raise DecoderLayerContractError(
+                    f"contextual token mode forbids caller-supplied {name}"
+                )
+        for name in ("use_cache", "output_hidden_states", "return_dict"):
+            call_kwargs.pop(name, None)
+        allowed = {
+            "attention_mask",
+            "position_ids",
+            "per_layer_inputs",
+            "cache_position",
+        }
+        unexpected = sorted(set(call_kwargs).difference(allowed))
+        if unexpected:
+            raise DecoderLayerContractError(
+                "unsupported contextual text arguments: " + ", ".join(unexpected)
+            )
+
+        attention_mask = call_kwargs.get("attention_mask")
+        if attention_mask is not None:
+            if (
+                not isinstance(attention_mask, Tensor)
+                or tuple(attention_mask.shape) != tuple(input_ids.shape)
+                or attention_mask.device != input_ids.device
+            ):
+                raise DecoderLayerContractError(
+                    "contextual attention_mask must match input_ids shape and device"
+                )
+            if torch.is_floating_point(attention_mask) and not bool(
+                torch.isfinite(attention_mask).all()
+            ):
+                raise DecoderLayerContractError(
+                    "contextual attention_mask must contain finite values"
+                )
+
+        path = self._contextual_text_model_path
+        if path is None:
+            raise DecoderLayerContractError("contextual text model is not configured")
+        text_model = _module_at_path(self.model, path)
+        if text_model is None or _owns_language_model_head(text_model):
+            raise DecoderLayerContractError(
+                "contextual text model path no longer resolves to a head-less module"
+            )
+        output = text_model(
+            input_ids=input_ids,
+            **call_kwargs,
+            use_cache=False,
+            # ``last_hidden_state`` is the only answer-bearing tensor needed
+            # here. Capturing every decoder layer would retain 43 sequence
+            # activations on the 42-layer production Gemma 4 model.
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        if isinstance(output, tuple):
+            raise DecoderLayerContractError(
+                "contextual text model ignored return_dict=True"
+            )
+        for name in (
+            "past_key_value",
+            "past_key_values",
+            "cache",
+            "kv_cache",
+            "shared_kv_states",
+        ):
+            if _output_field(output, name) is not None:
+                raise DecoderLayerContractError(
+                    f"contextual text model returned forbidden {name} state"
+                )
+
+        hidden = extract_hidden_states(output)
+        if (
+            hidden.ndim != 3
+            or tuple(hidden.shape[:2]) != tuple(input_ids.shape)
+            or hidden.shape[-1] == 0
+            or not torch.is_floating_point(hidden)
+            or hidden.device != input_ids.device
+            or not bool(torch.isfinite(hidden).all())
+        ):
+            raise DecoderLayerContractError(
+                "contextual hidden state must be finite floating [batch, sequence, hidden]"
+            )
+
+        if attention_mask is None:
+            last_indices = torch.full(
+                (input_ids.shape[0],),
+                input_ids.shape[1] - 1,
+                device=input_ids.device,
+                dtype=torch.int64,
+            )
+        else:
+            valid = attention_mask != 0
+            positions = torch.arange(
+                input_ids.shape[1], device=input_ids.device, dtype=torch.int64
+            ).expand(input_ids.shape[0], -1)
+            last_indices = torch.where(
+                valid,
+                positions,
+                torch.full_like(positions, -1),
+            ).amax(dim=1)
+            if bool((last_indices < 0).any()):
+                raise DecoderLayerContractError(
+                    "each contextual sequence must contain at least one valid token"
+                )
+        pooled = hidden[
+            torch.arange(input_ids.shape[0], device=input_ids.device), last_indices
+        ]
+        if tuple(pooled.shape) != (input_ids.shape[0], hidden.shape[-1]) or not bool(
+            torch.isfinite(pooled).all()
+        ):
+            raise DecoderLayerContractError(
+                "last-token contextual pooling produced an invalid latent"
+            )
+        return pooled
 
 
 def find_decoder_layers(model: nn.Module) -> nn.ModuleList:

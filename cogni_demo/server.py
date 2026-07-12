@@ -2063,6 +2063,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             open_graphical_app(existing.bootstrap_url)
         return 0
 
+    # Validate the content-addressed CTS policy in the actual backend process
+    # before binding HTTP or publishing session metadata. The native launcher
+    # preflight is diagnostic only and cannot authorize this later process.
+    from cogni_core.cts_policy import load_default_bounded_cts_controller
+
+    load_default_bounded_cts_controller(device="cpu")
+
     gpu_lease_manager = GPULeaseManager()
     rhythm = RhythmController()
     manager = JobManager(

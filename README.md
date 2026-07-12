@@ -1,7 +1,7 @@
-# Cogni-OS 2.0 Genesis — v0.3.0
+# Cogni-OS 2.0 Genesis — v0.3.1
 
 Cogni-OS 2.0 is an offline, bounded research runtime for a verified local
-dense Gemma 4 E4B artifact. Version 0.3.0 connects conversation integrity,
+dense Gemma 4 E4B artifact. Version 0.3.1 connects conversation integrity,
 causal DEQ/CTS conditioning, typed local tasks, bounded research workflows,
 and a **proposal-only** Self-Harness behind explicit capability and evidence
 states.
@@ -12,7 +12,7 @@ passing component test never upgrades a capability by itself.
 
 ## Product authority at a glance
 
-| Capability | v0.3.0 state | May affect the answer? | What is still required |
+| Capability | v0.3.1 state | May affect the answer? | What is still required |
 |---|---|---:|---|
 | verified local Gemma 4 E4B | `authoritative` | yes | exact local artifact and manifest |
 | causal CTS/DEQ bridge | `canary` | yes, bounded logits bias | trained adapter/Wproj and independent held-out evidence for promotion |
@@ -89,17 +89,22 @@ python scripts\benchmark_system4.py `
 
 ## Windows launcher
 
-Build the v0.3.0 launcher from the exact source tree:
+Build the v0.3.1 launcher from the exact source tree:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_windows_launcher.ps1 `
-  -OutputPath release\CogniBoard-v0.3.0.exe
+  -OutputPath release\CogniBoard-v0.3.1.exe
 ```
 
 The launcher is a console-free bootstrapper, not a standalone model bundle. It
 requires this source tree, local Python/CUDA dependencies, and the verified
 model plus manifest. The binary is not code-signed in this research release.
-Do not use older release assets as v0.3.0 evidence.
+Do not use older release assets as v0.3.1 evidence.
+
+Korean operator documentation: [`docs/COGNIBOARD_USER_MANUAL_PLAYBOOK_KO.md`](docs/COGNIBOARD_USER_MANUAL_PLAYBOOK_KO.md).
+
+The v0.3.1 distribution-integrity validation addendum is
+[`release/COGNI_OS_0.3.1_VALIDATION_ADDENDUM_KO.md`](release/COGNI_OS_0.3.1_VALIDATION_ADDENDUM_KO.md).
 
 ## Runtime boundaries
 
@@ -111,7 +116,7 @@ Do not use older release assets as v0.3.0 evidence.
 - Local tasks execute only typed, allowlisted operations. Natural language is
   never passed to a shell.
 - AFlow can only create a bounded research archive.
-- Self-Harness stores inert proposals and cannot install them in v0.3.0.
+- Self-Harness stores inert proposals and cannot install them in v0.3.1.
 - The graphical server is loopback-only, uses per-session authentication and
   local allowlisted assets, and has no CDN or analytics dependency.
 

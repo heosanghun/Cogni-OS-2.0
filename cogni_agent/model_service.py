@@ -110,6 +110,37 @@ _FINISH_REASON_NAMES = {
     FINISH_ERROR: "error",
 }
 
+# Startup diagnostics cross the process boundary as one packed int64 value,
+# never as exception text. The upper bits hold the last startup stage and the
+# low byte holds a coarse error class. One shared scalar avoids a torn
+# stage/error observation across processes.
+_STARTUP_STAGE_CODES = {
+    "worker_startup": 1,
+    "worker_authority": 2,
+    "model_factory": 3,
+    "prepare_base_model": 4,
+    "core_pipeline_factory": 5,
+    "base_signature": 6,
+    "model_device": 7,
+    "product_factory_check": 8,
+    "ready": 100,
+}
+_STARTUP_STAGE_LABELS = {
+    1: "worker bootstrap",
+    2: "GPU lease authority verification",
+    3: "verified local model loading",
+    4: "base-model preparation",
+    5: "Cogni-Core pipeline initialization",
+    6: "base-model integrity signature",
+    7: "model device verification",
+    8: "product factory verification",
+    100: "ready publication",
+}
+_STARTUP_ERROR_NONE = 0
+_STARTUP_ERROR_GENERAL = 1
+_STARTUP_ERROR_CTS_CHECKPOINT = 2
+_STARTUP_ERROR_GPU_MEMORY = 3
+
 
 class ModelServiceError(RuntimeError):
     """Base error for the local generation service."""
@@ -256,6 +287,66 @@ def _worker_authority_tensor(artifact_digest: Tensor) -> Tensor:
     return torch.cat(
         (torch.zeros(2, dtype=torch.int64), artifact_digest.clone())
     ).contiguous()
+
+
+def _worker_startup_status_tensor() -> Tensor:
+    return torch.zeros(1, dtype=torch.int64).share_memory_()
+
+
+def _record_worker_startup_status(
+    status: Tensor | None,
+    stage: str,
+    *,
+    error_code: int = _STARTUP_ERROR_NONE,
+) -> None:
+    if status is None:
+        return
+    if (
+        not isinstance(status, Tensor)
+        or status.device.type != "cpu"
+        or status.dtype != torch.int64
+        or status.shape != (1,)
+        or not status.is_contiguous()
+    ):
+        raise WorkerStartupError("worker startup status tensor is invalid")
+    stage_code = _STARTUP_STAGE_CODES.get(stage)
+    if stage_code is None:
+        raise WorkerStartupError("worker startup stage is unknown")
+    if error_code not in {
+        _STARTUP_ERROR_NONE,
+        _STARTUP_ERROR_GENERAL,
+        _STARTUP_ERROR_CTS_CHECKPOINT,
+        _STARTUP_ERROR_GPU_MEMORY,
+    }:
+        raise WorkerStartupError("worker startup error code is unknown")
+    status[0] = (int(stage_code) << 8) | int(error_code)
+
+
+def _worker_startup_failure_message(status: Tensor | None) -> str:
+    if (
+        not isinstance(status, Tensor)
+        or status.device.type != "cpu"
+        or status.dtype != torch.int64
+        or status.shape != (1,)
+        or not status.is_contiguous()
+    ):
+        return "local model worker failed to initialize"
+    try:
+        packed = int(status[0].item())
+    except (RuntimeError, TypeError, ValueError):
+        return "local model worker failed to initialize"
+    if packed < 0:
+        return "local model worker failed to initialize"
+    stage_code = packed >> 8
+    error_code = packed & 0xFF
+    if error_code == _STARTUP_ERROR_CTS_CHECKPOINT:
+        return "CTS policy checkpoint integrity verification failed"
+    if error_code == _STARTUP_ERROR_GPU_MEMORY:
+        return "local model worker could not reserve bounded GPU memory"
+    stage = _STARTUP_STAGE_LABELS.get(stage_code)
+    if stage:
+        return f"local model worker failed during {stage}"
+    return "local model worker failed to initialize"
 
 
 def _parse_worker_authority(value: Tensor | None) -> tuple[int, int, Tensor]:
@@ -1172,29 +1263,38 @@ def _worker_main(
     max_input_tokens: int,
     core_workspace_bytes: int,
     worker_authority: Tensor | None = None,
+    startup_status: Tensor | None = None,
 ) -> None:
-    _force_offline_environment()
     stage = "worker_startup"
     try:
+        _force_offline_environment()
+        _record_worker_startup_status(startup_status, stage)
         stage = "worker_authority"
+        _record_worker_startup_status(startup_status, stage)
         expected_epoch, expected_lease_deadline, expected_artifact = (
             _parse_worker_authority(worker_authority)
         )
         stage = "model_factory"
+        _record_worker_startup_status(startup_status, stage)
         model = model_factory()
         stage = "prepare_base_model"
+        _record_worker_startup_status(startup_status, stage)
         _prepare_base_model(model)
         stage = "core_pipeline_factory"
+        _record_worker_startup_status(startup_status, stage)
         pipeline = (
             None if core_pipeline_factory is None else core_pipeline_factory(model)
         )
         if pipeline is not None and not callable(getattr(pipeline, "run", None)):
             raise TypeError("core pipeline factory must return an object with run()")
         stage = "base_signature"
+        _record_worker_startup_status(startup_status, stage)
         base_signature = _parameter_signature(model)
         stage = "model_device"
+        _record_worker_startup_status(startup_status, stage)
         device = _model_device(model)
         stage = "product_factory_check"
+        _record_worker_startup_status(startup_status, stage)
         product_factory = (
             core_pipeline_factory
             if isinstance(core_pipeline_factory, LocalGemmaCorePipelineFactory)
@@ -1204,11 +1304,32 @@ def _worker_main(
         # immutable launch fence before advertising readiness.
         if expected_epoch and monotonic_ns() >= expected_lease_deadline:
             raise WorkerAuthorityError("GPU lease expired during model loading")
+        stage = "ready"
+        _record_worker_startup_status(startup_status, stage)
+        ready_event.set()
     except BaseException as error:
-        _debug_worker_error(stage, error)
-        failed_event.set()
+        error_code = _STARTUP_ERROR_GENERAL
+        if isinstance(error, CTSCheckpointError):
+            error_code = _STARTUP_ERROR_CTS_CHECKPOINT
+        elif isinstance(error, getattr(torch, "OutOfMemoryError", ())):
+            error_code = _STARTUP_ERROR_GPU_MEMORY
+        try:
+            _record_worker_startup_status(
+                startup_status,
+                stage,
+                error_code=error_code,
+            )
+        except BaseException:
+            pass
+        try:
+            _debug_worker_error(stage, error)
+        except BaseException:
+            pass
+        try:
+            failed_event.set()
+        except BaseException:
+            pass
         return
-    ready_event.set()
     last_request_id = 0
     seen_job_ids: set[int] = set()
 
@@ -1548,6 +1669,7 @@ class ModelService:
         self._failed_event: Any = None
         self._gpu_lease: GPULease | None = None
         self._worker_authority: Tensor | None = None
+        self._startup_status: Tensor | None = None
         self._reserved_stop_sequences = reserved_stop_sequences(tokenizer)
 
     @classmethod
@@ -1579,7 +1701,10 @@ class ModelService:
     @property
     def is_running(self) -> bool:
         process = self._process
-        return bool(process is not None and process.is_alive())
+        try:
+            return bool(process is not None and process.is_alive())
+        except (AssertionError, OSError, ValueError):
+            return False
 
     @property
     def worker_pid(self) -> int | None:
@@ -1647,111 +1772,188 @@ class ModelService:
         )
 
     def start(self) -> ModelService:
+        def process_alive(candidate: Any) -> bool:
+            try:
+                return bool(candidate is not None and candidate.is_alive())
+            except BaseException:
+                return False
+
         with self._state_lock:
+            created_attempt = False
             if self._process is None and self._gpu_lease is not None:
                 raise WorkerExecutionError(
                     "GPU lease exists without a worker handle; death is unproven"
                 )
-            if self._process is not None:
-                if self.is_running:
-                    self._validate_running_gpu_lease()
-                    return self
+            if self._process is not None and not process_alive(self._process):
                 # A crashed worker must be reaped, its exact lease retired,
                 # and all old IPC closed before a successor gets a new epoch.
                 self.stop()
-            self._request_queue = self._context.Queue(maxsize=2)
-            self._response_queue = self._context.Queue(
-                maxsize=DEFAULT_RESPONSE_QUEUE_SIZE
-            )
-            self._cancel_event = self._context.Event()
-            self._ready_event = self._context.Event()
-            self._failed_event = self._context.Event()
-            self._worker_authority = _worker_authority_tensor(
-                self._artifact_digest_tensor
-            )
-            self._process = self._context.Process(
-                target=_worker_main,
-                args=(
-                    self.model_factory,
-                    self.core_pipeline_factory,
-                    self._request_queue,
-                    self._response_queue,
-                    self._cancel_event,
-                    self._ready_event,
-                    self._failed_event,
-                    self._reserved_stop_sequences,
-                    self.max_input_tokens,
-                    self.core_workspace_bytes,
-                    self._worker_authority,
-                ),
-                name="cogni-local-model",
-                daemon=True,
-            )
-            process = self._process
-            spawn_state = {"completed": False}
-            manager = self.gpu_lease_manager
-            if manager is not None:
-
-                def owner_alive() -> bool:
-                    # Between acquire() and Process.start(), is_alive() is
-                    # false even though the lease must remain fenced. Health
-                    # becomes process-backed only after spawn completes.
-                    if not spawn_state["completed"]:
-                        return True
+            if self._process is None:
+                created_attempt = True
+                try:
+                    self._request_queue = self._context.Queue(maxsize=2)
+                    self._response_queue = self._context.Queue(
+                        maxsize=DEFAULT_RESPONSE_QUEUE_SIZE
+                    )
+                    self._cancel_event = self._context.Event()
+                    self._ready_event = self._context.Event()
+                    self._failed_event = self._context.Event()
+                    self._worker_authority = _worker_authority_tensor(
+                        self._artifact_digest_tensor
+                    )
+                    self._startup_status = _worker_startup_status_tensor()
+                    self._process = self._context.Process(
+                        target=_worker_main,
+                        args=(
+                            self.model_factory,
+                            self.core_pipeline_factory,
+                            self._request_queue,
+                            self._response_queue,
+                            self._cancel_event,
+                            self._ready_event,
+                            self._failed_event,
+                            self._reserved_stop_sequences,
+                            self.max_input_tokens,
+                            self.core_workspace_bytes,
+                            self._worker_authority,
+                            self._startup_status,
+                        ),
+                        name="cogni-local-model",
+                        daemon=True,
+                    )
+                except BaseException as error:
                     try:
-                        return bool(process.is_alive())
-                    except BaseException:
-                        return True
-
-                try:
-                    self._gpu_lease = manager.acquire(
-                        self.gpu_lease_owner,
-                        self._current_gpu_purpose(),
-                        self.gpu_lease_vram_bytes,
-                        deadline=self._gpu_deadline(),
-                        owner_alive=owner_alive,
-                    )
-                    self._worker_authority[0] = self._gpu_lease.epoch
-                    self._worker_authority[1] = int(
-                        self._gpu_lease.deadline * 1_000_000_000
-                    )
-                except BaseException:
-                    # The process object exists but was never spawned. Reuse
-                    # the death-confirming cleanup path before propagating the
-                    # admission error.
-                    self.stop()
-                    raise
-            try:
-                process.start()
-            except BaseException as error:
-                try:
-                    self.stop()
-                except BaseException as cleanup_error:
+                        self.stop()
+                    except BaseException as cleanup_error:
+                        raise WorkerStartupError(
+                            "local model worker IPC setup failed and cleanup "
+                            "could not close the partial attempt"
+                        ) from cleanup_error
                     raise WorkerStartupError(
-                        "local model process spawn failed and cleanup could not "
-                        "confirm worker death"
-                    ) from cleanup_error
-                raise WorkerStartupError("local model process spawn failed") from error
-            spawn_state["completed"] = True
+                        "local model worker IPC setup failed"
+                    ) from error
+
+                process = self._process
+                spawn_state = {"completed": False}
+                manager = self.gpu_lease_manager
+                if manager is not None:
+
+                    def owner_alive() -> bool:
+                        # Between acquire() and Process.start(), is_alive() is
+                        # false even though the lease must remain fenced. Health
+                        # becomes process-backed only after spawn completes.
+                        if not spawn_state["completed"]:
+                            return True
+                        try:
+                            return bool(process.is_alive())
+                        except BaseException:
+                            return True
+
+                    try:
+                        self._gpu_lease = manager.acquire(
+                            self.gpu_lease_owner,
+                            self._current_gpu_purpose(),
+                            self.gpu_lease_vram_bytes,
+                            deadline=self._gpu_deadline(),
+                            owner_alive=owner_alive,
+                        )
+                        self._worker_authority[0] = self._gpu_lease.epoch
+                        self._worker_authority[1] = int(
+                            self._gpu_lease.deadline * 1_000_000_000
+                        )
+                    except BaseException:
+                        # The process object exists but was never spawned. Reuse
+                        # the death-confirming cleanup path before propagating the
+                        # admission error.
+                        self.stop()
+                        raise
+                try:
+                    process.start()
+                except BaseException as error:
+                    try:
+                        self.stop()
+                    except BaseException as cleanup_error:
+                        raise WorkerStartupError(
+                            "local model process spawn failed and cleanup could not "
+                            "confirm worker death"
+                        ) from cleanup_error
+                    raise WorkerStartupError(
+                        "local model process spawn failed"
+                    ) from error
+                spawn_state["completed"] = True
+            else:
+                process = self._process
+
+            ready_event = self._ready_event
+            failed_event = self._failed_event
+            startup_status = self._startup_status
+            if ready_event is None or failed_event is None or startup_status is None:
+                self.stop()
+                raise WorkerStartupError(
+                    "local model worker startup controls are incomplete"
+                )
+            if not created_attempt and ready_event.is_set():
+                if failed_event.is_set() or not process_alive(process):
+                    self.stop()
+                    raise WorkerStartupError(
+                        _worker_startup_failure_message(startup_status)
+                    )
+                # Re-validating an already resident worker must not destroy it
+                # when the caller presents a changed purpose/budget. The
+                # existing lease remains authoritative for its original scope.
+                self._validate_running_gpu_lease()
+                if failed_event.is_set() or not process_alive(process):
+                    self.stop()
+                    raise WorkerStartupError(
+                        _worker_startup_failure_message(startup_status)
+                    )
+                return self
+
+        def cleanup_attempt() -> None:
+            with self._state_lock:
+                if self._process is process:
+                    self.stop()
+
         deadline = monotonic() + self.startup_timeout
         while monotonic() < deadline:
-            if self._ready_event.is_set():
+            failed = failed_event.is_set()
+            alive = process_alive(process)
+            if failed or not alive:
+                cleanup_attempt()
+                raise WorkerStartupError(
+                    _worker_startup_failure_message(startup_status)
+                )
+            if ready_event.is_set():
+                liveness_failure = False
                 try:
                     with self._state_lock:
-                        self._validate_running_gpu_lease()
+                        if self._process is not process:
+                            raise WorkerStartupError(
+                                "local model worker startup was superseded"
+                            )
+                        if failed_event.is_set() or not process_alive(process):
+                            liveness_failure = True
+                        else:
+                            self._validate_running_gpu_lease()
+                            liveness_failure = failed_event.is_set() or not (
+                                process_alive(process)
+                            )
                 except BaseException:
                     # A purpose/budget/deadline change during model loading is
                     # a startup failure. Retire the process before surfacing
                     # the lease error so no unauthorized resident remains.
-                    self.stop()
+                    cleanup_attempt()
                     raise
+                if liveness_failure:
+                    cleanup_attempt()
+                    raise WorkerStartupError(
+                        _worker_startup_failure_message(startup_status)
+                    )
                 return self
-            if self._failed_event.is_set() or not self.is_running:
-                self.stop()
-                raise WorkerStartupError("local model worker failed to initialize")
             sleep(0.01)
-        self.stop()
-        raise WorkerStartupError("local model worker startup timed out")
+        cleanup_attempt()
+        stage = _worker_startup_failure_message(startup_status)
+        raise WorkerStartupError(f"local model worker startup timed out ({stage})")
 
     def iter_generate_tokens(
         self,
@@ -2027,8 +2229,29 @@ class ModelService:
                     raise WorkerExecutionError(
                         "GPU lease exists without a worker handle; capability retained"
                     )
+                # A setup failure can occur after one or both queues were
+                # allocated but before Process construction completed.
+                for queue in (self._request_queue, self._response_queue):
+                    if queue is not None:
+                        queue.close()
+                        queue.join_thread()
+                self._request_queue = None
+                self._response_queue = None
+                self._cancel_event = None
+                self._ready_event = None
+                self._failed_event = None
+                self._worker_authority = None
+                self._startup_status = None
+                self._active_request_id = None
                 return
             shutdown_errors: list[str] = []
+
+            def worker_alive() -> bool:
+                try:
+                    return bool(process.is_alive())
+                except (AssertionError, OSError, ValueError) as error:
+                    shutdown_errors.append(f"liveness check: {type(error).__name__}")
+                    return False
 
             def join_worker(stage: str, wait_seconds: float) -> None:
                 try:
@@ -2038,7 +2261,7 @@ class ModelService:
 
             if self._cancel_event is not None:
                 self._cancel_event.set()
-            if process.is_alive() and self._request_queue is not None:
+            if worker_alive() and self._request_queue is not None:
                 try:
                     self._request_queue.put(make_stop_request(), timeout=0.2)
                 except Full:
@@ -2051,14 +2274,14 @@ class ModelService:
             # Cooperative shutdown is always attempted first. A worker may be
             # loading a multi-gigabyte model, so the caller controls this wait.
             join_worker("graceful", float(timeout))
-            if process.is_alive():
+            if worker_alive():
                 try:
                     process.terminate()
                 except Exception as error:
                     shutdown_errors.append(f"terminate: {type(error).__name__}")
                 join_worker("terminate", 2.0)
 
-            if process.is_alive():
+            if worker_alive():
                 kill = getattr(process, "kill", None)
                 if callable(kill):
                     try:
@@ -2072,7 +2295,7 @@ class ModelService:
             # Never destroy IPC or forget a process that may still own CUDA.
             # Keeping every reference makes the failure observable and allows
             # a supervisor/operator to retry or inspect the live worker.
-            if process.is_alive():
+            if worker_alive():
                 detail = (
                     "; ".join(shutdown_errors)
                     if shutdown_errors
@@ -2096,12 +2319,27 @@ class ModelService:
             # issue more work under this epoch. Unexpected stale cleanup is
             # surfaced while retaining the dead process and lease references.
             self._release_gpu_lease_after_worker_death()
-            self._process = None
+            close_error: Exception | None = None
+            close_process = getattr(process, "close", None)
+            if callable(close_process):
+                try:
+                    close_process()
+                except Exception as error:
+                    close_error = error
             self._cancel_event = None
             self._ready_event = None
             self._failed_event = None
             self._worker_authority = None
+            self._startup_status = None
             self._active_request_id = None
+            if close_error is not None:
+                # Retain the dead Process handle so an operator/supervisor can
+                # retry cleanup. Silently forgetting it would hide an OS
+                # handle leak on repeated Windows restarts.
+                raise WorkerExecutionError(
+                    "dead local model process handle could not be closed"
+                ) from close_error
+            self._process = None
 
     def _tokenize(self, prompt: str) -> tuple[Tensor, Tensor]:
         if not isinstance(prompt, str):

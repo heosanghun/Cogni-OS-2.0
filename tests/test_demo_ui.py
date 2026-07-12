@@ -195,6 +195,26 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn(".chat-message.is-truncated", stylesheet)
         self.assertIn(".chat-continue-button", stylesheet)
 
+    def test_factbook_and_model_generation_are_visibly_distinct(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn("검증 READY", html)
+        self.assertIn("Runtime Fact-book", script)
+        self.assertIn("FACT-BOOK · 검증된 사실", script)
+        self.assertIn("MODEL STANDBY", script)
+        self.assertIn("NOT LOADED", script)
+        self.assertIn('generationMode === "factbook"', script)
+        self.assertIn(
+            '.chat-message[data-generation-mode="factbook"] .chat-avatar',
+            stylesheet,
+        )
+        self.assertIn(
+            '.chat-message[data-generation-mode="factbook"] .chat-completion-status',
+            stylesheet,
+        )
+
     def test_api_error_copy_and_connection_recovery_are_actionable(self) -> None:
         script = (STATIC / "app.js").read_text(encoding="utf-8")
         for code in (
@@ -332,7 +352,20 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("cogni_demo.server", native)
         self.assertIn("CreateNoWindow = true", native)
         self.assertIn("HF_HUB_OFFLINE", native)
+        self.assertIn("load_default_bounded_cts_controller", native)
+        self.assertIn("DriveType.Fixed", native)
+        self.assertIn("FileAttributes.ReparsePoint", native)
+        self.assertIn("QuoteArgument", native)
+        self.assertIn("BeginErrorReadLine", native)
         self.assertNotIn("validate_gemma4_runtime.py", native)
+
+        server = (ROOT / "cogni_demo" / "server.py").read_text(encoding="utf-8")
+        backend_preflight = server.index(
+            'load_default_bounded_cts_controller(device="cpu")',
+            server.index("def main("),
+        )
+        http_bind = server.index("server = DemoHTTPServer(", backend_preflight)
+        self.assertLess(backend_preflight, http_bind)
 
 
 if __name__ == "__main__":

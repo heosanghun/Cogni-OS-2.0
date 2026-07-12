@@ -249,7 +249,42 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(state["status"], "succeeded")
         self.assertEqual(state["stage"], "complete")
         self.assertIn("Runtime Fact-book", state["conversation"][-1]["content"])
+        self.assertEqual(
+            state["conversation"][-1]["generation_mode"],
+            "factbook",
+        )
+        self.assertEqual(state["completion"]["generation_mode"], "factbook")
+        self.assertFalse(state["core"]["model_loaded"])
+        self.assertEqual(state["core"]["modules"]["gemma"], "not_loaded")
         self.assertEqual(rhythm.active_requests, 0)
+
+    def test_general_question_starts_model_and_uses_cogni_core_generation(self) -> None:
+        from tests.test_agent_quality_integration import _factbook
+
+        service = _ScriptedService(
+            [
+                (
+                    "대한민국의 수도는 서울입니다. 서울은 대한민국의 행정 중심지입니다.",
+                    "stop",
+                )
+            ]
+        )
+        manager = self.manager(
+            service,
+            fact_grounder=RuntimeFactGrounder(_factbook()),
+        )
+
+        manager.start_turn("대한민국의 수도를 한 문장으로 알려줘.", "chat")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertTrue(service.started)
+        self.assertEqual(len(service.prompts), 1)
+        self.assertEqual(
+            state["conversation"][-1]["generation_mode"],
+            "cogni_core",
+        )
+        self.assertEqual(state["completion"]["generation_mode"], "cogni_core")
 
     def test_shared_rhythm_covers_task_mode_until_tool_completion(self) -> None:
         rhythm = RhythmController()

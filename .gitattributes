@@ -1,4 +1,7 @@
 *.cmd text eol=crlf
+# This checkpoint is content-addressed at runtime.  Treat it as an opaque
+# artifact so Windows archive/export never rewrites LF to CRLF.
+/cogni_core/cts_policy_checkpoint.json -text
 *.exe export-ignore
 *.whl export-ignore
 *.zip export-ignore

@@ -800,10 +800,12 @@ class AgentManager:
                 continuations=0,
                 truncated=False,
                 generated_tokens=0,
+                generation_mode="factbook",
             )
             self._completion = self._completion_state(
                 state="complete",
                 finish_reason="stop",
+                generation_mode="factbook",
             )
             self._core = self._core_state()
         return "succeeded", "complete", 100
@@ -1262,6 +1264,7 @@ class AgentManager:
         continuations: int = 0,
         truncated: bool = False,
         generated_tokens: int = 0,
+        generation_mode: str | None = None,
     ) -> str:
         with self._condition:
             message_id = secrets.token_hex(8)
@@ -1273,12 +1276,20 @@ class AgentManager:
                 "streaming": bool(streaming),
             }
             if role == "assistant":
+                if generation_mode not in {
+                    None,
+                    "cogni_core",
+                    "factbook",
+                    "quality_fallback",
+                }:
+                    raise ValueError("generation_mode is invalid")
                 payload.update(
                     {
                         "finish_reason": finish_reason,
                         "continuations": max(0, int(continuations)),
                         "truncated": bool(truncated),
                         "generated_tokens": max(0, int(generated_tokens)),
+                        "generation_mode": generation_mode,
                     }
                 )
             if artifact is not None:
@@ -1310,6 +1321,7 @@ class AgentManager:
                     if generation_mode is not None:
                         if generation_mode not in {
                             "cogni_core",
+                            "factbook",
                             "quality_fallback",
                         }:
                             raise ValueError("generation_mode is invalid")
@@ -1343,6 +1355,7 @@ class AgentManager:
         if generation_mode not in {
             None,
             "cogni_core",
+            "factbook",
             "quality_fallback",
         }:
             raise ValueError("generation_mode is invalid")
@@ -1355,16 +1368,23 @@ class AgentManager:
             "generation_mode": generation_mode,
         }
 
-    @staticmethod
-    def _core_state(active: tuple[str, ...] = ()) -> dict[str, Any]:
+    def _core_state(self, active: tuple[str, ...] = ()) -> dict[str, Any]:
+        model_loaded = bool(getattr(self.model_service, "is_running", False))
+        if active == ("factbook",):
+            verdict = "Fact-book 사실 응답"
+        elif active:
+            verdict = "실행 중"
+        else:
+            verdict = "모델 준비" if model_loaded else "모델 대기"
         return {
-            "verdict": "실행 중" if active else "대기",
+            "verdict": verdict,
             "active_modules": list(active),
+            "model_loaded": model_loaded,
             "modules": {
-                "gemma": "local",
+                "gemma": "local" if model_loaded else "not_loaded",
                 "router": "ready",
                 "swarm": "advisory",
-                "cts": "ready",
+                "cts": "ready" if model_loaded else "not_loaded",
                 "fast": "gated",
             },
         }

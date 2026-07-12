@@ -1,4 +1,4 @@
-# Local Gemma 4 E4B Validation — v0.3.0
+# Local Gemma 4 E4B Validation — v0.3.1
 
 ## Scope
 

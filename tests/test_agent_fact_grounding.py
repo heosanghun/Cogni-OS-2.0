@@ -96,8 +96,28 @@ class TestRuntimeFactGrounder(unittest.TestCase):
         offsets = [answer.index(label) for label in labels]
         self.assertEqual(offsets, sorted(offsets))
 
+    def test_exact_operator_greeting_returns_identity_and_capability_overview(self):
+        answer = self.grounder.answer(
+            "안녕하세여! 당신은 어떤 모델이고 어떤 기능을 할 수 있나요?"
+        )
+
+        self.assertIsNotNone(answer)
+        assert answer is not None
+        for label in (
+            "gemma4-e4b-test",
+            "CTS · DEQ",
+            "System 1.5",
+            "System 2.5",
+            "System 3",
+            "System 4",
+            "Self-Harness",
+        ):
+            with self.subTest(label=label):
+                self.assertIn(label, answer)
+
     def test_general_conversation_falls_through_to_local_model(self):
         for question in (
+            "대한민국의 수도를 한 문장으로 알려줘.",
             "오늘 날씨가 어때?",
             "파이썬에서 리스트를 정렬하는 방법을 알려줘.",
             "심리학에서 거울 노출 기법은 무엇인가요?",

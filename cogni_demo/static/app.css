@@ -1080,6 +1080,13 @@ button:disabled {
   color: var(--amber);
 }
 
+.chat-message[data-generation-mode="factbook"] .chat-avatar,
+.chat-message[data-generation-mode="factbook"] .chat-completion-status {
+  border-color: rgba(157, 140, 255, 0.32);
+  background: var(--violet-soft);
+  color: var(--violet);
+}
+
 .chat-bubble {
   min-width: 0;
   padding: 11px 13px;
@@ -1343,6 +1350,14 @@ button:disabled {
 .core-route > div.is-active {
   border-color: rgba(99, 230, 255, 0.42);
   background: var(--cyan-soft);
+}
+
+.core-route > div.is-unavailable {
+  opacity: 0.58;
+}
+
+.core-route > div.is-unavailable b {
+  color: var(--dim);
 }
 
 .core-route > div > span {

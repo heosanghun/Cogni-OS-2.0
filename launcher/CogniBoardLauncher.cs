@@ -3,14 +3,15 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Text;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("CogniBoard")]
 [assembly: AssemblyDescription("Cogni-OS 2.0 Genesis local sovereign AI control")]
 [assembly: AssemblyCompany("Cogni-OS")]
 [assembly: AssemblyProduct("Cogni-OS 2.0 Genesis")]
-[assembly: AssemblyVersion("0.3.0.0")]
-[assembly: AssemblyFileVersion("0.3.0.0")]
+[assembly: AssemblyVersion("0.3.1.0")]
+[assembly: AssemblyFileVersion("0.3.1.0")]
 
 internal static class CogniBoardLauncher
 {
@@ -33,9 +34,9 @@ internal static class CogniBoardLauncher
                 model = DefaultModel;
             }
 
-            RequireSafePath(projectRoot, "project root");
-            RequireSafePath(manifest, "model manifest");
-            RequireSafePath(model, "model directory");
+            projectRoot = RequireSafePath(projectRoot, "project root");
+            manifest = RequireSafePath(manifest, "model manifest");
+            model = RequireSafePath(model, "model directory");
             if (!File.Exists(manifest))
             {
                 throw new FileNotFoundException("Model manifest not found.", manifest);
@@ -123,7 +124,7 @@ internal static class CogniBoardLauncher
         string configured = Environment.GetEnvironmentVariable("COGNI_OS_PYTHON");
         if (!String.IsNullOrWhiteSpace(configured))
         {
-            RequireSafePath(configured, "COGNI_OS_PYTHON");
+            configured = RequireSafePath(configured, "COGNI_OS_PYTHON");
             if (!File.Exists(configured))
             {
                 throw new FileNotFoundException(
@@ -161,15 +162,17 @@ internal static class CogniBoardLauncher
             Arguments = JoinArguments(
                 python.Prefix,
                 "-c",
-                "import sys,torch,transformers,cogni_demo.server;"
+                "import sys,torch,transformers;"
+                + "from cogni_core.cts_policy import load_default_bounded_cts_controller;"
                 + "assert sys.version_info >= (3,11);"
-                + "assert torch.cuda.is_available()"
+                + "assert torch.cuda.is_available();"
+                + "load_default_bounded_cts_controller(device='cpu');"
+                + "import cogni_demo.server"
             ),
             WorkingDirectory = projectRoot,
             UseShellExecute = false,
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden,
-            RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
         SetOfflineEnvironment(start);
@@ -179,18 +182,32 @@ internal static class CogniBoardLauncher
             {
                 throw new InvalidOperationException("Python preflight did not start.");
             }
+            StringBuilder standardError = new StringBuilder();
+            process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs args)
+            {
+                if (args.Data != null && standardError.Length < 1500)
+                {
+                    int remaining = 1500 - standardError.Length;
+                    string line = args.Data.Length <= remaining
+                        ? args.Data
+                        : args.Data.Substring(0, remaining);
+                    standardError.AppendLine(line);
+                }
+            };
+            process.BeginErrorReadLine();
             if (!process.WaitForExit(30000))
             {
                 process.Kill();
                 process.WaitForExit();
                 throw new TimeoutException("Python/CUDA preflight exceeded 30 seconds.");
             }
-            string standardError = process.StandardError.ReadToEnd().Trim();
+            process.WaitForExit();
+            string errorText = standardError.ToString().Trim();
             if (process.ExitCode != 0)
             {
-                string detail = standardError.Length == 0
+                string detail = errorText.Length == 0
                     ? "Python 3.11+, CUDA PyTorch, Transformers, or Cogni-OS is unavailable."
-                    : standardError;
+                    : errorText;
                 if (detail.Length > 1500)
                 {
                     detail = detail.Substring(0, 1500);
@@ -215,7 +232,7 @@ internal static class CogniBoardLauncher
                 string candidate = Path.GetFullPath(Path.Combine(directory, fileName));
                 if (File.Exists(candidate))
                 {
-                    return candidate;
+                    return RequireSafePath(candidate, "Python runtime");
                 }
             }
             catch (ArgumentException)
@@ -230,7 +247,7 @@ internal static class CogniBoardLauncher
         return null;
     }
 
-    private static void RequireSafePath(string value, string label)
+    private static string RequireSafePath(string value, string label)
     {
         if (
             String.IsNullOrWhiteSpace(value)
@@ -242,6 +259,36 @@ internal static class CogniBoardLauncher
         {
             throw new ArgumentException(label + " contains unsupported characters.");
         }
+        string full = Path.GetFullPath(value);
+        if (
+            full.StartsWith(@"\\", StringComparison.Ordinal)
+            || full.StartsWith(@"\\?\", StringComparison.Ordinal)
+            || full.StartsWith(@"\\.\", StringComparison.Ordinal)
+        )
+        {
+            throw new ArgumentException(label + " must be on a local fixed volume.");
+        }
+        string root = Path.GetPathRoot(full);
+        if (String.IsNullOrEmpty(root))
+        {
+            throw new ArgumentException(label + " has no local volume root.");
+        }
+        DriveInfo drive = new DriveInfo(root);
+        if (drive.DriveType != DriveType.Fixed)
+        {
+            throw new ArgumentException(label + " must be on a local fixed volume.");
+        }
+        string current = File.Exists(full) ? Path.GetDirectoryName(full) : full;
+        while (!String.IsNullOrEmpty(current) && Directory.Exists(current))
+        {
+            DirectoryInfo info = new DirectoryInfo(current);
+            if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new ArgumentException(label + " crosses a reparse point.");
+            }
+            current = info.Parent == null ? null : info.Parent.FullName;
+        }
+        return full;
     }
 
     private static string JoinArguments(params string[] values)
@@ -257,9 +304,37 @@ internal static class CogniBoardLauncher
             {
                 throw new ArgumentException("Launcher argument contains unsupported characters.");
             }
-            result.Add("\"" + value + "\"");
+            result.Add(QuoteArgument(value));
         }
         return String.Join(" ", result);
+    }
+
+    private static string QuoteArgument(string value)
+    {
+        StringBuilder result = new StringBuilder();
+        result.Append('"');
+        int backslashes = 0;
+        foreach (char character in value)
+        {
+            if (character == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+            if (character == '"')
+            {
+                result.Append('\\', backslashes * 2 + 1);
+                result.Append('"');
+                backslashes = 0;
+                continue;
+            }
+            result.Append('\\', backslashes);
+            backslashes = 0;
+            result.Append(character);
+        }
+        result.Append('\\', backslashes * 2);
+        result.Append('"');
+        return result.ToString();
     }
 
     private static void SetOfflineEnvironment(ProcessStartInfo start)

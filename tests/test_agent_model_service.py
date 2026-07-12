@@ -242,6 +242,14 @@ class AdvisoryCoreFactory:
         return AdvisoryCorePipeline(model, fail=self.fail)
 
 
+@dataclass(frozen=True)
+class CheckpointFailingCoreFactory:
+    """Picklable worker fixture for a content-addressed policy failure."""
+
+    def __call__(self, _model):
+        raise CTSCheckpointError("checkpoint SHA-256 verification failed")
+
+
 class SessionAwareCorePipeline(AdvisoryCorePipeline):
     def run(self, request):
         result = super().run(request)
@@ -392,11 +400,22 @@ class _RecordingLeaseManager(GPULeaseManager):
 
 
 class _LeaseProcess:
-    def __init__(self, events, ready_event, index, *, fail_start=False):
+    def __init__(
+        self,
+        events,
+        ready_event,
+        index,
+        *,
+        fail_start=False,
+        auto_ready=True,
+        dies_after_ready=False,
+    ):
         self.events = events
         self.ready_event = ready_event
         self.index = index
         self.fail_start = fail_start
+        self.auto_ready = auto_ready
+        self.dies_after_ready = dies_after_ready
         self.alive = False
         self.pid = 10_000 + index
 
@@ -408,7 +427,10 @@ class _LeaseProcess:
         if self.fail_start:
             raise OSError("synthetic spawn failure")
         self.alive = True
-        self.ready_event.set()
+        if self.auto_ready:
+            self.ready_event.set()
+        if self.dies_after_ready:
+            self.alive = False
 
     def join(self, timeout):
         self.events.append(("process.join", self.index, timeout))
@@ -424,9 +446,18 @@ class _LeaseProcess:
 
 
 class _LeaseContext:
-    def __init__(self, events, *, failed_starts=()):
+    def __init__(
+        self,
+        events,
+        *,
+        failed_starts=(),
+        auto_ready=True,
+        dies_after_ready=False,
+    ):
         self.events = events
         self.failed_starts = set(failed_starts)
+        self.auto_ready = auto_ready
+        self.dies_after_ready = dies_after_ready
         self.queue_count = 0
         self.processes = []
 
@@ -447,6 +478,8 @@ class _LeaseContext:
             args[5],
             index,
             fail_start=index in self.failed_starts,
+            auto_ready=self.auto_ready,
+            dies_after_ready=self.dies_after_ready,
         )
         self.processes.append(process)
         self.events.append(("process.construct", index))
@@ -486,6 +519,91 @@ def service_for(
 
 
 class TestResidentModelService(unittest.TestCase):
+    def test_checkpoint_integrity_failure_is_reported_from_spawned_worker(self):
+        service = service_for(core_pipeline_factory=CheckpointFailingCoreFactory())
+
+        with self.assertRaisesRegex(
+            WorkerStartupError,
+            "CTS policy checkpoint integrity verification failed",
+        ):
+            service.start()
+
+        self.assertFalse(service.is_running)
+        self.assertIsNone(service._process)
+
+    def test_two_start_callers_wait_for_one_shared_ready_attempt(self):
+        events = []
+        context = _LeaseContext(events, auto_ready=False)
+        service = service_for()
+        service._context = context
+        gate = Event()
+        results = []
+        errors = []
+
+        def start_service():
+            gate.wait()
+            try:
+                results.append(service.start())
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [Thread(target=start_service) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        gate.set()
+        deadline = monotonic() + 2
+        while not context.processes and monotonic() < deadline:
+            sleep(0.01)
+        self.assertEqual(len(context.processes), 1)
+        sleep(0.05)
+        self.assertTrue(all(thread.is_alive() for thread in threads))
+        self.assertEqual(results, [])
+
+        context.processes[0].ready_event.set()
+        for thread in threads:
+            thread.join(2)
+        try:
+            self.assertEqual(errors, [])
+            self.assertEqual(results, [service, service])
+            self.assertEqual(len(context.processes), 1)
+        finally:
+            service.stop()
+
+    def test_ready_signal_followed_by_immediate_death_is_not_success(self):
+        events = []
+        service = service_for()
+        service._context = _LeaseContext(events, dies_after_ready=True)
+
+        with self.assertRaisesRegex(WorkerStartupError, "failed to initialize"):
+            service.start()
+
+        self.assertIsNone(service._process)
+        self.assertFalse(service.is_running)
+
+    def test_partial_ipc_setup_failure_closes_the_first_queue(self):
+        events = []
+
+        class PartialContext:
+            def __init__(self):
+                self.calls = 0
+
+            def Queue(self, *, maxsize):
+                del maxsize
+                self.calls += 1
+                if self.calls == 1:
+                    return _ShutdownQueue("partial", events)
+                raise OSError("synthetic queue construction failure")
+
+        service = service_for()
+        service._context = PartialContext()
+
+        with self.assertRaisesRegex(WorkerStartupError, "IPC setup failed"):
+            service.start()
+
+        self.assertEqual(events, ["partial.close", "partial.join_thread"])
+        self.assertIsNone(service._request_queue)
+        self.assertIsNone(service._process)
+
     def test_meta_controller_uses_dtype_aware_tolerance_floor(self):
         learned = SimpleNamespace(
             exploration=torch.tensor(1.0),

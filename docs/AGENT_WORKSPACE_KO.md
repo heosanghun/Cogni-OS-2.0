@@ -1,13 +1,13 @@
-# CogniBoard v0.3.0 AI 워크스페이스 사용 안내
+# CogniBoard v0.3.1 AI 워크스페이스 사용 안내
 
 ## 실행
 
-최종 검증 후 생성된 `release\CogniBoard-v0.3.0.exe`를 더블클릭한다. 개발 소스에서
+최종 검증 후 생성된 `release\CogniBoard-v0.3.1.exe`를 더블클릭한다. 개발 소스에서
 직접 빌드하려면 다음 명령을 사용한다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_windows_launcher.ps1 `
-  -OutputPath release\CogniBoard-v0.3.0.exe
+  -OutputPath release\CogniBoard-v0.3.1.exe
 ```
 
 launcher는 standalone model bundle이 아니라 console-free bootstrapper다. 동일
@@ -52,7 +52,7 @@ output-only `/save`다.
 evidence, expected behavior, risk, reproduction test와 rollback trigger를 가진다.
 거부된 후보는 negative archive에 남는다.
 
-v0.3.0 지원 profile은 `proposal_only`다. source는 실행·덮어쓰기·승격되지 않는다.
+v0.3.1 지원 profile은 `proposal_only`다. source는 실행·덮어쓰기·승격되지 않는다.
 야간 주기 전후 source digest가 달라지면 safe mode로 진입한다. 별도 kernel, network/
 host-filesystem isolation, immutable image와 command digest가 독립 검증되는 Phase 12
 이전에는 자동 승격을 기능으로 표시하지 않는다.

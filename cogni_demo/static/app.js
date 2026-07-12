@@ -210,15 +210,15 @@ function setRuntimeStatus(status, stage) {
   const label = $("#runtime-label");
   if (!pill || !label) return;
   const display = {
-    ready: "READY",
-    starting: "STARTING",
-    running: "LIVE",
-    cancelling: "STOPPING",
-    cancelled: "CANCELLED",
-    succeeded: "VERIFIED",
-    failed: "FAILED",
-    offline: "RECONNECTING",
-  }[status] || String(status || "READY").toUpperCase();
+    ready: "검증 READY",
+    starting: "검증 STARTING",
+    running: "검증 LIVE",
+    cancelling: "검증 STOPPING",
+    cancelled: "검증 CANCELLED",
+    succeeded: "검증 VERIFIED",
+    failed: "검증 FAILED",
+    offline: "검증 RECONNECTING",
+  }[status] || `검증 ${String(status || "READY").toUpperCase()}`;
   label.textContent = display;
   pill.dataset.state = status;
   pill.title = String(PHASE_LABELS[stage] || display).slice(0, 128);
@@ -652,13 +652,20 @@ function renderAgentConversation(messages = []) {
     item.dataset.messageId = message.key;
     item.classList.toggle("is-streaming", message.streaming);
     item.classList.toggle("is-truncated", message.truncated);
+    if (message.generationMode) item.dataset.generationMode = message.generationMode;
+    else delete item.dataset.generationMode;
     item.setAttribute("aria-busy", String(message.streaming));
     const role = message.role;
     item.dataset.role = role;
     const avatar = $(".chat-avatar", item);
-    avatar.textContent = { user: "YOU", assistant: "AI", tool: "TOOL", system: "SYS" }[role];
+    const factbookAnswer = role === "assistant" && message.generationMode === "factbook";
+    avatar.textContent = factbookAnswer
+      ? "FACT"
+      : { user: "YOU", assistant: "AI", tool: "TOOL", system: "SYS" }[role];
     const author = $(".chat-bubble header strong", item);
-    author.textContent = { user: "사용자", assistant: "Cogni Agent", tool: "로컬 작업", system: "시스템" }[role];
+    author.textContent = factbookAnswer
+      ? "Runtime Fact-book"
+      : { user: "사용자", assistant: "Cogni Agent", tool: "로컬 작업", system: "시스템" }[role];
     const time = $(".chat-bubble header time", item);
     time.textContent = formatAgentTime(message.createdAt);
     if (time.textContent) time.dateTime = message.createdAt;
@@ -669,7 +676,9 @@ function renderAgentConversation(messages = []) {
       if (role === "assistant" && message.streaming) completionCopy = "작성 중";
       else if (role === "assistant" && message.truncated) completionCopy = "길이 한계 · 이어서 가능";
       else if (role === "assistant" && message.finishReason) {
-        if (message.generationMode === "quality_fallback") {
+        if (message.generationMode === "factbook") {
+          completionCopy = "FACT-BOOK · 검증된 사실";
+        } else if (message.generationMode === "quality_fallback") {
           completionCopy = "품질 안전 응답 · 완료";
         } else {
           completionCopy = message.continuations
@@ -679,9 +688,11 @@ function renderAgentConversation(messages = []) {
       }
       completion.textContent = completionCopy;
       completion.hidden = !completionCopy;
-      completion.title = message.generatedTokens
-        ? `생성 ${message.generatedTokens.toLocaleString("ko-KR")} 토큰`
-        : "";
+      completion.title = message.generationMode === "factbook"
+        ? "모델 생성 없이 검증된 Runtime Fact-book에서 구성한 응답"
+        : message.generatedTokens
+          ? `생성 ${message.generatedTokens.toLocaleString("ko-KR")} 토큰`
+          : "";
     }
     const content = $(".chat-bubble p", item);
     content.textContent = message.content;
@@ -695,15 +706,21 @@ function renderAgentConversation(messages = []) {
 
 function updateAgentCore(core = {}) {
   const active = new Set(Array.isArray(core.active_modules) ? core.active_modules : []);
+  const modelLoaded = core.model_loaded === true;
   $$('[data-agent-module]').forEach((module) => {
-    const enabled = active.has(module.dataset.agentModule);
+    const moduleName = module.dataset.agentModule;
+    const modelDependent = moduleName === "gemma" || moduleName === "cts";
+    const unavailable = modelDependent && !modelLoaded;
+    const enabled = active.has(moduleName) && !unavailable;
     module.classList.toggle("is-active", enabled);
+    module.classList.toggle("is-unavailable", unavailable);
     const state = $("b", module);
-    if (state && enabled) state.textContent = "ACTIVE";
-    else if (state && core.modules && typeof core.modules[module.dataset.agentModule] === "string") {
-      state.textContent = core.modules[module.dataset.agentModule].slice(0, 32).toUpperCase();
+    if (state && unavailable) state.textContent = "NOT LOADED";
+    else if (state && enabled) state.textContent = "ACTIVE";
+    else if (state && core.modules && typeof core.modules[moduleName] === "string") {
+      state.textContent = core.modules[moduleName].slice(0, 32).toUpperCase();
     } else if (state) {
-      state.textContent = AGENT_MODULE_DEFAULTS[module.dataset.agentModule] || "READY";
+      state.textContent = AGENT_MODULE_DEFAULTS[moduleName] || "READY";
     }
   });
   const badge = $("#agent-core-badge");
@@ -780,7 +797,14 @@ function updateAgentState(state) {
     cancelled: "CANCELLED",
     failed: "FAILED",
   };
-  setText("#agent-status-label", labels[ui.agentStatus] || ui.agentStatus.toUpperCase());
+  let agentLabel = labels[ui.agentStatus] || ui.agentStatus.toUpperCase();
+  const modelLoaded = state.core?.model_loaded === true;
+  if ((ui.agentStatus === "ready" || ui.agentStatus === "succeeded") && !modelLoaded) {
+    agentLabel = state.completion?.generation_mode === "factbook"
+      ? "FACT-BOOK ONLY"
+      : "MODEL STANDBY";
+  }
+  setText("#agent-status-label", agentLabel);
   const heading = $("#agent-heading-state");
   if (heading) heading.dataset.state = ui.agentStatus;
   if (Array.isArray(state.conversation)) renderAgentConversation(state.conversation);

@@ -1,4 +1,4 @@
-# Cogni-OS 2.0 v0.3.0 Architecture
+# Cogni-OS 2.0 v0.3.1 Architecture
 
 ## Authority and evidence first
 
@@ -144,7 +144,7 @@ an exclusive evolution window.
 - The System 3 lifecycle operates on an eight-slot preallocated pool and
   orders calibration, candidate selection, C-FIRE, isolated candidate
   training, held-out checks, routed Fisher, canary and independent authority.
-  No verified trained expert artifact ships with v0.3.0, so the product state
+  No verified trained expert artifact ships with v0.3.1, so the product state
   remains `advisory`.
 - AFlow accepts only six typed operators, a sealed evaluator/policy/suite,
   bounded DAGs and budgets, repeated held-in/out metrics, and single-parent
@@ -155,7 +155,7 @@ an exclusive evolution window.
   immutable-surface changes and path escapes are rejected. Rejected
   replacements enter a negative archive.
 - The production assembly hashes mutable source before and after a night
-  proposal cycle. Any change enters safe mode. There is no v0.3.0 install or
+  proposal cycle. Any change enters safe mode. There is no v0.3.1 install or
   promotion path.
 
 Phase 12 attested sandbox and safe promotion are deliberately outside the

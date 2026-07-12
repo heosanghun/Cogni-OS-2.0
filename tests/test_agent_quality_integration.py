@@ -192,6 +192,13 @@ class TestAgentQualityIntegration(unittest.TestCase):
         )
         self.assertEqual(answer["generation_mode"], "quality_fallback")
         self.assertEqual(failures[0][0], "ResponseQualityError")
+        diagnostic = failures[0][1]
+        self.assertIn("quality_gate_v2;", diagnostic)
+        self.assertIn("candidate_sha256=", diagnostic)
+        self.assertIn("incomplete_korean_clause", diagnostic)
+        self.assertNotIn("이는 내가", diagnostic)
+        self.assertNotIn("나는.", diagnostic)
+        self.assertLessEqual(len(diagnostic), 512)
 
 
 if __name__ == "__main__":

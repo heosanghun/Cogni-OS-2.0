@@ -1,7 +1,7 @@
-# Cogni-OS 2.0 Genesis — v0.3.1
+# Cogni-OS 2.0 Genesis — v0.3.2
 
 Cogni-OS 2.0 is an offline, bounded research runtime for a verified local
-dense Gemma 4 E4B artifact. Version 0.3.1 connects conversation integrity,
+dense Gemma 4 E4B artifact. Version 0.3.2 connects conversation integrity,
 causal DEQ/CTS conditioning, typed local tasks, bounded research workflows,
 and a **proposal-only** Self-Harness behind explicit capability and evidence
 states.
@@ -12,9 +12,10 @@ passing component test never upgrades a capability by itself.
 
 ## Product authority at a glance
 
-| Capability | v0.3.1 state | May affect the answer? | What is still required |
+| Capability | v0.3.2 state | May affect the answer? | What is still required |
 |---|---|---:|---|
 | verified local Gemma 4 E4B | `authoritative` | yes | exact local artifact and manifest |
+| bounded conversation fast path | `product_ux` | yes, narrow social turns only | must never intercept general knowledge/code/format requests |
 | causal CTS/DEQ bridge | `canary` | yes, bounded logits bias | trained adapter/Wproj and independent held-out evidence for promotion |
 | BIO-HAMA | `advisory` | no | calibrated routing-quality evidence |
 | System 1.5 Fast Weight | `gated` | no by default | trained checkpoint, AQ/OOD and held-out admission evidence |
@@ -34,8 +35,8 @@ malformed evidence.
 
 | Phase | Implemented software path | Evidence boundary |
 |---:|---|---|
-| 1 | Fact-book identity grounding, repetition/completion guards, bounded retry | four-turn local-Gemma regression exists; the required 20-turn product study is not yet certified |
-| 2 | lifecycle/GPU lease authority, IPC v3 job/epoch/deadline/artifact/session binding | fault-injection tests are repository evidence; target-hardware endurance remains external |
+| 1 | Fact-book identity grounding, narrow social fast path, repetition/completion/relevance guards, bounded retry | 10-turn casual and 20-turn local-Gemma gates must both pass on the frozen release commit |
+| 2 | lifecycle/GPU lease authority, IPC v4 job/epoch/deadline/artifact/session/decode-policy binding | fault-injection tests are repository evidence; target-hardware endurance remains external |
 | 3 | frozen Gemma features feed a bounded equilibrium reasoner and causal decode bias | `canary`; no trained DEQ/Wproj quality artifact |
 | 4 | fixed 301-node CTS V2, rank-16 solver history, bounded retrieval/policy/critic surfaces | depth-100 was measured on the attached RTX 5090 Laptop GPU, not RTX 4090 |
 | 5 | strict Fast Weight checkpoint, AQ/OOD, norm, TTL and session gates | no admitted trained product checkpoint; remains `gated` |
@@ -71,12 +72,18 @@ python scripts\validate_gemma4_runtime.py `
   --event-stream
 ```
 
-Run the four-turn completion regression:
+Run the recommended 20-turn completion stress and the natural Korean gate:
 
 ```powershell
 python scripts\validate_agent_completion.py `
   --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml
+  --manifest config\gemma4-e4b.manifest.toml `
+  --turns 20
+
+python scripts\validate_agent_casual_korean.py `
+  --model C:\Project\cognios\gemma4-e4b `
+  --manifest config\gemma4-e4b.manifest.toml `
+  --timeout 120
 ```
 
 Run the System 4 stress benchmark. Its output separates instantaneous
@@ -89,22 +96,22 @@ python scripts\benchmark_system4.py `
 
 ## Windows launcher
 
-Build the v0.3.1 launcher from the exact source tree:
+Build the v0.3.2 launcher from the exact source tree:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_windows_launcher.ps1 `
-  -OutputPath release\CogniBoard-v0.3.1.exe
+  -OutputPath release\CogniBoard-v0.3.2.exe
 ```
 
 The launcher is a console-free bootstrapper, not a standalone model bundle. It
 requires this source tree, local Python/CUDA dependencies, and the verified
 model plus manifest. The binary is not code-signed in this research release.
-Do not use older release assets as v0.3.1 evidence.
+Do not use older release assets as v0.3.2 evidence.
 
 Korean operator documentation: [`docs/COGNIBOARD_USER_MANUAL_PLAYBOOK_KO.md`](docs/COGNIBOARD_USER_MANUAL_PLAYBOOK_KO.md).
 
-The v0.3.1 distribution-integrity validation addendum is
-[`release/COGNI_OS_0.3.1_VALIDATION_ADDENDUM_KO.md`](release/COGNI_OS_0.3.1_VALIDATION_ADDENDUM_KO.md).
+The v0.3.2 validation addendum is
+[`release/COGNI_OS_0.3.2_VALIDATION_ADDENDUM_KO.md`](release/COGNI_OS_0.3.2_VALIDATION_ADDENDUM_KO.md).
 
 ## Runtime boundaries
 
@@ -116,7 +123,7 @@ The v0.3.1 distribution-integrity validation addendum is
 - Local tasks execute only typed, allowlisted operations. Natural language is
   never passed to a shell.
 - AFlow can only create a bounded research archive.
-- Self-Harness stores inert proposals and cannot install them in v0.3.1.
+- Self-Harness stores inert proposals and cannot install them in v0.3.2.
 - The graphical server is loopback-only, uses per-session authentication and
   local allowlisted assets, and has no CDN or analytics dependency.
 

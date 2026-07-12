@@ -1387,7 +1387,11 @@ class _ServiceBackedPatchModel:
         )
         if not isinstance(prompt, str) or not prompt:
             raise ValueError("patch prompt could not be decoded")
-        generated = self.service.generate(prompt, max_new_tokens=requested).token_ids
+        generated = self.service.generate(
+            prompt,
+            max_new_tokens=requested,
+            decode_mode="strict",
+        ).token_ids
         generated = generated.detach().to(
             device=input_ids.device, dtype=input_ids.dtype
         )
@@ -1938,6 +1942,7 @@ def _build_product_controls(
     # component so this path cannot bypass the signed manifest boundary.
     verified = verify_artifact_manifest(model_path, manifest_path)
 
+    from cogni_agent.conversation_fastpath import ConversationFastPath
     from cogni_agent.fact_grounding import RuntimeFactGrounder
     from cogni_agent.manager import SYSTEM_PROMPT, AgentManager
     from cogni_agent.model_service import ModelService
@@ -1960,7 +1965,6 @@ def _build_product_controls(
         build_version=build_version,
         device="현재 프로세스 라이브 검증 전 미측정",
     )
-    fact_context = factbook.prompt_context_ko()
     lease_authority = gpu_lease_manager or GPULeaseManager()
     active_rhythm = rhythm or RhythmController()
 
@@ -2027,8 +2031,13 @@ def _build_product_controls(
             failure_sink=capture_failure,
             evolution_snapshot=evolution.snapshot,
             availability_check=lambda: not validator.is_active,
+            conversation_fast_path=ConversationFastPath(),
             fact_grounder=RuntimeFactGrounder(factbook),
-            system_prompt=SYSTEM_PROMPT + "\n\n" + fact_context,
+            # Product identity and capability questions are answered by the
+            # deterministic RuntimeFactGrounder before generation.  Repeating
+            # the complete Fact-book in every ordinary Gemma prompt polluted
+            # short social turns and made the small E4B imitate status prose.
+            system_prompt=SYSTEM_PROMPT,
             rhythm=active_rhythm,
         )
         return agent, evolution

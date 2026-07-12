@@ -14,6 +14,9 @@ from torch import nn
 
 from cogni_agent.model_service import (
     BaseModelMutationError,
+    CONVERSATION_TEMPERATURE,
+    CONVERSATION_TOP_K,
+    CONVERSATION_TOP_P,
     GenerationCancelled,
     LocalGemmaCorePipelineFactory,
     LocalGemmaModelFactory,
@@ -91,6 +94,7 @@ class SafeFakeModel(nn.Module):
         require_conditioning: bool = False,
         output_head: bool = True,
         data_mutate: bool = False,
+        stochastic: bool = False,
     ):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(1))
@@ -100,6 +104,7 @@ class SafeFakeModel(nn.Module):
         self.require_core = require_core
         self.require_conditioning = require_conditioning
         self.data_mutate = data_mutate
+        self.stochastic = stochastic
         self.core_ran = False
         self.register_buffer("bounded_state", torch.tensor([3.0]))
         self.lm_head = nn.Linear(4, 128, bias=False) if output_head else None
@@ -114,22 +119,29 @@ class SafeFakeModel(nn.Module):
 
     def generate(self, **kwargs):
         expected_decode = {
-            "do_sample": False,
             "num_beams": 1,
             "num_return_sequences": 1,
             "use_cache": False,
         }
         if any(kwargs.get(name) != value for name, value in expected_decode.items()):
             raise RuntimeError("unsafe generation options")
+        if kwargs.get("do_sample") is True:
+            expected_sampling = {
+                "temperature": CONVERSATION_TEMPERATURE,
+                "top_p": CONVERSATION_TOP_P,
+                "top_k": CONVERSATION_TOP_K,
+            }
+            if any(
+                kwargs.get(name) != value for name, value in expected_sampling.items()
+            ):
+                raise RuntimeError("conversation sampling profile is not bounded")
+        elif kwargs.get("do_sample") is False:
+            if any(name in kwargs for name in ("temperature", "top_p", "top_k")):
+                raise RuntimeError("strict decoding cannot carry sampling controls")
+        else:
+            raise RuntimeError("decode policy was not selected")
         if any(
-            name in kwargs
-            for name in (
-                "temperature",
-                "top_p",
-                "top_k",
-                "repetition_penalty",
-                "no_repeat_ngram_size",
-            )
+            name in kwargs for name in ("repetition_penalty", "no_repeat_ngram_size")
         ):
             raise RuntimeError("prompt-wide logits policies break exact-copy requests")
         if "inputs_embeds" in kwargs:
@@ -167,11 +179,16 @@ class SafeFakeModel(nn.Module):
             self.weight.add_(1.0)
         if self.data_mutate:
             self.weight.data.add_(1.0)
-        generated_tokens = (
-            (conditioned_token, 102, 103, 104)
-            if conditioned_token is not None
-            else (int(getattr(self, "session_token", 101)), 102, 103, 104)
-        )
+        if self.stochastic and kwargs["do_sample"]:
+            generated_tokens = tuple(
+                map(int, torch.randint(1, 128, (4,), dtype=torch.int64).tolist())
+            )
+        else:
+            generated_tokens = (
+                (conditioned_token, 102, 103, 104)
+                if conditioned_token is not None
+                else (int(getattr(self, "session_token", 101)), 102, 103, 104)
+            )
         for token in generated_tokens[: kwargs["max_new_tokens"]]:
             if self.delay:
                 sleep(self.delay)
@@ -193,6 +210,7 @@ class FakeFactory:
     require_conditioning: bool = False
     output_head: bool = True
     data_mutate: bool = False
+    stochastic: bool = False
 
     def __call__(self):
         if os.getpid() == self.parent_pid:
@@ -204,6 +222,7 @@ class FakeFactory:
             require_conditioning=self.require_conditioning,
             output_head=self.output_head,
             data_mutate=self.data_mutate,
+            stochastic=self.stochastic,
         )
 
 
@@ -494,6 +513,7 @@ def service_for(
     require_conditioning=False,
     output_head=True,
     data_mutate=False,
+    stochastic=False,
     core_pipeline_factory=None,
     **kwargs,
 ):
@@ -507,6 +527,7 @@ def service_for(
             require_conditioning=require_conditioning,
             output_head=output_head,
             data_mutate=data_mutate,
+            stochastic=stochastic,
         ),
         core_pipeline_factory=core_pipeline_factory,
         max_input_tokens=32,
@@ -1037,11 +1058,15 @@ class TestResidentModelService(unittest.TestCase):
                 artifact_digest=torch.ones(DIGEST_BYTES, dtype=torch.int64),
             )
         )
-        with patch.object(service, "start", return_value=service):
+        with (
+            patch.object(service, "start", return_value=service),
+            patch.object(service, "stop", return_value=None) as retired,
+        ):
             with self.assertRaisesRegex(WorkerAuthorityError, "digest authority"):
                 list(
                     service.iter_generate_tokens("tampered response", max_new_tokens=1)
                 )
+        retired.assert_called_once_with(timeout=0.01)
 
     def test_text_boundary_decodes_only_after_tensor_worker_response(self):
         with service_for() as service:
@@ -1049,6 +1074,54 @@ class TestResidentModelService(unittest.TestCase):
         self.assertEqual(result.token_ids.tolist(), [101, 102, 103])
         self.assertEqual(result.text, "101 102 103")
         self.assertEqual(result.finish_reason, "length")
+
+    def test_conversation_sampling_is_seeded_replayable_and_strict_is_greedy(self):
+        with service_for(stochastic=True) as service:
+            first = service.generate(
+                "same request", max_new_tokens=4, sampling_seed=712
+            )
+            replay = service.generate(
+                "same request", max_new_tokens=4, sampling_seed=712
+            )
+            counterfactual = service.generate(
+                "same request", max_new_tokens=4, sampling_seed=713
+            )
+            strict = service.generate(
+                "exact request",
+                max_new_tokens=4,
+                decode_mode="strict",
+                sampling_seed=713,
+            )
+
+        self.assertEqual(first.token_ids.tolist(), replay.token_ids.tolist())
+        self.assertNotEqual(first.token_ids.tolist(), counterfactual.token_ids.tolist())
+        self.assertEqual(strict.token_ids.tolist(), [101, 102, 103, 104])
+
+    def test_default_conversation_seed_is_stable_and_session_scoped(self):
+        with service_for(stochastic=True) as service:
+            first = service.generate(
+                "derived seed", max_new_tokens=4, conversation_id="alpha"
+            )
+            replay = service.generate(
+                "derived seed", max_new_tokens=4, conversation_id="alpha"
+            )
+            other_session = service.generate(
+                "derived seed", max_new_tokens=4, conversation_id="beta"
+            )
+
+        self.assertEqual(first.token_ids.tolist(), replay.token_ids.tolist())
+        self.assertNotEqual(first.token_ids.tolist(), other_session.token_ids.tolist())
+
+    def test_invalid_decode_controls_fail_before_worker_start(self):
+        service = service_for()
+        with self.assertRaisesRegex(ValueError, "decode_mode"):
+            service.generate("hello", decode_mode="creative")
+        with self.assertRaisesRegex(ValueError, "sampling_seed"):
+            service.generate("hello", sampling_seed=True)
+        with self.assertRaisesRegex(ValueError, "sampling_seed"):
+            service.generate("hello", sampling_seed=2**63)
+        self.assertFalse(service.is_running)
+        self.assertIsNone(service._process)
 
     def test_core_pipeline_runs_before_authoritative_base_generation(self):
         with service_for(
@@ -1481,6 +1554,48 @@ class TestResidentModelService(unittest.TestCase):
             elapsed = monotonic() - started
         self.assertGreater(elapsed, 0.25)
         self.assertEqual(result.finish_reason, "length")
+
+    def test_total_timeout_does_not_reset_after_healthy_worker_frames(self):
+        lease_manager = GPULeaseManager()
+        with service_for(
+            delay=0.12,
+            gpu_lease_manager=lease_manager,
+            gpu_lease_owner="timeout-test",
+            gpu_lease_purpose="inference",
+            gpu_lease_vram_bytes=1_024,
+        ) as service:
+            first_lease = service.gpu_lease
+            self.assertIsNotNone(first_lease)
+            started = monotonic()
+            with self.assertRaisesRegex(TimeoutError, "total deadline"):
+                service.generate(
+                    "bounded healthy stream",
+                    max_new_tokens=4,
+                    timeout=0.25,
+                    total_timeout=0.25,
+                )
+            elapsed = monotonic() - started
+            # A deadline retires the resident CUDA owner even after a trusted
+            # cancellation terminal, then releases the exact lease only after
+            # worker death. No stale process or capability can be reused.
+            self.assertFalse(service.is_running)
+            self.assertIsNone(service._process)
+            self.assertIsNone(service.gpu_lease)
+            self.assertIsNone(lease_manager.active)
+            recovered = service.generate(
+                "request after bounded timeout",
+                max_new_tokens=1,
+                timeout=5.0,
+                total_timeout=5.0,
+            )
+            second_lease = service.gpu_lease
+        # The 250 ms generation fence is absolute; fail-closed process
+        # termination and handle/lease cleanup may add bounded shutdown time.
+        self.assertLess(elapsed, 6.0)
+        self.assertEqual(recovered.token_ids.tolist(), [101])
+        self.assertIsNotNone(second_lease)
+        assert first_lease is not None and second_lease is not None
+        self.assertGreater(second_lease.epoch, first_lease.epoch)
 
     def test_consumer_render_time_does_not_count_as_worker_idle_time(self):
         with service_for(delay=0.01) as service:

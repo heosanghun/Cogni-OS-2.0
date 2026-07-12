@@ -628,7 +628,7 @@ function renderAgentConversation(messages = []) {
       generatedTokens: Number.isInteger(message.generated_tokens)
         ? Math.max(0, Math.min(1536, message.generated_tokens))
         : 0,
-      generationMode: ["cogni_core", "quality_fallback"].includes(message.generation_mode)
+      generationMode: ["cogni_core", "conversation_fastpath", "factbook", "quality_fallback"].includes(message.generation_mode)
         ? message.generation_mode
         : null,
     });
@@ -658,6 +658,7 @@ function renderAgentConversation(messages = []) {
     const role = message.role;
     item.dataset.role = role;
     const avatar = $(".chat-avatar", item);
+    const fastPathAnswer = role === "assistant" && message.generationMode === "conversation_fastpath";
     const factbookAnswer = role === "assistant" && message.generationMode === "factbook";
     avatar.textContent = factbookAnswer
       ? "FACT"
@@ -676,10 +677,12 @@ function renderAgentConversation(messages = []) {
       if (role === "assistant" && message.streaming) completionCopy = "작성 중";
       else if (role === "assistant" && message.truncated) completionCopy = "길이 한계 · 이어서 가능";
       else if (role === "assistant" && message.finishReason) {
-        if (message.generationMode === "factbook") {
+        if (fastPathAnswer) {
+          completionCopy = "대화 FAST PATH · 완료";
+        } else if (message.generationMode === "factbook") {
           completionCopy = "FACT-BOOK · 검증된 사실";
         } else if (message.generationMode === "quality_fallback") {
-          completionCopy = "품질 안전 응답 · 완료";
+          completionCopy = "품질 검증 실패 · 복구 필요";
         } else {
           completionCopy = message.continuations
             ? `자동 이어쓰기 ${message.continuations}회 · 완료`
@@ -688,11 +691,15 @@ function renderAgentConversation(messages = []) {
       }
       completion.textContent = completionCopy;
       completion.hidden = !completionCopy;
-      completion.title = message.generationMode === "factbook"
-        ? "모델 생성 없이 검증된 Runtime Fact-book에서 구성한 응답"
-        : message.generatedTokens
-          ? `생성 ${message.generatedTokens.toLocaleString("ko-KR")} 토큰`
-          : "";
+      completion.title = fastPathAnswer
+        ? "짧은 소셜 대화를 제한된 로컬 규칙으로 한 번만 응답"
+        : message.generationMode === "factbook"
+          ? "모델 생성 없이 검증된 Runtime Fact-book에서 구성한 응답"
+          : message.generationMode === "quality_fallback"
+          ? "모델 후보가 품질 기준을 통과하지 못해 실제 답변을 제공하지 못했습니다."
+          : message.generatedTokens
+            ? `생성 ${message.generatedTokens.toLocaleString("ko-KR")} 토큰`
+            : "";
     }
     const content = $(".chat-bubble p", item);
     content.textContent = message.content;
@@ -799,10 +806,17 @@ function updateAgentState(state) {
   };
   let agentLabel = labels[ui.agentStatus] || ui.agentStatus.toUpperCase();
   const modelLoaded = state.core?.model_loaded === true;
+  if (ui.agentStatus === "succeeded" && state.completion?.generation_mode === "quality_fallback") {
+    agentLabel = "RESPONSE FAILED";
+  }
   if ((ui.agentStatus === "ready" || ui.agentStatus === "succeeded") && !modelLoaded) {
-    agentLabel = state.completion?.generation_mode === "factbook"
-      ? "FACT-BOOK ONLY"
-      : "MODEL STANDBY";
+    if (state.completion?.generation_mode === "conversation_fastpath") {
+      agentLabel = "CONVERSATION READY";
+    } else {
+      agentLabel = state.completion?.generation_mode === "factbook"
+        ? "FACT-BOOK ONLY"
+        : "MODEL STANDBY";
+    }
   }
   setText("#agent-status-label", agentLabel);
   const heading = $("#agent-heading-state");

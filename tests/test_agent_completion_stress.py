@@ -67,16 +67,34 @@ def _complete_answer(
 
 
 class TestAgentCompletionStressValidation(unittest.TestCase):
-    def test_turn_argument_preserves_four_turn_default_and_accepts_twenty(self):
+    def test_release_defaults_to_twenty_turns_and_120_second_ceiling(self):
         parser = build_parser()
         default = parser.parse_args(["--model", "m", "--manifest", "x"])
         stress = parser.parse_args(["--model", "m", "--manifest", "x", "--turns", "20"])
-        self.assertEqual(default.turns, 4)
-        self.assertEqual(default.timeout, 180.0)
+        self.assertEqual(default.turns, 20)
+        self.assertEqual(default.timeout, 120.0)
         self.assertEqual(stress.turns, 20)
         for value in ("0", "101", "not-a-number"):
             with self.subTest(value=value), self.assertRaises(SystemExit):
                 parser.parse_args(["--model", "m", "--manifest", "x", "--turns", value])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                ["--model", "m", "--manifest", "x", "--timeout", "120.001"]
+            )
+
+        diagnostic = [
+            {
+                "passed": True,
+                "checks": {},
+                "repetition": {},
+                "worker": {},
+                "generation_mode": "cogni_core",
+            }
+            for _ in range(4)
+        ]
+        summary = _summarize_turns(diagnostic, 4)
+        self.assertFalse(summary["release_schedule_gate_passed"])
+        self.assertFalse(summary["strict_turn_gate_passed"])
 
     def test_twenty_turn_schedule_keeps_original_four_and_is_deterministic(self):
         first = _prompt_cases(20)
@@ -101,6 +119,89 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         self.assertEqual(metrics["sentence_count"], 2)
         self.assertEqual(metrics["duplicate_sentence_count"], 1)
         self.assertEqual(metrics["duplicate_sentence_rate"], 0.5)
+
+    def test_adversarial_repetition_topic_and_trailing_marker_are_rejected(self):
+        state = _complete_state()
+        short_loop = _complete_answer("좋아요. " * 30)
+        checks = _answer_checks(short_loop, state)
+        self.assertFalse(checks["no_short_sentence_loop"])
+        self.assertFalse(checks["quality_report_accepts"])
+
+        off_topic = _complete_answer(
+            "사과는 빨갛습니다. 바다는 넓습니다. 하늘은 맑습니다."
+        )
+        checks = _answer_checks(
+            off_topic,
+            state,
+            "백업과 검증과 롤백을 세 문장으로 설명하세요.",
+            required_groups=(("백업",), ("검증",), ("롤백",)),
+        )
+        self.assertFalse(checks["topic_anchors_satisfied"])
+
+        truncated_list = _complete_answer(
+            "1. 백업을 만듭니다. 2. 회귀 테스트를 실행합니다. 3."
+        )
+        checks = _answer_checks(truncated_list, state)
+        self.assertFalse(checks["korean_complete"])
+
+    def test_required_literal_period_and_factbook_values_are_exact(self):
+        state = _complete_state()
+        literal = _answer_checks(
+            _complete_answer("검증을 마쳤습니다."),
+            state,
+            "답변은 반드시 '이상입니다.'로 끝내세요.",
+        )
+        self.assertFalse(literal["required_literal_ending"])
+        period = _answer_checks(
+            _complete_answer("검증을 완료했습니다!"),
+            state,
+            "한 문장으로 설명하고 마침표로 끝내세요.",
+        )
+        self.assertFalse(period["required_period_ending"])
+
+        expected = {
+            "build_version": "0.3.2",
+            "model_label": "gemma4-e4b",
+            "stored_parameters": 7_996_157_418,
+            "effective_parameters": 4_506_496_490,
+        }
+        correct = _complete_answer(
+            "gemma4-e4b 모델이며 저장 파라미터는 7,996,157,418개, "
+            "effective 파라미터는 4,506,496,490개입니다. 현재 빌드는 0.3.2입니다."
+        )
+        correct_checks = _answer_checks(
+            correct,
+            state,
+            "정확히 어떤 모델이며 파라미터는 몇 개인가요?",
+            expected_factbook=expected,
+        )
+        self.assertTrue(correct_checks["factbook_model_exact"])
+        self.assertTrue(correct_checks["factbook_version_exact"])
+        self.assertTrue(correct_checks["factbook_parameters_exact"])
+
+        wrong = dict(correct)
+        wrong["content"] = str(correct["content"]).replace("0.3.2", "0.3.1")
+        wrong_checks = _answer_checks(
+            wrong,
+            state,
+            "정확히 어떤 모델이며 파라미터는 몇 개인가요?",
+            expected_factbook=expected,
+        )
+        self.assertFalse(wrong_checks["factbook_version_exact"])
+
+    def test_parallel_structured_checks_are_not_near_duplicate_false_positives(self):
+        answer = _complete_answer(
+            "수정된 기능이 예상대로 작동하는지 확인합니다. "
+            "수정된 기능이 다른 기능에 영향을 미치지 않는지 확인합니다. "
+            "수정된 기능이 성능에 영향을 미치지 않는지 확인합니다. "
+            "수정된 기능이 보안에 영향을 미치지 않는지 확인합니다."
+        )
+        checks = _answer_checks(
+            answer,
+            _complete_state(),
+            "자체 검증을 네 항목 이내로 정리하세요.",
+        )
+        self.assertTrue(checks["no_near_duplicate_sentence"])
 
     def test_release_gate_rejects_any_quality_fallback(self):
         base = {
@@ -255,7 +356,7 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         self.assertFalse(record["checks"]["no_cross_turn_sentence_echo"])
         self.assertEqual(len(record["cross_turn_sentence_reuse"]), 2)
 
-    def test_turn_record_rejects_interactive_latency_over_three_minutes(self):
+    def test_turn_record_rejects_interactive_latency_over_two_minutes(self):
         record = _turn_record(
             turn_number=1,
             case=PromptCase("slow", "간결하게 답하세요.", "generated"),
@@ -263,7 +364,7 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
             peer_session_id="completion-b",
             state=_complete_state(),
             answer=_complete_answer(),
-            elapsed_seconds=180.001,
+            elapsed_seconds=120.001,
             worker=_healthy_worker(),
             peer_before_digest="a" * 64,
             peer_after_digest="a" * 64,

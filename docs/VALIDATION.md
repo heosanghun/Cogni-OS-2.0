@@ -1,4 +1,4 @@
-# Cogni-OS 2.0 v0.3.1 Validation Gates
+# Cogni-OS 2.0 v0.3.2 Validation Gates
 
 ## Evidence rule
 
@@ -37,7 +37,8 @@ The retained current-scope evidence has the following status:
 | automated 20-turn local completion run | `PASS` |
 | integrated Gemma/DEQ/CTS GPU runtime measurement | `PASS (RTX 5090 Laptop measured)` |
 | final System 4 stress measurement | `PASS (measurement-only/advisory)` |
-| final release bytes and `SHA256SUMS.txt` | `PASS` only after regeneration from the frozen v0.3.1 commit |
+| natural Korean 10-turn release gate | `PASS (local Gemma + bounded product routes)` |
+| final release bytes and `SHA256SUMS.txt` | `PASS` only after regeneration from the frozen v0.3.2 commit |
 
 These passes are scoped to the retained source/model/config/device evidence.
 They do not certify the target RTX 4090, code signing, or a standalone installer.
@@ -60,11 +61,11 @@ python -m pytest -q
 The exact number of collected tests is intentionally not a release contract:
 new security cases change it. A release candidate must retain the complete raw
 command output, source commit/tree digest, Python/PyTorch versions and skipped
-test reasons. No historical fixed count is accepted as v0.3.1 evidence.
+test reasons. No historical fixed count is accepted as v0.3.2 evidence.
 
-The current retained run passed Ruff check, Ruff format check across 126 files,
-and Node syntax check. Pytest completed with 599 passed, 3 skipped,
-3 deprecation warnings and 482 subtests passed in 97.67 seconds. These counts
+The current retained run passed Ruff and format checks plus Node syntax check.
+Pytest completed with 672 passed, 3 skipped, 3 deprecation warnings and
+536 subtests passed in 107.14 seconds. These counts
 describe this validation snapshot; they are not a permanent product contract.
 
 The suite covers the following Phase 1–11 invariants:

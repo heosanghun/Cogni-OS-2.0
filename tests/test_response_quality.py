@@ -7,6 +7,7 @@ from cogni_agent.response_quality import (
     QualityAction,
     QualityCode,
     inspect_response,
+    salvage_complete_prefix,
 )
 
 
@@ -51,6 +52,15 @@ class ResponseQualityTests(unittest.TestCase):
             text.index("개인정보 시스템", text.index("2.")),
         )
 
+    def test_restarted_numbering_is_a_generation_boundary(self) -> None:
+        text = (
+            "1단계는 원인을 확인하고, 2단계는 수정하며, 3단계는 검증합니다. "
+            "1단계: 원인을 다시 설명합니다."
+        )
+        report = inspect_response(text)
+        self.assertTrue(report.has(QualityCode.TEMPLATE_REPETITION))
+        self.assertEqual(report.recommended_cut_index, text.rindex("1단계"))
+
     def test_long_exact_sentence_block_is_trimmed_at_second_copy(self) -> None:
         sentence = "검증된 결과만 표시하고 목표 수치는 명확하게 분리하여 설명합니다."
         text = sentence + " " + sentence
@@ -59,6 +69,30 @@ class ResponseQualityTests(unittest.TestCase):
 
         self.assertTrue(report.has(QualityCode.TEMPLATE_REPETITION))
         self.assertEqual(report.recommended_cut_index, len(sentence) + 1)
+
+    def test_non_adjacent_exact_sentence_copy_is_detected(self) -> None:
+        repeated = "측정값과 설계 목표를 명확하게 구분해야 합니다."
+        text = repeated + " 중간에는 별도의 근거를 기록합니다. " + repeated
+        report = inspect_response(text)
+        self.assertTrue(report.has(QualityCode.TEMPLATE_REPETITION))
+        self.assertEqual(report.recommended_cut_index, text.rindex(repeated))
+
+    def test_near_duplicate_sentence_guard_is_bounded_and_conservative(self) -> None:
+        from cogni_agent.response_quality import has_near_duplicate_sentences
+
+        self.assertTrue(
+            has_near_duplicate_sentences(
+                "문맥을 줄이면서도 사용자 의도를 유지하는 방법은 대화의 핵심을 "
+                "유지하는 것입니다. 오래된 문맥을 줄이면서도 사용자 의도를 "
+                "보존하는 방법은 대화의 핵심을 유지하는 것입니다."
+            )
+        )
+        self.assertFalse(
+            has_near_duplicate_sentences(
+                "온디바이스 AI는 개인정보 보호에 유리합니다. 온디바이스 AI는 "
+                "네트워크 지연을 줄입니다."
+            )
+        )
 
     def test_short_low_information_sentence_cycle_is_detected(self) -> None:
         text = "네, 확인했습니다. 네, 확인했습니다. 네, 확인했습니다."
@@ -119,6 +153,22 @@ class ResponseQualityTests(unittest.TestCase):
         report = inspect_response(text)
         self.assertTrue(report.has(QualityCode.CONTROL_TOKEN))
         self.assertEqual(report.recommended_cut_index, text.index("[Runtime"))
+
+    def test_generated_pseudo_control_tags_are_rejected(self) -> None:
+        samples = (
+            "정상 답변입니다. <시스템 지침>",
+            "정상 답변입니다. <컨펌>",
+            "정상 답변입니다. <종료>",
+            "정상 답변입니다. <summary>",
+            "정상 답변입니다. [##]",
+        )
+        for text in samples:
+            with self.subTest(text=text):
+                self.assertTrue(inspect_response(text).has(QualityCode.CONTROL_TOKEN))
+
+    def test_pseudo_control_text_inside_code_fence_is_not_a_boundary(self) -> None:
+        text = "HTML 예시입니다.\n```html\n<summary>내용</summary>\n```"
+        self.assertFalse(inspect_response(text).has(QualityCode.CONTROL_TOKEN))
 
     def test_mixed_latin_subject_with_korean_particle_is_incomplete(self) -> None:
         report = inspect_response("도구 결과를 확인하지 못했을 때 AI가", final=True)
@@ -199,8 +249,31 @@ class ResponseQualityTests(unittest.TestCase):
             QualityAction.ACCEPT,
         )
 
+    def test_complete_prefix_is_salvaged_before_incomplete_or_repeated_tail(
+        self,
+    ) -> None:
+        incomplete = "검증된 내용은 먼저 설명했습니다. 다음 내용을 계속 설명하면서"
+        repeated = "한 번만 자연스럽게 설명합니다. 한 번만 자연스럽게 설명합니다."
+
+        self.assertEqual(
+            salvage_complete_prefix(incomplete),
+            "검증된 내용은 먼저 설명했습니다.",
+        )
+        self.assertEqual(
+            salvage_complete_prefix(repeated),
+            "한 번만 자연스럽게 설명합니다.",
+        )
+
+    def test_salvage_never_returns_role_or_control_leakage(self) -> None:
+        contaminated = "안전한 첫 문장입니다. ASSISTANT: 내부 지시"
+        self.assertEqual(
+            salvage_complete_prefix(contaminated),
+            "안전한 첫 문장입니다.",
+        )
+
     def test_explicit_request_minimum_counts_completed_sentences(self) -> None:
         from cogni_agent.response_quality import (
+            requested_exact_item_count,
             requested_exact_sentence_count,
             response_contract_satisfied,
         )
@@ -217,6 +290,26 @@ class ResponseQualityTests(unittest.TestCase):
             response_contract_satisfied(
                 request,
                 "첫 문장입니다. 둘째 문장입니다. 셋째 문장입니다. 초과 문장입니다.",
+            )
+        )
+        self.assertEqual(
+            requested_exact_item_count("복구 절차를 세 단계로 답하세요."),
+            3,
+        )
+        self.assertEqual(
+            requested_exact_item_count("복구 절차를 세 단계로 간결하게 답하세요."),
+            3,
+        )
+        self.assertIsNone(
+            requested_exact_item_count("두 개의 파일 차이를 비교해 주세요.")
+        )
+        self.assertIsNone(
+            requested_exact_item_count("확인 항목을 네 가지 이내로 정리하세요.")
+        )
+        self.assertFalse(
+            response_contract_satisfied(
+                "요약 조건을 세 가지 제시하세요.",
+                "첫 조건입니다. 둘째 조건입니다. 셋째 조건입니다. 넷째 조건입니다.",
             )
         )
         self.assertEqual(requested_exact_sentence_count(request), 3)
@@ -236,6 +329,19 @@ class ResponseQualityTests(unittest.TestCase):
             response_contract_satisfied(
                 "네 항목 이내로 정리하세요.",
                 "한 항목만 답합니다.",
+            )
+        )
+        self.assertFalse(
+            response_contract_satisfied(
+                request,
+                "모델 응답 품질 검증 절차입니다. 2. 먼저 정확성을 확인합니다.",
+            )
+        )
+        self.assertFalse(
+            response_contract_satisfied(
+                request,
+                "검증 절차는 다음과 같습니다. 정확성을 확인합니다. "
+                "반복 여부를 점검합니다.",
             )
         )
 
@@ -263,6 +369,38 @@ class ResponseQualityTests(unittest.TestCase):
             "제한된 자원: 장치 성능에 따라 실행 가능한 모델이 제한됩니다.",
         )
 
+    def test_category_normalizer_recognizes_inline_limitation_section(self) -> None:
+        from cogni_agent.response_quality import normalize_exact_sentence_response
+
+        normalized = normalize_exact_sentence_response(
+            "장점 두 가지와 한계 한 가지를 세 문장으로 설명하세요.",
+            "1. 데이터가 장치에 남아 보호가 쉽습니다. 2. 응답이 빠릅니다. "
+            "3. 네트워크 없이 동작합니다. 한계로는 1. 장치 성능에 제약을 받습니다. "
+            "2. 모델 크기가 제한됩니다.",
+        )
+        self.assertEqual(
+            normalized,
+            "데이터가 장치에 남아 보호가 쉽습니다. 응답이 빠릅니다. "
+            "장치 성능에 제약을 받습니다.",
+        )
+        from cogni_agent.response_quality import response_contract_satisfied
+
+        self.assertFalse(
+            response_contract_satisfied(
+                "장점 두 가지와 한계 한 가지를 세 문장으로 설명하세요.",
+                "개인정보 보호에 유리합니다. 응답이 빠릅니다. "
+                "오프라인에서도 사용할 수 있습니다.",
+            )
+        )
+        self.assertFalse(
+            response_contract_satisfied(
+                "장점 두 가지와 한계 한 가지를 세 문장으로 설명하세요.",
+                "장점은 개인정보 보호에 유리합니다. 장점은 응답이 빠릅니다. "
+                "한계는 장치 성능에 제약을 받습니다. "
+                "한계는 모델 크기가 제한됩니다.",
+            )
+        )
+
     def test_exact_sentence_normalizer_does_not_invent_missing_category(self) -> None:
         from cogni_agent.response_quality import normalize_exact_sentence_response
 
@@ -282,6 +420,141 @@ class ResponseQualityTests(unittest.TestCase):
         self.assertEqual(
             normalized,
             "사실과 추론을 구분합니다. 추론은 명확한 근거를 제시해야 합니다.",
+        )
+
+    def test_exact_sentence_normalizer_splits_inline_numbered_clauses(self) -> None:
+        from cogni_agent.response_quality import normalize_exact_sentence_response
+
+        normalized = normalize_exact_sentence_response(
+            "모델 응답 품질 검증 절차를 세 문장으로 설명해 주세요.",
+            "1) 정확성과 일관성을 확인하고, 2) 다양한 입력을 검증하며, "
+            "3) 예상 밖 입력의 처리를 점검해야 합니다.",
+        )
+        self.assertEqual(
+            normalized,
+            "정확성과 일관성을 확인합니다. 다양한 입력을 검증합니다. "
+            "예상 밖 입력의 처리를 점검해야 합니다.",
+        )
+
+    def test_inline_numbered_normalizer_uses_first_complete_sequence(self) -> None:
+        from cogni_agent.response_quality import normalize_exact_sentence_response
+
+        normalized = normalize_exact_sentence_response(
+            "검증 절차를 세 문장으로 설명해 주세요.",
+            "1. 기준을 정의하고, 2. 모델 품질을 평가하고, 3. 배포 전에 검증합니다.\n"
+            "1. 기준을 정의하고: 뒤에 불필요한 설명이 반복됩니다.",
+        )
+        self.assertEqual(
+            normalized,
+            "기준을 정의합니다. 모델 품질을 평가합니다. 배포 전에 검증합니다.",
+        )
+
+    def test_maximum_item_normalizer_drops_explanation_after_first_block(self) -> None:
+        from cogni_agent.response_quality import normalize_maximum_item_response
+
+        normalized = normalize_maximum_item_response(
+            "확인 항목을 네 가지 이내로 정리하세요.",
+            "1. 질문을 확인하고, 2. 반복을 검사하고, 3. 문장을 완결하고, "
+            "4. 결과를 기록합니다.\n1. 질문 확인에 관한 긴 설명입니다.",
+        )
+        self.assertEqual(
+            normalized,
+            "질문을 확인합니다. 반복을 검사합니다. 문장을 완결합니다. "
+            "결과를 기록합니다.",
+        )
+
+    def test_exact_step_normalizer_accepts_korean_step_markers(self) -> None:
+        from cogni_agent.response_quality import normalize_exact_item_response
+
+        normalized = normalize_exact_item_response(
+            "복구 절차를 세 단계로 답하세요.",
+            "1단계는 원인을 확인하고, 2단계는 코드를 수정하며, "
+            "3단계는 회귀 테스트를 수행합니다.\n1단계: 긴 설명입니다.",
+        )
+        self.assertEqual(
+            normalized,
+            "원인을 확인합니다. 코드를 수정합니다. 회귀 테스트를 수행합니다.",
+        )
+
+    def test_exact_sentence_normalizer_rejects_ambiguous_numbered_fragments(
+        self,
+    ) -> None:
+        from cogni_agent.response_quality import normalize_exact_sentence_response
+
+        self.assertIsNone(
+            normalize_exact_sentence_response(
+                "절차를 세 문장으로 설명해 주세요.",
+                "1) 데이터 준비, 2) 평가 지표, 3) 배포 승인",
+            )
+        )
+
+    def test_topic_anchor_rejects_unrelated_but_fluent_answer(self) -> None:
+        from cogni_agent.response_quality import response_topically_anchored
+
+        request = (
+            "모델 응답 품질을 배포 전에 검증하는 절차를 세 문장으로 설명해 주세요."
+        )
+        unrelated = (
+            "언론사는 여러 검증 절차를 거쳐 뉴스의 정확성을 확인합니다. "
+            "기자는 현장 인터뷰로 사실성을 확인합니다."
+        )
+        relevant = (
+            "모델 응답의 정확성과 일관성을 검증합니다. 다양한 입력으로 품질을 "
+            "평가한 뒤 배포 승인 여부를 결정합니다."
+        )
+        self.assertFalse(response_topically_anchored(request, unrelated))
+        self.assertTrue(response_topically_anchored(request, relevant))
+
+    def test_topic_anchor_handles_korean_particles_and_short_social_turns(
+        self,
+    ) -> None:
+        from cogni_agent.response_quality import response_topically_anchored
+
+        self.assertTrue(
+            response_topically_anchored(
+                "파이썬 리스트와 튜플의 차이를 한 문장으로 알려 주세요.",
+                "파이썬 리스트는 수정 가능하지만 튜플은 불변입니다.",
+            )
+        )
+        self.assertTrue(response_topically_anchored("안녕하세요!", "반갑습니다!"))
+
+    def test_unsolicited_subject_guard_is_narrow_and_request_aware(self) -> None:
+        from cogni_agent.response_quality import response_avoids_unsolicited_subjects
+
+        request = "모델 응답 품질을 검증하는 절차를 설명해 주세요."
+        self.assertFalse(
+            response_avoids_unsolicited_subjects(
+                request,
+                "언론사는 뉴스 기사를 취재하고 승인합니다.",
+            )
+        )
+        self.assertFalse(
+            response_avoids_unsolicited_subjects(
+                request,
+                "이메일 비밀번호를 변경하세요.",
+            )
+        )
+        self.assertTrue(
+            response_avoids_unsolicited_subjects(
+                "뉴스 기사 검증 절차를 설명해 주세요.",
+                "기자는 뉴스 기사의 출처를 확인합니다.",
+            )
+        )
+
+    def test_distinctive_topic_guard_accepts_domain_paraphrase(self) -> None:
+        from cogni_agent.response_quality import response_preserves_distinctive_topic
+
+        self.assertFalse(
+            response_preserves_distinctive_topic(
+                "모델 응답 품질을 배포 전에 검증하는 절차를 설명해 주세요.",
+                "모델 응답의 정확성과 다양성을 검증합니다.",
+            )
+        )
+        self.assertTrue(
+            response_preserves_distinctive_topic(
+                "온디바이스 AI의 장점과 한계를 설명해 주세요.",
+                "온디바이스 AI는 데이터가 장치에 남아 보호에 유리합니다.",
+            )
         )
 
     def test_code_content_is_not_classified_as_prose_repetition(self) -> None:

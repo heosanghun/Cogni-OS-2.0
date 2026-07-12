@@ -3,8 +3,11 @@ import unittest
 import torch
 
 from cogni_agent.protocol import (
+    DECODE_CONVERSATION,
+    DECODE_STRICT,
     DIGEST_BYTES,
     FINISH_CANCELLED,
+    FINISH_ERROR,
     FINISH_LENGTH,
     FINISH_LKG_LENGTH,
     FINISH_LKG_STOP,
@@ -12,6 +15,7 @@ from cogni_agent.protocol import (
     FINISH_STOP,
     HARD_MAX_INPUT_TOKENS,
     STATUS_CANCELLED,
+    STATUS_DEADLINE_EXCEEDED,
     STATUS_OK,
     TensorProtocolError,
     make_generate_request,
@@ -38,6 +42,8 @@ class TestAgentTensorProtocol(unittest.TestCase):
             lease_deadline_ns=2_000_000,
             artifact_digest=artifact,
             session_digest=session,
+            decode_mode=DECODE_CONVERSATION,
+            sampling_seed=712,
         )
         self.assertEqual(len(message), 4)
         self.assertTrue(all(item.device.type == "cpu" for item in message))
@@ -51,8 +57,37 @@ class TestAgentTensorProtocol(unittest.TestCase):
         self.assertTrue(torch.equal(request.artifact_digest, artifact))
         self.assertTrue(torch.equal(request.session_digest, session))
         self.assertEqual(request.max_new_tokens, 12)
+        self.assertEqual(request.decode_mode, DECODE_CONVERSATION)
+        self.assertEqual(request.sampling_seed, 712)
         self.assertTrue(torch.equal(request.input_ids, torch.tensor([[1, 2, 3]])))
         self.assertIsNone(parse_request(make_stop_request()))
+
+    def test_decode_policy_and_seed_are_closed_bounded_scalars(self) -> None:
+        strict = parse_request(
+            make_generate_request(
+                8,
+                torch.tensor([[1]], dtype=torch.int64),
+                None,
+                max_new_tokens=1,
+                decode_mode=DECODE_STRICT,
+                sampling_seed=2**63 - 1,
+            )
+        )
+        self.assertIsNotNone(strict)
+        self.assertEqual(strict.decode_mode, DECODE_STRICT)
+        self.assertEqual(strict.sampling_seed, 2**63 - 1)
+
+        for mode, seed in ((99, 0), (DECODE_CONVERSATION, -1), (0, 2**63)):
+            with self.subTest(mode=mode, seed=seed):
+                with self.assertRaises(TensorProtocolError):
+                    make_generate_request(
+                        8,
+                        torch.tensor([[1]], dtype=torch.int64),
+                        None,
+                        max_new_tokens=1,
+                        decode_mode=mode,
+                        sampling_seed=seed,
+                    )
 
     def test_request_schema_rejects_wrong_dtype_shape_mask_and_size(self) -> None:
         with self.assertRaises(TensorProtocolError):
@@ -118,6 +153,7 @@ class TestAgentTensorProtocol(unittest.TestCase):
             (STATUS_OK, FINISH_LKG_STOP),
             (STATUS_OK, FINISH_LKG_LENGTH),
             (STATUS_CANCELLED, FINISH_CANCELLED),
+            (STATUS_DEADLINE_EXCEEDED, FINISH_ERROR),
         )
         for status, reason in cases:
             with self.subTest(status=status, reason=reason):

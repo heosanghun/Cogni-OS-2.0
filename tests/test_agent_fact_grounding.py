@@ -115,6 +115,51 @@ class TestRuntimeFactGrounder(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertIn(label, answer)
 
+    def test_collaboration_question_is_concise_but_invitation_stays_conversational(
+        self,
+    ):
+        answer = self.grounder.answer("나와 어떤 일을 함께 할 수 있나요?")
+
+        self.assertIsNotNone(answer)
+        assert answer is not None
+        self.assertIn("아이디어 정리", answer)
+        self.assertIn("별도 작업 모드", answer)
+        self.assertNotIn("System 1.5", answer)
+        self.assertLessEqual(answer.count("."), 3)
+        self.assertIsNone(
+            self.grounder.answer("좋아요, 같이 재미있는 프로젝트를 하자!")
+        )
+
+    def test_natural_feature_paraphrases_use_grounded_overview(self):
+        for question in (
+            "당신이 지원하는 기능이 뭐예요?",
+            "이 에이전트가 할 수 있는 기능을 알려주세요.",
+            "너는 무엇을 할 수 있니?",
+            "Cogni-OS 프로젝트의 모든 기능을 알려주세요.",
+        ):
+            with self.subTest(question=question):
+                answer = self.grounder.answer(question)
+                self.assertIsNotNone(answer)
+                assert answer is not None
+                self.assertIn("CTS · DEQ", answer)
+
+    def test_unrelated_feature_question_does_not_overroute_to_factbook(self):
+        for question in (
+            "이 파이썬 함수는 어떤 기능을 하나요?",
+            "리스트가 제공하는 기능을 예시와 함께 알려주세요.",
+            "이 코드의 특별한 기능이 무엇인지 분석해 주세요.",
+            "이 컨테이너는 어떤 기능을 제공하나요?",
+            "이 라이브러리의 모든 기능을 설명해 주세요.",
+            "이 코드의 전체 기능을 분석해 주세요.",
+            "프로그램 모듈을 모두 설명해 주세요.",
+            "이 프로젝트의 모든 기능을 정리해줘.",
+            "이 앱의 전체 기능을 알려줘.",
+            "이 서비스의 모든 모듈을 분석해줘.",
+            "우리 웹사이트 기능을 모두 설명해줘.",
+        ):
+            with self.subTest(question=question):
+                self.assertIsNone(self.grounder.answer(question))
+
     def test_general_conversation_falls_through_to_local_model(self):
         for question in (
             "대한민국의 수도를 한 문장으로 알려줘.",
@@ -145,6 +190,24 @@ class TestRuntimeFactGrounder(unittest.TestCase):
                 "방금 답변을 요약하세요.", "일반적인 모델 답변입니다."
             )
         )
+
+    def test_referential_followup_reports_only_currently_usable_capabilities(self):
+        previous = self.grounder.answer(
+            "CTS와 System 1.5, System 3의 상태를 설명하세요."
+        )
+        self.assertIsNotNone(previous)
+
+        answer = self.grounder.answer_followup(
+            "그중 지금 쓸 수 있는 것만 쉽게 말해줘.",
+            previous,
+        )
+
+        self.assertIsNotNone(answer)
+        assert answer is not None
+        self.assertIn("CTS·DEQ(제한 실험)", answer)
+        self.assertIn("System 1.5(게이트 대기)", answer)
+        self.assertIn("System 3(자문 전용)", answer)
+        self.assertIn("활성화됐다고 말할 수 없습니다", answer)
 
     def test_unverified_tool_success_is_grounded_in_operational_policy(self):
         answer = self.grounder.answer(

@@ -2,7 +2,7 @@
 
 - 제품: Cogni-OS 2.0 Genesis
 - 화면: CogniBoard — Sovereign AI Mission Control
-- 문서 기준 버전: 0.3.1
+- 문서 기준 버전: 0.3.2
 - 운영 원칙: 로컬 전용, 외부 API 호출 금지, 단일 GPU 소유권, 증거 기반 표시
 
 ## 1. 이 문서의 목적
@@ -19,7 +19,7 @@ CogniBoard는 단순한 채팅 화면이 아니라 로컬 Gemma 4 E4B, Cogni-Cor
 
 ## 2. 1분 빠른 시작
 
-1. 배포 폴더에서 `CogniBoard-v0.3.1.exe`를 더블클릭한다.
+1. 배포 폴더에서 `CogniBoard-v0.3.2.exe`를 더블클릭한다.
 2. 브라우저가 열리면 상단의 `LOCAL ONLY`, `외부 호출 0`, `리듬 INFERENCE`를
    확인한다.
 3. `AI 워크스페이스`에서 “대한민국의 수도를 한 문장으로 알려줘.”처럼
@@ -118,13 +118,17 @@ flowchart LR
 | 화면 표시 | 의미 | 모델 생성 |
 |---|---|---:|
 | `Cogni Agent` | 일반 질문을 로컬 Gemma + Cogni-Core가 생성 | 있음 |
+| `대화 FAST PATH` | 인사·협업 제안·능력 안내와 직전 협업을 잇는 첫 단계 질문의 제한된 로컬 응답 | 없음 |
 | `Runtime Fact-book` | 모델/파라미터/권한 같은 검증 사실을 스냅샷에서 응답 | 없음 |
+| `품질 검증 실패 · 복구 필요` | 후보가 반복·완결·관련성 게이트를 통과하지 못함 | 게시 거부 |
 | `시스템` | 실패, 정책 거부, 연결 상태 안내 | 없음 |
 | `도구` | 허용된 로컬 작업 결과 | 없음 |
 
-Fact-book 답변이 정상이라고 해서 모델 워커가 정상이라는 뜻은 아니다. 일반 질문이
-실패하고 Fact-book만 답하면 오른쪽 레일과 시스템 메시지의 워커 초기화 원인을
-확인한다.
+첫 단계 질문은 바로 앞 턴이 Fast Path로 처리된 프로젝트·데모 협업 제안일 때만 이
+경로를 사용한다. 문맥 없는 첫 단계 질문과 일반 지식·코드·형식 요청은 Fast Path가
+가로채지 않는다. Fact-book 답변이나 Fast Path 응답이 정상이라고 해서 모델 워커가
+정상이라는 뜻은 아니다. 일반 질문이 실패하고 Fact-book만 답하면 오른쪽 레일과
+시스템 메시지의 워커 초기화 원인을 확인한다.
 
 ### 4.2 미션 컨트롤
 
@@ -268,7 +272,7 @@ spectral margin `< 0.95`, finite `PASS`, fallback `NOT USED`, external API
 2. 동일 원인의 증거를 군집화한다.
 3. 최소 K개 독립 증거가 있는 후보만 제안한다.
 4. 후보는 격리된 제안·회귀 검증 경로로 보낸다.
-5. 현재 v0.3.1 제품은 결과를 `proposal_only`로 보존한다.
+5. 현재 v0.3.2 제품은 결과를 `proposal_only`로 보존한다.
 
 현재 활성 source 자동 덮어쓰기, 임의 코드 실행, 무인 승격은 지원하지 않는다.
 이 경계는 미완성 UI가 아니라 증명되지 않은 자가수정의 위험을 막는 안전 정책이다.
@@ -310,7 +314,7 @@ proposal-only Self-Harness를 설명한다.
 
 1. 시스템 메시지의 구체적인 초기화 단계를 확인한다.
 2. `CTS policy checkpoint integrity verification failed`이면 배포 ZIP/소스가
-   v0.3.1인지와 `SHA256SUMS.txt`를 확인한다.
+   v0.3.2인지와 `SHA256SUMS.txt`를 확인한다.
 3. 모델 경로 `C:\Project\cognios\gemma4-e4b`와 manifest 6개 파일을 확인한다.
 4. Python, PyTorch, Transformers, CUDA, GPU 여유 메모리를 확인한다.
 5. 배포 폴더의 source와 EXE가 같은 버전인지 확인한다.
@@ -343,7 +347,7 @@ proposal-only Self-Harness를 설명한다.
 | `AUTH_REQUIRED` | 로컬 세션 인증 만료 | 전원 종료 후 EXE 재실행 | session 시각, 오류 코드 | 새 세션 인증 성공 |
 | `COMPUTE_BUSY` | 대화·검증·진화가 GPU lease 소유 | 반복 클릭 금지, 완료 대기 또는 해당 작업 중단 | active job, rhythm, lease | active job 0 |
 | `CONNECTION_LOST` | UI와 loopback 서버 연결 단절 | 자동 복구 대기, 연속 새로고침 금지 | 시각, 마지막 이벤트 | 연결 복구 알림 |
-| 체크포인트 무결성 | 배포 byte와 신뢰 SHA 불일치 | 즉시 실행 중지 | ZIP/파일 SHA-256, commit OID | v0.3.1 번들 재검증 |
+| 체크포인트 무결성 | 배포 byte와 신뢰 SHA 불일치 | 즉시 실행 중지 | ZIP/파일 SHA-256, commit OID | v0.3.2 번들 재검증 |
 | VRAM/OOM | 16.7GiB 경계 또는 여유 메모리 실패 | 다른 GPU 프로세스 종료 후 재시험 | 장치, peak VRAM, 프로세스 목록 | 경계 PASS |
 | finite/residual/fallback 실패 | DEQ/CTS 안전 postcheck 실패 | VERIFIED 선언 금지 | 원시 이벤트와 terminal metrics | 전체 라이브 검증 PASS |
 | 반복·미완성 답변 | 품질 경계 또는 생성 실패 | 중단하고 같은 질문 연타 금지 | prompt, answer, finish/quality reason | 새 회귀·일반질문 smoke PASS |

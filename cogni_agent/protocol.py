@@ -15,10 +15,16 @@ import torch
 from torch import Tensor
 
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 OP_GENERATE = 1
 OP_STOP = 2
+
+# Decode policy is an explicit, bounded scalar in the tensor protocol.  Normal
+# conversation uses the model-recommended sampling profile; callers that need
+# exact-copy/replay semantics must opt into strict greedy decoding.
+DECODE_STRICT = 0
+DECODE_CONVERSATION = 1
 
 STATUS_OK = 0
 STATUS_CANCELLED = 1
@@ -26,6 +32,7 @@ STATUS_INVALID_REQUEST = 2
 STATUS_MODEL_ERROR = 3
 STATUS_BASE_MUTATED = 4
 STATUS_AUTHORITY_REJECTED = 5
+STATUS_DEADLINE_EXCEEDED = 6
 
 # Terminal generation cause.  This travels in the fourth tensor so the
 # controller never confuses a token-budget cut with a real model stop.
@@ -74,6 +81,8 @@ class GenerationRequest:
     attention_mask: Tensor
     stop_token_ids: Tensor
     max_new_tokens: int
+    decode_mode: int
+    sampling_seed: int
 
 
 @dataclass(frozen=True)
@@ -181,6 +190,8 @@ def make_generate_request(
     lease_deadline_ns: int = 0,
     artifact_digest: Tensor | None = None,
     session_digest: Tensor | None = None,
+    decode_mode: int = DECODE_CONVERSATION,
+    sampling_seed: int = 0,
 ) -> TensorMessage:
     if (
         not isinstance(request_id, int)
@@ -194,6 +205,16 @@ def make_generate_request(
         or not 1 <= max_new_tokens <= HARD_MAX_NEW_TOKENS
     ):
         raise TensorProtocolError("max_new_tokens exceeds the hard protocol bound")
+    if decode_mode not in {DECODE_STRICT, DECODE_CONVERSATION}:
+        raise TensorProtocolError("decode_mode is unsupported")
+    if (
+        not isinstance(sampling_seed, int)
+        or isinstance(sampling_seed, bool)
+        or not 0 <= sampling_seed <= NO_DEADLINE_NS
+    ):
+        raise TensorProtocolError(
+            "sampling_seed must be a non-negative signed-63-bit integer"
+        )
     ids = _cpu_i64(input_ids, "input_ids", ndim=2)
     if ids.shape[0] != 1 or not 1 <= ids.shape[1] <= HARD_MAX_INPUT_TOKENS:
         raise TensorProtocolError("input_ids must have bounded batch-one shape")
@@ -232,6 +253,8 @@ def make_generate_request(
             epoch,
             request_deadline,
             lease_deadline,
+            decode_mode,
+            sampling_seed,
         ],
         dtype=torch.int64,
     )
@@ -248,7 +271,7 @@ def make_generate_request(
 
 def make_stop_request() -> TensorMessage:
     header = torch.tensor(
-        [PROTOCOL_VERSION, OP_STOP, 0, 0, 0, 0, 0, 0],
+        [PROTOCOL_VERSION, OP_STOP, 0, 0, 0, 0, 0, 0, 0, 0],
         dtype=torch.int64,
     )
     return header, _empty(), _empty(), _empty()
@@ -258,7 +281,7 @@ def parse_request(message: object) -> GenerationRequest | None:
     if not isinstance(message, tuple) or len(message) != 4:
         raise TensorProtocolError("request must contain exactly four tensors")
     header = _cpu_i64(message[0], "request header", ndim=1)
-    if header.shape != (8,):
+    if header.shape != (10,):
         raise TensorProtocolError("request header shape is invalid")
     (
         version,
@@ -269,6 +292,8 @@ def parse_request(message: object) -> GenerationRequest | None:
         lease_epoch,
         request_deadline_ns,
         lease_deadline_ns,
+        decode_mode,
+        sampling_seed,
     ) = map(int, header.tolist())
     if version != PROTOCOL_VERSION:
         raise TensorProtocolError("request protocol version is unsupported")
@@ -286,6 +311,8 @@ def parse_request(message: object) -> GenerationRequest | None:
                 lease_epoch,
                 request_deadline_ns,
                 lease_deadline_ns,
+                decode_mode,
+                sampling_seed,
             )
         ):
             raise TensorProtocolError("stop request header is invalid")
@@ -318,6 +345,8 @@ def parse_request(message: object) -> GenerationRequest | None:
         lease_deadline_ns=lease_deadline_ns,
         artifact_digest=artifact,
         session_digest=session,
+        decode_mode=decode_mode,
+        sampling_seed=sampling_seed,
     )
     return GenerationRequest(
         request_id=request_id,
@@ -331,6 +360,8 @@ def parse_request(message: object) -> GenerationRequest | None:
         attention_mask=rebuilt[2],
         stop_token_ids=stop.clone(),
         max_new_tokens=max_new_tokens,
+        decode_mode=decode_mode,
+        sampling_seed=sampling_seed,
     )
 
 
@@ -362,6 +393,7 @@ def make_response(
         STATUS_MODEL_ERROR,
         STATUS_BASE_MUTATED,
         STATUS_AUTHORITY_REJECTED,
+        STATUS_DEADLINE_EXCEEDED,
     }:
         raise TensorProtocolError("response status is unsupported")
     if (
@@ -515,6 +547,8 @@ def parse_response(message: object) -> ResponseFrame:
 
 __all__ = [
     "GenerationRequest",
+    "DECODE_CONVERSATION",
+    "DECODE_STRICT",
     "FINISH_CANCELLED",
     "FINISH_ERROR",
     "FINISH_LENGTH",
@@ -535,6 +569,7 @@ __all__ = [
     "STATUS_BASE_MUTATED",
     "STATUS_AUTHORITY_REJECTED",
     "STATUS_CANCELLED",
+    "STATUS_DEADLINE_EXCEEDED",
     "STATUS_INVALID_REQUEST",
     "STATUS_MODEL_ERROR",
     "STATUS_OK",

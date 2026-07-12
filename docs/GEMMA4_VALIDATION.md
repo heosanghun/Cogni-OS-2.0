@@ -1,4 +1,4 @@
-# Local Gemma 4 E4B Validation — v0.3.1
+# Local Gemma 4 E4B Validation — v0.3.2
 
 ## Scope
 
@@ -78,6 +78,22 @@ The current script runs four offline turns and checks clean terminal reasons,
 no truncation, no public role/control markers, no repetitive output, truthful
 identity grounding and worker cleanup. It is a regression canary, not the
 Phase 1 requirement for an independently reviewed 20-turn corpus.
+
+Natural Korean conversation is a separate mandatory gate:
+
+```powershell
+python scripts\validate_agent_casual_korean.py `
+  --model C:\Project\cognios\gemma4-e4b `
+  --manifest config\gemma4-e4b.manifest.toml `
+  --timeout 120 `
+  --output C:\Project\cognios-evidence\casual-korean-v0.3.2.json
+```
+
+This reproduces the reported two-turn collaboration conversation verbatim and
+adds independent greetings, paraphrases, typos, follow-ups, a context switch,
+and formal regressions. Release requires zero quality fallbacks, exactly one
+assistant message per user turn, natural Korean completion, no loops, and a
+bounded per-turn latency. See [CASUAL_KOREAN_VALIDATION.md](CASUAL_KOREAN_VALIDATION.md).
 
 ## Experimental decoder-DEQ smoke
 

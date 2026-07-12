@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from html import escape
+import os
 from pathlib import Path
 import re
+from runpy import run_path
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -38,6 +41,23 @@ MUTED = colors.HexColor("#52677A")
 LINE = colors.HexColor("#CEDBE5")
 PAPER = colors.HexColor("#F7FAFC")
 AMBER = colors.HexColor("#A56A00")
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PRODUCT_VERSION = str(
+    run_path(str(_PROJECT_ROOT / "cogni_os" / "version.py"))["__version__"]
+)
+if re.fullmatch(r"\d+\.\d+\.\d+", PRODUCT_VERSION) is None:
+    raise RuntimeError("cogni_os.version.__version__ must be semantic version text")
+
+
+def document_date() -> str:
+    """Return a reproducible UTC date when SOURCE_DATE_EPOCH is available."""
+
+    source_epoch = os.environ.get("SOURCE_DATE_EPOCH", "")
+    if re.fullmatch(r"\d{1,12}", source_epoch):
+        return (
+            datetime.fromtimestamp(int(source_epoch), timezone.utc).date().isoformat()
+        )
+    return datetime.now().astimezone().date().isoformat()
 
 
 def register_fonts() -> None:
@@ -498,7 +518,11 @@ def page_background(canvas, doc) -> None:
         canvas.setFont("Malgun", 7.2)
         canvas.setFillColor(MUTED)
         canvas.drawRightString(width - 20 * mm, 10 * mm, f"{doc.page - 1:02d}")
-        canvas.drawString(20 * mm, 10 * mm, "Cogni-OS 2.0 Genesis v0.3.1 · Local only")
+        canvas.drawString(
+            20 * mm,
+            10 * mm,
+            f"Cogni-OS 2.0 Genesis v{PRODUCT_VERSION} · Local only",
+        )
     canvas.restoreState()
 
 
@@ -515,7 +539,7 @@ def build_pdf(input_path: Path, output_path: Path) -> None:
         bottomMargin=18 * mm,
         title="CogniBoard 사용자 매뉴얼 및 운영 플레이북",
         author="Cogni-OS 2.0 Genesis",
-        subject="CogniBoard v0.3.1 operator manual",
+        subject=f"CogniBoard v{PRODUCT_VERSION} operator manual",
     )
     story = [
         Spacer(1, 57 * mm),
@@ -525,7 +549,7 @@ def build_pdf(input_path: Path, output_path: Path) -> None:
         Spacer(1, 7 * mm),
         Paragraph(
             "로컬 Gemma 4 E4B · Cogni-Core · 라이브 검증 · Self-Harness<br/>"
-            "버전 0.3.1 · 2026-07-12",
+            f"버전 {PRODUCT_VERSION} · {document_date()}",
             styles["cover_subtitle"],
         ),
         Spacer(1, 55 * mm),

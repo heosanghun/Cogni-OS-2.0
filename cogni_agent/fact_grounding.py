@@ -11,6 +11,7 @@ local Gemma conversation path.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 import unicodedata
 
 from cogni_os.capabilities import CapabilityRecord, CapabilityState
@@ -171,26 +172,75 @@ _IDENTITY_ALIASES = (
     "cogni agent는 뭐",
 )
 
-_OVERVIEW_ALIASES = (
+_EXPLICIT_OVERVIEW_ALIASES = (
     "모든 기능",
     "전체 기능",
     "기능을 모두",
     "기능 모두",
-    "어떤 기능",
     "모듈을 모두",
     "모든 모듈",
     "전체 모듈",
-    "뭘 할 수",
-    "무엇을 할 수",
     "all capabilities",
     "all features",
 )
 
+_SELF_FEATURE_ALIASES = (
+    "어떤 기능",
+    "할 수 있는 기능",
+    "지원하는 기능",
+    "제공하는 기능",
+    "특별한 기능",
+    "기능이 뭐",
+    "기능은 뭐",
+)
+
+_SELF_ABILITY_ALIASES = (
+    "뭘 할 수",
+    "무엇을 할 수",
+    "할 수 있는 일이",
+    "할 수 있는 일은",
+    "what can you do",
+)
+
+_SELF_REFERENCE_RE = re.compile(
+    r"(?<![0-9a-z가-힣])(?:"
+    r"너(?:는|가|의)?|당신(?:은|이|의)?|"
+    r"이\s+에이전트(?:는|가|의)?|cogni(?:-os)?|you"
+    r")(?![0-9a-z가-힣])"
+)
+
+_EXTERNAL_FEATURE_SUBJECT_RE = re.compile(
+    r"(?<![0-9a-z가-힣])(?:이|해당|위|저|우리|현재)?\s*"
+    r"(?:함수|코드|라이브러리|프로그램|클래스|패키지|컨테이너|api|"
+    r"프로젝트|앱|애플리케이션|서비스|웹사이트|사이트|웹\s*앱|도구|"
+    r"스크립트|문서|저장소|리포지터리|레포지토리)"
+    r"(?:의|가|는|은|\s+모듈)?(?![0-9a-z가-힣])"
+)
+
+_COLLABORATION_ALIASES = (
+    "나와 어떤 일을 함께",
+    "저와 어떤 일을 함께",
+    "나와 무슨 일을 함께",
+    "저와 무슨 일을 함께",
+    "어떤 일을 같이 할 수",
+    "어떤 일을 함께 할 수",
+    "무엇을 도와줄 수",
+    "뭘 도와줄 수",
+    "어떻게 도와줄 수",
+    "how can you help me",
+)
+
 _FOLLOWUP_REFERENCE_ALIASES = (
     "방금 답변",
+    "방금 말한",
     "앞선 답변",
     "이전 답변",
     "위 답변",
+    "앞에서 말한",
+    "그중",
+    "그 중",
+    "이 중",
+    "그 기능",
 )
 _EVIDENCE_BOUNDARY_ALIASES = (
     "실제 검증",
@@ -199,6 +249,36 @@ _EVIDENCE_BOUNDARY_ALIASES = (
     "설계 목표",
     "검증과 목표",
 )
+_CURRENTLY_USABLE_ALIASES = (
+    "지금 쓸 수",
+    "현재 쓸 수",
+    "바로 쓸 수",
+    "현재 사용 가능",
+    "바로 사용 가능",
+    "실제로 사용 가능",
+    "지금 활성",
+    "현재 활성",
+)
+
+_PREVIOUS_ANSWER_CAPABILITIES = (
+    ("gemma4_e4b", ("Cogni Agent", "모델 파라미터")),
+    ("cts_deq", ("CTS · DEQ",)),
+    ("system_1_5", ("System 1.5",)),
+    ("system_2_5", ("System 2.5",)),
+    ("system_3", ("System 3",)),
+    ("system_4", ("System 4",)),
+    ("self_harness", ("Self-Harness",)),
+)
+
+_CAPABILITY_SHORT_LABELS = {
+    "gemma4_e4b": "로컬 Gemma",
+    "cts_deq": "CTS·DEQ",
+    "system_1_5": "System 1.5",
+    "system_2_5": "System 2.5",
+    "system_3": "System 3",
+    "system_4": "System 4",
+    "self_harness": "Self-Harness",
+}
 
 _EXECUTION_RESULT_ALIASES = (
     "도구 실행 결과",
@@ -231,6 +311,14 @@ def _normalize(text: str) -> str:
 
 def _contains_any(text: str, aliases: tuple[str, ...]) -> bool:
     return any(_normalize(alias) in text for alias in aliases)
+
+
+def _has_self_reference(text: str) -> bool:
+    return _SELF_REFERENCE_RE.search(text) is not None
+
+
+def _has_external_feature_subject(text: str) -> bool:
+    return _EXTERNAL_FEATURE_SUBJECT_RE.search(text) is not None
 
 
 def _capability_status(record: CapabilityRecord) -> str:
@@ -324,6 +412,44 @@ class RuntimeFactGrounder:
         text = _normalize(question)
         if not _contains_any(text, _FOLLOWUP_REFERENCE_ALIASES):
             return None
+        if (
+            _contains_any(text, _CURRENTLY_USABLE_ALIASES)
+            and "Fact-book:" in previous_answer
+        ):
+            referenced = [
+                name
+                for name, labels in _PREVIOUS_ANSWER_CAPABILITIES
+                if any(label in previous_answer for label in labels)
+            ]
+            if not referenced:
+                return None
+            available: list[str] = []
+            unavailable: list[str] = []
+            for name in referenced:
+                record = self._factbook.capabilities.require(name)
+                label = _CAPABILITY_SHORT_LABELS[name]
+                item = f"{label}({_STATE_KO[record.state]})"
+                if record.answer_bearing:
+                    available.append(item)
+                else:
+                    unavailable.append(item)
+            if available:
+                answer = (
+                    "앞서 언급한 항목 중 현재 검증된 답변 경로에서 사용할 수 있는 "
+                    f"것은 {', '.join(available)}입니다."
+                )
+            else:
+                answer = (
+                    "앞서 언급한 항목 중 현재 답변 기능으로 사용할 수 있다고 "
+                    "검증된 것은 없습니다."
+                )
+            if unavailable:
+                answer += (
+                    f" {', '.join(unavailable)}은 현재 대화 기능으로 활성화됐다고 "
+                    "말할 수 없습니다."
+                )
+            answer += " 상태가 바뀌기 전까지는 이 경계를 그대로 안내합니다."
+            return answer
         if not _contains_any(text, _EVIDENCE_BOUNDARY_ALIASES):
             return None
         if "Fact-book:" not in previous_answer:
@@ -336,7 +462,24 @@ class RuntimeFactGrounder:
         )
 
     def _classify(self, text: str) -> tuple[str, ...]:
-        if _contains_any(text, _OVERVIEW_ALIASES):
+        # A direct "what can we work on?" question needs a short, useful
+        # workspace answer, not the full eight-section architecture dump.  An
+        # invitation such as "같이 재미있는 프로젝트를 하자" deliberately does
+        # not match this narrow list and continues through local Gemma.
+        if _contains_any(text, _COLLABORATION_ALIASES):
+            return ("collaboration",)
+
+        explicit_overview = _contains_any(text, _EXPLICIT_OVERVIEW_ALIASES)
+        if (
+            explicit_overview
+            and (_has_self_reference(text) or not _has_external_feature_subject(text))
+        ) or (
+            (
+                _contains_any(text, _SELF_FEATURE_ALIASES)
+                or _contains_any(text, _SELF_ABILITY_ALIASES)
+            )
+            and _has_self_reference(text)
+        ):
             return _TOPIC_ORDER
 
         topics = {
@@ -355,6 +498,14 @@ class RuntimeFactGrounder:
         return tuple(topic for topic in _TOPIC_ORDER if topic in topics)
 
     def _answer_topic(self, topic: str) -> str:
+        if topic == "collaboration":
+            return (
+                "아이디어 정리, 기술 설명, 코드·문서 검토처럼 대화로 풀 수 있는 "
+                "일을 함께할 수 있습니다. 프로젝트 내부 파일 조회와 허용된 회귀 "
+                "테스트·Git 상태 확인은 별도 작업 모드에서 로컬로 실행하고, 결과의 "
+                "검증 여부를 구분해 알려드립니다. 만들고 싶은 목표를 말씀해 주시면 "
+                "가장 작은 다음 단계부터 제안하겠습니다."
+            )
         if topic == "identity":
             return self._identity_answer()
         if topic == "parameters":

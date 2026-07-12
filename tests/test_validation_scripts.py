@@ -12,6 +12,7 @@ class TestValidationScriptBootstrap(unittest.TestCase):
     def test_readme_direct_commands_import_checkout_from_any_working_directory(self):
         root = Path(__file__).resolve().parents[1]
         scripts = (
+            "validate_agent_casual_korean.py",
             "validate_agent_completion.py",
             "validate_gemma4.py",
             "validate_gemma4_deq.py",

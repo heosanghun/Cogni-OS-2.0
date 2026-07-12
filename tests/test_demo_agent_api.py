@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import torch
 
-from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError
+from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError, SYSTEM_PROMPT
 from cogni_demo.server import (
     ComputeBusyError,
     DemoHTTPServer,
@@ -138,10 +138,10 @@ class _PatchTokenizer:
 
 class _PatchService:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, int]] = []
+        self.calls: list[tuple[str, int, str]] = []
 
-    def generate(self, prompt: str, *, max_new_tokens: int):
-        self.calls.append((prompt, max_new_tokens))
+    def generate(self, prompt: str, *, max_new_tokens: int, decode_mode: str):
+        self.calls.append((prompt, max_new_tokens, decode_mode))
         return SimpleNamespace(token_ids=torch.tensor([3, 4], dtype=torch.int64))
 
 
@@ -406,6 +406,7 @@ class TestEvolutionAndPatchServiceIntegration(unittest.TestCase):
         controller.shutdown()
 
     def test_product_controls_share_one_gpu_authority_and_rhythm(self) -> None:
+        from cogni_agent.conversation_fastpath import ConversationFastPath
         from tests.test_agent_quality_integration import _factbook
 
         validator = manager_for("success")
@@ -451,6 +452,9 @@ class TestEvolutionAndPatchServiceIntegration(unittest.TestCase):
         self.assertEqual(purpose(), "evolution")
         rhythm.resume_inference("test complete")
         self.assertIs(agent.rhythm, rhythm)
+        self.assertEqual(agent.system_prompt, SYSTEM_PROMPT)
+        self.assertNotIn("[Runtime Fact-book:", agent.system_prompt)
+        self.assertIsInstance(agent.conversation_fast_path, ConversationFastPath)
         self.assertIs(harness_factory.call_args.kwargs["rhythm"], rhythm)
         self.assertIs(evolution.worker_cleanup.__self__, service)
         self.assertTrue(harness.started)
@@ -486,7 +490,7 @@ class TestEvolutionAndPatchServiceIntegration(unittest.TestCase):
         )
 
         self.assertTrue(torch.equal(output, torch.tensor([[1, 2, 3, 4]])))
-        self.assertEqual(service.calls, [("bounded repair prompt", 2)])
+        self.assertEqual(service.calls, [("bounded repair prompt", 2, "strict")])
         with self.assertRaises(ValueError):
             model.generate(
                 input_ids=torch.tensor([[1, 2]]),

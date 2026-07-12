@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import subprocess
 import sys
 from time import monotonic, sleep
 from typing import Any, Sequence
+import unicodedata
 
 import torch
 
@@ -27,7 +29,14 @@ from cogni_agent.manager import (  # noqa: E402
     AgentManager,
 )
 from cogni_agent.model_service import ModelService  # noqa: E402
-from cogni_agent.response_quality import response_contract_satisfied  # noqa: E402
+from cogni_agent.response_quality import (  # noqa: E402
+    QualityAction,
+    has_near_duplicate_sentences,
+    inspect_response,
+    requested_exact_item_count,
+    requested_maximum_items,
+    response_contract_satisfied,
+)
 from cogni_agent.tools import WorkspaceToolExecutor  # noqa: E402
 from cogni_flow.rhythm import RhythmController  # noqa: E402
 from cogni_os.artifacts import verify_artifact_manifest  # noqa: E402
@@ -47,10 +56,10 @@ DEFAULT_PROMPTS = (
 )
 GROUNDED_TURNS = 4
 GROUNDED_STRESS_INDICES = frozenset({9})
-DEFAULT_TURNS = 4
+DEFAULT_TURNS = 20
 RECOMMENDED_STRESS_TURNS = 20
 MAX_STRESS_TURNS = 100
-MAX_INTERACTIVE_TURN_SECONDS = 180.0
+MAX_INTERACTIVE_TURN_SECONDS = 120.0
 STRESS_PROMPTS = (
     "온디바이스 AI의 장점 두 가지와 한계 한 가지를 세 문장으로 설명하세요. 같은 문장을 반복하지 마세요.",
     "사용자가 잘못된 사실을 정정했을 때 대화형 AI가 취해야 할 절차를 세 단계로 간결하게 답하세요.",
@@ -90,8 +99,54 @@ _DANGLING_KOREAN_RE = re.compile(
     r"(?:이는\s+내가|그\s+이유는|예를\s+들어|따라서|그리고|하지만|반면에|"
     r"하기\s+위해|수\s+있으며|것은|경우에는)\s*[.!?。！？]*\s*$"
 )
-_TRAILING_LIST_MARKER_RE = re.compile(r"(?m)^\s*(?:[-*+]|\d{1,4}[.)])\s*$")
+_TRAILING_LIST_MARKER_RE = re.compile(r"(?:^|\s)(?P<marker>[-*+]|\d{1,4}[.)])\s*$")
+_NUMBERED_ITEM_WITH_CONTENT_RE = re.compile(r"(?:^|\s)1[.)]\s+\S")
 _TRUNCATED_FINISH_REASONS = {"length", "max_tokens", "truncated"}
+_REQUIRED_LITERAL_END_RE = re.compile(
+    r"(?:반드시\s*)?['\"“”‘’](?P<literal>[^'\"“”‘’\r\n]{1,80})['\"“”‘’]"
+    r"(?:로|으로)\s*(?:끝|마무리|종료)"
+)
+_PERIOD_END_REQUEST_RE = re.compile(r"마침표(?:로|를 사용해)?\s*(?:끝|마무리)")
+
+
+DEFAULT_ANCHOR_GROUPS = (
+    (("gemma", "cogni"), ("파라미터", "effective", "저장")),
+    (("자가 거울치료", "self-harness"), ("패치", "검증", "제안", "코드")),
+    (
+        ("cts",),
+        ("system 1.5",),
+        ("system 2.5",),
+        ("system 3",),
+        ("system 4",),
+    ),
+    (("검증", "실측", "사실"), ("목표", "향후", "설계")),
+)
+STRESS_ANCHOR_GROUPS = (
+    (
+        ("온디바이스", "기기", "로컬"),
+        ("장점", "보안", "응답", "오프라인"),
+        ("한계", "제약", "메모리", "성능", "전력"),
+    ),
+    (("정정", "사실", "수정"), ("확인", "검증", "반영")),
+    (("사실", "확인"), ("추론", "판단")),
+    (("문장", "답변", "생성"), ("끝", "완결", "길이", "토큰", "중단")),
+    (("백업",), ("검증", "테스트"), ("롤백", "복구")),
+    (("재시도", "예외", "오류"), ("종료", "중단", "한도", "횟수")),
+    (("요약", "핵심 내용"), ("반복", "핵심", "간결")),
+    (("개인정보", "데이터"), ("오프라인", "로컬", "장치")),
+    (("측정값", "측정"), ("설계 목표", "목표"), ("메모리", "gpu")),
+    (("실행", "도구", "결과"), ("확인", "검증", "성공")),
+    (("원인",), ("수정",), ("회귀", "테스트")),
+    (("문맥", "대화"), ("의도", "사용자"), ("오래된", "요약", "줄")),
+    (("불확실", "추측"), ("사실", "단정", "근거")),
+    (("권한",), ("안전", "경계"), ("작업", "실행")),
+    (
+        ("검증", "테스트", "확인"),
+        ("수정", "기능"),
+        ("보안", "성능", "회귀", "작동"),
+    ),
+    (("한국어", "답변"), ("완결", "문장", "종결"), ("반복", "자연", "문법")),
+)
 
 
 @dataclass(frozen=True)
@@ -101,6 +156,7 @@ class PromptCase:
     label: str
     prompt: str
     expected_route: str
+    required_groups: tuple[tuple[str, ...], ...] = ()
 
 
 def _bounded_turn_count(value: str) -> int:
@@ -113,6 +169,18 @@ def _bounded_turn_count(value: str) -> int:
     return count
 
 
+def _bounded_timeout(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("timeout must be a number") from error
+    if not 1.0 <= timeout <= MAX_INTERACTIVE_TURN_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"timeout must be in [1, {MAX_INTERACTIVE_TURN_SECONDS:.0f}] seconds"
+        )
+    return timeout
+
+
 def _prompt_cases(turns: int) -> tuple[PromptCase, ...]:
     if not 1 <= int(turns) <= MAX_STRESS_TURNS:
         raise ValueError(f"turns must be in [1, {MAX_STRESS_TURNS}]")
@@ -121,6 +189,7 @@ def _prompt_cases(turns: int) -> tuple[PromptCase, ...]:
             label=f"baseline-{index + 1:02d}",
             prompt=prompt,
             expected_route="grounded" if index < GROUNDED_TURNS else "generated",
+            required_groups=DEFAULT_ANCHOR_GROUPS[index],
         )
         for index, prompt in enumerate(DEFAULT_PROMPTS)
     )
@@ -141,6 +210,7 @@ def _prompt_cases(turns: int) -> tuple[PromptCase, ...]:
                     if prompt_index in GROUNDED_STRESS_INDICES
                     else "generated"
                 ),
+                required_groups=STRESS_ANCHOR_GROUPS[prompt_index],
             )
         )
     return tuple(cases)
@@ -157,6 +227,126 @@ def _has_repeated_sentence(text: str) -> bool:
             return True
         seen.add(sentence)
     return False
+
+
+def _complete_sentence_keys(text: str) -> tuple[str, ...]:
+    keys: list[str] = []
+    for match in _SENTENCE_RE.finditer(text[:32_000]):
+        key = re.sub(r"\s+", " ", match.group(0)).strip().casefold()
+        key = re.sub(r"^(?:[-*+]\s+|\d{1,4}[.)]\s+)", "", key)
+        key = key.rstrip(" .!?。！？")
+        if key:
+            keys.append(key)
+    return tuple(keys)
+
+
+def _has_short_sentence_loop(text: str) -> bool:
+    observed: set[str] = set()
+    for key in _complete_sentence_keys(text):
+        if key in observed:
+            return True
+        observed.add(key)
+    return False
+
+
+def _has_repeated_paragraph(text: str) -> bool:
+    observed: set[str] = set()
+    for block in re.split(r"(?:\r?\n\s*)+", text[:32_000]):
+        key = re.sub(r"\s+", " ", block).strip().casefold()
+        if len(key) < 8:
+            continue
+        if key in observed:
+            return True
+        observed.add(key)
+    return False
+
+
+def _has_conservative_near_duplicate(
+    text: str,
+    *,
+    structured_items: bool,
+) -> bool:
+    """Detect near copies without rejecting ordinary parallel list scaffolds."""
+
+    if not structured_items:
+        return has_near_duplicate_sentences(text)
+    sentences = [key[:256] for key in _complete_sentence_keys(text) if len(key) >= 20]
+    for index, first in enumerate(sentences):
+        for second in sentences[index + 1 :]:
+            if first == second:
+                return True
+            if SequenceMatcher(None, first, second, autojunk=False).ratio() >= 0.985:
+                return True
+    return False
+
+
+def _topic_anchors_satisfied(
+    text: str,
+    groups: tuple[tuple[str, ...], ...],
+) -> bool:
+    if not groups:
+        return True
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    return all(any(term.casefold() in folded for term in group) for group in groups)
+
+
+def _required_literal_ending(request: str) -> str | None:
+    match = _REQUIRED_LITERAL_END_RE.search(request[:2_000])
+    return None if match is None else match.group("literal")
+
+
+def _literal_and_period_contract(request: str, response: str) -> dict[str, bool]:
+    literal = _required_literal_ending(request)
+    period_required = _PERIOD_END_REQUEST_RE.search(request[:2_000]) is not None
+    stripped = response.rstrip()
+    return {
+        "required_literal_ending": literal is None or stripped.endswith(literal),
+        "required_period_ending": not period_required or stripped.endswith("."),
+    }
+
+
+def _has_empty_trailing_list_item(text: str) -> bool:
+    stripped = text.rstrip()
+    match = _TRAILING_LIST_MARKER_RE.search(stripped)
+    if match is None:
+        return False
+    marker = match.group("marker")
+    if (
+        stripped == marker
+        or marker in {"-", "*", "+"}
+        or "\n" in match.group(0)
+        or "\r" in match.group(0)
+    ):
+        return True
+    return _NUMBERED_ITEM_WITH_CONTENT_RE.search(stripped[: match.start()]) is not None
+
+
+def _factbook_identity_checks(
+    request: str,
+    response: str,
+    expected: dict[str, Any] | None,
+) -> dict[str, bool]:
+    identity_request = "어떤 모델" in request or "파라미터" in request
+    if not identity_request:
+        return {
+            "factbook_model_exact": True,
+            "factbook_version_exact": True,
+            "factbook_parameters_exact": True,
+        }
+    if not expected:
+        return {
+            "factbook_model_exact": False,
+            "factbook_version_exact": False,
+            "factbook_parameters_exact": False,
+        }
+    folded = unicodedata.normalize("NFKC", response).casefold()
+    digits = re.sub(r"(?<=\d),(?=\d)", "", folded)
+    return {
+        "factbook_model_exact": str(expected["model_label"]).casefold() in folded,
+        "factbook_version_exact": str(expected["build_version"]).casefold() in folded,
+        "factbook_parameters_exact": str(expected["stored_parameters"]) in digits
+        and str(expected["effective_parameters"]) in digits,
+    }
 
 
 def _sentence_repetition_metrics(text: str) -> dict[str, Any]:
@@ -200,8 +390,7 @@ def _korean_completion_metrics(text: str) -> dict[str, Any]:
         reasons.append("missing_terminal_punctuation")
     if contains_korean and _DANGLING_KOREAN_RE.search(stripped) is not None:
         reasons.append("dangling_korean_clause")
-    last_line = stripped.rsplit("\n", 1)[-1]
-    if contains_korean and _TRAILING_LIST_MARKER_RE.fullmatch(last_line):
+    if contains_korean and _has_empty_trailing_list_item(stripped):
         reasons.append("empty_trailing_list_item")
     return {
         "contains_korean": contains_korean,
@@ -420,11 +609,21 @@ def _wait_for_turn(manager: AgentManager, timeout: float) -> dict[str, Any]:
 
 
 def _answer_checks(
-    answer: dict[str, Any], state: dict[str, Any], request: str = ""
+    answer: dict[str, Any],
+    state: dict[str, Any],
+    request: str = "",
+    *,
+    required_groups: tuple[tuple[str, ...], ...] = (),
+    expected_factbook: dict[str, Any] | None = None,
 ) -> dict[str, bool]:
     text = str(answer.get("content", "")).strip()
     korean = _korean_completion_metrics(text)
-    return {
+    parallel_item_shape = (
+        requested_exact_item_count(request) is not None
+        or requested_maximum_items(request) is not None
+    )
+    quality = inspect_response(text, final=True)
+    checks = {
         "succeeded": state.get("status") == "succeeded",
         "complete_stage": state.get("stage") == "complete",
         "finish_stop": answer.get("finish_reason") == "stop",
@@ -435,16 +634,27 @@ def _answer_checks(
         # prose must expose an actual sentence boundary as well as model stop.
         "natural_boundary": len(text) < 80 or text.endswith(_COMPLETE_ENDINGS),
         "no_role_leak": _ROLE_LEAK.search(text) is None,
-        "no_control_marker": not any(marker in text for marker in _CONTROL_MARKERS),
+        "no_control_marker": not _control_marker_leaks(text),
         "no_repeated_sentence": not _has_repeated_sentence(text),
+        "no_short_sentence_loop": not _has_short_sentence_loop(text),
+        "no_repeated_paragraph": not _has_repeated_paragraph(text),
+        "no_near_duplicate_sentence": not _has_conservative_near_duplicate(
+            text,
+            structured_items=parallel_item_shape,
+        ),
+        "quality_report_accepts": quality.recommended_action is QualityAction.ACCEPT,
         "contains_korean": bool(korean["contains_korean"]),
         "korean_complete": bool(korean["complete"]),
+        "topic_anchors_satisfied": _topic_anchors_satisfied(text, required_groups),
         "request_contract_fulfilled": answer.get("generation_mode")
         != "quality_fallback"
         and response_contract_satisfied(request, text),
         "no_false_7b_identity": "70억" not in text
         and "7 billion" not in text.casefold(),
     }
+    checks.update(_literal_and_period_contract(request, text))
+    checks.update(_factbook_identity_checks(request, text, expected_factbook))
+    return checks
 
 
 def _worker_snapshot(
@@ -495,6 +705,7 @@ def _turn_record(
     peer_after_digest: str,
     prior_answer_digests: set[str],
     prior_sentence_keys: set[str] | None = None,
+    expected_factbook: dict[str, Any] | None = None,
     error: str | None = None,
 ) -> dict[str, Any]:
     text = str(answer.get("content", "")).strip()
@@ -522,7 +733,13 @@ def _turn_record(
     )
     peer_unchanged = peer_before_digest == peer_after_digest
     memory = worker["memory"]
-    checks = _answer_checks(answer, state, case.prompt)
+    checks = _answer_checks(
+        answer,
+        state,
+        case.prompt,
+        required_groups=case.required_groups,
+        expected_factbook=expected_factbook,
+    )
     checks.update(
         {
             "grounding_route": route_ok,
@@ -662,7 +879,10 @@ def _summarize_turns(
             if gpu_samples == 0
             else ("failed" if gpu_over_limit else "passed")
         ),
-        "strict_turn_gate_passed": len(turns) == requested_turns
+        "release_schedule_gate_passed": requested_turns == RECOMMENDED_STRESS_TURNS
+        and len(turns) == RECOMMENDED_STRESS_TURNS,
+        "strict_turn_gate_passed": requested_turns == RECOMMENDED_STRESS_TURNS
+        and len(turns) == requested_turns
         and passed_turns == requested_turns
         and quality_fallback_gate_passed,
     }
@@ -678,7 +898,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--timeout", type=float, default=MAX_INTERACTIVE_TURN_SECONDS)
+    parser.add_argument(
+        "--timeout",
+        type=_bounded_timeout,
+        default=MAX_INTERACTIVE_TURN_SECONDS,
+    )
     parser.add_argument(
         "--output",
         help=(
@@ -721,6 +945,11 @@ def _atomic_external_report(path: str | Path, report: dict[str, Any]) -> Path:
 def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     _offline_environment()
     requested_turns = int(getattr(args, "turns", DEFAULT_TURNS))
+    timeout = float(args.timeout)
+    if not 1.0 <= timeout <= MAX_INTERACTIVE_TURN_SECONDS:
+        raise ValueError(
+            f"timeout must be in [1, {MAX_INTERACTIVE_TURN_SECONDS:.0f}] seconds"
+        )
     cases = _prompt_cases(requested_turns)
     vram_limit_bytes = int(16.7 * 1024**3)
     report: dict[str, Any] = {
@@ -736,8 +965,8 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             ),
             "completion": "stop finish, no explicit truncation, complete Korean boundary",
             "content": (
-                "at least 95% of the 20-turn release gate must publish a grounded "
-                "or Cogni-Core answer rather than a quality fallback"
+                "all 20 release turns must publish a grounded or Cogni-Core answer "
+                "rather than a quality fallback"
             ),
             "session": "the inactive A/B peer conversation digest must remain unchanged",
             "worker": "resident worker healthy, stable, idle after each generated turn",
@@ -759,6 +988,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     prior_answer_digests: set[str] = set()
     prior_sentence_keys: set[str] = set()
     stable_worker_pid: int | None = None
+    expected_factbook: dict[str, Any] | None = None
     try:
         verified = verify_artifact_manifest(args.model, args.manifest)
         report["verified_files"] = len(verified.files)
@@ -772,6 +1002,12 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             device=report["cuda_device"],
         )
         report["factbook"] = factbook.as_payload()
+        expected_factbook = {
+            "build_version": factbook.build_version,
+            "model_label": factbook.model.label,
+            "stored_parameters": factbook.model.stored_parameters,
+            "effective_parameters": factbook.model.effective_parameters,
+        }
         service = ModelService.for_local_gemma(
             args.model,
             manifest_path=args.manifest,
@@ -781,7 +1017,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             max_new_tokens=512,
             max_prompt_chars=32_000,
             max_response_chars=32_000,
-            request_timeout=min(MAX_INTERACTIVE_TURN_SECONDS, float(args.timeout)),
+            request_timeout=timeout,
             gpu_lease_manager=leases,
             gpu_lease_owner="completion-validator-model",
             gpu_lease_purpose="inference",
@@ -793,7 +1029,10 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 WorkspaceToolExecutor(_PROJECT_ROOT),
                 session_id=f"completion-{key}",
                 fact_grounder=RuntimeFactGrounder(factbook),
-                system_prompt=SYSTEM_PROMPT + "\n\n" + factbook.prompt_context_ko(),
+                # Runtime facts are routed through the deterministic grounder.
+                # Repeating the entire Fact-book in every model prompt caused
+                # later open turns to copy product metadata and safety prose.
+                system_prompt=SYSTEM_PROMPT,
                 rhythm=rhythm,
             )
         for index, case in enumerate(cases):
@@ -816,7 +1055,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             turn_error: str | None = None
             try:
                 manager.start_turn(case.prompt, "chat")
-                state = _wait_for_turn(manager, args.timeout)
+                state = _wait_for_turn(manager, timeout)
             except BaseException as error:
                 turn_error = f"{type(error).__name__}: {error}"
                 state = manager.snapshot()
@@ -862,6 +1101,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 peer_after_digest=peer_after_digest,
                 prior_answer_digests=prior_answer_digests,
                 prior_sentence_keys=prior_sentence_keys,
+                expected_factbook=expected_factbook,
                 error=turn_error,
             )
             report["turns"].append(record)

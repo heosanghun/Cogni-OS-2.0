@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from enum import Enum
 import re
 import unicodedata
@@ -150,7 +151,8 @@ _CONTROL_TOKEN_RE = re.compile(
     r"(?i)<\|[^|<>\r\n]{1,64}\|>|"
     r"</?(?:start_of_turn|end_of_turn|turn|bos|eos|pad|unk)>|"
     r"<unused\d{1,5}>|\[(?:/?inst|system|/?sys|multimodal)\]|"
-    r"<<\s*/?sys\s*>>|\[Runtime Fact-book:|\[턴\s*종료\]"
+    r"<<\s*/?sys\s*>>|\[Runtime Fact-book:|\[턴\s*종료\]|"
+    r"</?(?:시스템|컨펌|종료|summary)(?:\s+[^<>\r\n]{0,96})?>|\[##\]"
 )
 _CODE_FENCE_RE = re.compile(r"```[\s\S]*?(?:```|\Z)")
 _UNIT_RE = re.compile(r".+?(?:[.!?。！？]+(?=\s|$)|\n+|$)", re.DOTALL)
@@ -161,13 +163,46 @@ _REQUEST_COUNT_RE = re.compile(
     r"(?P<count>[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*"
     r"(?P<unit>문장|단계|항목)"
 )
+_MAX_ITEM_REQUEST_RE = re.compile(
+    r"(?P<count>[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*"
+    r"(?:개|가지|항목)\s*이내"
+)
+_EXACT_ITEM_COUNT_RE = re.compile(
+    r"(?P<count>[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*"
+    r"(?P<unit>단계|항목|가지|개)"
+)
+_EXACT_ITEM_OUTPUT_CUE_RE = re.compile(
+    r"^\s*(?:(?:만|을|를|로|으로|에|은|는)\s*)?"
+    r"(?:(?:각각|간결하게|간단히|자세히|명확하게|짧게|자연스럽게|"
+    r"순서대로|구체적으로)\s*)*"
+    r"(?:답|설명|정리|제시|작성|나열|열거|구분|요약|알려|말해|꼽|선정|"
+    r"적어|기술|제안|무엇|인가|입니까|일까)"
+)
 _SENTENCE_BOUNDARY_RE = re.compile(r"[.!?。！？]+(?=\s|$)")
 _COMPLETE_SENTENCE_RE = re.compile(r".+?[.!?。！？]+(?=\s|$)", re.DOTALL)
 _ALL_LIST_PREFIX_RE = re.compile(r"(?m)^\s*(?:[-*+]\s+|\d{1,4}[.)]\s+)")
-_NEGATIVE_SECTION_RE = re.compile(r"(?im)^\s*(?:한계|단점|제약|위험)\s*[:：]\s*")
+_INLINE_NUMBERED_CLAUSE_RE = re.compile(
+    r"(?<!\S)(?P<number>\d{1,2})(?:[.)]\s+|"
+    r"단계(?:는|로|:)?\s*|항목(?:은|으로|:)?\s*)"
+)
+_NEGATIVE_SECTION_RE = re.compile(
+    r"(?im)(?:한계|단점|제약|위험)(?:(?:로)?는\s*|[:：]\s*)"
+)
 _CATEGORY_COUNT_RE = re.compile(
     r"(?P<category>장점|이점|강점|한계|단점|제약|위험)\s*"
     r"(?P<count>[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*가지"
+)
+_NEGATIVE_CATEGORY_CUES = (
+    "한계",
+    "단점",
+    "제약",
+    "제한",
+    "부족",
+    "위험",
+    "어렵",
+    "떨어",
+    "소모",
+    "의존",
 )
 _META_SENTENCE_ENDINGS = (
     "설명하겠습니다.",
@@ -175,6 +210,8 @@ _META_SENTENCE_ENDINGS = (
     "정리하겠습니다.",
     "알려드리겠습니다.",
     "살펴보겠습니다.",
+    "다음과 같습니다.",
+    "다음과 같아요.",
 )
 _CLOSING_SENTENCES = frozenset({"이상입니다.", "답변을 마칩니다.", "설명을 마칩니다."})
 _KOREAN_COORDINATE_SPLIT_RE = re.compile(
@@ -328,6 +365,196 @@ _ADJECTIVAL_SUFFIX_RE = re.compile(
     r"스럽(?:다|게|고|지만|습니다|러운)|"
     r"롭(?:다|게|고|지만|습니다|로운)|[가-힣]{2,}한)$"
 )
+_TOPIC_TERM_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+#.-]{1,31}|[가-힣]{2,24}")
+_TOPIC_STOP_TERMS = frozenset(
+    {
+        "그럼",
+        "그리고",
+        "대해서",
+        "대한",
+        "답하세요",
+        "관련",
+        "전에",
+        "먼저",
+        "무엇",
+        "문장",
+        "설명",
+        "설명해",
+        "알려",
+        "어떤",
+        "이번",
+        "정리",
+        "주세요",
+        "질문",
+        "하나",
+        "항목",
+        "현재",
+    }
+)
+_TOPIC_SUFFIXES = (
+    "해주세요",
+    "입니다",
+    "하세요",
+    "합니다",
+    "하는",
+    "하여",
+    "해서",
+    "하며",
+    "하고",
+    "되는",
+    "에서",
+    "으로",
+    "에게",
+    "까지",
+    "부터",
+    "처럼",
+    "보다",
+    "이랑",
+    "랑",
+    "과",
+    "와",
+    "의",
+    "이",
+    "가",
+    "은",
+    "는",
+    "을",
+    "를",
+    "도",
+    "만",
+)
+_UNSOLICITED_SUBJECT_GROUPS = (
+    frozenset({"뉴스", "언론사", "기자", "취재", "기사"}),
+    frozenset({"이메일", "메일", "비밀번호", "gmail", "email", "password"}),
+    frozenset({"chatgpt", "openai", "gemini", "claude"}),
+    frozenset({"여행", "호텔", "항공권", "관광"}),
+    frozenset({"짱구", "만화", "애니메이션"}),
+)
+_GENERIC_TOPIC_TERMS = frozenset(
+    {
+        "답변",
+        "모델",
+        "방법",
+        "설명",
+        "원칙",
+        "응답",
+        "절차",
+        "질문",
+        "확인",
+        "검증",
+    }
+)
+
+
+def _topic_terms(text: str) -> frozenset[str]:
+    terms: set[str] = set()
+    normalized = unicodedata.normalize("NFKC", text[:MAX_INSPECT_CHARS]).casefold()
+    for match in _TOPIC_TERM_RE.finditer(normalized):
+        term = match.group(0)
+        if re.fullmatch(r"[가-힣]+", term):
+            for suffix in _TOPIC_SUFFIXES:
+                if term.endswith(suffix) and len(term) - len(suffix) >= 2:
+                    term = term[: -len(suffix)]
+                    break
+        if len(term) >= 2 and term not in _TOPIC_STOP_TERMS:
+            terms.add(term)
+        if len(terms) >= 128:
+            break
+    return frozenset(terms)
+
+
+def response_topically_anchored(request: str, response: str) -> bool:
+    """Reject obvious subject drift without pretending to judge semantics.
+
+    The check is intentionally inactive for short/social requests.  For a
+    substantive request with at least four bounded content terms, a response
+    must preserve at least three (or 40 percent for smaller sets).  This catches
+    failures such as answering a model-quality question with an unrelated news
+    workflow while allowing ordinary paraphrase and Korean particles.
+    """
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    requested = _topic_terms(request)
+    if len(requested) < 4:
+        return True
+    observed = _topic_terms(response)
+    required = 4 if len(requested) >= 6 else max(2, (len(requested) + 1) // 2)
+    return len(requested & observed) >= required
+
+
+def request_topic_terms(request: str, *, limit: int = 8) -> tuple[str, ...]:
+    """Return a stable bounded topic vocabulary for one repair directive."""
+
+    if not isinstance(request, str):
+        raise TypeError("request must be a string")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 16:
+        raise ValueError("limit must be an integer in [1, 16]")
+    return tuple(sorted(_topic_terms(request)))[:limit]
+
+
+def response_preserves_distinctive_topic(request: str, response: str) -> bool:
+    """Require one non-generic request concept in a substantive response."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    distinctive = _topic_terms(request) - _GENERIC_TOPIC_TERMS
+    if not distinctive:
+        return True
+    return bool(distinctive & _topic_terms(response))
+
+
+def response_avoids_unsolicited_subjects(request: str, response: str) -> bool:
+    """Reject a small set of observed, high-confidence subject intrusions.
+
+    Lexical overlap alone cannot judge paraphrases.  This guard is therefore
+    narrower: it blocks only recurrent unrelated corpora seen in the shipped
+    checkpoint (news, credentials/mail, other assistant brands, travel, and
+    animation) when the user did not mention that subject at all.
+    """
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    requested = unicodedata.normalize("NFKC", request).casefold()
+    observed = unicodedata.normalize("NFKC", response).casefold()
+    for group in _UNSOLICITED_SUBJECT_GROUPS:
+        if any(term in observed for term in group) and not any(
+            term in requested for term in group
+        ):
+            return False
+    return True
+
+
+def has_near_duplicate_sentences(text: str) -> bool:
+    """Detect two almost-identical long sentences within fixed work bounds."""
+
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    sentences: list[str] = []
+    masked = _mask_code(text[:MAX_INSPECT_CHARS])
+    for match in _COMPLETE_SENTENCE_RE.finditer(masked):
+        sentence = re.sub(
+            r"^(?:[-*+]\s+|\d{1,4}(?:[.)]|단계(?:는|로|:)?)\s*)",
+            "",
+            " ".join(match.group(0).split()).strip(),
+        ).casefold()
+        if len(sentence) >= 20:
+            sentences.append(sentence[:256])
+        if len(sentences) >= 64:
+            break
+    for index, first in enumerate(sentences):
+        for second in sentences[index + 1 :]:
+            if (
+                SequenceMatcher(
+                    None,
+                    first,
+                    second,
+                    autojunk=False,
+                ).ratio()
+                >= 0.90
+            ):
+                return True
+    return False
 
 
 def inspect_response(text: str, *, final: bool = False) -> ResponseQualityReport:
@@ -349,10 +576,10 @@ def inspect_response(text: str, *, final: bool = False) -> ResponseQualityReport
     remaining_tokens = MAX_ANALYSIS_TOKENS
 
     for offset, region in regions:
-        findings.extend(_boundary_findings(region, offset))
+        masked = _mask_code(region)
+        findings.extend(_boundary_findings(masked, offset))
         if remaining_units <= 0 or remaining_tokens <= 0:
             continue
-        masked = _mask_code(region)
         units, used_tokens = _units(
             masked,
             offset,
@@ -361,12 +588,18 @@ def inspect_response(text: str, *, final: bool = False) -> ResponseQualityReport
         )
         remaining_units -= len(units)
         remaining_tokens -= used_tokens
+        exact_repetition = _exact_unit_repetition(units)
+        if exact_repetition is not None:
+            findings.append(exact_repetition)
         template = _template_repetition(units)
         if template is not None:
             findings.append(template)
         low_information = _low_information_repetition(masked, offset)
         if low_information is not None:
             findings.append(low_information)
+        numbering_restart = _numbering_restart(masked, offset)
+        if numbering_restart is not None:
+            findings.append(numbering_restart)
 
     if final and text:
         incomplete = _incomplete_korean_clause(text)
@@ -393,6 +626,73 @@ def inspect_response(text: str, *, final: bool = False) -> ResponseQualityReport
         inspected_characters=inspected,
         input_truncated=len(text) > MAX_INSPECT_CHARS,
     )
+
+
+def salvage_complete_prefix(text: str, *, cutoff: int | None = None) -> str:
+    """Return the longest complete, quality-clean prefix without inventing text.
+
+    A locally generated answer can contain useful complete sentences before an
+    incomplete tail, a generated role marker, or a repetition cycle.  Rejecting
+    the whole candidate in that situation produces a less helpful answer than
+    publishing the already complete prefix.  This helper is deliberately
+    conservative: it only returns text that independently passes the final
+    quality inspection, and it considers at most the last 64 observed sentence
+    boundaries.
+
+    ``cutoff`` is an optional trusted upper bound supplied by a streaming guard.
+    When omitted, hard-stop findings automatically bound the search.  An
+    incomplete-clause finding at offset zero does *not* erase earlier complete
+    sentences on the same line; the boundary scan still has a chance to retain
+    them.
+    """
+
+    if not isinstance(text, str):
+        raise TypeError("response text must be a string")
+    if cutoff is not None and (not isinstance(cutoff, int) or isinstance(cutoff, bool)):
+        raise TypeError("cutoff must be an integer or None")
+    if not text:
+        return ""
+
+    report = inspect_response(text, final=True)
+    limit = len(text)
+    hard_stops = [
+        finding.start for finding in report.findings if finding.code in _STOP_CODES
+    ]
+    if hard_stops:
+        limit = min(limit, min(hard_stops))
+    if cutoff is not None:
+        limit = min(limit, max(0, cutoff))
+
+    candidate = text[:limit].rstrip()
+    if (
+        candidate
+        and inspect_response(candidate, final=True).recommended_action
+        is QualityAction.ACCEPT
+    ):
+        return candidate
+
+    # If the incomplete clause started after a clean prefix, avoid scanning
+    # past it.  Offset zero means the detector conservatively marked the whole
+    # line, so sentence boundaries in that line must still be considered.
+    incomplete_starts = [
+        finding.start
+        for finding in report.findings
+        if finding.code is QualityCode.INCOMPLETE_KOREAN_CLAUSE
+        and 0 < finding.start < limit
+    ]
+    if incomplete_starts:
+        limit = min(limit, min(incomplete_starts))
+
+    boundaries = _content_sentence_boundaries(text[:limit])[-64:]
+    for boundary in reversed(boundaries):
+        candidate = text[: boundary.end()].rstrip()
+        if (
+            candidate
+            and inspect_response(candidate, final=True).recommended_action
+            is QualityAction.ACCEPT
+        ):
+            return candidate
+    return ""
 
 
 def _bounded_regions(text: str) -> tuple[tuple[int, str], ...]:
@@ -599,6 +899,41 @@ def _template_repetition(units: list[_Unit]) -> QualityFinding | None:
     return None
 
 
+def _exact_unit_repetition(units: list[_Unit]) -> QualityFinding | None:
+    """Detect a repeated substantive sentence even when copies are separated."""
+
+    seen: dict[tuple[str, ...], _Unit] = {}
+    for unit in units:
+        if unit.visible_characters < 12 or len(unit.raw_key) < 3:
+            continue
+        if unit.raw_key in seen:
+            return QualityFinding(
+                QualityCode.TEMPLATE_REPETITION,
+                unit.start,
+                unit.end,
+                occurrences=2,
+            )
+        seen[unit.raw_key] = unit
+    return None
+
+
+def _numbering_restart(text: str, offset: int) -> QualityFinding | None:
+    """Stop when a generated numbered answer restarts at item one."""
+
+    highest = 0
+    for match in _INLINE_NUMBERED_CLAUSE_RE.finditer(text):
+        number = int(match.group("number"))
+        if number == 1 and highest >= 2:
+            return QualityFinding(
+                QualityCode.TEMPLATE_REPETITION,
+                offset + match.start(),
+                offset + match.end(),
+                occurrences=2,
+            )
+        highest = max(highest, number)
+    return None
+
+
 def _low_information_repetition(text: str, offset: int) -> QualityFinding | None:
     tokens = _tokens_with_positions(text, offset)
     values = tuple(token.value for token in tokens)
@@ -752,19 +1087,103 @@ def requested_exact_sentence_count(request: str) -> int | None:
     return None
 
 
+def requested_maximum_items(request: str) -> int | None:
+    """Return an explicit Korean maximum item count such as ``네 가지 이내``."""
+
+    if not isinstance(request, str):
+        raise TypeError("request must be a string")
+    match = _MAX_ITEM_REQUEST_RE.search(request[:MAX_INSPECT_CHARS])
+    if match is None:
+        return None
+    raw = match.group("count")
+    return int(raw) if raw.isdigit() else _KOREAN_COUNTS[raw]
+
+
+def requested_exact_item_count(request: str) -> int | None:
+    """Return one exact step/item count, excluding ranges and category pairs."""
+
+    if not isinstance(request, str):
+        raise TypeError("request must be a string")
+    bounded = request[:MAX_INSPECT_CHARS]
+    matches = list(_EXACT_ITEM_COUNT_RE.finditer(bounded))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    prefix = bounded[max(0, match.start() - 6) : match.start()]
+    suffix = bounded[match.end() : match.end() + 8]
+    if re.search(r"(?:최소|최대|각각)\s*$", prefix):
+        return None
+    if re.match(r"\s*(?:씩|이상|이하|이내|미만|초과)", suffix):
+        return None
+    output_tail = bounded[match.end() : match.end() + 40]
+    if _EXACT_ITEM_OUTPUT_CUE_RE.search(output_tail) is None:
+        return None
+    raw = match.group("count")
+    return int(raw) if raw.isdigit() else _KOREAN_COUNTS[raw]
+
+
 def response_contract_satisfied(request: str, response: str) -> bool:
     """Check the bounded minimum for an explicitly requested response shape."""
 
     if not isinstance(response, str):
         raise TypeError("response must be a string")
     exact = requested_exact_sentence_count(request)
+    exact_items = requested_exact_item_count(request)
     minimum = requested_minimum_units(request)
-    if minimum is None:
+    categories = _requested_category_counts(request)
+    if minimum is None and exact_items is None and categories is None:
         return True
-    completed = len(_SENTENCE_BOUNDARY_RE.findall(response[:MAX_INSPECT_CHARS]))
+    completed = _contract_sentence_count(response[:MAX_INSPECT_CHARS])
+    if categories is not None and not _category_contract_satisfied(
+        response,
+        categories,
+    ):
+        return False
     if exact is not None:
         return completed == exact
+    if exact_items is not None:
+        return completed == exact_items
+    if minimum is None:
+        return True
     return completed >= minimum
+
+
+def _content_sentence_boundaries(text: str) -> list[re.Match[str]]:
+    """Return punctuation boundaries while ignoring inline list ordinals."""
+
+    boundaries: list[re.Match[str]] = []
+    for match in _SENTENCE_BOUNDARY_RE.finditer(text):
+        if match.group(0).startswith(".") and match.start() >= 1:
+            number_index = match.start() - 1
+            before_number = text[number_index - 1] if number_index >= 1 else ""
+            following = text[match.end() :]
+            if (
+                text[number_index].isdigit()
+                and (number_index == 0 or before_number.isspace())
+                and bool(following.lstrip())
+            ):
+                continue
+        boundaries.append(match)
+    return boundaries
+
+
+def _contract_sentence_count(text: str) -> int:
+    """Count substantive completed sentences, not headings or list numbers."""
+
+    count = 0
+    cursor = 0
+    for boundary in _content_sentence_boundaries(text):
+        sentence = " ".join(text[cursor : boundary.end()].split()).strip()
+        cursor = boundary.end()
+        sentence = re.sub(r"^\d{1,4}[.)]\s*", "", sentence)
+        if (
+            not sentence
+            or sentence in _CLOSING_SENTENCES
+            or sentence.endswith(_META_SENTENCE_ENDINGS)
+        ):
+            continue
+        count += 1
+    return count
 
 
 def _completed_content_sentences(text: str) -> list[str]:
@@ -779,7 +1198,11 @@ def _completed_content_sentences(text: str) -> list[str]:
             sentence,
             flags=re.IGNORECASE,
         )
-        if not sentence or sentence in _CLOSING_SENTENCES:
+        if (
+            not sentence
+            or sentence in _CLOSING_SENTENCES
+            or _LIST_MARKER_ONLY_RE.fullmatch(sentence) is not None
+        ):
             continue
         if sentence.endswith(_META_SENTENCE_ENDINGS):
             continue
@@ -808,6 +1231,78 @@ def _requested_category_counts(request: str) -> tuple[int, int] | None:
     return None
 
 
+def _category_contract_satisfied(
+    response: str,
+    categories: tuple[int, int],
+) -> bool:
+    """Require requested positive and negative categories to remain visible."""
+
+    positive_count, negative_count = categories
+    sentences = _completed_content_sentences(response)
+    negatives = sum(
+        any(cue in sentence for cue in _NEGATIVE_CATEGORY_CUES)
+        for sentence in sentences
+    )
+    positives = len(sentences) - negatives
+    return negatives == negative_count and positives == positive_count
+
+
+def compose_observed_contract_response(
+    request: str,
+    observed: list[str],
+) -> str:
+    """Compose a response only from distinct complete sentences already seen.
+
+    This is a bounded last-resort salvage path for local generations whose
+    individual attempts degenerate after different useful sentences. It never
+    invents content and re-runs the full request contract before publication.
+    """
+
+    if not isinstance(request, str) or not isinstance(observed, list):
+        raise TypeError("request must be a string and observed must be a list")
+    sentences: list[str] = []
+    for item in observed[:MAX_ANALYSIS_UNITS]:
+        if not isinstance(item, str):
+            raise TypeError("observed items must be strings")
+        sentences.extend(_completed_content_sentences(item))
+        if len(sentences) >= MAX_ANALYSIS_UNITS:
+            break
+
+    categories = _requested_category_counts(request)
+    if categories is not None:
+        positive_count, negative_count = categories
+        positives = [
+            sentence
+            for sentence in sentences
+            if not any(cue in sentence for cue in _NEGATIVE_CATEGORY_CUES)
+        ]
+        negatives = [
+            sentence
+            for sentence in sentences
+            if any(cue in sentence for cue in _NEGATIVE_CATEGORY_CUES)
+        ]
+        if len(positives) < positive_count or len(negatives) < negative_count:
+            return ""
+        selected = positives[:positive_count] + negatives[:negative_count]
+    else:
+        expected = requested_exact_sentence_count(request)
+        if expected is None:
+            expected = requested_exact_item_count(request)
+        if expected is None or len(sentences) < expected:
+            return ""
+        selected = sentences[:expected]
+
+    normalized = " ".join(selected).strip()
+    if (
+        not response_contract_satisfied(request, normalized)
+        or inspect_response(normalized, final=True).recommended_action
+        is not QualityAction.ACCEPT
+        or has_near_duplicate_sentences(normalized)
+    ):
+        return ""
+    return normalized
+
+
 def _split_complete_korean_coordinate(sentence: str) -> list[str] | None:
     match = _KOREAN_COORDINATE_SPLIT_RE.fullmatch(sentence.strip())
     if match is None:
@@ -818,6 +1313,68 @@ def _split_complete_korean_coordinate(sentence: str) -> list[str] | None:
     if len(first) < 12 or len(second) < 12:
         return None
     return [first, second]
+
+
+def _split_inline_numbered_sentences(
+    text: str,
+    expected: int,
+) -> list[str] | None:
+    """Turn a model's numbered coordinate clauses into complete sentences.
+
+    Small instruction-tuned models often satisfy a requested item count but
+    join ``1) ...하고, 2) ...하며, 3) ...합니다.`` into one grammatical
+    sentence.  This bounded normalizer keeps the generated meaning and only
+    completes the two common Korean coordinate predicates.  Any ambiguous
+    fragment fails closed and is retried by the caller.
+    """
+
+    bounded = text[:MAX_INSPECT_CHARS]
+    observed = list(_INLINE_NUMBERED_CLAUSE_RE.finditer(bounded))[: expected + 1]
+    if len(observed) < expected:
+        return None
+    matches = observed[:expected]
+    if [int(match.group("number")) for match in matches] != list(
+        range(1, expected + 1)
+    ):
+        return None
+
+    result: list[str] = []
+    for index, match in enumerate(matches):
+        if index + 1 < len(matches):
+            end = matches[index + 1].start()
+        elif len(observed) > expected:
+            end = observed[expected].start()
+        else:
+            end = len(bounded)
+        raw_clause = bounded[match.end() : end].strip()
+        boundaries = _content_sentence_boundaries(raw_clause)
+        if boundaries:
+            raw_clause = raw_clause[: boundaries[0].end()]
+        clause = raw_clause.strip().rstrip(" ,;")
+        if not clause or len(clause) < 8:
+            return None
+        if clause.endswith((".", "!", "?", "。", "！", "？")):
+            sentence = clause
+        elif clause.endswith(("하고", "하며")):
+            sentence = clause[:-2].rstrip() + "합니다."
+        elif clause.endswith(("이고", "이며")):
+            sentence = clause[:-2].rstrip() + "입니다."
+        elif clause.endswith(("되고", "되며")):
+            sentence = clause[:-2].rstrip() + "됩니다."
+        elif clause.endswith(("있고", "있으며")):
+            suffix = "있고" if clause.endswith("있고") else "있으며"
+            sentence = clause[: -len(suffix)].rstrip() + "있습니다."
+        elif clause.endswith(("없고", "없으며")):
+            suffix = "없고" if clause.endswith("없고") else "없으며"
+            sentence = clause[: -len(suffix)].rstrip() + "없습니다."
+        elif clause.endswith(("다", "요", "니다")):
+            sentence = clause + "."
+        else:
+            return None
+        if len(sentence) < 8:
+            return None
+        result.append(sentence)
+    return result
 
 
 def normalize_exact_sentence_response(request: str, response: str) -> str | None:
@@ -847,8 +1404,14 @@ def normalize_exact_sentence_response(request: str, response: str) -> str | None
             return None
         selected = positive[:positive_count] + negative[:negative_count]
     else:
-        candidates = _completed_content_sentences(response)
-        if len(candidates) < exact and exact == 2 and len(candidates) == 1:
+        inline = _split_inline_numbered_sentences(response, exact)
+        candidates = inline or _completed_content_sentences(response)
+        if (
+            inline is None
+            and len(candidates) < exact
+            and exact == 2
+            and len(candidates) == 1
+        ):
             split = _split_complete_korean_coordinate(candidates[0])
             if split is not None:
                 candidates = split
@@ -867,6 +1430,50 @@ def normalize_exact_sentence_response(request: str, response: str) -> str | None
     return normalized
 
 
+def normalize_maximum_item_response(request: str, response: str) -> str | None:
+    """Publish the first bounded sequential item block for an ``이내`` request."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    maximum = requested_maximum_items(request)
+    if maximum is None or not response.strip():
+        return None
+    minimum = 2 if maximum >= 2 else 1
+    for count in range(maximum, minimum - 1, -1):
+        sentences = _split_inline_numbered_sentences(response, count)
+        if sentences is None:
+            continue
+        normalized = " ".join(sentences).strip()
+        if (
+            normalized
+            and inspect_response(normalized, final=True).recommended_action
+            is QualityAction.ACCEPT
+        ):
+            return normalized
+    return None
+
+
+def normalize_exact_item_response(request: str, response: str) -> str | None:
+    """Normalize the first sequential block for an exact step/item request."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    expected = requested_exact_item_count(request)
+    if expected is None or not response.strip():
+        return None
+    sentences = _split_inline_numbered_sentences(response, expected)
+    if sentences is None:
+        return None
+    normalized = " ".join(sentences).strip()
+    if (
+        _contract_sentence_count(normalized) != expected
+        or inspect_response(normalized, final=True).recommended_action
+        is not QualityAction.ACCEPT
+    ):
+        return None
+    return normalized
+
+
 __all__ = [
     "MAX_INSPECT_CHARS",
     "QualityAction",
@@ -874,9 +1481,20 @@ __all__ = [
     "QualityFinding",
     "ResponseQualityError",
     "ResponseQualityReport",
+    "compose_observed_contract_response",
     "inspect_response",
+    "has_near_duplicate_sentences",
     "normalize_exact_sentence_response",
+    "normalize_exact_item_response",
+    "normalize_maximum_item_response",
+    "request_topic_terms",
     "requested_exact_sentence_count",
+    "requested_exact_item_count",
+    "requested_maximum_items",
     "requested_minimum_units",
+    "response_avoids_unsolicited_subjects",
     "response_contract_satisfied",
+    "response_preserves_distinctive_topic",
+    "response_topically_anchored",
+    "salvage_complete_prefix",
 ]

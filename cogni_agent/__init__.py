@@ -6,6 +6,7 @@ from .conversation import (
     ConversationSnapshot,
     ConversationTurn,
 )
+from .conversation_fastpath import ConversationFastPath
 from .core_pipeline import (
     CorePipelineLimits,
     CoreTurnAuthorityError,
@@ -48,6 +49,7 @@ __all__ = [
     "BaseModelMutationError",
     "BoundedConversationStore",
     "ConversationError",
+    "ConversationFastPath",
     "ConversationSnapshot",
     "ConversationTurn",
     "CorePipelineLimits",

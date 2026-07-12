@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from hashlib import sha256
 import math
@@ -63,6 +64,8 @@ from cogni_os.runtime import SearchCollaboratorsV2
 
 from .conditioning import build_latent_logits_processor
 from .protocol import (
+    DECODE_CONVERSATION,
+    DECODE_STRICT,
     DIGEST_BYTES,
     FINISH_CANCELLED,
     FINISH_ERROR,
@@ -74,6 +77,7 @@ from .protocol import (
     STATUS_BASE_MUTATED,
     STATUS_AUTHORITY_REJECTED,
     STATUS_CANCELLED,
+    STATUS_DEADLINE_EXCEEDED,
     STATUS_INVALID_REQUEST,
     STATUS_MODEL_ERROR,
     STATUS_OK,
@@ -102,6 +106,13 @@ PRODUCTION_CTS_NODE_CAPACITY = 301
 # certified arena admits at most 100 full width-3 expansions; all 301 bounded
 # simulations remain available for selection/backup evidence.
 PRODUCTION_CTS_ACT_HARD_FLOOR = 301
+
+# Gemma 4 e4b's local generation profile. These values are deliberately
+# constants rather than user-controlled floats so the worker's search space
+# remains bounded and the tensor protocol only needs a policy enum and seed.
+CONVERSATION_TEMPERATURE = 1.0
+CONVERSATION_TOP_P = 0.95
+CONVERSATION_TOP_K = 64
 
 _FINISH_REASON_NAMES = {
     FINISH_STOP: "stop",
@@ -279,6 +290,60 @@ def _session_digest(session_id: str) -> Tensor:
     return torch.tensor(
         list(sha256(normalized.encode("utf-8")).digest()), dtype=torch.int64
     )
+
+
+def _decode_mode_code(value: object) -> int:
+    if value == "conversation":
+        return DECODE_CONVERSATION
+    if value == "strict":
+        return DECODE_STRICT
+    raise ValueError("decode_mode must be 'conversation' or 'strict'")
+
+
+def _validated_sampling_seed(value: object) -> int | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= NO_DEADLINE_NS
+    ):
+        raise ValueError("sampling_seed must be a non-negative signed-63-bit integer")
+    return int(value)
+
+
+def _derived_sampling_seed(input_ids: Tensor, session_digest: Tensor) -> int:
+    """Derive a stable seed from the bounded request, independent of process RNG."""
+
+    ids = input_ids.detach().to("cpu", dtype=torch.int64).flatten()
+    if not 1 <= ids.numel() <= HARD_MAX_INPUT_TOKENS:
+        raise TensorProtocolError("sampling seed input exceeds its token bound")
+    if bool((ids < 0).any()):
+        raise TensorProtocolError("sampling seed input contains a negative token id")
+    if session_digest.shape != (DIGEST_BYTES,):
+        raise TensorProtocolError("sampling seed session digest is malformed")
+    digest = sha256(b"CogniBoard/conversation-sampling/v1\0")
+    digest.update(bytes(map(int, session_digest.tolist())))
+    for token in ids.tolist():
+        digest.update(int(token).to_bytes(8, "big", signed=False))
+    return int.from_bytes(digest.digest()[:8], "big") & NO_DEADLINE_NS
+
+
+@contextmanager
+def _request_sampling_rng(seed: int, device: torch.device) -> Iterator[None]:
+    """Seed and restore only the RNGs used by this single-owner worker request."""
+
+    cuda_devices: list[int] = []
+    if device.type == "cuda":
+        cuda_devices = [
+            torch.cuda.current_device() if device.index is None else int(device.index)
+        ]
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.random.default_generator.manual_seed(seed)
+        if cuda_devices:
+            with torch.cuda.device(cuda_devices[0]):
+                torch.cuda.manual_seed(seed)
+        yield
 
 
 def _worker_authority_tensor(artifact_digest: Tensor) -> Tensor:
@@ -1472,16 +1537,31 @@ def _worker_main(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         max_new_tokens=request.max_new_tokens,
-                        do_sample=False,
                         num_beams=1,
                         num_return_sequences=1,
                         use_cache=False,
                         streamer=streamer,
                         stopping_criteria=_stopping_criteria(stop_criteria),
                     )
+                    if request.decode_mode == DECODE_CONVERSATION:
+                        generation_options.update(
+                            do_sample=True,
+                            temperature=CONVERSATION_TEMPERATURE,
+                            top_p=CONVERSATION_TOP_P,
+                            top_k=CONVERSATION_TOP_K,
+                        )
+                        rng_context = _request_sampling_rng(
+                            request.sampling_seed, device
+                        )
+                    elif request.decode_mode == DECODE_STRICT:
+                        generation_options["do_sample"] = False
+                        rng_context = nullcontext()
+                    else:  # Protocol parsing should already make this unreachable.
+                        raise TensorProtocolError("worker decode mode is unsupported")
                     if logits_processor is not None:
                         generation_options["logits_processor"] = [logits_processor]
-                    output = model.generate(**generation_options)
+                    with rng_context:
+                        output = model.generate(**generation_options)
             stage = "token_postcheck"
             generated = _generated_suffix(output, request.input_ids)
             if generated.numel() > request.max_new_tokens:
@@ -1496,7 +1576,7 @@ def _worker_main(
             else:
                 remaining = generated
             if stop_criteria.deadline_observed:
-                status = STATUS_AUTHORITY_REJECTED
+                status = STATUS_DEADLINE_EXCEEDED
                 finish_reason = FINISH_ERROR
                 remaining = torch.empty(0, dtype=torch.int64)
             elif status == STATUS_CANCELLED or stop_criteria.cancel_observed:
@@ -1519,7 +1599,11 @@ def _worker_main(
                 )
         except CoreTurnAuthorityError as error:
             _debug_worker_error(stage, error)
-            status = STATUS_AUTHORITY_REJECTED
+            status = (
+                STATUS_DEADLINE_EXCEEDED
+                if monotonic_ns() >= authority.request_deadline_ns
+                else STATUS_AUTHORITY_REJECTED
+            )
             finish_reason = FINISH_ERROR
             remaining = torch.empty(0, dtype=torch.int64)
         except BaseException as error:
@@ -1691,6 +1775,10 @@ class ModelService:
         self._gpu_lease: GPULease | None = None
         self._worker_authority: Tensor | None = None
         self._startup_status: Tensor | None = None
+        # Set before retiring a worker whose cancelled request never produced
+        # a trusted terminal frame. No successor request may reuse that IPC or
+        # CUDA resident until ``stop()`` positively confirms worker death.
+        self._retire_required = False
         self._reserved_stop_sequences = reserved_stop_sequences(tokenizer)
 
     @classmethod
@@ -1801,6 +1889,10 @@ class ModelService:
 
         with self._state_lock:
             created_attempt = False
+            if self._retire_required:
+                raise WorkerExecutionError(
+                    "local model worker retirement is required before restart"
+                )
             if self._process is None and self._gpu_lease is not None:
                 raise WorkerExecutionError(
                     "GPU lease exists without a worker handle; death is unproven"
@@ -1983,18 +2075,49 @@ class ModelService:
         max_new_tokens: int | None = None,
         stop_token_ids: Tensor | None = None,
         timeout: float | None = None,
+        total_timeout: float | None = None,
         conversation_id: str = "primary",
+        decode_mode: str = "conversation",
+        sampling_seed: int | None = None,
     ) -> Iterator[GenerationChunk]:
+        decode_mode_code = _decode_mode_code(decode_mode)
+        requested_seed = _validated_sampling_seed(sampling_seed)
+        wait_seconds = self.request_timeout if timeout is None else float(timeout)
+        if not math.isfinite(wait_seconds) or wait_seconds <= 0:
+            raise ValueError("request timeout must be finite and positive")
+        explicit_total_timeout = total_timeout is not None
+        total_wait_seconds = (
+            self.request_timeout if total_timeout is None else float(total_timeout)
+        )
+        if not math.isfinite(total_wait_seconds) or total_wait_seconds <= 0:
+            raise ValueError("total request timeout must be finite and positive")
+        # A single absolute fence starts when the iterator itself begins work.
+        # Model startup, tokenization, queue admission, and every healthy
+        # intermediate frame all consume the same wall-clock budget.
+        total_deadline = monotonic() + total_wait_seconds
+        total_deadline_ns = monotonic_ns() + int(total_wait_seconds * 1_000_000_000)
         self.start()
+        if monotonic() >= total_deadline:
+            try:
+                self.stop(timeout=0.01)
+            except BaseException as error:
+                raise WorkerExecutionError(
+                    "timed-out model startup could not safely retire its worker"
+                ) from error
+            raise TimeoutError("local generation exceeded its total deadline")
         if not self._request_lock.acquire(blocking=False):
             raise ServiceBusyError("one generation request is already active")
         completed = False
+        deadline_exceeded = False
         request_id = 0
         observed_total = 0
         buffered_tokens: list[Tensor] = []
         authority: _RequestAuthority | None = None
         try:
             input_ids, attention_mask = self._tokenize(prompt)
+            if monotonic() >= total_deadline:
+                deadline_exceeded = True
+                raise TimeoutError("local generation exceeded its total deadline")
             requested = (
                 self.max_new_tokens if max_new_tokens is None else max_new_tokens
             )
@@ -2004,10 +2127,20 @@ class ModelService:
                 or not 1 <= requested <= self.max_new_tokens
             ):
                 raise RequestLimitError("max_new_tokens exceeds the service budget")
-            wait_seconds = self.request_timeout if timeout is None else float(timeout)
-            if wait_seconds <= 0:
-                raise ValueError("request timeout must be positive")
+            # ``timeout`` remains an idle-worker timeout for API compatibility.
+            # ``total_timeout`` is the independent wall-clock fence used by the
+            # interactive manager. Healthy token frames may refresh the former,
+            # but can never extend the latter.
             session_digest = _session_digest(conversation_id)
+            effective_seed = (
+                requested_seed
+                if requested_seed is not None
+                else (
+                    _derived_sampling_seed(input_ids, session_digest)
+                    if decode_mode_code == DECODE_CONVERSATION
+                    else 0
+                )
+            )
             with self._state_lock:
                 self._validate_running_gpu_lease()
                 request_id = self._next_request_id
@@ -2028,12 +2161,14 @@ class ModelService:
                 )
                 request_deadline_ns = (
                     NO_DEADLINE_NS
-                    if lease is None
-                    else min(
-                        monotonic_ns() + int(self.request_timeout * 1_000_000_000),
+                    if lease is None and not explicit_total_timeout
+                    else min(total_deadline_ns, NO_DEADLINE_NS)
+                )
+                if lease is not None:
+                    request_deadline_ns = min(
+                        request_deadline_ns,
                         lease_deadline_ns,
                     )
-                )
                 authority = _RequestAuthority(
                     request_id=request_id,
                     job_id=job_id,
@@ -2049,16 +2184,39 @@ class ModelService:
                 attention_mask,
                 max_new_tokens=requested,
                 stop_token_ids=stop_token_ids,
+                decode_mode=decode_mode_code,
+                sampling_seed=effective_seed,
                 **authority.response_kwargs(),
             )
+            admission_remaining = total_deadline - monotonic()
+            if admission_remaining <= 0:
+                deadline_exceeded = True
+                self._cancel_event.set()
+                raise TimeoutError("local generation exceeded its total deadline")
             try:
-                self._request_queue.put(message, timeout=1.0)
+                self._request_queue.put(
+                    message,
+                    timeout=min(1.0, admission_remaining),
+                )
             except Full as exc:
+                if monotonic() >= total_deadline:
+                    deadline_exceeded = True
+                    self._cancel_event.set()
+                    raise TimeoutError(
+                        "local generation exceeded its total deadline"
+                    ) from exc
                 raise ServiceBusyError("bounded request queue is full") from exc
             deadline = monotonic() + wait_seconds
             while True:
-                remaining = deadline - monotonic()
+                now = monotonic()
+                remaining = deadline - now
+                total_remaining = total_deadline - now
+                if total_remaining <= 0:
+                    deadline_exceeded = True
+                    self._cancel_event.set()
+                    raise TimeoutError("local generation exceeded its total deadline")
                 if remaining <= 0:
+                    deadline_exceeded = True
                     self._cancel_event.set()
                     raise TimeoutError("local generation exceeded its deadline")
                 if not self.is_running:
@@ -2066,9 +2224,15 @@ class ModelService:
                         "local model worker stopped unexpectedly"
                     )
                 try:
-                    raw = self._response_queue.get(timeout=min(0.1, remaining))
+                    raw = self._response_queue.get(
+                        timeout=min(0.1, remaining, total_remaining)
+                    )
                 except Empty:
                     continue
+                if monotonic() >= total_deadline:
+                    deadline_exceeded = True
+                    self._cancel_event.set()
+                    raise TimeoutError("local generation exceeded its total deadline")
                 try:
                     frame = parse_response(raw)
                 except TensorProtocolError as exc:
@@ -2145,19 +2309,44 @@ class ModelService:
                     raise WorkerAuthorityError(
                         "local model worker rejected stale request authority"
                     )
+                if frame.status == STATUS_DEADLINE_EXCEEDED:
+                    deadline_exceeded = True
+                    completed = True
+                    raise TimeoutError("local generation exceeded its total deadline")
                 if frame.status in {STATUS_INVALID_REQUEST, STATUS_MODEL_ERROR}:
                     completed = True
                     raise WorkerExecutionError("local model worker rejected generation")
                 completed = True
                 raise WorkerExecutionError("local model worker returned unknown status")
         finally:
+            retirement_error: BaseException | None = None
+            retire_worker = deadline_exceeded
             if request_id and not completed:
                 self._cancel_event.set()
-                self._drain_cancelled_request(request_id, authority=authority)
+                drained = self._drain_cancelled_request(
+                    request_id,
+                    authority=authority,
+                )
+                if not drained:
+                    retire_worker = True
+            if retire_worker:
+                with self._state_lock:
+                    self._retire_required = True
+                try:
+                    # Cancellation was already signalled and drained above.
+                    # stop() confirms process death before releasing the exact
+                    # GPU capability, escalating to terminate/kill if needed.
+                    self.stop(timeout=min(1.0, self.cancellation_timeout))
+                except BaseException as error:
+                    retirement_error = error
             with self._state_lock:
                 if self._active_request_id == request_id:
                     self._active_request_id = None
             self._request_lock.release()
+            if retirement_error is not None:
+                raise WorkerExecutionError(
+                    "cancelled model request could not safely retire its worker"
+                ) from retirement_error
 
     def generate(
         self,
@@ -2166,7 +2355,10 @@ class ModelService:
         max_new_tokens: int | None = None,
         stop_token_ids: Tensor | None = None,
         timeout: float | None = None,
+        total_timeout: float | None = None,
         conversation_id: str = "primary",
+        decode_mode: str = "conversation",
+        sampling_seed: int | None = None,
     ) -> GenerationResult:
         chunks: list[Tensor] = []
         request_id = 0
@@ -2178,7 +2370,10 @@ class ModelService:
             max_new_tokens=max_new_tokens,
             stop_token_ids=stop_token_ids,
             timeout=timeout,
+            total_timeout=total_timeout,
             conversation_id=conversation_id,
+            decode_mode=decode_mode,
+            sampling_seed=sampling_seed,
         ):
             request_id = chunk.request_id
             if chunk.token_ids.numel():
@@ -2264,6 +2459,7 @@ class ModelService:
                 self._worker_authority = None
                 self._startup_status = None
                 self._active_request_id = None
+                self._retire_required = False
                 return
             shutdown_errors: list[str] = []
 
@@ -2361,6 +2557,7 @@ class ModelService:
                     "dead local model process handle could not be closed"
                 ) from close_error
             self._process = None
+            self._retire_required = False
 
     def _tokenize(self, prompt: str) -> tuple[Tensor, Tensor]:
         if not isinstance(prompt, str):
@@ -2393,7 +2590,9 @@ class ModelService:
 
     def _drain_cancelled_request(
         self, request_id: int, *, authority: _RequestAuthority | None = None
-    ) -> None:
+    ) -> bool:
+        """Return true only after a trusted terminal frame or proven worker death."""
+
         deadline = monotonic() + self.cancellation_timeout
         while self.is_running and monotonic() < deadline:
             try:
@@ -2401,14 +2600,15 @@ class ModelService:
             except Empty:
                 continue
             except TensorProtocolError:
-                return
+                return False
             if authority is not None:
                 try:
                     authority.validate_frame(frame)
                 except WorkerAuthorityError:
-                    return
+                    return False
             if frame.request_id == request_id and frame.final:
-                return
+                return True
+        return not self.is_running
 
     def __enter__(self) -> ModelService:
         return self.start()
@@ -2419,6 +2619,9 @@ class ModelService:
 
 __all__ = [
     "BaseModelMutationError",
+    "CONVERSATION_TEMPERATURE",
+    "CONVERSATION_TOP_K",
+    "CONVERSATION_TOP_P",
     "GenerationCancelled",
     "GenerationChunk",
     "GenerationResult",

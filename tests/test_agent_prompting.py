@@ -185,6 +185,22 @@ class TestGemma4PromptContract(unittest.TestCase):
             "public answer",
         )
 
+    def test_decode_exposes_plain_answer_after_closed_thought_channel(self):
+        tokens = torch.tensor(
+            [
+                100,
+                *[1_000 + ord(value) for value in "thought\nprivate reasoning"],
+                101,
+                *[1_000 + ord(value) for value in "public answer"],
+                106,
+            ],
+            dtype=torch.int64,
+        )
+        self.assertEqual(
+            decode_response(self.tokenizer, tokens, stop_token_ids(self.tokenizer)),
+            "public answer",
+        )
+
     def test_reserved_text_markers_are_bounded_multi_token_stops(self):
         sequences = reserved_stop_sequences(self.tokenizer)
         self.assertEqual(tuple(sequences.shape), (2, 15))

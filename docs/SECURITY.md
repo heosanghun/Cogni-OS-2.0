@@ -1,8 +1,8 @@
-# Cogni-OS 2.0 v0.3.1 Security and Safety Model
+# Cogni-OS 2.0 v0.3.2 Security and Safety Model
 
 ## Release boundary
 
-Version 0.3.1 is a local research runtime with a **proposal-only** evolution
+Version 0.3.2 is a local research runtime with a **proposal-only** evolution
 boundary. It may observe failures, build evidence-linked candidates, and store
 an inert proposal archive. It may not execute candidate source, replace active
 source, or promote a proposal. Safe promotion belongs to a later phase and
@@ -20,12 +20,14 @@ requires independently attested kernel isolation.
   per-process session token, restrictive CSP, exact routes, bounded bodies and
   a static-asset allowlist;
 - one spawned worker owns the model and CUDA;
-- IPC v3 is tensor-only and binds each request/response to job, lease epoch,
-  deadlines, artifact digest and session digest;
+- IPC v4 is tensor-only and binds each request/response to job, lease epoch,
+  deadlines, artifact digest, session digest, decode policy and request-scoped
+  sampling seed;
 - stale epochs, expired work, wrong artifacts, late replies and cross-session
   frames are rejected;
-- decode is deterministic and cache-free, with bounded inputs, outputs and
-  queues;
+- decode is cache-free and request-seeded: ordinary conversation uses bounded
+  sampling, while exact grounded formats can use strict decoding; both retain
+  bounded inputs, outputs and queues;
 - the product factory rejects enabling Gemma last-known-good/base-only
   generation fallback; Cogni-Core terminal success and base-integrity checks
   are required before the response is atomically published, and Core failure
@@ -145,7 +147,7 @@ device descriptors and artifact hashes must come from the trusted host. A
 Python class cannot prove that a malicious injected object is offline or that
 an external evaluator is honest.
 
-## Deliberately unavailable in v0.3.1
+## Deliberately unavailable in v0.3.2
 
 - automatic source promotion or live-code replacement;
 - a trusted kernel-isolated Windows Sandbox/VM/container attestation;
@@ -167,7 +169,7 @@ boundary or marker is never accepted as proof of kernel isolation.
 ## Deployment responsibility
 
 Mirror the model, tokenizer, licenses, configuration and provenance into the
-offline environment before launch. Do not allow runtime downloads. The v0.3.1
+offline environment before launch. Do not allow runtime downloads. The v0.3.2
 launcher is a bootstrapper that requires the source tree and dependencies; it
 is not a signed standalone appliance. Repeat all VRAM, air-gap, conversation
 and failure-injection gates on the exact deployment hardware and software

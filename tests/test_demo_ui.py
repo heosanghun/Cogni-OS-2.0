@@ -203,6 +203,12 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("검증 READY", html)
         self.assertIn("Runtime Fact-book", script)
         self.assertIn("FACT-BOOK · 검증된 사실", script)
+        self.assertIn(
+            '["cogni_core", "conversation_fastpath", "factbook", "quality_fallback"]',
+            script,
+        )
+        self.assertIn("대화 FAST PATH · 완료", script)
+        self.assertIn("CONVERSATION READY", script)
         self.assertIn("MODEL STANDBY", script)
         self.assertIn("NOT LOADED", script)
         self.assertIn('generationMode === "factbook"', script)
@@ -212,6 +218,26 @@ class TestCogniBoardUI(unittest.TestCase):
         )
         self.assertIn(
             '.chat-message[data-generation-mode="factbook"] .chat-completion-status',
+            stylesheet,
+        )
+        self.assertIn(
+            '.chat-message[data-generation-mode="conversation_fastpath"] .chat-avatar',
+            stylesheet,
+        )
+        self.assertIn(
+            '.chat-message[data-generation-mode="conversation_fastpath"] .chat-completion-status',
+            stylesheet,
+        )
+
+    def test_quality_fallback_is_presented_as_failure_not_completion(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn("품질 검증 실패 · 복구 필요", script)
+        self.assertIn("RESPONSE FAILED", script)
+        self.assertNotIn("품질 안전 응답 · 완료", script)
+        self.assertIn(
+            '.chat-message[data-generation-mode="quality_fallback"]',
             stylesheet,
         )
 

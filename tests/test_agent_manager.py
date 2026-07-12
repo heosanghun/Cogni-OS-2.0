@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 
+from cogni_agent.conversation_fastpath import ConversationFastPath
 from cogni_agent.manager import (
     ACTIVE_AGENT_STATUSES,
     SAFE_QUALITY_FALLBACK,
@@ -80,11 +81,29 @@ class _ScriptedService(_Service):
         self.plans = list(plans)
         self.budgets = []
         self.stop_ids = []
+        self.decode_modes = []
+        self.timeouts = []
+        self.total_timeouts = []
+        self.sampling_seeds = []
 
-    def iter_generate_tokens(self, prompt, *, max_new_tokens, stop_token_ids=None):
+    def iter_generate_tokens(
+        self,
+        prompt,
+        *,
+        max_new_tokens,
+        stop_token_ids=None,
+        decode_mode="conversation",
+        timeout=None,
+        total_timeout=None,
+        sampling_seed=None,
+    ):
         self.prompts.append(prompt)
         self.budgets.append(max_new_tokens)
         self.stop_ids.append(None if stop_token_ids is None else stop_token_ids.clone())
+        self.decode_modes.append(decode_mode)
+        self.timeouts.append(timeout)
+        self.total_timeouts.append(total_timeout)
+        self.sampling_seeds.append(sampling_seed)
         self.active_request_id = len(self.prompts)
         selected = self.plans.pop(0)
         text, finish_reason = selected[:2]
@@ -128,6 +147,32 @@ class _TokenStreamService(_Service):
             finish_reason="stop",
         )
         self.active_request_id = None
+
+
+class _TimeoutService(_Service):
+    def iter_generate_tokens(
+        self,
+        prompt,
+        *,
+        max_new_tokens,
+        stop_token_ids=None,
+        conversation_id=None,
+        decode_mode="conversation",
+        sampling_seed=None,
+        timeout=None,
+        total_timeout=None,
+    ):
+        del (
+            prompt,
+            max_new_tokens,
+            stop_token_ids,
+            conversation_id,
+            decode_mode,
+            sampling_seed,
+            timeout,
+            total_timeout,
+        )
+        raise TimeoutError("bounded test deadline")
 
 
 class _BlockingFactGrounder(RuntimeFactGrounder):
@@ -258,6 +303,100 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(state["core"]["modules"]["gemma"], "not_loaded")
         self.assertEqual(rhythm.active_requests, 0)
 
+    def test_optional_conversation_fast_path_precedes_factbook(self) -> None:
+        from tests.test_agent_quality_integration import _factbook
+
+        service = _ScriptedService([])
+        manager = self.manager(
+            service,
+            conversation_fast_path=ConversationFastPath(),
+            fact_grounder=RuntimeFactGrounder(_factbook()),
+        )
+
+        manager.start_turn("나와 어떤 일을 함께 할 수 있나요?", "chat")
+        state = _wait(manager)
+
+        assistants = [
+            item for item in state["conversation"] if item["role"] == "assistant"
+        ]
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(len(assistants), 1)
+        self.assertEqual(
+            assistants[0]["generation_mode"],
+            "conversation_fastpath",
+        )
+        self.assertEqual(
+            state["completion"]["generation_mode"],
+            "conversation_fastpath",
+        )
+        self.assertIn("코드·문서 검토", assistants[0]["content"])
+        self.assertFalse(service.started)
+        self.assertEqual(service.prompts, [])
+
+    def test_fast_path_exchange_remains_in_later_model_context(self) -> None:
+        service = _ScriptedService(
+            [("목표와 사용자를 정하면 작은 기능부터 구체화할 수 있습니다.", "stop")]
+        )
+        manager = self.manager(
+            service,
+            conversation_fast_path=ConversationFastPath(),
+        )
+
+        manager.start_turn("나랑 재미잇는 프로잭트 같이 만드러볼래요?", "chat")
+        first = _wait(manager)
+        fast_answer = first["conversation"][-1]["content"]
+        manager.start_turn("이제 주제를 구체화해 주세요.", "chat")
+        second = _wait(manager)
+
+        self.assertEqual(
+            first["completion"]["generation_mode"],
+            "conversation_fastpath",
+        )
+        self.assertEqual(second["completion"]["generation_mode"], "cogni_core")
+        self.assertEqual(len(service.prompts), 1)
+        self.assertIn(fast_answer, service.prompts[0])
+        self.assertIn("이제 주제를 구체화", service.prompts[0])
+
+    def test_first_step_fast_path_requires_immediate_collaboration_context(
+        self,
+    ) -> None:
+        standalone_service = _ScriptedService(
+            [("어떤 종류의 첫 단계를 말씀하시는지 알려 주세요.", "stop")]
+        )
+        standalone = self.manager(
+            standalone_service,
+            conversation_fast_path=ConversationFastPath(),
+        )
+        prompt = "첫 단계에서 하나만 물어봐 주세요."
+        standalone.start_turn(prompt, "chat")
+        standalone_state = _wait(standalone)
+        self.assertEqual(
+            standalone_state["completion"]["generation_mode"],
+            "cogni_core",
+        )
+
+        contextual_service = _ScriptedService([])
+        contextual = self.manager(
+            contextual_service,
+            conversation_fast_path=ConversationFastPath(),
+        )
+        contextual.start_turn("오프라인 AI 데모를 함께 만들고 싶어요.", "chat")
+        _wait(contextual)
+        contextual.start_turn(
+            "좋아요. 그럼 첫 단계에서 제가 정할 것 하나만 물어봐 주세요.",
+            "chat",
+        )
+        contextual_state = _wait(contextual)
+
+        self.assertEqual(
+            contextual_state["completion"]["generation_mode"],
+            "conversation_fastpath",
+        )
+        self.assertIn(
+            "사용자는 누구인가요", contextual_state["conversation"][-1]["content"]
+        )
+        self.assertFalse(contextual_service.started)
+
     def test_general_question_starts_model_and_uses_cogni_core_generation(self) -> None:
         from tests.test_agent_quality_integration import _factbook
 
@@ -285,6 +424,130 @@ class TestAgentManager(unittest.TestCase):
             "cogni_core",
         )
         self.assertEqual(state["completion"]["generation_mode"], "cogni_core")
+        self.assertEqual(service.decode_modes, ["strict"])
+        self.assertTrue(
+            service.prompts[0].endswith("assistant:대한민국의 수도를 설명하면, ")
+        )
+
+    def test_open_conversation_uses_sampling_and_excludes_factbook_exchange(
+        self,
+    ) -> None:
+        from tests.test_agent_quality_integration import _factbook
+
+        service = _ScriptedService(
+            [("좋습니다. 어떤 분야의 프로젝트부터 시작해 볼까요?", "stop")]
+        )
+        manager = self.manager(
+            service,
+            fact_grounder=RuntimeFactGrounder(_factbook()),
+        )
+
+        manager.start_turn("당신은 어떤 모델이고 어떤 기능을 할 수 있나요?", "chat")
+        grounded = _wait(manager)
+        grounded_answer = grounded["conversation"][-1]["content"]
+        self.assertEqual(grounded["completion"]["generation_mode"], "factbook")
+
+        manager.start_turn("같이 재미있는 프로젝트를 하자!", "chat")
+        conversational = _wait(manager)
+
+        self.assertEqual(conversational["status"], "succeeded")
+        self.assertEqual(service.decode_modes, ["conversation"])
+        self.assertIsNotNone(service.timeouts[0])
+        self.assertLessEqual(service.timeouts[0], 120.0)
+        self.assertIsNotNone(service.total_timeouts[0])
+        self.assertLessEqual(service.total_timeouts[0], 120.0)
+        self.assertIsInstance(service.sampling_seeds[0], int)
+        self.assertGreaterEqual(service.sampling_seeds[0], 0)
+        self.assertLess(service.sampling_seeds[0], 2**63)
+        self.assertNotIn(grounded_answer, service.prompts[0])
+        self.assertNotIn("당신은 어떤 모델", service.prompts[0])
+        self.assertIn("같이 재미있는 프로젝트", service.prompts[0])
+
+    def test_explicit_explanation_uses_strict_grounded_prefill(self) -> None:
+        service = _ScriptedService(
+            [("원인을 기록한 뒤 수정하고 마지막에 회귀 테스트를 수행합니다.", "stop")]
+        )
+        manager = self.manager(service)
+        question = "오류 복구 순서를 설명하세요."
+        manager.start_turn(question, "chat")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(service.decode_modes, ["strict"])
+        self.assertTrue(
+            service.prompts[0].endswith("assistant:오류 복구 순서를 설명하면, ")
+        )
+
+    def test_exact_step_request_keeps_only_first_complete_step_block(self) -> None:
+        service = _ScriptedService(
+            [
+                (
+                    "1단계는 원인을 확인하고, 2단계는 코드를 수정하며, "
+                    "3단계는 회귀 테스트를 수행합니다.\n"
+                    "1단계: 원인을 다시 길게 설명합니다.",
+                    "stop",
+                )
+            ]
+        )
+        manager = self.manager(service)
+        manager.start_turn("복구 절차를 세 단계로 답하세요.", "chat")
+        state = _wait(manager)
+
+        self.assertEqual(service.decode_modes, ["strict"])
+        self.assertEqual(
+            state["conversation"][-1]["content"],
+            "원인을 확인합니다. 코드를 수정합니다. 회귀 테스트를 수행합니다.",
+        )
+
+    def test_referential_factbook_followup_stays_grounded_without_model_history(
+        self,
+    ) -> None:
+        from tests.test_agent_quality_integration import _factbook
+
+        service = _ScriptedService([])
+        manager = self.manager(
+            service,
+            fact_grounder=RuntimeFactGrounder(_factbook()),
+        )
+
+        manager.start_turn("CTS와 System 1.5, System 3의 상태를 알려줘.", "chat")
+        _wait(manager)
+        manager.start_turn("그중 지금 쓸 수 있는 것만 쉽게 말해줘.", "chat")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(state["completion"]["generation_mode"], "factbook")
+        self.assertIn("CTS·DEQ(제한 실험)", state["conversation"][-1]["content"])
+        self.assertFalse(service.started)
+        self.assertEqual(service.prompts, [])
+
+    def test_compact_collaboration_grounding_remains_followup_context(self) -> None:
+        from tests.test_agent_quality_integration import _factbook
+
+        service = _ScriptedService(
+            [
+                (
+                    "좋습니다. 먼저 만들고 싶은 프로젝트의 목표를 한 문장으로 알려 주세요.",
+                    "stop",
+                )
+            ]
+        )
+        manager = self.manager(
+            service,
+            fact_grounder=RuntimeFactGrounder(_factbook()),
+        )
+
+        manager.start_turn("나와 어떤 일을 함께 할 수 있나요?", "chat")
+        grounded = _wait(manager)
+        compact_answer = grounded["conversation"][-1]["content"]
+        self.assertEqual(grounded["completion"]["generation_mode"], "factbook")
+
+        manager.start_turn("그럼 첫 번째부터 해보자.", "chat")
+        followup = _wait(manager)
+
+        self.assertEqual(followup["completion"]["generation_mode"], "cogni_core")
+        self.assertIn(compact_answer, service.prompts[-1])
+        self.assertIn("그럼 첫 번째부터", service.prompts[-1])
 
     def test_shared_rhythm_covers_task_mode_until_tool_completion(self) -> None:
         rhythm = RhythmController()
@@ -376,7 +639,7 @@ class TestAgentManager(unittest.TestCase):
         service = _ScriptedService(
             [
                 ("첫 문장은 중간에서", "length"),
-                (" 이어지고 자연스럽게 끝납니다.", "stop"),
+                (" 이어지고 자연스럽게 끝납니다. 둘째 설명도 완결됩니다.", "stop"),
             ]
         )
         manager = self.manager(service)
@@ -384,9 +647,10 @@ class TestAgentManager(unittest.TestCase):
         state = _wait(manager)
 
         answer = state["conversation"][-1]
-        self.assertEqual(service.budgets, [512, 512])
+        self.assertEqual(service.budgets, [512, 256])
         self.assertEqual(
-            answer["content"], "첫 문장은 중간에서 이어지고 자연스럽게 끝납니다."
+            answer["content"],
+            "첫 문장은 중간에서 이어지고 자연스럽게 끝납니다. 둘째 설명도 완결됩니다.",
         )
         self.assertEqual(answer["finish_reason"], "stop")
         self.assertEqual(answer["continuations"], 1)
@@ -492,7 +756,7 @@ class TestAgentManager(unittest.TestCase):
     def test_hard_total_budget_reports_truncation_and_explicit_resume(self) -> None:
         service = _ScriptedService(
             [
-                ("중단 답변", "length"),
+                ("첫 부분은 완결된 답변입니다. 다음 내용은", "length"),
                 ("완성합니다.", "stop"),
             ]
         )
@@ -513,7 +777,15 @@ class TestAgentManager(unittest.TestCase):
         self.assertFalse(second["conversation"][-1]["truncated"])
 
     def test_dynamic_budget_is_deterministic_and_bounded(self) -> None:
-        service = _ScriptedService([("짧은 답.", "stop"), ("상세 답.", "stop")])
+        service = _ScriptedService(
+            [
+                ("짧은 답.", "stop"),
+                (
+                    "첫째 핵심을 충분히 설명합니다. 둘째 핵심도 빠뜨리지 않고 설명합니다.",
+                    "stop",
+                ),
+            ]
+        )
         manager = self.manager(service)
         manager.start_turn("안녕하세요?", "chat")
         _wait(manager)
@@ -522,7 +794,7 @@ class TestAgentManager(unittest.TestCase):
         )
         _wait(manager)
 
-        self.assertEqual(service.budgets, [256, 512])
+        self.assertEqual(service.budgets, [128, 512])
         self.assertTrue(all(1 <= value <= 512 for value in service.budgets))
 
     def test_explicit_concise_request_disables_unbounded_continuation(self) -> None:
@@ -531,8 +803,8 @@ class TestAgentManager(unittest.TestCase):
         selected = manager._response_budget(
             "핵심만 세 문장으로 설명하세요.", resume_truncated=False
         )
-        self.assertEqual(selected.first_request, 192)
-        self.assertEqual(selected.total, 576)
+        self.assertEqual(selected.first_request, 128)
+        self.assertEqual(selected.total, 384)
         self.assertEqual(selected.max_continuations, 0)
 
     def test_raw_factbook_prompt_echo_is_cut_at_its_first_marker(self) -> None:
@@ -598,7 +870,7 @@ class TestAgentManager(unittest.TestCase):
             "첫째 장점입니다. 둘째 장점입니다. 마지막 한계입니다.",
         )
 
-    def test_two_failed_repairs_publish_one_honest_quality_fallback(self) -> None:
+    def test_one_bounded_repair_then_honest_quality_fallback(self) -> None:
         question = "온디바이스 AI의 장점을 세 문장으로 설명하세요."
         echo = question + "\n[턴 종료]"
         service = _ScriptedService([(echo, "stop"), (echo, "stop"), (echo, "stop")])
@@ -607,7 +879,7 @@ class TestAgentManager(unittest.TestCase):
         state = _wait(manager)
         answer = state["conversation"][-1]
         self.assertEqual(state["status"], "succeeded")
-        self.assertEqual(len(service.budgets), 3)
+        self.assertEqual(len(service.budgets), 2)
         self.assertEqual(answer["content"], safe_quality_fallback(question))
         self.assertEqual(answer["generation_mode"], "quality_fallback")
 
@@ -659,7 +931,7 @@ class TestAgentManager(unittest.TestCase):
         manager.start_turn("사실과 추론의 구분 원칙을 두 문장으로 답하세요.", "chat")
         second = _wait(manager)
         self.assertEqual(second["conversation"][-1]["content"], corrected)
-        self.assertEqual(service.prompts[-1].count(echoed), 1)
+        self.assertEqual(service.prompts[-1].count(echoed), 0)
         self.assertIn("사실과 추론의 구분 원칙", service.prompts[-1])
 
     def test_explicit_sentence_minimum_triggers_bounded_repair(self) -> None:
@@ -667,7 +939,10 @@ class TestAgentManager(unittest.TestCase):
         service = _ScriptedService(
             [
                 ("한 문장만 답했습니다.", "stop"),
-                ("첫 문장입니다. 둘째 문장입니다. 셋째 문장입니다.", "stop"),
+                (
+                    "첫 안전 원칙입니다. 둘째 안전 원칙입니다. 셋째 안전 원칙입니다.",
+                    "stop",
+                ),
             ]
         )
         manager = self.manager(service)
@@ -677,7 +952,157 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(len(service.budgets), 2)
         self.assertEqual(
             state["conversation"][-1]["content"],
-            "첫 문장입니다. 둘째 문장입니다. 셋째 문장입니다.",
+            "첫 안전 원칙입니다. 둘째 안전 원칙입니다. 셋째 안전 원칙입니다.",
+        )
+
+    def test_fluent_topic_drift_triggers_one_bounded_repair(self) -> None:
+        question = (
+            "모델 응답 품질을 배포 전에 검증하는 절차를 세 문장으로 설명해 주세요."
+        )
+        service = _ScriptedService(
+            [
+                (
+                    "언론사는 뉴스의 정확성을 확인합니다. 기자는 현장을 취재합니다. "
+                    "편집자는 기사를 승인합니다.",
+                    "stop",
+                ),
+                (
+                    "모델 응답의 정확성을 검증합니다. 반복과 완결성을 품질 기준으로 "
+                    "평가합니다. 기준을 통과한 결과만 배포합니다.",
+                    "stop",
+                ),
+            ]
+        )
+        manager = self.manager(service)
+        manager.start_turn(question, "chat")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(len(service.prompts), 2)
+        self.assertEqual(service.decode_modes, ["strict", "strict"])
+        self.assertIn("요청한 범위를 빠뜨리지 말고", service.prompts[1])
+        self.assertIn("모델 응답의 정확성을", state["conversation"][-1]["content"])
+
+    def test_exact_answer_missing_scope_terms_is_repaired(self) -> None:
+        question = (
+            "모델 응답 품질을 배포 전에 검증하는 절차를 세 문장으로 설명해 주세요."
+        )
+        service = _ScriptedService(
+            [
+                (
+                    "모델 응답의 정확성을 검증합니다. 모델 응답의 다양성을 검증합니다. "
+                    "모델 응답의 유용성을 검증합니다.",
+                    "stop",
+                ),
+                (
+                    "모델 응답의 정확성을 품질 기준으로 검증합니다. 반복과 완결성을 "
+                    "평가합니다. 기준을 통과한 결과만 배포합니다.",
+                    "stop",
+                ),
+            ]
+        )
+        manager = self.manager(service)
+        manager.start_turn(question, "chat")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(len(service.prompts), 2)
+        self.assertIn("질문의 핵심 용어를 직접 유지하세요", service.prompts[1])
+        self.assertIn("배포합니다", state["conversation"][-1]["content"])
+
+    def test_repeated_exact_answer_switches_bounded_repair_to_sampling(self) -> None:
+        question = "배포 전 검증 절차를 정확히 두 문장으로 설명하세요."
+        repeated = (
+            "배포 전 검증 절차는 모델 응답의 정확성과 완결성을 확인합니다. "
+            "배포 전 검증 절차는 모델 응답의 정확성과 완결성을 확인합니다."
+        )
+        repaired = (
+            "배포 전 검증 절차는 모델 응답의 정확성과 완결성을 확인합니다. "
+            "그다음 반복과 중단이 없는 결과만 배포 후보로 승인합니다."
+        )
+        service = _ScriptedService([(repeated, "stop"), (repaired, "stop")])
+        manager = self.manager(service)
+
+        manager.start_turn(question, "chat")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(service.decode_modes, ["strict", "conversation"])
+        self.assertIn("서로 다른 핵심을 한 번씩만", service.prompts[1])
+        self.assertEqual(state["conversation"][-1]["content"], repaired)
+
+    def test_distinct_sentences_are_composed_across_bounded_attempts(self) -> None:
+        question = (
+            "긴 대화에서 오래된 문맥을 줄이면서 사용자 의도를 보존하는 방법을 "
+            "세 문장으로 답하세요."
+        )
+        service = _ScriptedService(
+            [
+                (
+                    "오래된 문맥은 핵심만 요약합니다. 사용자 의도는 별도 상태로 "
+                    "보존합니다. 중요한 사용자 의도는 별도 상태로 보존합니다.",
+                    "stop",
+                ),
+                (
+                    "오래된 문맥은 핵심만 요약합니다. 최근 대화는 원문 그대로 "
+                    "유지합니다. 중요한 최근 대화는 원문 그대로 유지합니다.",
+                    "stop",
+                ),
+            ]
+        )
+        manager = self.manager(service)
+        manager.start_turn(question, "chat")
+        state = _wait(manager)
+
+        self.assertEqual(len(service.prompts), 2)
+        self.assertEqual(
+            state["conversation"][-1]["content"],
+            "오래된 문맥은 핵심만 요약합니다. 사용자 의도는 별도 상태로 보존합니다. "
+            "최근 대화는 원문 그대로 유지합니다.",
+        )
+
+    def test_distinct_steps_are_composed_across_bounded_attempts(self) -> None:
+        service = _ScriptedService(
+            [
+                ("원인을 기록합니다. 수정 후보를 만듭니다.", "stop"),
+                ("수정 후보를 만듭니다. 회귀 테스트를 실행합니다.", "stop"),
+            ]
+        )
+        manager = self.manager(service)
+
+        manager.start_turn("복구 절차를 세 단계로 답하세요.", "chat")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(
+            state["conversation"][-1]["content"],
+            "원인을 기록합니다. 수정 후보를 만듭니다. 회귀 테스트를 실행합니다.",
+        )
+
+    def test_requested_categories_are_composed_across_attempts(self) -> None:
+        service = _ScriptedService(
+            [
+                (
+                    "온디바이스 AI의 장점은 데이터 보호에 유리합니다. "
+                    "장점은 응답 지연을 줄입니다.",
+                    "stop",
+                ),
+                ("한계는 장치 자원에 제약을 받습니다.", "stop"),
+            ]
+        )
+        manager = self.manager(service)
+
+        manager.start_turn(
+            "온디바이스 AI의 장점 두 가지와 한계 한 가지를 세 문장으로 설명하세요.",
+            "chat",
+        )
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(
+            state["conversation"][-1]["content"],
+            "온디바이스 AI의 장점은 데이터 보호에 유리합니다. "
+            "장점은 응답 지연을 줄입니다. 한계는 장치 자원에 제약을 받습니다.",
         )
 
     def test_exact_sentence_request_injects_shape_contract_and_preserves_repair_budget(
@@ -698,9 +1123,12 @@ class TestAgentManager(unittest.TestCase):
         state = _wait(manager)
 
         self.assertEqual(state["status"], "succeeded")
-        self.assertEqual(service.budgets, [192, 192])
-        self.assertIn("서론입니다. 첫 장점입니다.", service.prompts[1])
+        self.assertEqual(service.budgets, [128, 128])
+        self.assertEqual(service.decode_modes, ["strict", "strict"])
+        self.assertEqual(len(set(service.sampling_seeds)), 2)
+        self.assertNotIn("서론입니다. 첫 장점입니다.", service.prompts[1])
         self.assertIn("수정 답변만 작성하세요", service.prompts[1])
+        self.assertIn("정확히 3개의 완결된 문장", service.prompts[1])
         self.assertEqual(
             state["conversation"][-1]["content"],
             "첫 장점입니다. 둘째 장점입니다. 한계입니다.",
@@ -712,6 +1140,35 @@ class TestAgentManager(unittest.TestCase):
         )
         self.assertTrue(boundary)
         self.assertEqual(cleaned, "")
+        cleaned, boundary = AgentManager._clean_model_text(
+            "사용자가 문장이나 항목 수를 지정하면 군더더기 없이 그 수를 지키십시오."
+        )
+        self.assertTrue(boundary)
+        self.assertEqual(cleaned, "")
+
+    def test_maximum_item_block_is_completed_before_length_tail(self) -> None:
+        service = _ScriptedService(
+            [
+                (
+                    "1. 질문을 확인하고, 2. 반복을 검사하고, 3. 문장을 완결하고, "
+                    "4. 결과를 기록합니다.\n1. 뒤의 긴 설명은 아직 작성 중",
+                    "length",
+                )
+            ]
+        )
+        manager = self.manager(service)
+        manager.start_turn("확인 항목을 네 가지 이내로 정리하세요.", "chat")
+        state = _wait(manager)
+        answer = state["conversation"][-1]
+
+        self.assertEqual(state["stage"], "complete")
+        self.assertEqual(answer["finish_reason"], "stop")
+        self.assertFalse(answer["truncated"])
+        self.assertEqual(
+            answer["content"],
+            "질문을 확인합니다. 반복을 검사합니다. 문장을 완결합니다. "
+            "결과를 기록합니다.",
+        )
 
     def test_concise_mixed_subject_fragment_is_repaired_from_scratch(self) -> None:
         service = _ScriptedService(
@@ -730,6 +1187,96 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(state["status"], "succeeded")
         self.assertEqual(len(service.budgets), 2)
         self.assertNotIn("AI가", state["conversation"][-1]["content"])
+
+    def test_incomplete_tail_salvages_complete_prefix_at_attempt_bound(self) -> None:
+        service = _ScriptedService(
+            [
+                (
+                    "첫 문장은 자연스럽게 완결되었습니다. 다음 설명을 이어가면서",
+                    "stop",
+                )
+            ]
+        )
+        manager = self.manager(service, max_generation_attempts=1)
+
+        manager.start_turn("핵심을 자연스럽게 설명해 주세요.", "chat")
+        state = _wait(manager)
+
+        answer = state["conversation"][-1]
+        self.assertEqual(answer["content"], "첫 문장은 자연스럽게 완결되었습니다.")
+        self.assertEqual(answer["generation_mode"], "cogni_core")
+        self.assertEqual(len(service.budgets), 1)
+
+    def test_broad_request_never_promotes_one_generic_salvage_sentence(self) -> None:
+        service = _ScriptedService(
+            [("좋은 생각입니다. 나머지 기능을 설명하면서", "stop")]
+        )
+        manager = self.manager(service, max_generation_attempts=1)
+
+        manager.start_turn("모든 기능을 자세히 분석하고 설명해 주세요.", "chat")
+        state = _wait(manager)
+
+        answer = state["conversation"][-1]
+        self.assertEqual(answer["generation_mode"], "quality_fallback")
+        self.assertNotEqual(answer["content"], "좋은 생각입니다.")
+
+    def test_length_boundary_removes_incomplete_tail_but_remains_resumable(
+        self,
+    ) -> None:
+        service = _ScriptedService(
+            [("첫 부분은 자연스럽게 완결됩니다. 다음 설명은", "length")]
+        )
+        manager = self.manager(
+            service,
+            max_new_tokens=64,
+            max_total_new_tokens=64,
+            max_continuations=0,
+            max_generation_attempts=1,
+        )
+
+        manager.start_turn("핵심 내용을 알려 주세요.", "chat")
+        state = _wait(manager)
+
+        answer = state["conversation"][-1]
+        self.assertEqual(answer["content"], "첫 부분은 자연스럽게 완결됩니다.")
+        self.assertTrue(answer["truncated"])
+        self.assertEqual(state["completion"]["state"], "truncated")
+
+    def test_decode_deadline_is_bounded_and_does_not_publish_partial_token(
+        self,
+    ) -> None:
+        service = _Service(delay=0.03)
+        manager = self.manager(
+            service,
+            max_generation_attempts=1,
+            max_decode_seconds=0.01,
+        )
+
+        manager.start_turn("짧게 인사해 주세요.", "chat")
+        state = _wait(manager)
+
+        answer = state["conversation"][-1]
+        self.assertEqual(answer["generation_mode"], "quality_fallback")
+        self.assertTrue(service.cancelled)
+
+    def test_backend_total_timeout_uses_quality_fallback_not_failed_turn(self) -> None:
+        failures = []
+        manager = self.manager(
+            _TimeoutService(),
+            max_generation_attempts=1,
+            failure_sink=lambda code, detail: failures.append((code, detail)),
+        )
+
+        manager.start_turn("자연스럽게 답해 주세요.", "chat")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(
+            state["conversation"][-1]["generation_mode"],
+            "quality_fallback",
+        )
+        self.assertEqual(failures[0][0], "ResponseQualityError")
+        self.assertIn("decode_deadline", failures[0][1])
 
     def test_response_character_bound_is_explicit(self) -> None:
         text, truncated = AgentManager._clip_response("가" * 9_000)

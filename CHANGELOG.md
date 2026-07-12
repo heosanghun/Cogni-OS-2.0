@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.2 — 2026-07-12
+
+### Natural conversation and completion integrity
+
+- aligned local Gemma prompts with the model's turn contract and separated
+  hidden thought content from the published answer;
+- added request-seeded bounded sampling for ordinary conversation and grounded
+  strict decoding for exact sentence-count requests;
+- added a narrow, NFKC-normalized conversation fast path for greetings,
+  project/demo collaboration, bounded capability guidance, and an immediate
+  context-bound first-step follow-up;
+- kept general knowledge, code and formatting questions on the Fact-book or
+  Cogni-Core path instead of allowing the fast path to overroute them;
+- isolated long Runtime Fact-book answers from later generative context and
+  added bounded relevance, repetition, control-token and completion guards;
+- retained only complete safe prefixes when a generated tail fails, while
+  publishing quality failure as a failure rather than a successful answer.
+
+### Runtime, UI and release gates
+
+- upgraded tensor IPC to v4 with explicit conversation/strict decode policy
+  and request-scoped sampling seeds while preserving job, lease, deadline,
+  artifact and session binding;
+- bounded total decode time, generation attempts, cooperative cancellation,
+  worker retirement and GPU lease cleanup;
+- distinguished Cogni-Core, Conversation Fast Path, Runtime Fact-book and
+  quality-failure responses in CogniBoard;
+- added the exact reported Korean exchange, typo/paraphrase cases, context
+  transitions and formal regressions to a 10-turn release gate alongside the
+  existing 20-turn local-model completion stress gate.
+
 ## 0.3.0 — 2026-07-12
 
 ### Runtime truth and evidence

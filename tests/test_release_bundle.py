@@ -19,6 +19,8 @@ class TestReleaseBundleIntegrity(unittest.TestCase):
         self.assertIn("/cogni_core/cts_policy_checkpoint.json -text", attributes)
 
     def test_archive_with_autocrlf_disabled_preserves_checkpoint_bytes(self) -> None:
+        if not (ROOT / ".git").is_dir():
+            self.skipTest("exact git archive reproduction requires a Git checkout")
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "source.zip"
             subprocess.run(

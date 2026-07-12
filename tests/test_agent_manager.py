@@ -638,8 +638,11 @@ class TestAgentManager(unittest.TestCase):
     def test_length_finish_auto_continues_and_exposes_completion_metadata(self) -> None:
         service = _ScriptedService(
             [
-                ("첫 문장은 중간에서", "length"),
-                (" 이어지고 자연스럽게 끝납니다. 둘째 설명도 완결됩니다.", "stop"),
+                ("기능 심층 분석은 중간에서", "length"),
+                (
+                    " 이어지고 자연스럽게 끝납니다. 단계별 설명도 완결됩니다.",
+                    "stop",
+                ),
             ]
         )
         manager = self.manager(service)
@@ -650,7 +653,8 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(service.budgets, [512, 256])
         self.assertEqual(
             answer["content"],
-            "첫 문장은 중간에서 이어지고 자연스럽게 끝납니다. 둘째 설명도 완결됩니다.",
+            "기능 심층 분석은 중간에서 이어지고 자연스럽게 끝납니다. "
+            "단계별 설명도 완결됩니다.",
         )
         self.assertEqual(answer["finish_reason"], "stop")
         self.assertEqual(answer["continuations"], 1)
@@ -781,7 +785,8 @@ class TestAgentManager(unittest.TestCase):
             [
                 ("짧은 답.", "stop"),
                 (
-                    "첫째 핵심을 충분히 설명합니다. 둘째 핵심도 빠뜨리지 않고 설명합니다.",
+                    "모든 기능의 핵심을 심층 분석합니다. 단계별 계획도 빠뜨리지 않고 "
+                    "설명합니다.",
                     "stop",
                 ),
             ]
@@ -870,7 +875,7 @@ class TestAgentManager(unittest.TestCase):
             "첫째 장점입니다. 둘째 장점입니다. 마지막 한계입니다.",
         )
 
-    def test_one_bounded_repair_then_honest_quality_fallback(self) -> None:
+    def test_two_bounded_repairs_then_honest_quality_fallback(self) -> None:
         question = "온디바이스 AI의 장점을 세 문장으로 설명하세요."
         echo = question + "\n[턴 종료]"
         service = _ScriptedService([(echo, "stop"), (echo, "stop"), (echo, "stop")])
@@ -879,7 +884,7 @@ class TestAgentManager(unittest.TestCase):
         state = _wait(manager)
         answer = state["conversation"][-1]
         self.assertEqual(state["status"], "succeeded")
-        self.assertEqual(len(service.budgets), 2)
+        self.assertEqual(len(service.budgets), 3)
         self.assertEqual(answer["content"], safe_quality_fallback(question))
         self.assertEqual(answer["generation_mode"], "quality_fallback")
 
@@ -891,7 +896,10 @@ class TestAgentManager(unittest.TestCase):
                 (echo, "stop"),
                 (echo, "stop"),
                 (echo, "stop"),
-                ("다음 요청에는 검증 가능한 사실만 답합니다.", "stop"),
+                (
+                    "다음 답변 원칙은 검증 가능한 사실만 말하는 것입니다.",
+                    "stop",
+                ),
             ]
         )
         manager = self.manager(service)
@@ -1010,6 +1018,35 @@ class TestAgentManager(unittest.TestCase):
         self.assertIn("질문의 핵심 용어를 직접 유지하세요", service.prompts[1])
         self.assertIn("배포합니다", state["conversation"][-1]["content"])
 
+    def test_generic_exact_answer_missing_multiple_topics_is_repaired(self) -> None:
+        question = (
+            "긴 대화에서 오래된 문맥을 줄이면서 사용자 의도를 보존하는 방법을 "
+            "세 문장으로 답하세요."
+        )
+        service = _ScriptedService(
+            [
+                (
+                    "중요한 정보만 추출합니다. 핵심 의도를 유지합니다. "
+                    "불필요한 세부 사항을 제거합니다.",
+                    "stop",
+                ),
+                (
+                    "오래된 대화 문맥은 핵심만 요약합니다. 사용자 의도는 별도 상태로 "
+                    "보존합니다. 최근 대화는 원문에 가깝게 유지합니다.",
+                    "stop",
+                ),
+            ]
+        )
+        manager = self.manager(service)
+
+        manager.start_turn(question, "chat")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(len(service.prompts), 2)
+        self.assertIn("질문의 핵심 용어를 직접 유지하세요", service.prompts[1])
+        self.assertIn("오래된 대화 문맥", state["conversation"][-1]["content"])
+
     def test_repeated_exact_answer_switches_bounded_repair_to_sampling(self) -> None:
         question = "배포 전 검증 절차를 정확히 두 문장으로 설명하세요."
         repeated = (
@@ -1112,7 +1149,7 @@ class TestAgentManager(unittest.TestCase):
         service = _ScriptedService(
             [
                 (
-                    "서론입니다. 첫 장점입니다. 둘째 장점입니다. 한계입니다.",
+                    "서론입니다. 첫 장점입니다. 둘째 장점입니다. 셋째 장점입니다.",
                     "stop",
                 ),
                 ("첫 장점입니다. 둘째 장점입니다. 한계입니다.", "stop"),
@@ -1128,7 +1165,7 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(len(set(service.sampling_seeds)), 2)
         self.assertNotIn("서론입니다. 첫 장점입니다.", service.prompts[1])
         self.assertIn("수정 답변만 작성하세요", service.prompts[1])
-        self.assertIn("정확히 3개의 완결된 문장", service.prompts[1])
+        self.assertIn("정확히 장점 2개와 한계 1개", service.prompts[1])
         self.assertEqual(
             state["conversation"][-1]["content"],
             "첫 장점입니다. 둘째 장점입니다. 한계입니다.",
@@ -1145,6 +1182,27 @@ class TestAgentManager(unittest.TestCase):
         )
         self.assertTrue(boundary)
         self.assertEqual(cleaned, "")
+        cleaned, boundary = AgentManager._clean_model_text(
+            "물음의 핵심과 요청 형식에 맞게 아래 내용을 두 문장으로 작성하세요."
+        )
+        self.assertTrue(boundary)
+        self.assertEqual(cleaned, "")
+
+    def test_orphan_leading_smart_quote_is_removed(self) -> None:
+        cleaned, boundary = AgentManager._clean_model_text(
+            "“ 불확실한 내용은 가능성으로 표현합니다."
+        )
+        self.assertFalse(boundary)
+        self.assertEqual(cleaned, "불확실한 내용은 가능성으로 표현합니다.")
+
+        quoted, boundary = AgentManager._clean_model_text(
+            "“검증됨”이라는 표시는 근거가 있을 때만 사용합니다."
+        )
+        self.assertFalse(boundary)
+        self.assertEqual(
+            quoted,
+            "“검증됨”이라는 표시는 근거가 있을 때만 사용합니다.",
+        )
 
     def test_maximum_item_block_is_completed_before_length_tail(self) -> None:
         service = _ScriptedService(

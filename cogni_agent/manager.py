@@ -39,12 +39,15 @@ from .response_quality import (
     normalize_exact_sentence_response,
     normalize_maximum_item_response,
     request_topic_terms,
+    requested_category_counts,
     requested_exact_item_count,
     requested_exact_sentence_count,
     requested_maximum_items,
+    response_avoids_prompt_echo,
     response_avoids_unsolicited_subjects,
     response_contract_satisfied,
     response_preserves_distinctive_topic,
+    response_topically_anchored,
     salvage_complete_prefix,
 )
 from .tools import HELP_TEXT, ToolPolicyError, WorkspaceToolExecutor, parse_tool_request
@@ -59,7 +62,7 @@ HARD_MAX_TOTAL_TOKENS = 1_536
 HARD_MAX_CONTINUATIONS = 2
 HARD_MAX_GENERATION_ATTEMPTS = 4
 HARD_MAX_DECODE_SECONDS = 120.0
-HARD_MAX_QUALITY_REPAIRS = 1
+HARD_MAX_QUALITY_REPAIRS = 2
 INTERACTIVE_MAX_INPUT_TOKENS = 2_048
 DEFAULT_SHORT_RESPONSE_TOKENS = 128
 DEFAULT_DETAILED_RESPONSE_TOKENS = 256
@@ -245,7 +248,9 @@ _QUALITY_REPAIR_ECHO_RE = re.compile(
     r"사용자가 문장이나 항목 수를 지정하면|"
     r"반복된 질문에는 최신 답변만 제공하세요|"
     r"최신 답변을 제공하고, 이전 답변은|"
-    r"\d+개의 완결된 문장으로 작성해야 합니다"
+    r"\d+개의 완결된 문장으로 작성해야 합니다|"
+    r"물음의 핵심과 요청 형식에 맞게|"
+    r"아래 내용을\s*\d+\s*문장으로 작성하세요"
 )
 _SENTENCE_UNIT_RE = re.compile(
     r".+?(?:[.!?。！？]+(?=\s|$)|\n{2,}|$)",
@@ -853,6 +858,20 @@ class AgentManager:
                 observed_sentences,
                 response,
             )
+            observed_contract = compose_observed_contract_response(
+                message,
+                observed_sentences,
+            )
+            if (
+                observed_contract
+                and not self._response_adequate_for_request(message, response)
+                and self._response_adequate_for_request(message, observed_contract)
+                and not self._has_cross_turn_sentence_echo(observed_contract)
+            ):
+                response = observed_contract
+                terminal_quality = inspect_response(response, final=True)
+                response_contract_incomplete = False
+                finish_reason = "stop"
             if (
                 exact_sentence_count is None
                 and exact_item_count is None
@@ -1351,7 +1370,14 @@ class AgentManager:
         directions = [QUALITY_REPAIR_DIRECTIVE]
         if "response_contract" in code_set:
             exact = requested_exact_sentence_count(message)
-            if exact is not None:
+            categories = requested_category_counts(message)
+            if categories is not None:
+                positive_count, negative_count = categories
+                directions.append(
+                    f"정확히 장점 {positive_count}개와 한계 {negative_count}개를 "
+                    "각각 별도 문장으로 쓰고, 각 문장에 '장점' 또는 '한계'를 표시하세요."
+                )
+            elif exact is not None:
                 directions.append(
                     f"서론이나 맺음말 없이 정확히 {exact}개의 완결된 문장만 작성하세요."
                 )
@@ -1614,6 +1640,8 @@ class AgentManager:
             return False
         if not response_avoids_unsolicited_subjects(message, candidate):
             return False
+        if not response_avoids_prompt_echo(message, candidate):
+            return False
         if (
             inspect_response(candidate, final=True).recommended_action
             is not QualityAction.ACCEPT
@@ -1621,6 +1649,11 @@ class AgentManager:
             return False
         exact = requested_exact_sentence_count(message)
         exact_items = requested_exact_item_count(message)
+        explicit_formal_request = _FORMAL_INSTRUCTION_RE.search(message) is not None
+        if (
+            exact is not None or exact_items is not None or explicit_formal_request
+        ) and not response_topically_anchored(message, candidate):
+            return False
         if (exact or 0) >= 3 and not response_preserves_distinctive_topic(
             message,
             candidate,
@@ -1722,6 +1755,11 @@ class AgentManager:
         """Remove model headers and stop at the next generated chat role."""
 
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        leading_quote = re.match(r"\A\s*([“‘])\s*", normalized)
+        if leading_quote is not None:
+            closing_quote = "”" if leading_quote.group(1) == "“" else "’"
+            if closing_quote not in normalized[leading_quote.end() :]:
+                normalized = normalized[leading_quote.end() :].lstrip()
         normalized = _LEADING_ASSISTANT_RE.sub("", normalized, count=1)
         turn_token = _TURN_TOKEN_RE.search(normalized)
         turn_start = _TURN_START_BOUNDARY_RE.search(normalized)

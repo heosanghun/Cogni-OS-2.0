@@ -223,12 +223,21 @@ class ResponseQualityTests(unittest.TestCase):
         for text in (
             "원칙은 다음과 같습니다:\n\n1.",
             "첫 항목은 완전합니다.\n2.",
+            "1. 첫 항목은 완전합니다. 2.",
             "절차는 다음과 같습니다:\n-",
         ):
             with self.subTest(text=text):
                 report = inspect_response(text, final=True)
                 self.assertTrue(report.has(QualityCode.INCOMPLETE_KOREAN_CLAUSE))
                 self.assertEqual(report.recommended_action, QualityAction.CONTINUE)
+
+    def test_trailing_meta_introduction_requires_continuation(self) -> None:
+        report = inspect_response(
+            "측정값과 설계 목표를 구분하는 방법은 다음과 같습니다.",
+            final=True,
+        )
+        self.assertTrue(report.has(QualityCode.INCOMPLETE_KOREAN_CLAUSE))
+        self.assertEqual(report.recommended_action, QualityAction.CONTINUE)
 
     def test_long_unpunctuated_noun_fragment_requires_repair(self) -> None:
         incomplete = (
@@ -436,6 +445,23 @@ class ResponseQualityTests(unittest.TestCase):
             "예상 밖 입력의 처리를 점검해야 합니다.",
         )
 
+    def test_inline_question_clauses_share_the_final_check_predicate(self) -> None:
+        from cogni_agent.response_quality import normalize_exact_sentence_response
+
+        normalized = normalize_exact_sentence_response(
+            "한국어 답변의 완결성을 세 문장으로 설명하세요.",
+            "1. 문장의 구조와 의미가 명확한지, "
+            "2. 문장이 자연스럽게 연결되어 있는지, "
+            "3. 문장이 완결성을 가지고 있는지 확인합니다.\n"
+            "사용자가 문장 수를 지정하면 그 수를 지키십시오.",
+        )
+        self.assertEqual(
+            normalized,
+            "문장의 구조와 의미가 명확한지 확인합니다. "
+            "문장이 자연스럽게 연결되어 있는지 확인합니다. "
+            "문장이 완결성을 가지고 있는지 확인합니다.",
+        )
+
     def test_inline_numbered_normalizer_uses_first_complete_sequence(self) -> None:
         from cogni_agent.response_quality import normalize_exact_sentence_response
 
@@ -538,6 +564,25 @@ class ResponseQualityTests(unittest.TestCase):
             response_avoids_unsolicited_subjects(
                 "뉴스 기사 검증 절차를 설명해 주세요.",
                 "기자는 뉴스 기사의 출처를 확인합니다.",
+            )
+        )
+
+    def test_full_prompt_echo_is_rejected_but_partial_topic_overlap_is_allowed(
+        self,
+    ) -> None:
+        from cogni_agent.response_quality import response_avoids_prompt_echo
+
+        request = "긴 대화에서 오래된 문맥을 줄이면서 사용자 의도를 보존하는 방법을 세 문장으로 답하세요."
+        self.assertFalse(
+            response_avoids_prompt_echo(
+                request,
+                "핵심 의도를 보존합니다. " + request,
+            )
+        )
+        self.assertTrue(
+            response_avoids_prompt_echo(
+                request,
+                "오래된 대화 문맥은 핵심만 요약하고 사용자 의도는 별도 상태로 보존합니다.",
             )
         )
 

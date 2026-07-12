@@ -159,6 +159,7 @@ _UNIT_RE = re.compile(r".+?(?:[.!?。！？]+(?=\s|$)|\n+|$)", re.DOTALL)
 _LEXEME_RE = re.compile(r"[가-힣]+|[A-Za-z]+(?:'[A-Za-z]+)?|\d+(?:[.,]\d+)*")
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]\s+|\d{1,4}[.)]\s+)")
 _LIST_MARKER_ONLY_RE = re.compile(r"^\s*(?:[-*+]|\d{1,4}[.)])\s*$")
+_TRAILING_LIST_MARKER_RE = re.compile(r"(?:^|\s)(?:[-*+]|\d{1,4}[.)])\s*$")
 _REQUEST_COUNT_RE = re.compile(
     r"(?P<count>[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*"
     r"(?P<unit>문장|단계|항목)"
@@ -479,7 +480,7 @@ def response_topically_anchored(request: str, response: str) -> bool:
     if len(requested) < 4:
         return True
     observed = _topic_terms(response)
-    required = 4 if len(requested) >= 6 else max(2, (len(requested) + 1) // 2)
+    required = 3 if len(requested) >= 6 else max(2, (len(requested) + 1) // 2)
     return len(requested & observed) >= required
 
 
@@ -523,6 +524,22 @@ def response_avoids_unsolicited_subjects(request: str, response: str) -> bool:
         ):
             return False
     return True
+
+
+def response_avoids_prompt_echo(request: str, response: str) -> bool:
+    """Reject a full user request copied into the middle or end of an answer."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    normalized_request = " ".join(
+        unicodedata.normalize("NFKC", request).casefold().split()
+    ).strip()
+    if len(normalized_request) < 24 or len(normalized_request.split()) < 4:
+        return True
+    normalized_response = " ".join(
+        unicodedata.normalize("NFKC", response).casefold().split()
+    ).strip()
+    return normalized_request not in normalized_response
 
 
 def has_near_duplicate_sentences(text: str) -> bool:
@@ -985,6 +1002,20 @@ def _incomplete_korean_clause(text: str) -> QualityFinding | None:
             len(visible) - len(last_line),
             len(visible),
         )
+    if visible.endswith(_META_SENTENCE_ENDINGS):
+        start = max(0, visible.rfind(".", 0, max(0, len(visible) - 1)) + 1)
+        return QualityFinding(
+            QualityCode.INCOMPLETE_KOREAN_CLAUSE,
+            start,
+            len(visible),
+        )
+    trailing_marker = _TRAILING_LIST_MARKER_RE.search(visible)
+    if trailing_marker is not None:
+        return QualityFinding(
+            QualityCode.INCOMPLETE_KOREAN_CLAUSE,
+            trailing_marker.start(),
+            len(visible),
+        )
     terminal_punctuation = visible.endswith((".", "!", "?", "。", "！", "？"))
     analyzable = visible.rstrip(".!?。！？").rstrip()
     if not analyzable:
@@ -1231,6 +1262,14 @@ def _requested_category_counts(request: str) -> tuple[int, int] | None:
     return None
 
 
+def requested_category_counts(request: str) -> tuple[int, int] | None:
+    """Return exact positive/negative category counts requested together."""
+
+    if not isinstance(request, str):
+        raise TypeError("request must be a string")
+    return _requested_category_counts(request)
+
+
 def _category_contract_satisfied(
     response: str,
     categories: tuple[int, int],
@@ -1367,6 +1406,8 @@ def _split_inline_numbered_sentences(
         elif clause.endswith(("없고", "없으며")):
             suffix = "없고" if clause.endswith("없고") else "없으며"
             sentence = clause[: -len(suffix)].rstrip() + "없습니다."
+        elif clause.endswith(("는지", "인지", "한지")):
+            sentence = clause + " 확인합니다."
         elif clause.endswith(("다", "요", "니다")):
             sentence = clause + "."
         else:
@@ -1490,8 +1531,10 @@ __all__ = [
     "request_topic_terms",
     "requested_exact_sentence_count",
     "requested_exact_item_count",
+    "requested_category_counts",
     "requested_maximum_items",
     "requested_minimum_units",
+    "response_avoids_prompt_echo",
     "response_avoids_unsolicited_subjects",
     "response_contract_satisfied",
     "response_preserves_distinctive_topic",

@@ -64,8 +64,8 @@ command output, source commit/tree digest, Python/PyTorch versions and skipped
 test reasons. No historical fixed count is accepted as v0.3.2 evidence.
 
 The current retained run passed Ruff and format checks plus Node syntax check.
-Pytest completed with 672 passed, 3 skipped, 3 deprecation warnings and
-536 subtests passed in 107.14 seconds. These counts
+Pytest completed with 678 passed, 3 skipped, 3 deprecation warnings and
+537 subtests passed in 108.02 seconds. These counts
 describe this validation snapshot; they are not a permanent product contract.
 
 The suite covers the following Phase 1–11 invariants:

@@ -59,7 +59,7 @@ requires independently attested kernel isolation.
   repetition, false completion and incomplete Korean endings are checked before
   commit;
 - a failed or cancelled turn is aborted transactionally;
-- one bounded response-repair generation is permitted; it is not an unbounded
+- at most two bounded response-repair generations are permitted; this is not an unbounded
   retry loop and is not a Gemma base-only fallback;
 - if response repair still fails, the manager may return a bounded static safe
   response instead of publishing partial, repetitive or Core-bypassing model

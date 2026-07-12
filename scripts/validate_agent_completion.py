@@ -35,6 +35,7 @@ from cogni_agent.response_quality import (  # noqa: E402
     inspect_response,
     requested_exact_item_count,
     requested_maximum_items,
+    response_avoids_prompt_echo,
     response_contract_satisfied,
 )
 from cogni_agent.tools import WorkspaceToolExecutor  # noqa: E402
@@ -145,7 +146,7 @@ STRESS_ANCHOR_GROUPS = (
         ("수정", "기능"),
         ("보안", "성능", "회귀", "작동"),
     ),
-    (("한국어", "답변"), ("완결", "문장", "종결"), ("반복", "자연", "문법")),
+    (("한국어", "답변", "문장"), ("완결", "문장", "종결"), ("반복", "자연", "문법")),
 )
 
 
@@ -303,6 +304,10 @@ def _literal_and_period_contract(request: str, response: str) -> dict[str, bool]
         "required_literal_ending": literal is None or stripped.endswith(literal),
         "required_period_ending": not period_required or stripped.endswith("."),
     }
+
+
+def _smart_quotes_balanced(text: str) -> bool:
+    return text.count("“") == text.count("”") and text.count("‘") == text.count("’")
 
 
 def _has_empty_trailing_list_item(text: str) -> bool:
@@ -655,9 +660,11 @@ def _answer_checks(
             structured_items=parallel_item_shape,
         ),
         "quality_report_accepts": quality.recommended_action is QualityAction.ACCEPT,
+        "balanced_smart_quotes": _smart_quotes_balanced(text),
         "contains_korean": bool(korean["contains_korean"]),
         "korean_complete": bool(korean["complete"]),
         "topic_anchors_satisfied": _topic_anchors_satisfied(text, required_groups),
+        "no_full_prompt_echo": response_avoids_prompt_echo(request, text),
         "request_contract_fulfilled": answer.get("generation_mode")
         != "quality_fallback"
         and response_contract_satisfied(request, text),

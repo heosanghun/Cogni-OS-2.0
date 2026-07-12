@@ -145,6 +145,20 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         checks = _answer_checks(truncated_list, state)
         self.assertFalse(checks["korean_complete"])
 
+        unbalanced_quote = _complete_answer("“불확실한 내용은 가능성으로 표현합니다.")
+        checks = _answer_checks(unbalanced_quote, state)
+        self.assertFalse(checks["balanced_smart_quotes"])
+
+        echoed_request = (
+            "오래된 대화 문맥을 줄이면서 사용자 의도를 보존하는 방법을 설명하세요."
+        )
+        checks = _answer_checks(
+            _complete_answer("핵심을 요약합니다. " + echoed_request),
+            state,
+            echoed_request,
+        )
+        self.assertFalse(checks["no_full_prompt_echo"])
+
     def test_required_literal_period_and_factbook_values_are_exact(self):
         state = _complete_state()
         literal = _answer_checks(

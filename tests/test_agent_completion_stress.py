@@ -8,6 +8,7 @@ from scripts.validate_agent_completion import (
     DEFAULT_PROMPTS,
     PromptCase,
     _answer_checks,
+    _expected_factbook_identity,
     _korean_completion_metrics,
     _prompt_cases,
     _read_process_rss_bytes,
@@ -188,6 +189,28 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
             expected_factbook=expected,
         )
         self.assertFalse(wrong_checks["factbook_version_exact"])
+
+    def test_expected_factbook_identity_reads_typed_inventory(self):
+        factbook = SimpleNamespace(
+            build_version="0.3.2",
+            model=SimpleNamespace(
+                label="gemma4-e4b",
+                inventory=SimpleNamespace(
+                    stored_parameters=7_996_157_418,
+                    effective_parameters=4_506_496_490,
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            _expected_factbook_identity(factbook),
+            {
+                "build_version": "0.3.2",
+                "model_label": "gemma4-e4b",
+                "stored_parameters": 7_996_157_418,
+                "effective_parameters": 4_506_496_490,
+            },
+        )
 
     def test_parallel_structured_checks_are_not_near_duplicate_false_positives(self):
         answer = _complete_answer(

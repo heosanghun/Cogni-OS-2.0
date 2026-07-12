@@ -43,6 +43,7 @@ from cogni_os.version import __version__  # noqa: E402
 from scripts.validate_agent_completion import (  # noqa: E402
     _answer_checks,
     _atomic_external_report,
+    _expected_factbook_identity,
     _has_conservative_near_duplicate,
     _offline_environment,
     _sentence_repetition_metrics,
@@ -456,12 +457,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             device=report["cuda_device"],
         )
         report["factbook"] = factbook.as_payload()
-        expected_factbook = {
-            "build_version": factbook.build_version,
-            "model_label": factbook.model.label,
-            "stored_parameters": factbook.model.stored_parameters,
-            "effective_parameters": factbook.model.effective_parameters,
-        }
+        expected_factbook = _expected_factbook_identity(factbook)
         service = ModelService.for_local_gemma(
             args.model,
             manifest_path=args.manifest,

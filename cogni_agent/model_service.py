@@ -835,6 +835,7 @@ class _TokenRepetitionGuard:
     max_period_tokens = 192
     min_repeat_span_tokens = 48
     min_unique_tokens = 4
+    max_identical_run_tokens = 24
     prompt_match_tokens = 24
     leading_prompt_echo_allowance = 64
 
@@ -869,6 +870,12 @@ class _TokenRepetitionGuard:
         for value in values.flatten().tolist():
             self._tokens.append(int(value))
             self._observed += 1
+            identical_run_start = self._identical_run_start()
+            if identical_run_start is not None:
+                self.triggered = True
+                self.trigger_reason = "identical_token_run"
+                self.repeat_cut_index = identical_run_start
+                break
             prompt_echo_start = self._prompt_echo_start()
             if (
                 prompt_echo_start is not None
@@ -887,6 +894,20 @@ class _TokenRepetitionGuard:
                 self.repeat_cut_index = self._observed - period * (copies - 1)
                 break
         return self.triggered
+
+    def _identical_run_start(self) -> int | None:
+        if len(self._tokens) < self.max_identical_run_tokens:
+            return None
+        values = tuple(self._tokens)
+        last = values[-1]
+        run = 1
+        for previous in reversed(values[:-1]):
+            if previous != last:
+                break
+            run += 1
+        if run < self.max_identical_run_tokens:
+            return None
+        return self._observed - run
 
     def _prompt_echo_start(self) -> int | None:
         if not self._prompt_ngrams or len(self._tokens) < self.prompt_match_tokens:
@@ -929,7 +950,7 @@ def truncate_repeated_tokens(token_ids: Tensor) -> tuple[Tensor, bool]:
         return tokens.contiguous(), False
     if (
         guard.repeat_cut_index is None
-        or not 0 < guard.repeat_cut_index <= tokens.numel()
+        or not 0 <= guard.repeat_cut_index <= tokens.numel()
     ):
         raise TensorProtocolError("repetition guard produced an invalid cut point")
     return tokens[: guard.repeat_cut_index].contiguous(), True

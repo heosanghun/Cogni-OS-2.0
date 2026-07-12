@@ -923,7 +923,7 @@ class TestResidentModelService(unittest.TestCase):
         self.assertIs(service.gpu_lease, lease)
         self.assertEqual(manager.active, lease)
 
-    def test_bounded_token_guard_stops_exact_cycles_without_false_emphasis(self):
+    def test_bounded_token_guard_stops_exact_cycles_and_identical_runs(self):
         long_pattern = torch.arange(24, dtype=torch.int64)
         guard = _TokenRepetitionGuard()
         self.assertFalse(guard.observe(long_pattern))
@@ -941,8 +941,21 @@ class TestResidentModelService(unittest.TestCase):
             self.assertFalse(short_guard.observe(short_pattern))
         self.assertTrue(short_guard.observe(short_pattern))
 
-        emphasis = _TokenRepetitionGuard()
-        self.assertFalse(emphasis.observe(torch.tensor([7] * 96)))
+        degenerate = _TokenRepetitionGuard()
+        self.assertFalse(
+            degenerate.observe(
+                torch.tensor([7] * (degenerate.max_identical_run_tokens - 1))
+            )
+        )
+        self.assertTrue(degenerate.observe(torch.tensor([7])))
+        self.assertEqual(degenerate.trigger_reason, "identical_token_run")
+        self.assertEqual(degenerate.repeat_cut_index, 0)
+        trimmed, repeated = truncate_repeated_tokens(torch.tensor([7] * 96))
+        self.assertTrue(repeated)
+        self.assertEqual(trimmed.numel(), 0)
+
+        ordinary_emphasis = _TokenRepetitionGuard()
+        self.assertFalse(ordinary_emphasis.observe(torch.tensor([7] * 8)))
 
         prompt = torch.arange(100, 160, dtype=torch.int64)
         prompt_echo = _TokenRepetitionGuard(prompt)

@@ -29,6 +29,8 @@ Cogni-Core 초기화 단계에서 fail-closed로 종료되는 원인이었다.
   `검증 READY`, `MODEL STANDBY`, `NOT LOADED` 상태를 표시한다.
 - 운영자가 실제로 입력한 “어떤 모델이고 어떤 기능을 할 수 있나요?” 질문은
   검증된 정체성과 전체 capability 개요를 한 번에 반환한다.
+- 동일한 단일 토큰이 24회 이상 이어지는 퇴행 생성도 bounded repetition guard가
+  중단해 `[` 같은 저다양성 반복이 길이 한계까지 쌓이지 않도록 했다.
 
 ## 검증 원칙
 

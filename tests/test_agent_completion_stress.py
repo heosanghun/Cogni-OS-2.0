@@ -159,6 +159,20 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         )
         self.assertFalse(checks["no_full_prompt_echo"])
 
+        self_intro = _complete_answer(
+            "안녕하세요, AI 어시스턴트입니다. 문맥을 요약합니다."
+        )
+        checks = _answer_checks(
+            self_intro,
+            state,
+            "문맥을 요약하는 방법을 설명하세요.",
+        )
+        self.assertFalse(checks["no_unsolicited_self_intro"])
+
+        dangling = _complete_answer("에서 잘못된 사실을 정정합니다.")
+        checks = _answer_checks(dangling, state)
+        self.assertFalse(checks["no_dangling_sentence_start"])
+
     def test_required_literal_period_and_factbook_values_are_exact(self):
         state = _complete_state()
         literal = _answer_checks(

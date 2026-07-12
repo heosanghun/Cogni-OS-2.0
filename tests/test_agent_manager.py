@@ -463,6 +463,39 @@ class TestAgentManager(unittest.TestCase):
         self.assertNotIn("당신은 어떤 모델", service.prompts[0])
         self.assertIn("같이 재미있는 프로젝트", service.prompts[0])
 
+    def test_independent_turn_isolates_history_but_context_reference_keeps_it(
+        self,
+    ) -> None:
+        service = _ScriptedService(
+            [
+                ("파이썬의 특징은 읽기 쉬운 문법입니다.", "stop"),
+                ("자바의 특징은 플랫폼 이식성입니다.", "stop"),
+                (
+                    "방금 답변의 두 번째 요점은 자바의 플랫폼 이식성입니다.",
+                    "stop",
+                ),
+            ]
+        )
+        manager = self.manager(service)
+
+        manager.start_turn("파이썬의 특징을 설명해 주세요.", "chat")
+        _wait(manager)
+        first_answer = "파이썬의 특징은 읽기 쉬운 문법입니다."
+
+        manager.start_turn("자바의 특징을 설명해 주세요.", "chat")
+        _wait(manager)
+        second_answer = "자바의 특징은 플랫폼 이식성입니다."
+
+        self.assertNotIn(first_answer, service.prompts[1])
+        manager.start_turn(
+            "방금 답변의 두 번째 요점을 더 설명해 주세요.",
+            "chat",
+        )
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertIn(second_answer, service.prompts[2])
+
     def test_explicit_explanation_uses_strict_grounded_prefill(self) -> None:
         service = _ScriptedService(
             [("원인을 기록한 뒤 수정하고 마지막에 회귀 테스트를 수행합니다.", "stop")]
@@ -1202,6 +1235,16 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(
             quoted,
             "“검증됨”이라는 표시는 근거가 있을 때만 사용합니다.",
+        )
+
+    def test_complete_korean_predicate_receives_one_terminal_period(self) -> None:
+        self.assertEqual(
+            AgentManager._ensure_terminal_punctuation("검증 결과를 기록합니다"),
+            "검증 결과를 기록합니다.",
+        )
+        self.assertEqual(
+            AgentManager._ensure_terminal_punctuation("이미 완결되었습니다."),
+            "이미 완결되었습니다.",
         )
 
     def test_maximum_item_block_is_completed_before_length_tail(self) -> None:

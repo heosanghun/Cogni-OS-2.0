@@ -586,6 +586,31 @@ class ResponseQualityTests(unittest.TestCase):
             )
         )
 
+    def test_unsolicited_self_intro_and_dangling_particle_are_rejected(self) -> None:
+        from cogni_agent.response_quality import (
+            response_avoids_dangling_sentence_start,
+            response_avoids_unsolicited_self_intro,
+        )
+
+        self.assertFalse(
+            response_avoids_unsolicited_self_intro(
+                "문맥 관리 방법을 설명하세요.",
+                "안녕하세요, AI 어시스턴트입니다. 문맥을 요약합니다.",
+            )
+        )
+        self.assertTrue(
+            response_avoids_unsolicited_self_intro(
+                "당신은 누구인가요?",
+                "저는 AI 어시스턴트입니다.",
+            )
+        )
+        self.assertFalse(
+            response_avoids_dangling_sentence_start("에서 잘못된 사실을 정정합니다.")
+        )
+        self.assertTrue(
+            response_avoids_dangling_sentence_start("잘못된 사실을 먼저 정정합니다.")
+        )
+
     def test_distinctive_topic_guard_accepts_domain_paraphrase(self) -> None:
         from cogni_agent.response_quality import response_preserves_distinctive_topic
 

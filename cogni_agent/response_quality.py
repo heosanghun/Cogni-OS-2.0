@@ -431,6 +431,19 @@ _UNSOLICITED_SUBJECT_GROUPS = (
     frozenset({"여행", "호텔", "항공권", "관광"}),
     frozenset({"짱구", "만화", "애니메이션"}),
 )
+_UNSOLICITED_SELF_INTRO_RE = re.compile(
+    r"^\s*(?:안녕하세요[,! ]*)?(?:저는\s*)?(?:AI\s*)?(?:어시스턴트|도우미)"
+    r"(?:입니다|예요|이에요)",
+    re.IGNORECASE,
+)
+_IDENTITY_REQUEST_RE = re.compile(
+    r"(?:당신은|너는|모델|정체|누구|소개|어떤\s*AI)",
+    re.IGNORECASE,
+)
+_DANGLING_SENTENCE_START_RE = re.compile(
+    r"^\s*(?:(?:[-*+]\s+|\d{1,4}[.)]\s+))?"
+    r"(?:에서|에서는|에는|으로|에게|와|과|를|을)\s+"
+)
 _GENERIC_TOPIC_TERMS = frozenset(
     {
         "답변",
@@ -540,6 +553,25 @@ def response_avoids_prompt_echo(request: str, response: str) -> bool:
         unicodedata.normalize("NFKC", response).casefold().split()
     ).strip()
     return normalized_request not in normalized_response
+
+
+def response_avoids_unsolicited_self_intro(request: str, response: str) -> bool:
+    """Reject a generated self-introduction when identity was not requested."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    return (
+        _UNSOLICITED_SELF_INTRO_RE.search(response) is None
+        or _IDENTITY_REQUEST_RE.search(request) is not None
+    )
+
+
+def response_avoids_dangling_sentence_start(response: str) -> bool:
+    """Reject answers whose first sentence begins with an orphaned particle."""
+
+    if not isinstance(response, str):
+        raise TypeError("response must be a string")
+    return _DANGLING_SENTENCE_START_RE.search(response) is None
 
 
 def has_near_duplicate_sentences(text: str) -> bool:
@@ -1535,6 +1567,8 @@ __all__ = [
     "requested_maximum_items",
     "requested_minimum_units",
     "response_avoids_prompt_echo",
+    "response_avoids_dangling_sentence_start",
+    "response_avoids_unsolicited_self_intro",
     "response_avoids_unsolicited_subjects",
     "response_contract_satisfied",
     "response_preserves_distinctive_topic",

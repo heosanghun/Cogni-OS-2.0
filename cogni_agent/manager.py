@@ -43,7 +43,9 @@ from .response_quality import (
     requested_exact_item_count,
     requested_exact_sentence_count,
     requested_maximum_items,
+    response_avoids_dangling_sentence_start,
     response_avoids_prompt_echo,
+    response_avoids_unsolicited_self_intro,
     response_avoids_unsolicited_subjects,
     response_contract_satisfied,
     response_preserves_distinctive_topic,
@@ -170,6 +172,18 @@ _FORMAL_INSTRUCTION_RE = re.compile(
     r"\s*[.!?。！？]*\s*$",
     re.IGNORECASE,
 )
+_CONTEXT_REFERENCE_RE = re.compile(
+    r"(?:방금|앞서|앞선|이전\s*(?:답변|말|내용)|위\s*(?:답변|내용)|"
+    r"그중|그것|그걸|그\s*이야기|그럼|이제|이어서|계속\s*(?:이어|설명|답)|"
+    r"(?:첫|두|세)\s*번째|마지막\s*(?:답변|항목))",
+    re.IGNORECASE,
+)
+
+
+def _requires_prior_context(message: str) -> bool:
+    """Keep model-visible history only for an explicit contextual reference."""
+
+    return _CONTEXT_REFERENCE_RE.search(message[:512]) is not None
 
 
 def _exact_response_prefill(message: str) -> str:
@@ -250,7 +264,10 @@ _QUALITY_REPAIR_ECHO_RE = re.compile(
     r"최신 답변을 제공하고, 이전 답변은|"
     r"\d+개의 완결된 문장으로 작성해야 합니다|"
     r"물음의 핵심과 요청 형식에 맞게|"
-    r"아래 내용을\s*\d+\s*문장으로 작성하세요"
+    r"아래 내용을\s*\d+\s*문장으로 작성하세요|"
+    r"현재 답변이 사용자 요청의 전체 범위|"
+    r"앞 답변의\s*\d+\s*[~～-]\s*\d+번 핵심|"
+    r"수정 답변을 작성해서 사용자와 시스템"
 )
 _SENTENCE_UNIT_RE = re.compile(
     r".+?(?:[.!?。！？]+(?=\s|$)|\n{2,}|$)",
@@ -657,6 +674,9 @@ class AgentManager:
         maximum_item_count = (
             None if resume_truncated else requested_maximum_items(message)
         )
+        isolate_turn_history = not resume_truncated and not _requires_prior_context(
+            message
+        )
         response_prefill = None
         if exact_sentence_count is not None:
             response_prefill = _exact_response_prefill(message)
@@ -667,6 +687,7 @@ class AgentManager:
         prompt = self._build_prompt(
             resume_truncated=resume_truncated,
             partial_assistant=response_prefill,
+            isolate_history=isolate_turn_history,
         )
         message_id = self._append_message(
             "assistant",
@@ -935,9 +956,13 @@ class AgentManager:
             ):
                 quality_repair_attempts += 1
                 last_candidate = response
-                isolate_repair = cross_turn_echo or (
-                    response_contract_incomplete
-                    and requested_exact_sentence_count(message) is not None
+                isolate_repair = (
+                    isolate_turn_history
+                    or cross_turn_echo
+                    or (
+                        response_contract_incomplete
+                        and requested_exact_sentence_count(message) is not None
+                    )
                 )
                 adaptive_sampling_repair = decode_mode == "strict" and bool(
                     diagnostic_codes
@@ -1009,11 +1034,15 @@ class AgentManager:
                     cutoff=incomplete_start if incomplete_start > 0 else None,
                 )
                 prompt = (
-                    self._build_continuation_prompt(response)
+                    self._build_continuation_prompt(
+                        response,
+                        isolate_history=isolate_turn_history,
+                    )
                     if response
                     else self._build_quality_repair_prompt(
                         message,
                         issue_codes=(QualityCode.INCOMPLETE_KOREAN_CLAUSE.value,),
+                        isolate_history=isolate_turn_history,
                     )
                 )
                 with self._condition:
@@ -1027,11 +1056,14 @@ class AgentManager:
                         generated_tokens=total_generated,
                     )
             else:
-                prompt = self._build_continuation_prompt(response)
+                prompt = self._build_continuation_prompt(
+                    response,
+                    isolate_history=isolate_turn_history,
+                )
             with self._condition:
                 self._transition_locked("generating", "continuing", self._progress)
 
-        response = response.strip()
+        response = self._ensure_terminal_punctuation(response.strip())
         truncated = char_truncated or finish_reason == "length"
         if repetition_boundary:
             diagnostic_codes.add("token_repetition")
@@ -1327,8 +1359,11 @@ class AgentManager:
         *,
         resume_truncated: bool = False,
         partial_assistant: str | None = None,
+        isolate_history: bool = False,
     ) -> str:
         messages = self._model_messages()
+        if isolate_history and messages and messages[-1]["role"] == "user":
+            messages = [messages[-1]]
         if resume_truncated and messages and messages[-1]["role"] == "user":
             messages[-1] = {"role": "user", "content": CONTINUATION_DIRECTIVE}
         return self._render_bounded_prompt(
@@ -1336,10 +1371,17 @@ class AgentManager:
             partial_assistant=partial_assistant,
         )
 
-    def _build_continuation_prompt(self, response: str) -> str:
+    def _build_continuation_prompt(
+        self,
+        response: str,
+        *,
+        isolate_history: bool = False,
+    ) -> str:
         """Continue the same open model turn without adding transcript roles."""
 
         messages = self._model_messages()
+        if isolate_history and messages and messages[-1]["role"] == "user":
+            messages = [messages[-1]]
         return self._render_bounded_prompt(
             messages,
             partial_assistant=response,
@@ -1640,6 +1682,10 @@ class AgentManager:
             return False
         if not response_avoids_unsolicited_subjects(message, candidate):
             return False
+        if not response_avoids_unsolicited_self_intro(message, candidate):
+            return False
+        if not response_avoids_dangling_sentence_start(candidate):
+            return False
         if not response_avoids_prompt_echo(message, candidate):
             return False
         if (
@@ -1857,6 +1903,19 @@ class AgentManager:
                 second_start = units[first + block_size][1]
                 return text[:second_start].rstrip(), True
         return text, False
+
+    @staticmethod
+    def _ensure_terminal_punctuation(text: str) -> str:
+        """Add one period only to a complete Korean predicate missing punctuation."""
+
+        stripped = text.rstrip()
+        if (
+            stripped
+            and not stripped.endswith((".", "!", "?", "。", "！", "？"))
+            and re.search(r"[가-힣](?:다|요)$", stripped) is not None
+        ):
+            return stripped + "."
+        return stripped
 
     @staticmethod
     def _complete_prefix(text: str, cutoff: int | None = None) -> str:

@@ -35,7 +35,9 @@ from cogni_agent.response_quality import (  # noqa: E402
     inspect_response,
     requested_exact_item_count,
     requested_maximum_items,
+    response_avoids_dangling_sentence_start,
     response_avoids_prompt_echo,
+    response_avoids_unsolicited_self_intro,
     response_contract_satisfied,
 )
 from cogni_agent.tools import WorkspaceToolExecutor  # noqa: E402
@@ -664,6 +666,11 @@ def _answer_checks(
         "contains_korean": bool(korean["contains_korean"]),
         "korean_complete": bool(korean["complete"]),
         "topic_anchors_satisfied": _topic_anchors_satisfied(text, required_groups),
+        "no_unsolicited_self_intro": response_avoids_unsolicited_self_intro(
+            request,
+            text,
+        ),
+        "no_dangling_sentence_start": response_avoids_dangling_sentence_start(text),
         "no_full_prompt_echo": response_avoids_prompt_echo(request, text),
         "request_contract_fulfilled": answer.get("generation_mode")
         != "quality_fallback"

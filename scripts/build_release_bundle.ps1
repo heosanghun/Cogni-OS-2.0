@@ -205,8 +205,8 @@ try {
     try {
         & $python -c (
             'from cogni_core.cts_policy import load_default_bounded_cts_controller;' +
-            'load_default_bounded_cts_controller(device="cpu");' +
-            'print("checkpoint_preflight=PASS")'
+            'load_default_bounded_cts_controller(device=''cpu'');' +
+            'print(''checkpoint_preflight=PASS'')'
         )
         if ($LASTEXITCODE -ne 0) {
             throw 'Extracted CTS checkpoint preflight failed.'

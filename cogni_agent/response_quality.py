@@ -154,7 +154,6 @@ _CONTROL_TOKEN_RE = re.compile(
     r"<<\s*/?sys\s*>>|\[Runtime Fact-book:|\[턴\s*종료\]|"
     r"</?(?:시스템|컨펌|종료|summary)(?:\s+[^<>\r\n]{0,96})?>|\[##\]"
 )
-_CODE_FENCE_RE = re.compile(r"```[\s\S]*?(?:```|\Z)")
 _UNIT_RE = re.compile(r".+?(?:[.!?。！？]+(?=\s|$)|\n+|$)", re.DOTALL)
 _LEXEME_RE = re.compile(r"[가-힣]+|[A-Za-z]+(?:'[A-Za-z]+)?|\d+(?:[.,]\d+)*")
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]\s+|\d{1,4}[.)]\s+)")
@@ -205,6 +204,10 @@ _NEGATIVE_CATEGORY_CUES = (
     "소모",
     "의존",
 )
+_MITIGATED_NEGATIVE_CATEGORY_RE = re.compile(
+    r"(?:제약|제한|위험|부족|소모|의존|어려움|저하).{0,16}"
+    r"(?:없|낮|적|줄|감소|완화|해소|방지|않)"
+)
 _META_SENTENCE_ENDINGS = (
     "설명하겠습니다.",
     "답변하겠습니다.",
@@ -213,6 +216,14 @@ _META_SENTENCE_ENDINGS = (
     "살펴보겠습니다.",
     "다음과 같습니다.",
     "다음과 같아요.",
+)
+_GENERIC_OUTLINE_HEADING_RE = re.compile(
+    r"(?im)^\s*(?:#{1,6}\s*)?(?:서론|목적|개요|배경|결론)\s*"
+    r"(?:[:：]\s*[^\r\n]*|$)"
+)
+_TRAILING_EXPLANATION_MARKER_RE = re.compile(
+    r"(?m)\n\s*(?:\n+|\[[^\]\r\n]{1,32}\]|#{1,6}\s+[^\r\n]+|"
+    r"(?:추가\s*설명|보충(?:\s*설명)?|상세\s*설명|참고)\s*[:：])"
 )
 _CLOSING_SENTENCES = frozenset({"이상입니다.", "답변을 마칩니다.", "설명을 마칩니다."})
 _KOREAN_COORDINATE_SPLIT_RE = re.compile(
@@ -458,6 +469,29 @@ _GENERIC_TOPIC_TERMS = frozenset(
         "검증",
     }
 )
+_CATEGORY_STRUCTURAL_TOPIC_TERMS = frozenset(
+    {"장점", "이점", "강점", "한계", "단점", "제약", "위험", "가지"}
+)
+_DISTINCTIVE_TOPIC_EQUIVALENTS = (
+    (
+        frozenset({"복구", "복원"}),
+        frozenset({"원인", "수정", "회귀", "재시도", "오류", "롤백"}),
+    ),
+    (
+        frozenset({"요약", "요약문"}),
+        frozenset({"핵심", "군더더기", "완결", "문장", "반복"}),
+    ),
+    (
+        frozenset({"자가검증", "자체검증"}),
+        frozenset({"테스트", "점검", "회귀", "결과", "기능"}),
+    ),
+    (
+        frozenset({"온디바이스", "ai"}),
+        frozenset(
+            {"장치", "로컬", "인터넷", "클라우드", "데이터", "개인정보", "오프라인"}
+        ),
+    ),
+)
 
 
 def _topic_terms(text: str) -> frozenset[str]:
@@ -512,10 +546,35 @@ def response_preserves_distinctive_topic(request: str, response: str) -> bool:
 
     if not isinstance(request, str) or not isinstance(response, str):
         raise TypeError("request and response must be strings")
-    distinctive = _topic_terms(request) - _GENERIC_TOPIC_TERMS
+    requested = _topic_terms(request)
+    observed = _topic_terms(response)
+    distinctive = requested - _GENERIC_TOPIC_TERMS
     if not distinctive:
         return True
-    return bool(distinctive & _topic_terms(response))
+    if distinctive & observed:
+        return True
+    return any(
+        requested & triggers and observed & equivalents
+        for triggers, equivalents in _DISTINCTIVE_TOPIC_EQUIVALENTS
+    )
+
+
+def response_preserves_category_subject(request: str, response: str) -> bool:
+    """Require the subject of a pros/cons request, excluding category labels."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    requested = _topic_terms(request)
+    observed = _topic_terms(response)
+    subject = requested - _GENERIC_TOPIC_TERMS - _CATEGORY_STRUCTURAL_TOPIC_TERMS
+    if not subject:
+        return True
+    if subject & observed:
+        return True
+    return any(
+        subject & triggers and observed & equivalents
+        for triggers, equivalents in _DISTINCTIVE_TOPIC_EQUIVALENTS
+    )
 
 
 def response_avoids_unsolicited_subjects(request: str, response: str) -> bool:
@@ -574,6 +633,19 @@ def response_avoids_dangling_sentence_start(response: str) -> bool:
     return _DANGLING_SENTENCE_START_RE.search(response) is None
 
 
+def response_avoids_generic_outline(request: str, response: str) -> bool:
+    """Reject generic essay headings used instead of requested list items."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    structured_request = (
+        requested_exact_item_count(request) is not None
+        or requested_maximum_items(request) is not None
+    )
+    masked = _mask_code(response[:MAX_INSPECT_CHARS])
+    return not structured_request or _GENERIC_OUTLINE_HEADING_RE.search(masked) is None
+
+
 def has_near_duplicate_sentences(text: str) -> bool:
     """Detect two almost-identical long sentences within fixed work bounds."""
 
@@ -625,7 +697,8 @@ def inspect_response(text: str, *, final: bool = False) -> ResponseQualityReport
     remaining_tokens = MAX_ANALYSIS_TOKENS
 
     for offset, region in regions:
-        masked = _mask_code(region)
+        inside_fence = text.count("```", 0, offset) % 2 == 1
+        masked = _mask_code(region, inside_fence=inside_fence)
         findings.extend(_boundary_findings(masked, offset))
         if remaining_units <= 0 or remaining_tokens <= 0:
             continue
@@ -715,6 +788,11 @@ def salvage_complete_prefix(text: str, *, cutoff: int | None = None) -> str:
     candidate = text[:limit].rstrip()
     if (
         candidate
+        and (
+            cutoff is None
+            or candidate.endswith((".", "!", "?", "。", "！", "？"))
+            or _KOREAN_COMPLETE_PREDICATE_RE.search(candidate[-128:]) is not None
+        )
         and inspect_response(candidate, final=True).recommended_action
         is QualityAction.ACCEPT
     ):
@@ -771,17 +849,45 @@ def _boundary_findings(text: str, offset: int) -> list[QualityFinding]:
                 offset + control.end(),
             )
         )
+    folded = unicodedata.normalize("NFKC", text)
+    if folded != text:
+        folded_role = _ROLE_MARKER_RE.search(folded)
+        if folded_role is not None and role is None:
+            findings.append(
+                QualityFinding(
+                    QualityCode.ROLE_MARKER,
+                    offset + min(folded_role.start(), len(text)),
+                    offset + min(folded_role.end(), len(text)),
+                )
+            )
+        folded_control = _CONTROL_TOKEN_RE.search(folded)
+        if folded_control is not None and control is None:
+            findings.append(
+                QualityFinding(
+                    QualityCode.CONTROL_TOKEN,
+                    offset + min(folded_control.start(), len(text)),
+                    offset + min(folded_control.end(), len(text)),
+                )
+            )
     return findings
 
 
-def _mask_code(text: str) -> str:
-    if "```" not in text:
+def _mask_code(text: str, *, inside_fence: bool = False) -> str:
+    if "```" not in text and not inside_fence:
         return text
     characters = list(text)
-    for match in _CODE_FENCE_RE.finditer(text):
-        for index in range(match.start(), match.end()):
-            if characters[index] not in "\r\n":
-                characters[index] = " "
+    in_fence = inside_fence
+    index = 0
+    while index < len(text):
+        if text.startswith("```", index):
+            for marker_index in range(index, min(index + 3, len(text))):
+                characters[marker_index] = " "
+            in_fence = not in_fence
+            index += 3
+            continue
+        if in_fence and characters[index] not in "\r\n":
+            characters[index] = " "
+        index += 1
     return "".join(characters)
 
 
@@ -1310,12 +1416,17 @@ def _category_contract_satisfied(
 
     positive_count, negative_count = categories
     sentences = _completed_content_sentences(response)
-    negatives = sum(
-        any(cue in sentence for cue in _NEGATIVE_CATEGORY_CUES)
-        for sentence in sentences
-    )
+    negatives = sum(_sentence_is_negative_category(sentence) for sentence in sentences)
     positives = len(sentences) - negatives
     return negatives == negative_count and positives == positive_count
+
+
+def _sentence_is_negative_category(sentence: str) -> bool:
+    """Classify a limitation without treating its mitigation as a limitation."""
+
+    if not any(cue in sentence for cue in _NEGATIVE_CATEGORY_CUES):
+        return False
+    return _MITIGATED_NEGATIVE_CATEGORY_RE.search(sentence) is None
 
 
 def compose_observed_contract_response(
@@ -1345,12 +1456,12 @@ def compose_observed_contract_response(
         positives = [
             sentence
             for sentence in sentences
-            if not any(cue in sentence for cue in _NEGATIVE_CATEGORY_CUES)
+            if not _sentence_is_negative_category(sentence)
         ]
         negatives = [
             sentence
             for sentence in sentences
-            if any(cue in sentence for cue in _NEGATIVE_CATEGORY_CUES)
+            if _sentence_is_negative_category(sentence)
         ]
         if len(positives) < positive_count or len(negatives) < negative_count:
             return ""
@@ -1418,6 +1529,9 @@ def _split_inline_numbered_sentences(
         else:
             end = len(bounded)
         raw_clause = bounded[match.end() : end].strip()
+        trailing_marker = _TRAILING_EXPLANATION_MARKER_RE.search(raw_clause)
+        if trailing_marker is not None:
+            raw_clause = raw_clause[: trailing_marker.start()].rstrip()
         boundaries = _content_sentence_boundaries(raw_clause)
         if boundaries:
             raw_clause = raw_clause[: boundaries[0].end()]
@@ -1438,10 +1552,19 @@ def _split_inline_numbered_sentences(
         elif clause.endswith(("없고", "없으며")):
             suffix = "없고" if clause.endswith("없고") else "없으며"
             sentence = clause[: -len(suffix)].rstrip() + "없습니다."
+        elif clause.endswith("기 위해"):
+            sentence = clause[: -len("기 위해")].rstrip() + "도록 합니다."
         elif clause.endswith(("는지", "인지", "한지")):
             sentence = clause + " 확인합니다."
         elif clause.endswith(("다", "요", "니다")):
             sentence = clause + "."
+        elif (":" in clause or "：" in clause) and (
+            re.search(r"[가-힣]$", clause) is not None
+            and _KOREAN_INCOMPLETE_WORD_RE.search(clause) is None
+            and _KOREAN_CONNECTIVE_END_RE.search(clause) is None
+            and _KOREAN_PARTICLE_END_RE.search(clause) is None
+        ):
+            sentence = clause + "입니다."
         else:
             return None
         if len(sentence) < 8:
@@ -1568,10 +1691,12 @@ __all__ = [
     "requested_minimum_units",
     "response_avoids_prompt_echo",
     "response_avoids_dangling_sentence_start",
+    "response_avoids_generic_outline",
     "response_avoids_unsolicited_self_intro",
     "response_avoids_unsolicited_subjects",
     "response_contract_satisfied",
     "response_preserves_distinctive_topic",
+    "response_preserves_category_subject",
     "response_topically_anchored",
     "salvage_complete_prefix",
 ]

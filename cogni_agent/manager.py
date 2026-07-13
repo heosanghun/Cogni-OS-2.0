@@ -14,6 +14,7 @@ import secrets
 from threading import Condition, Event, RLock, Thread
 from time import monotonic
 from typing import Any, Protocol
+import unicodedata
 
 import torch
 
@@ -44,10 +45,12 @@ from .response_quality import (
     requested_exact_sentence_count,
     requested_maximum_items,
     response_avoids_dangling_sentence_start,
+    response_avoids_generic_outline,
     response_avoids_prompt_echo,
     response_avoids_unsolicited_self_intro,
     response_avoids_unsolicited_subjects,
     response_contract_satisfied,
+    response_preserves_category_subject,
     response_preserves_distinctive_topic,
     response_topically_anchored,
     salvage_complete_prefix,
@@ -267,7 +270,14 @@ _QUALITY_REPAIR_ECHO_RE = re.compile(
     r"아래 내용을\s*\d+\s*문장으로 작성하세요|"
     r"현재 답변이 사용자 요청의 전체 범위|"
     r"앞 답변의\s*\d+\s*[~～-]\s*\d+번 핵심|"
-    r"수정 답변을 작성해서 사용자와 시스템"
+    r"수정 답변을 작성해서 사용자와 시스템|"
+    r"서로 다른 핵심 내용을 반복하지 않고 한 번씩만|"
+    r"각 문장을 자연스러운 서술어로 끝까지 완결|"
+    r"질문의 핵심 용어인|"
+    r"같은 문장이나 표현을 반복하지 말고|"
+    r"요청한 범위를 빠뜨리지 말고|"
+    r"질문의 핵심 용어를 직접 유지하세요|"
+    r"제목·목록·HTML 표기 없이"
 )
 _SENTENCE_UNIT_RE = re.compile(
     r".+?(?:[.!?。！？]+(?=\s|$)|\n{2,}|$)",
@@ -751,6 +761,7 @@ class AgentManager:
                 sampling_seed=self._sampling_seed(
                     user_sequence,
                     generation_attempts,
+                    repair_message=(message if quality_repair_attempts else None),
                 ),
             ):
                 if getattr(chunk, "deadline_exceeded", False):
@@ -964,16 +975,27 @@ class AgentManager:
                         and requested_exact_sentence_count(message) is not None
                     )
                 )
-                adaptive_sampling_repair = decode_mode == "strict" and bool(
-                    diagnostic_codes
-                    & {
-                        QualityCode.TEMPLATE_REPETITION.value,
-                        QualityCode.LOW_INFORMATION_REPETITION.value,
-                        "token_repetition",
-                        "quality_boundary",
-                        "empty_candidate",
-                        "near_duplicate",
-                    }
+                adaptive_sampling_repair = decode_mode == "strict" and (
+                    bool(
+                        diagnostic_codes
+                        & {
+                            QualityCode.TEMPLATE_REPETITION.value,
+                            QualityCode.LOW_INFORMATION_REPETITION.value,
+                            "token_repetition",
+                            "quality_boundary",
+                            "empty_candidate",
+                            "near_duplicate",
+                        }
+                    )
+                    or (
+                        "response_contract" in diagnostic_codes
+                        and requested_category_counts(message) is None
+                    )
+                    or (
+                        quality_repair_attempts >= 2
+                        and "insufficient_detail" in diagnostic_codes
+                        and requested_category_counts(message) is None
+                    )
                 )
                 repair_prefill = response_prefill
                 if adaptive_sampling_repair:
@@ -1003,14 +1025,23 @@ class AgentManager:
                 finish_reason == "stop"
                 and terminal_quality.recommended_action is QualityAction.CONTINUE
             )
+            emergency_continuation = (
+                (quality_needs_continuation or response_contract_incomplete)
+                and quality_repair_attempts >= HARD_MAX_QUALITY_REPAIRS
+                and continuations < 1
+            )
             can_continue = (
-                (finish_reason == "length" or quality_needs_continuation)
+                (
+                    finish_reason == "length"
+                    or quality_needs_continuation
+                    or emergency_continuation
+                )
                 and not role_boundary
                 and not repetition_boundary
-                and not quality_boundary
+                and (not quality_boundary or emergency_continuation)
                 and not char_truncated
                 and made_progress
-                and continuations < budget.max_continuations
+                and (continuations < budget.max_continuations or emergency_continuation)
                 and generation_attempts < self.max_generation_attempts
                 and monotonic() < decode_deadline
                 and remaining > 0
@@ -1419,6 +1450,9 @@ class AgentManager:
                     f"정확히 장점 {positive_count}개와 한계 {negative_count}개를 "
                     "각각 별도 문장으로 쓰고, 각 문장에 '장점' 또는 '한계'를 표시하세요."
                 )
+                directions.append(
+                    "제목·목록·HTML 표기 없이 짧은 평문 문장만 작성하세요."
+                )
             elif exact is not None:
                 directions.append(
                     f"서론이나 맺음말 없이 정확히 {exact}개의 완결된 문장만 작성하세요."
@@ -1605,12 +1639,24 @@ class AgentManager:
 
         return guarded_stream()
 
-    def _sampling_seed(self, user_sequence: int, generation_attempt: int) -> int:
+    def _sampling_seed(
+        self,
+        user_sequence: int,
+        generation_attempt: int,
+        *,
+        repair_message: str | None = None,
+    ) -> int:
         """Derive one deterministic but attempt-distinct signed-63-bit seed."""
 
-        material = (
-            f"{self.session_id}:{int(user_sequence)}:{int(generation_attempt)}"
-        ).encode("ascii")
+        if repair_message is None:
+            material = (
+                f"{self.session_id}:{int(user_sequence)}:{int(generation_attempt)}"
+            ).encode("ascii")
+        else:
+            material = (
+                f"repair:{int(user_sequence)}:{int(generation_attempt)}:"
+                + repair_message[:MAX_AGENT_INPUT_CHARS]
+            ).encode("utf-8")
         return int.from_bytes(hashlib.sha256(material).digest()[:8], "big") & (
             (1 << 63) - 1
         )
@@ -1686,6 +1732,8 @@ class AgentManager:
             return False
         if not response_avoids_dangling_sentence_start(candidate):
             return False
+        if not response_avoids_generic_outline(message, candidate):
+            return False
         if not response_avoids_prompt_echo(message, candidate):
             return False
         if (
@@ -1695,12 +1743,28 @@ class AgentManager:
             return False
         exact = requested_exact_sentence_count(message)
         exact_items = requested_exact_item_count(message)
+        categories = requested_category_counts(message)
         explicit_formal_request = _FORMAL_INSTRUCTION_RE.search(message) is not None
         if (
-            exact is not None or exact_items is not None or explicit_formal_request
-        ) and not response_topically_anchored(message, candidate):
+            exact_items is None
+            and (exact is not None or explicit_formal_request)
+            and not response_topically_anchored(message, candidate)
+            and not (
+                categories is not None
+                and response_preserves_category_subject(message, candidate)
+            )
+        ):
             return False
-        if (exact or 0) >= 3 and not response_preserves_distinctive_topic(
+        if (
+            categories is None
+            and (exact or 0) >= 3
+            and not response_preserves_distinctive_topic(
+                message,
+                candidate,
+            )
+        ):
+            return False
+        if exact_items is not None and not response_preserves_distinctive_topic(
             message,
             candidate,
         ):
@@ -1813,6 +1877,9 @@ class AgentManager:
         reserved = _RESERVED_OUTPUT_RE.search(normalized)
         factbook_echo = _FACTBOOK_ECHO_RE.search(normalized)
         repair_echo = _QUALITY_REPAIR_ECHO_RE.search(normalized)
+        folded = unicodedata.normalize("NFKC", normalized)
+        folded_role = _ROLE_BOUNDARY_RE.search(folded)
+        folded_leading = _LEADING_ASSISTANT_RE.search(folded)
         boundaries = [
             match.start()
             for match in (
@@ -1822,6 +1889,8 @@ class AgentManager:
                 reserved,
                 factbook_echo,
                 repair_echo,
+                folded_role,
+                folded_leading,
             )
             if match is not None
         ]

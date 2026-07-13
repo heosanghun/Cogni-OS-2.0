@@ -173,6 +173,16 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         checks = _answer_checks(dangling, state)
         self.assertFalse(checks["no_dangling_sentence_start"])
 
+        outline = _complete_answer(
+            "### 서론\n검증 목적을 설명합니다.\n### 개요\n품질을 설명합니다."
+        )
+        checks = _answer_checks(
+            outline,
+            state,
+            "자체 검증을 네 항목 이내로 정리하세요.",
+        )
+        self.assertFalse(checks["no_generic_outline"])
+
     def test_required_literal_period_and_factbook_values_are_exact(self):
         state = _complete_state()
         literal = _answer_checks(

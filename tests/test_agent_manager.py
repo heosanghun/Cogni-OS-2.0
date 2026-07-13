@@ -708,6 +708,16 @@ class TestAgentManager(unittest.TestCase):
         self.assertNotIn("USER:", answer["content"])
         self.assertFalse(answer["truncated"])
 
+    def test_fullwidth_role_marker_is_never_visible(self) -> None:
+        for text in (
+            "ASSISTANT： 답변입니다.",
+            "ＡＳＳＩＳＴＡＮＴ： 답변입니다.",
+        ):
+            with self.subTest(text=text):
+                cleaned, boundary = AgentManager._clean_model_text(text)
+                self.assertTrue(boundary)
+                self.assertEqual(cleaned, "")
+
     def test_reserved_pseudo_eos_is_not_visible_or_continued(self) -> None:
         service = _ScriptedService(
             [("자연스럽게 끝납니다.<|endoftext|><|startoftext|>", "length")]
@@ -1210,6 +1220,15 @@ class TestAgentManager(unittest.TestCase):
         )
         self.assertTrue(boundary)
         self.assertEqual(cleaned, "")
+        for directive in (
+            "같은 문장이나 표현을 반복하지 말고 서로 다른 핵심을 한 번씩만 답하세요.",
+            "요청한 범위를 빠뜨리지 말고 서로 다른 핵심 내용을 충분히 설명하세요.",
+            "질문의 핵심 용어를 직접 유지하세요: 반복, 복구, 오류.",
+        ):
+            with self.subTest(directive=directive):
+                cleaned, boundary = AgentManager._clean_model_text(directive)
+                self.assertTrue(boundary)
+                self.assertEqual(cleaned, "")
         cleaned, boundary = AgentManager._clean_model_text(
             "사용자가 문장이나 항목 수를 지정하면 군더더기 없이 그 수를 지키십시오."
         )
@@ -1245,6 +1264,96 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(
             AgentManager._ensure_terminal_punctuation("이미 완결되었습니다."),
             "이미 완결되었습니다.",
+        )
+
+    def test_repair_sampling_seed_is_session_independent_and_attempt_distinct(
+        self,
+    ) -> None:
+        first = self.manager(_ScriptedService([]), session_id="seed-a")
+        second = self.manager(_ScriptedService([]), session_id="seed-b")
+        message = "요약 조건을 세 가지 제시하세요."
+
+        self.assertNotEqual(first._sampling_seed(1, 1), second._sampling_seed(1, 1))
+        self.assertEqual(
+            first._sampling_seed(1, 2, repair_message=message),
+            second._sampling_seed(1, 2, repair_message=message),
+        )
+        self.assertNotEqual(
+            first._sampling_seed(1, 2, repair_message=message),
+            second._sampling_seed(9, 2, repair_message=message),
+        )
+        self.assertNotEqual(
+            first._sampling_seed(1, 2, repair_message=message),
+            first._sampling_seed(1, 3, repair_message=message),
+        )
+
+    def test_exact_category_contract_gets_one_bounded_emergency_continuation(
+        self,
+    ) -> None:
+        service = _ScriptedService(
+            [
+                ("온디바이스 AI는 유용합니다.", "stop"),
+                ("장점은 데이터 보호입니다. 장점은 낮은 지연입니다.", "stop"),
+                (
+                    "온디바이스 AI의 장점은 데이터 보호에 유리합니다. "
+                    "장점은 응답 지연을 줄입니다. 한계는 장치 자원이",
+                    "stop",
+                ),
+                ("한계는 장치 자원에 제약을 받습니다.", "stop"),
+            ]
+        )
+        manager = self.manager(service)
+
+        manager.start_turn(
+            "온디바이스 AI의 장점 두 가지와 한계 한 가지를 세 문장으로 설명하세요.",
+            "chat",
+        )
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(len(service.prompts), 4)
+        self.assertEqual(
+            state["conversation"][-1]["content"],
+            "온디바이스 AI의 장점은 데이터 보호에 유리합니다. "
+            "장점은 응답 지연을 줄입니다. "
+            "장치 자원에 제약을 받습니다.",
+        )
+        self.assertEqual(
+            state["conversation"][-1]["generation_mode"],
+            "cogni_core",
+        )
+
+    def test_off_topic_exact_items_are_not_published(self) -> None:
+        manager = self.manager(_ScriptedService([]))
+
+        self.assertFalse(
+            manager._response_adequate_for_request(
+                "로컬 모델 응답의 반복과 중단 오류 복구 절차를 세 단계로 답하세요.",
+                "재료를 고릅니다. 물을 끓입니다. 음식을 담습니다.",
+            )
+        )
+
+    def test_off_topic_category_sentences_are_not_published(self) -> None:
+        manager = self.manager(_ScriptedService([]))
+
+        self.assertFalse(
+            manager._response_adequate_for_request(
+                "온디바이스 AI의 장점 두 가지와 한계 한 가지를 세 문장으로 설명하세요.",
+                "딸기의 장점은 향이 좋습니다. 여름의 장점은 낮이 깁니다. "
+                "비의 한계는 길이 미끄럽다는 점입니다.",
+            )
+        )
+
+    def test_on_device_category_paraphrase_preserves_the_domain(self) -> None:
+        manager = self.manager(_ScriptedService([]))
+
+        self.assertTrue(
+            manager._response_adequate_for_request(
+                "온디바이스 AI의 장점 두 가지와 한계 한 가지를 세 문장으로 설명하세요.",
+                "데이터가 장치에 남아 개인정보 보호에 유리합니다. "
+                "인터넷 연결 없이 사용할 수 있습니다. "
+                "장치의 처리 성능에는 제한이 있습니다.",
+            )
         )
 
     def test_maximum_item_block_is_completed_before_length_tail(self) -> None:

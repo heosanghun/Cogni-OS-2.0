@@ -172,7 +172,12 @@ class TestAgentQualityIntegration(unittest.TestCase):
     def test_persistent_fragment_publishes_one_honest_quality_fallback(self) -> None:
         failures: list[tuple[str, str]] = []
         service = _ScriptedService(
-            [("이는 내가.", "stop"), ("나는.", "stop"), ("제가.", "stop")]
+            [
+                ("이는 내가.", "stop"),
+                ("나는.", "stop"),
+                ("제가.", "stop"),
+                ("그것은.", "stop"),
+            ]
         )
         manager = self.manager(
             service,
@@ -191,6 +196,7 @@ class TestAgentQualityIntegration(unittest.TestCase):
             safe_quality_fallback("완전한 문장으로 설명해 주세요."),
         )
         self.assertEqual(answer["generation_mode"], "quality_fallback")
+        self.assertEqual(len(service.prompts), 4)
         self.assertEqual(failures[0][0], "ResponseQualityError")
         diagnostic = failures[0][1]
         self.assertIn("quality_gate_v2;", diagnostic)

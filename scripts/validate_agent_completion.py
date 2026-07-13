@@ -36,6 +36,7 @@ from cogni_agent.response_quality import (  # noqa: E402
     requested_exact_item_count,
     requested_maximum_items,
     response_avoids_dangling_sentence_start,
+    response_avoids_generic_outline,
     response_avoids_prompt_echo,
     response_avoids_unsolicited_self_intro,
     response_contract_satisfied,
@@ -141,8 +142,8 @@ STRESS_ANCHOR_GROUPS = (
     (("실행", "도구", "결과"), ("확인", "검증", "성공")),
     (("원인",), ("수정",), ("회귀", "테스트")),
     (("문맥", "대화"), ("의도", "사용자"), ("오래된", "요약", "줄")),
-    (("불확실", "추측"), ("사실", "단정", "근거")),
-    (("권한",), ("안전", "경계"), ("작업", "실행")),
+    (("불확실", "추측"), ("사실", "단정", "근거", "정확")),
+    (("권한",), ("안전", "경계", "보안", "정책", "규정"), ("작업", "실행")),
     (
         ("검증", "테스트", "확인"),
         ("수정", "기능"),
@@ -671,6 +672,7 @@ def _answer_checks(
             text,
         ),
         "no_dangling_sentence_start": response_avoids_dangling_sentence_start(text),
+        "no_generic_outline": response_avoids_generic_outline(request, text),
         "no_full_prompt_echo": response_avoids_prompt_echo(request, text),
         "request_contract_fulfilled": answer.get("generation_mode")
         != "quality_fallback"

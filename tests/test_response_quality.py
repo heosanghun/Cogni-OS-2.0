@@ -130,6 +130,19 @@ class ResponseQualityTests(unittest.TestCase):
         self.assertEqual(report.recommended_action, QualityAction.TRIM_AND_STOP)
         self.assertEqual(report.recommended_cut_index, text.index("ASSISTANT:"))
 
+    def test_fullwidth_role_markers_are_hard_boundaries(self) -> None:
+        for text in (
+            "ASSISTANT： 답변입니다.",
+            "ＡＳＳＩＳＴＡＮＴ： 답변입니다.",
+        ):
+            with self.subTest(text=text):
+                report = inspect_response(text, final=True)
+                self.assertTrue(report.has(QualityCode.ROLE_MARKER))
+                self.assertEqual(
+                    report.recommended_action,
+                    QualityAction.TRIM_AND_STOP,
+                )
+
     def test_reserved_control_tokens_are_detected(self) -> None:
         samples = (
             "정상 답변<end_of_turn>",
@@ -417,6 +430,18 @@ class ResponseQualityTests(unittest.TestCase):
         candidate = "첫 장점입니다. 둘째 장점입니다. 셋째 장점입니다."
         self.assertIsNone(normalize_exact_sentence_response(request, candidate))
 
+    def test_mitigated_negative_word_is_not_counted_as_a_limitation(self) -> None:
+        from cogni_agent.response_quality import response_contract_satisfied
+
+        request = "장점 두 가지와 한계 한 가지를 세 문장으로 설명하세요."
+        response = (
+            "장점은 개인정보 보호에 유리합니다. "
+            "장점은 응답 속도가 빠릅니다. "
+            "배터리 소모가 적어 오래 사용할 수 있습니다."
+        )
+
+        self.assertFalse(response_contract_satisfied(request, response))
+
     def test_exact_sentence_normalizer_splits_one_complete_korean_coordinate(
         self,
     ) -> None:
@@ -461,6 +486,83 @@ class ResponseQualityTests(unittest.TestCase):
             "문장이 자연스럽게 연결되어 있는지 확인합니다. "
             "문장이 완결성을 가지고 있는지 확인합니다.",
         )
+
+    def test_inline_purpose_clause_is_completed_without_new_factual_content(
+        self,
+    ) -> None:
+        from cogni_agent.response_quality import normalize_exact_sentence_response
+
+        normalized = normalize_exact_sentence_response(
+            "불확실성을 두 문장으로 설명하세요.",
+            "1. 불확실한 답변을 사실처럼 단정하지 않기 위해, "
+            "2. '확실하지 않다'는 표현을 사용하세요.",
+        )
+        self.assertEqual(
+            normalized,
+            "불확실한 답변을 사실처럼 단정하지 않도록 합니다. "
+            "'확실하지 않다'는 표현을 사용하세요.",
+        )
+
+    def test_numbered_noun_items_receive_a_bounded_copula(self) -> None:
+        from cogni_agent.response_quality import normalize_exact_item_response
+
+        normalized = normalize_exact_item_response(
+            "요약 조건을 세 가지 제시하세요.",
+            "1. 핵심 메시지: 본문의 요점\n"
+            "2. 논리적 연결: 문단 사이의 관계\n"
+            "3. 정보의 신뢰성: 출처 확인과 사실 여부\n"
+            "[설명] 뒤의 장황한 내용",
+        )
+        self.assertEqual(
+            normalized,
+            "핵심 메시지: 본문의 요점입니다. "
+            "논리적 연결: 문단 사이의 관계입니다. "
+            "정보의 신뢰성: 출처 확인과 사실 여부입니다.",
+        )
+
+    def test_numbered_verb_fragment_never_receives_a_copula(self) -> None:
+        from cogni_agent.response_quality import normalize_exact_item_response
+
+        self.assertIsNone(
+            normalize_exact_item_response(
+                "복구 절차를 세 단계로 답하세요.",
+                "1. 원인을 분석하\n2. 코드를 수정하\n3. 회귀 테스트를 수행",
+            )
+        )
+
+    def test_last_numbered_item_does_not_absorb_followup_explanation(self) -> None:
+        from cogni_agent.response_quality import normalize_exact_item_response
+
+        for marker in ("추가 설명:", "보충:", "\n후속 문단입니다."):
+            with self.subTest(marker=marker):
+                normalized = normalize_exact_item_response(
+                    "요약 조건을 세 가지 제시하세요.",
+                    "1. 정확성: 사실을 확인\n"
+                    "2. 간결성: 핵심을 유지\n"
+                    f"3. 완결성: 문장을 끝냄\n{marker} 뒤의 내용",
+                )
+                self.assertEqual(
+                    normalized,
+                    "정확성: 사실을 확인입니다. 간결성: 핵심을 유지입니다. "
+                    "완결성: 문장을 끝냄입니다.",
+                )
+
+    def test_explicit_cutoff_does_not_publish_a_noun_fragment(self) -> None:
+        from cogni_agent.response_quality import salvage_complete_prefix
+
+        text = "장점은 데이터 보호에 유리합니다. 한계는 장치 자원이"
+        cutoff = text.index("자원이")
+
+        self.assertEqual(
+            salvage_complete_prefix(text, cutoff=cutoff),
+            "장점은 데이터 보호에 유리합니다.",
+        )
+
+    def test_explicit_cutoff_preserves_a_complete_unpunctuated_predicate(self) -> None:
+        from cogni_agent.response_quality import salvage_complete_prefix
+
+        text = "회귀 테스트를 모두 실행했습니다"
+        self.assertEqual(salvage_complete_prefix(text, cutoff=len(text)), text)
 
     def test_inline_numbered_normalizer_uses_first_complete_sequence(self) -> None:
         from cogni_agent.response_quality import normalize_exact_sentence_response
@@ -611,6 +713,35 @@ class ResponseQualityTests(unittest.TestCase):
             response_avoids_dangling_sentence_start("잘못된 사실을 먼저 정정합니다.")
         )
 
+    def test_generic_outline_does_not_replace_requested_items(self) -> None:
+        from cogni_agent.response_quality import response_avoids_generic_outline
+
+        request = "자체 검증을 네 항목 이내로 정리하세요."
+        self.assertFalse(
+            response_avoids_generic_outline(
+                request,
+                "### 서론\n검증 목적을 설명합니다.\n### 개요\n품질을 설명합니다.",
+            )
+        )
+        self.assertTrue(
+            response_avoids_generic_outline(
+                request,
+                "기능 테스트를 수행합니다. 회귀 테스트를 수행합니다.",
+            )
+        )
+        self.assertFalse(
+            response_avoids_generic_outline(
+                request,
+                "서론: 검증 목적입니다.\n개요: 품질 설명입니다.\n결론: 종료입니다.",
+            )
+        )
+        self.assertTrue(
+            response_avoids_generic_outline(
+                request,
+                "```markdown\n### 서론\n코드 예시입니다.\n```\n기능을 점검합니다.",
+            )
+        )
+
     def test_distinctive_topic_guard_accepts_domain_paraphrase(self) -> None:
         from cogni_agent.response_quality import response_preserves_distinctive_topic
 
@@ -645,6 +776,12 @@ class ResponseQualityTests(unittest.TestCase):
         self.assertEqual(report.input_characters, len(text))
         self.assertTrue(report.has(QualityCode.CONTROL_TOKEN))
         self.assertEqual(report.recommended_cut_index, text.index("<|eot_id|>"))
+
+    def test_long_code_fence_does_not_hide_a_trailing_control_token(self) -> None:
+        text = "```\n" + ("가" * 9_000) + "\n```\n<|eot_id|>"
+        report = inspect_response(text, final=True)
+        self.assertTrue(report.has(QualityCode.CONTROL_TOKEN))
+        self.assertEqual(report.recommended_action, QualityAction.TRIM_AND_STOP)
 
     def test_reports_are_deterministic_and_input_type_is_checked(self) -> None:
         text = "첫 번째 결과는 매우 빠릅니다. 두 번째 결과는 정말 안전합니다."

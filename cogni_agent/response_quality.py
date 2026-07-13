@@ -152,7 +152,8 @@ _CONTROL_TOKEN_RE = re.compile(
     r"</?(?:start_of_turn|end_of_turn|turn|bos|eos|pad|unk)>|"
     r"<unused\d{1,5}>|\[(?:/?inst|system|/?sys|multimodal)\]|"
     r"<<\s*/?sys\s*>>|\[Runtime Fact-book:|\[턴\s*종료\]|"
-    r"</?(?:시스템|컨펌|종료|summary)(?:\s+[^<>\r\n]{0,96})?>|\[##\]"
+    r"</?(?:시스템|컨펌|종료|summary)(?:\s+[^<>\r\n]{0,96})?>|\[##\]|"
+    r"</?(?:답변|본문|입력|출력|역할(?:과\s*지침)?)(?:\s+[^<>\r\n]{0,48})?>"
 )
 _UNIT_RE = re.compile(r".+?(?:[.!?。！？]+(?=\s|$)|\n+|$)", re.DOTALL)
 _LEXEME_RE = re.compile(r"[가-힣]+|[A-Za-z]+(?:'[A-Za-z]+)?|\d+(?:[.,]\d+)*")
@@ -160,15 +161,16 @@ _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]\s+|\d{1,4}[.)]\s+)")
 _LIST_MARKER_ONLY_RE = re.compile(r"^\s*(?:[-*+]|\d{1,4}[.)])\s*$")
 _TRAILING_LIST_MARKER_RE = re.compile(r"(?:^|\s)(?:[-*+]|\d{1,4}[.)])\s*$")
 _REQUEST_COUNT_RE = re.compile(
-    r"(?P<count>[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*"
+    r"(?P<count>10|[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*"
     r"(?P<unit>문장|단계|항목)"
 )
-_MAX_ITEM_REQUEST_RE = re.compile(
-    r"(?P<count>[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*"
-    r"(?:개|가지|항목)\s*이내"
+_MAXIMUM_UNIT_REQUEST_RE = re.compile(
+    r"(?:(?P<prefix>최대)\s*)?"
+    r"(?P<count>10|[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*"
+    r"(?P<unit>문장|단계|항목|가지|개)\s*(?P<suffix>이내|이하)?"
 )
 _EXACT_ITEM_COUNT_RE = re.compile(
-    r"(?P<count>[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*"
+    r"(?P<count>10|[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*"
     r"(?P<unit>단계|항목|가지|개)"
 )
 _EXACT_ITEM_OUTPUT_CUE_RE = re.compile(
@@ -190,7 +192,7 @@ _NEGATIVE_SECTION_RE = re.compile(
 )
 _CATEGORY_COUNT_RE = re.compile(
     r"(?P<category>장점|이점|강점|한계|단점|제약|위험)\s*"
-    r"(?P<count>[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*가지"
+    r"(?P<count>10|[1-9]|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*가지"
 )
 _NEGATIVE_CATEGORY_CUES = (
     "한계",
@@ -219,7 +221,23 @@ _META_SENTENCE_ENDINGS = (
 )
 _GENERIC_OUTLINE_HEADING_RE = re.compile(
     r"(?im)^\s*(?:#{1,6}\s*)?(?:서론|목적|개요|배경|결론)\s*"
-    r"(?:[:：]\s*[^\r\n]*|$)"
+    r"(?:[:：]\s*[^\r\n]*|입니다[.]?|$)"
+)
+_META_FORMAT_DISCUSSION_RE = re.compile(
+    r"(?:질문의\s*(?:형식|구조|요청\s*형식).{0,40}(?:정리|해석|설명)|"
+    r"사용자는.{0,64}(?:항목|문장|개수|수량|형식).{0,32}(?:요청|제한)|"
+    r"\d+개\s*항목만\s*요청|(?:이는|이것은).{0,32}형식으로\s*해석)"
+)
+_META_FORMAT_REQUEST_RE = re.compile(
+    r"(?:질문|답변|출력|문서|데이터).{0,16}형식"
+    r"(?:이|은|을|를|에|으로)?\s*(?:자체를\s*)?"
+    r"(?:설명|분석|정리|제시|작성|알려|무엇|어떤|인가|입니까)"
+)
+_INCOMPLETE_COLON_BODY_RE = re.compile(
+    r"(?:[A-Za-z0-9가-힣._-]+(?:을|를)\s+\S+|"
+    r"(?:이|가|은|는)\s+(?:왜|어떻게|무엇|어떤)\s+\S+|"
+    r"(?:변경하?|수정하?|저장하?|설명하?|실행하?|확인하?|검증하?|분석하?|"
+    r"수행하?|기록하?|작성하?|제공하?|처리하?|관리하?|점검하?))\s*$"
 )
 _TRAILING_EXPLANATION_MARKER_RE = re.compile(
     r"(?m)\n\s*(?:\n+|\[[^\]\r\n]{1,32}\]|#{1,6}\s+[^\r\n]+|"
@@ -482,8 +500,8 @@ _DISTINCTIVE_TOPIC_EQUIVALENTS = (
         frozenset({"핵심", "군더더기", "완결", "문장", "반복"}),
     ),
     (
-        frozenset({"자가검증", "자체검증"}),
-        frozenset({"테스트", "점검", "회귀", "결과", "기능"}),
+        frozenset({"자가검증", "자체검증", "자가", "자체"}),
+        frozenset({"테스트", "점검", "회귀", "결과", "기능", "오류", "코드"}),
     ),
     (
         frozenset({"온디바이스", "ai"}),
@@ -528,7 +546,12 @@ def response_topically_anchored(request: str, response: str) -> bool:
         return True
     observed = _topic_terms(response)
     required = 3 if len(requested) >= 6 else max(2, (len(requested) + 1) // 2)
-    return len(requested & observed) >= required
+    if len(requested & observed) >= required:
+        return True
+    return any(
+        requested & triggers and observed & equivalents
+        for triggers, equivalents in _DISTINCTIVE_TOPIC_EQUIVALENTS
+    )
 
 
 def request_topic_terms(request: str, *, limit: int = 8) -> tuple[str, ...]:
@@ -644,6 +667,16 @@ def response_avoids_generic_outline(request: str, response: str) -> bool:
     )
     masked = _mask_code(response[:MAX_INSPECT_CHARS])
     return not structured_request or _GENERIC_OUTLINE_HEADING_RE.search(masked) is None
+
+
+def response_avoids_meta_format_discussion(request: str, response: str) -> bool:
+    """Reject answers that discuss the requested format instead of its content."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    if _META_FORMAT_REQUEST_RE.search(request) is not None:
+        return True
+    return _META_FORMAT_DISCUSSION_RE.search(response) is None
 
 
 def has_near_duplicate_sentences(text: str) -> bool:
@@ -1220,7 +1253,10 @@ def requested_minimum_units(request: str) -> int | None:
     candidates: list[tuple[int, int, int]] = []
     priority = {"문장": 0, "단계": 1, "항목": 2}
     for match in _REQUEST_COUNT_RE.finditer(request[:MAX_INSPECT_CHARS]):
+        prefix = request[max(0, match.start() - 6) : match.start()]
         suffix = request[match.end() : match.end() + 4]
+        if re.search(r"최대\s*$", prefix):
+            continue
         if re.match(r"\s*(?:이내|이하)", suffix):
             continue
         raw = match.group("count")
@@ -1257,15 +1293,20 @@ def requested_exact_sentence_count(request: str) -> int | None:
 
 
 def requested_maximum_items(request: str) -> int | None:
-    """Return an explicit Korean maximum item count such as ``네 가지 이내``."""
+    """Return an explicit Korean output maximum such as ``네 가지 이내``."""
 
     if not isinstance(request, str):
         raise TypeError("request must be a string")
-    match = _MAX_ITEM_REQUEST_RE.search(request[:MAX_INSPECT_CHARS])
-    if match is None:
-        return None
-    raw = match.group("count")
-    return int(raw) if raw.isdigit() else _KOREAN_COUNTS[raw]
+    bounded = request[:MAX_INSPECT_CHARS]
+    for match in _MAXIMUM_UNIT_REQUEST_RE.finditer(bounded):
+        if match.group("prefix") is None and match.group("suffix") is None:
+            continue
+        output_tail = bounded[match.end() : match.end() + 48]
+        if _EXACT_ITEM_OUTPUT_CUE_RE.match(output_tail) is None:
+            continue
+        raw = match.group("count")
+        return int(raw) if raw.isdigit() else _KOREAN_COUNTS[raw]
+    return None
 
 
 def requested_exact_item_count(request: str) -> int | None:
@@ -1298,9 +1339,15 @@ def response_contract_satisfied(request: str, response: str) -> bool:
         raise TypeError("response must be a string")
     exact = requested_exact_sentence_count(request)
     exact_items = requested_exact_item_count(request)
+    maximum_items = requested_maximum_items(request)
     minimum = requested_minimum_units(request)
     categories = _requested_category_counts(request)
-    if minimum is None and exact_items is None and categories is None:
+    if (
+        minimum is None
+        and exact_items is None
+        and maximum_items is None
+        and categories is None
+    ):
         return True
     completed = _contract_sentence_count(response[:MAX_INSPECT_CHARS])
     if categories is not None and not _category_contract_satisfied(
@@ -1312,6 +1359,8 @@ def response_contract_satisfied(request: str, response: str) -> bool:
         return completed == exact
     if exact_items is not None:
         return completed == exact_items
+    if maximum_items is not None:
+        return 1 <= completed <= maximum_items
     if minimum is None:
         return True
     return completed >= minimum
@@ -1470,6 +1519,14 @@ def compose_observed_contract_response(
         expected = requested_exact_sentence_count(request)
         if expected is None:
             expected = requested_exact_item_count(request)
+        maximum = requested_maximum_items(request)
+        if expected is None and maximum is not None:
+            sentences = [
+                sentence
+                for sentence in sentences
+                if response_avoids_meta_format_discussion(request, sentence)
+            ]
+            expected = min(maximum, len(sentences))
         if expected is None or len(sentences) < expected:
             return ""
         selected = sentences[:expected]
@@ -1533,6 +1590,16 @@ def _split_inline_numbered_sentences(
         if trailing_marker is not None:
             raw_clause = raw_clause[: trailing_marker.start()].rstrip()
         boundaries = _content_sentence_boundaries(raw_clause)
+        # A small local model may omit the space after a completed Korean
+        # sentence (``확인합니다.이러한``).  Within a numbered item, a
+        # non-numeric terminal followed by a new Korean/Latin clause is a safe
+        # boundary; decimal/version dots remain untouched.
+        loose = re.search(r"(?<!\d)[.!?。！？]+(?=[가-힣A-Z])", raw_clause)
+        if loose is not None and (
+            not boundaries or loose.start() < boundaries[0].start()
+        ):
+            raw_clause = raw_clause[: loose.end()]
+            boundaries = _content_sentence_boundaries(raw_clause)
         if boundaries:
             raw_clause = raw_clause[: boundaries[0].end()]
         clause = raw_clause.strip().rstrip(" ,;")
@@ -1563,6 +1630,7 @@ def _split_inline_numbered_sentences(
             and _KOREAN_INCOMPLETE_WORD_RE.search(clause) is None
             and _KOREAN_CONNECTIVE_END_RE.search(clause) is None
             and _KOREAN_PARTICLE_END_RE.search(clause) is None
+            and _INCOMPLETE_COLON_BODY_RE.search(clause) is None
         ):
             sentence = clause + "입니다."
         else:
@@ -1634,7 +1702,7 @@ def normalize_maximum_item_response(request: str, response: str) -> str | None:
     maximum = requested_maximum_items(request)
     if maximum is None or not response.strip():
         return None
-    minimum = 2 if maximum >= 2 else 1
+    minimum = 1
     for count in range(maximum, minimum - 1, -1):
         sentences = _split_inline_numbered_sentences(response, count)
         if sentences is None:
@@ -1692,6 +1760,7 @@ __all__ = [
     "response_avoids_prompt_echo",
     "response_avoids_dangling_sentence_start",
     "response_avoids_generic_outline",
+    "response_avoids_meta_format_discussion",
     "response_avoids_unsolicited_self_intro",
     "response_avoids_unsolicited_subjects",
     "response_contract_satisfied",

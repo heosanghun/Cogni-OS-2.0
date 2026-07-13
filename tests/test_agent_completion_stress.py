@@ -183,6 +183,43 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         )
         self.assertFalse(checks["no_generic_outline"])
 
+        meta = _answer_checks(
+            _complete_answer(
+                "질문의 형식을 다시 정리합니다. 사용자는 네 개로 제한하라고 요청합니다."
+            ),
+            state,
+            "확인 항목을 네 가지 이내로 정리하세요.",
+        )
+        self.assertFalse(meta["no_meta_format_discussion"])
+
+    def test_semantic_on_device_and_summary_answers_keep_topic_anchors(self) -> None:
+        state = _complete_state()
+        cases = _prompt_cases(20)
+
+        on_device = _answer_checks(
+            _complete_answer(
+                "데이터가 인터넷에 노출되지 않아 개인정보가 보호됩니다. "
+                "장치에서 처리하므로 인터넷 연결 없이 사용할 수 있습니다. "
+                "처리 가능한 데이터 크기에는 제한이 있습니다."
+            ),
+            state,
+            cases[4].prompt,
+            required_groups=cases[4].required_groups,
+        )
+        self.assertTrue(on_device["topic_anchors_satisfied"])
+
+        summary = _answer_checks(
+            _complete_answer(
+                "군더더기 없이 핵심만 담아야 합니다. "
+                "문장마다 다른 내용을 간결하게 표현해야 합니다. "
+                "마지막 문장을 자연스럽게 완결해야 합니다."
+            ),
+            state,
+            cases[10].prompt,
+            required_groups=cases[10].required_groups,
+        )
+        self.assertTrue(summary["topic_anchors_satisfied"])
+
     def test_required_literal_period_and_factbook_values_are_exact(self):
         state = _complete_state()
         literal = _answer_checks(

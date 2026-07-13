@@ -174,10 +174,46 @@ class ResponseQualityTests(unittest.TestCase):
             "정상 답변입니다. <종료>",
             "정상 답변입니다. <summary>",
             "정상 답변입니다. [##]",
+            "정상 답변입니다. <답변>오염</답변>",
         )
         for text in samples:
             with self.subTest(text=text):
                 self.assertTrue(inspect_response(text).has(QualityCode.CONTROL_TOKEN))
+
+    def test_maximum_item_contract_enforces_only_the_requested_upper_bound(
+        self,
+    ) -> None:
+        from cogni_agent.response_quality import (
+            requested_maximum_items,
+            requested_minimum_units,
+            response_contract_satisfied,
+        )
+
+        request = "자체 검증을 네 항목 이내로 정리하세요."
+        self.assertTrue(response_contract_satisfied(request, "한 문장입니다."))
+        self.assertTrue(
+            response_contract_satisfied(
+                request,
+                "기능을 점검합니다. 회귀 테스트를 실행합니다.",
+            )
+        )
+        self.assertFalse(
+            response_contract_satisfied(
+                request,
+                "첫째입니다. 둘째입니다. 셋째입니다. 넷째입니다. 다섯째입니다.",
+            )
+        )
+        for wording in (
+            "최대 네 항목으로 답하세요.",
+            "확인 결과를 4개 이하로 정리하세요.",
+            "핵심을 네 문장 이내로 설명하세요.",
+            "핵심을 최대 10개로 제시하세요.",
+            "핵심을 10문장 이내로 작성하세요.",
+        ):
+            with self.subTest(wording=wording):
+                self.assertIsNotNone(requested_maximum_items(wording))
+                self.assertIsNone(requested_minimum_units(wording))
+        self.assertIsNone(requested_maximum_items("오류가 네 개 이내인지 확인하세요."))
 
     def test_pseudo_control_text_inside_code_fence_is_not_a_boundary(self) -> None:
         text = "HTML 예시입니다.\n```html\n<summary>내용</summary>\n```"
@@ -530,6 +566,34 @@ class ResponseQualityTests(unittest.TestCase):
             )
         )
 
+    def test_incomplete_colon_item_does_not_receive_a_copula(self) -> None:
+        from cogni_agent.response_quality import normalize_maximum_item_response
+
+        normalized = normalize_maximum_item_response(
+            "자체 검증을 네 항목 이내로 정리하세요.",
+            "1. 목적 정의: 변경 범위를 명확히 정의합니다.\n"
+            "2. 코드 검증: 회귀 테스트를 실행합니다.\n"
+            "3. 문서화: 코드가 왜 변경",
+        )
+        self.assertEqual(
+            normalized,
+            "목적 정의: 변경 범위를 명확히 정의합니다. "
+            "코드 검증: 회귀 테스트를 실행합니다.",
+        )
+
+        for fragment in (
+            "결과 기록: 로그에 저장",
+            "문서화: 변경된 이유를 설명",
+            "배포 준비: 결과를 제공",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIsNone(
+                    normalize_maximum_item_response(
+                        "자체 검증을 한 항목 이내로 정리하세요.",
+                        f"1. {fragment}",
+                    )
+                )
+
     def test_last_numbered_item_does_not_absorb_followup_explanation(self) -> None:
         from cogni_agent.response_quality import normalize_exact_item_response
 
@@ -537,14 +601,14 @@ class ResponseQualityTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 normalized = normalize_exact_item_response(
                     "요약 조건을 세 가지 제시하세요.",
-                    "1. 정확성: 사실을 확인\n"
-                    "2. 간결성: 핵심을 유지\n"
-                    f"3. 완결성: 문장을 끝냄\n{marker} 뒤의 내용",
+                    "1. 정확성: 확인된 사실\n"
+                    "2. 간결성: 핵심 정보\n"
+                    f"3. 완결성: 자연스러운 마무리\n{marker} 뒤의 내용",
                 )
                 self.assertEqual(
                     normalized,
-                    "정확성: 사실을 확인입니다. 간결성: 핵심을 유지입니다. "
-                    "완결성: 문장을 끝냄입니다.",
+                    "정확성: 확인된 사실입니다. 간결성: 핵심 정보입니다. "
+                    "완결성: 자연스러운 마무리입니다.",
                 )
 
     def test_explicit_cutoff_does_not_publish_a_noun_fragment(self) -> None:
@@ -589,6 +653,37 @@ class ResponseQualityTests(unittest.TestCase):
             normalized,
             "질문을 확인합니다. 반복을 검사합니다. 문장을 완결합니다. "
             "결과를 기록합니다.",
+        )
+
+        missing_space = normalize_maximum_item_response(
+            "자체 검증을 네 항목 이내로 정리하세요.",
+            "1. 예상 결과와 일치하는지 확인합니다. "
+            "2. 테스트 환경을 점검합니다. "
+            "3. 사용자 테스트를 수행합니다. "
+            "4. 오류가 발생하는지 확인합니다.이러한 검증으로 마무리합니다.\n"
+            "파란색 지침은 시스템 메시지입니다.",
+        )
+        self.assertEqual(
+            missing_space,
+            "예상 결과와 일치하는지 확인합니다. 테스트 환경을 점검합니다. "
+            "사용자 테스트를 수행합니다. 오류가 발생하는지 확인합니다.",
+        )
+
+        live_candidate = normalize_maximum_item_response(
+            "소프트웨어 수정 완료를 선언하기 전에 필요한 자체 검증을 네 항목 이내로 정리하세요.",
+            "1. 예상 문제를 고려하고 실제 결과와 일치하는지 확인하십시오. "
+            "2. 테스트 환경에서 가능한 한 최선의 환경을 선택하십시오. "
+            "3. 사용자 테스트를 수행하여 기능을 확인하고 보완할 수 있는 피드백을 얻으십시오. "
+            "4. 코드에서 오류나 오버플로우가 발생하는지 확인하십시오.이러한 검증을 완료하면 "
+            "완료할 수 있다고 선언할 수 있습니다.\n"
+            "파란색으로 표시된 지침은 시스템에 대한 메시지입니다.",
+        )
+        self.assertEqual(
+            live_candidate,
+            "예상 문제를 고려하고 실제 결과와 일치하는지 확인하십시오. "
+            "테스트 환경에서 가능한 한 최선의 환경을 선택하십시오. "
+            "사용자 테스트를 수행하여 기능을 확인하고 보완할 수 있는 피드백을 얻으십시오. "
+            "코드에서 오류나 오버플로우가 발생하는지 확인하십시오.",
         )
 
     def test_exact_step_normalizer_accepts_korean_step_markers(self) -> None:
@@ -729,6 +824,43 @@ class ResponseQualityTests(unittest.TestCase):
                 "기능 테스트를 수행합니다. 회귀 테스트를 수행합니다.",
             )
         )
+
+    def test_meta_format_discussion_is_not_an_answer(self) -> None:
+        from cogni_agent.response_quality import (
+            response_avoids_generic_outline,
+            response_avoids_meta_format_discussion,
+        )
+
+        request = "확인 항목을 네 가지 이내로 정리하세요."
+        response = (
+            "질문의 형식을 다시 정리합니다. 사용자는 항목 수를 네 개로 제한하라고 "
+            "요청합니다. 이는 형식으로 해석됩니다."
+        )
+        self.assertFalse(response_avoids_meta_format_discussion(request, response))
+        self.assertTrue(
+            response_avoids_meta_format_discussion(
+                "질문의 형식을 설명하세요.",
+                response,
+            )
+        )
+        self.assertTrue(
+            response_avoids_meta_format_discussion(
+                request,
+                "사용자는 잘못된 사실의 수정을 요청합니다.",
+            )
+        )
+        self.assertTrue(
+            response_avoids_meta_format_discussion(
+                "출력 형식을 정리하세요.",
+                "질문의 형식을 정리합니다.",
+            )
+        )
+        self.assertFalse(
+            response_avoids_meta_format_discussion(
+                "답변 형식을 지키며 확인 항목을 네 가지 이내로 정리하세요.",
+                "질문의 형식을 정리합니다.",
+            )
+        )
         self.assertFalse(
             response_avoids_generic_outline(
                 request,
@@ -743,7 +875,10 @@ class ResponseQualityTests(unittest.TestCase):
         )
 
     def test_distinctive_topic_guard_accepts_domain_paraphrase(self) -> None:
-        from cogni_agent.response_quality import response_preserves_distinctive_topic
+        from cogni_agent.response_quality import (
+            response_preserves_distinctive_topic,
+            response_topically_anchored,
+        )
 
         self.assertFalse(
             response_preserves_distinctive_topic(
@@ -755,6 +890,12 @@ class ResponseQualityTests(unittest.TestCase):
             response_preserves_distinctive_topic(
                 "온디바이스 AI의 장점과 한계를 설명해 주세요.",
                 "온디바이스 AI는 데이터가 장치에 남아 보호에 유리합니다.",
+            )
+        )
+        self.assertTrue(
+            response_topically_anchored(
+                "소프트웨어 수정 완료 전에 필요한 자체 검증을 정리하세요.",
+                "실제 결과를 확인하고 테스트 환경과 코드 오류를 점검합니다.",
             )
         )
 

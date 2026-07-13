@@ -718,6 +718,24 @@ class TestAgentManager(unittest.TestCase):
                 self.assertTrue(boundary)
                 self.assertEqual(cleaned, "")
 
+    def test_presentation_wrapper_is_never_visible(self) -> None:
+        cleaned, boundary = AgentManager._clean_model_text(
+            "<답변>질문을 반복합니다.</답변>"
+        )
+        self.assertTrue(boundary)
+        self.assertEqual(cleaned, "")
+
+    def test_control_words_inside_normal_prose_or_code_are_preserved(self) -> None:
+        prose = "모델의 출력 제약은 토큰 길이입니다."
+        cleaned, boundary = AgentManager._clean_model_text(prose)
+        self.assertFalse(boundary)
+        self.assertEqual(cleaned, prose)
+
+        fenced = "XML 예시입니다.\n```xml\n<답변>예시</답변>\n```"
+        cleaned, boundary = AgentManager._clean_model_text(fenced)
+        self.assertFalse(boundary)
+        self.assertEqual(cleaned, fenced)
+
     def test_reserved_pseudo_eos_is_not_visible_or_continued(self) -> None:
         service = _ScriptedService(
             [("자연스럽게 끝납니다.<|endoftext|><|startoftext|>", "length")]
@@ -1224,11 +1242,43 @@ class TestAgentManager(unittest.TestCase):
             "같은 문장이나 표현을 반복하지 말고 서로 다른 핵심을 한 번씩만 답하세요.",
             "요청한 범위를 빠뜨리지 말고 서로 다른 핵심 내용을 충분히 설명하세요.",
             "질문의 핵심 용어를 직접 유지하세요: 반복, 복구, 오류.",
+            "서론이나 맺음말 없이 정확히 3개의 완결된 문장을 작성하세요.",
         ):
             with self.subTest(directive=directive):
                 cleaned, boundary = AgentManager._clean_model_text(directive)
                 self.assertTrue(boundary)
                 self.assertEqual(cleaned, "")
+
+    def test_maximum_item_request_starts_with_a_subject_grounded_prefill(self) -> None:
+        service = _ScriptedService(
+            [("기능을 점검합니다. 회귀 테스트를 실행합니다.", "stop")]
+        )
+        manager = self.manager(service)
+
+        manager.start_turn("자체 검증을 네 항목 이내로 정리하세요.", "chat")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(service.decode_modes, ["strict"])
+        self.assertIn("자체 검증을 기준으로 구체적인 항목은", service.prompts[0])
+        self.assertNotIn("출력 제약", service.prompts[0])
+
+    def test_maximum_item_repair_prompt_repeats_the_upper_bound(self) -> None:
+        service = _ScriptedService(
+            [
+                ("서론입니다.", "stop"),
+                ("기능을 점검합니다. 회귀 테스트를 실행합니다.", "stop"),
+            ]
+        )
+        manager = self.manager(service)
+
+        manager.start_turn("자체 검증을 네 항목 이내로 정리하세요.", "chat")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(service.decode_modes, ["strict", "conversation"])
+        self.assertIn("자체 검증에서 중요한 내용을 최대 4개만", service.prompts[1])
+        self.assertNotIn("수정 답변만 작성하세요", service.prompts[1])
         cleaned, boundary = AgentManager._clean_model_text(
             "사용자가 문장이나 항목 수를 지정하면 군더더기 없이 그 수를 지키십시오."
         )

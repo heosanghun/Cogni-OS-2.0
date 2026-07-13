@@ -46,6 +46,7 @@ from .response_quality import (
     requested_maximum_items,
     response_avoids_dangling_sentence_start,
     response_avoids_generic_outline,
+    response_avoids_meta_format_discussion,
     response_avoids_prompt_echo,
     response_avoids_unsolicited_self_intro,
     response_avoids_unsolicited_subjects,
@@ -215,6 +216,38 @@ def _exact_item_response_prefill(message: str) -> str:
     return subject + " 정리하면, "
 
 
+def _maximum_item_response_prefill(message: str) -> str:
+    """Start an at-most response from its subject rather than its format."""
+
+    match = _EXACT_ITEM_PHRASE_RE.search(message[:512])
+    if match is None:
+        return EXACT_RESPONSE_PREFILL
+    subject = re.sub(r"\s+", " ", message[: match.start()]).strip(" ,.:;!?。！？")
+    if not 4 <= len(subject) <= 180:
+        return EXACT_RESPONSE_PREFILL
+    if subject.endswith("항목을"):
+        return subject[:-1] + "은 다음과 같습니다: "
+    return subject + " 기준으로 구체적인 항목은 다음과 같습니다: "
+
+
+def _maximum_item_repair_message(message: str, maximum: int) -> str:
+    """Rephrase one failed at-most request around meaning, not formatting."""
+
+    match = _EXACT_ITEM_PHRASE_RE.search(message[:512])
+    if match is None:
+        return message
+    subject = re.sub(r"\s+", " ", message[: match.start()]).strip(" ,.:;!?。！？")
+    if not subject:
+        return message
+    if subject.endswith("항목을"):
+        subject = subject[:-1] + " 가운데"
+    elif subject.endswith(("을", "를")):
+        subject = subject[:-1] + "에서"
+    else:
+        subject += "에서"
+    return f"{subject} 중요한 내용을 최대 {maximum}개만 구체적으로 설명하세요."
+
+
 def _formal_response_prefill(message: str) -> str | None:
     """Anchor an explicit explanation/summary request without exposing it."""
 
@@ -256,6 +289,10 @@ _RESERVED_OUTPUT_RE = re.compile(
     r"(?:<unused\d+>|\[multimodal\]|<\|(?:image|audio|endoftext|startoftext)\|>)",
     re.IGNORECASE,
 )
+_PRESENTATION_WRAPPER_RE = re.compile(
+    r"</?(?:답변|본문|입력|출력|역할(?:과\s*지침)?)(?:\s+[^<>\r\n]{0,48})?>",
+    re.IGNORECASE,
+)
 _FACTBOOK_ECHO_RE = re.compile(r"(?im)^[ \t]*\[Runtime Fact-book:")
 _QUALITY_REPAIR_ECHO_RE = re.compile(
     r"앞 답변은 요청 형식을 충족하지 못했습니다|"
@@ -266,6 +303,11 @@ _QUALITY_REPAIR_ECHO_RE = re.compile(
     r"반복된 질문에는 최신 답변만 제공하세요|"
     r"최신 답변을 제공하고, 이전 답변은|"
     r"\d+개의 완결된 문장으로 작성해야 합니다|"
+    r"\d+개의 완결된 문장을|"
+    r"서론이나 맺음말 없이 정확히|"
+    r"사용자가 지정한 개수와 형식을 정확히|"
+    r"(?m:^[ \t]*출력 제약\s*[:：])|"
+    r"서로 다른 확인 항목을\s*\d+개 이내|"
     r"물음의 핵심과 요청 형식에 맞게|"
     r"아래 내용을\s*\d+\s*문장으로 작성하세요|"
     r"현재 답변이 사용자 요청의 전체 범위|"
@@ -277,6 +319,7 @@ _QUALITY_REPAIR_ECHO_RE = re.compile(
     r"같은 문장이나 표현을 반복하지 말고|"
     r"요청한 범위를 빠뜨리지 말고|"
     r"질문의 핵심 용어를 직접 유지하세요|"
+    r"중요한 내용을 최대\s*\d+개만 구체적으로 설명하세요|"
     r"제목·목록·HTML 표기 없이"
 )
 _SENTENCE_UNIT_RE = re.compile(
@@ -286,6 +329,18 @@ _SENTENCE_UNIT_RE = re.compile(
 _STRUCTURED_REPEAT_RE = re.compile(
     r"(?m)^\s*(?:```|\||[-*+]\s+|\d+[.)]\s+)",
 )
+_FENCED_CODE_RE = re.compile(r"```[^\r\n]*\r?\n.*?(?:```|\Z)", re.DOTALL)
+
+
+def _mask_fenced_code(text: str) -> str:
+    """Hide fenced examples while preserving every public-text offset."""
+
+    masked = list(text)
+    for match in _FENCED_CODE_RE.finditer(text):
+        for index in range(match.start(), match.end()):
+            if masked[index] not in "\r\n":
+                masked[index] = " "
+    return "".join(masked)
 
 
 @dataclass(frozen=True)
@@ -692,6 +747,11 @@ class AgentManager:
             response_prefill = _exact_response_prefill(message)
         elif exact_item_count is not None:
             response_prefill = _exact_item_response_prefill(message)
+        elif maximum_item_count is not None:
+            # Ground the continuation in the user's subject.  Adding another
+            # output contract to the system/user text made E4B explain that
+            # contract instead of answering it.
+            response_prefill = _maximum_item_response_prefill(message)
         elif not resume_truncated:
             response_prefill = _formal_response_prefill(message)
         prompt = self._build_prompt(
@@ -725,7 +785,11 @@ class AgentManager:
         # explanation/shape requests use a bounded request-grounded prefill and
         # strict decode: the local E4B otherwise tends to echo the prompt or
         # drift topics while attempting to satisfy the requested shape.
-        decode_mode = "strict" if response_prefill is not None else "conversation"
+        decode_mode = (
+            "strict"
+            if response_prefill is not None or maximum_item_count is not None
+            else "conversation"
+        )
         best_safe_prefix = ""
         observed_sentences: list[str] = []
         last_candidate = ""
@@ -988,10 +1052,6 @@ class AgentManager:
                         }
                     )
                     or (
-                        "response_contract" in diagnostic_codes
-                        and requested_category_counts(message) is None
-                    )
-                    or (
                         quality_repair_attempts >= 2
                         and "insufficient_detail" in diagnostic_codes
                         and requested_category_counts(message) is None
@@ -1010,12 +1070,27 @@ class AgentManager:
                     self.max_new_tokens,
                     remaining,
                 )
-                prompt = self._build_quality_repair_prompt(
-                    message,
-                    issue_codes=tuple(sorted(diagnostic_codes)),
-                    isolate_history=isolate_repair,
-                    partial_assistant=repair_prefill,
-                )
+                if maximum_item_count is not None:
+                    # Retry the original semantic request with a new bounded
+                    # sample.  Repeating format instructions here invites the
+                    # model to discuss the instructions themselves.
+                    decode_mode = "conversation"
+                    semantic_repair = _maximum_item_repair_message(
+                        message,
+                        maximum_item_count,
+                    )
+                    repair_prefill = _formal_response_prefill(semantic_repair)
+                    prompt = self._render_bounded_prompt(
+                        [{"role": "user", "content": semantic_repair}],
+                        partial_assistant=repair_prefill,
+                    )
+                else:
+                    prompt = self._build_quality_repair_prompt(
+                        message,
+                        issue_codes=tuple(sorted(diagnostic_codes)),
+                        isolate_history=isolate_repair,
+                        partial_assistant=repair_prefill,
+                    )
                 repetition_boundary = False
                 quality_boundary = False
                 with self._condition:
@@ -1459,6 +1534,12 @@ class AgentManager:
                 )
             else:
                 directions.append("사용자가 지정한 개수와 형식을 정확히 지키세요.")
+        maximum = requested_maximum_items(message)
+        if maximum is not None:
+            directions.append(
+                f"서론이나 맺음말 없이 서로 다른 확인 항목을 {maximum}개 이내의 "
+                "완결된 문장으로만 작성하세요."
+            )
         if "cross_turn_echo" in code_set:
             directions.append(
                 "이전 답변의 문장을 재사용하지 말고 새 표현으로 답하세요."
@@ -1734,6 +1815,8 @@ class AgentManager:
             return False
         if not response_avoids_generic_outline(message, candidate):
             return False
+        if not response_avoids_meta_format_discussion(message, candidate):
+            return False
         if not response_avoids_prompt_echo(message, candidate):
             return False
         if (
@@ -1871,13 +1954,15 @@ class AgentManager:
             if closing_quote not in normalized[leading_quote.end() :]:
                 normalized = normalized[leading_quote.end() :].lstrip()
         normalized = _LEADING_ASSISTANT_RE.sub("", normalized, count=1)
-        turn_token = _TURN_TOKEN_RE.search(normalized)
-        turn_start = _TURN_START_BOUNDARY_RE.search(normalized)
-        role_marker = _ROLE_BOUNDARY_RE.search(normalized)
-        reserved = _RESERVED_OUTPUT_RE.search(normalized)
-        factbook_echo = _FACTBOOK_ECHO_RE.search(normalized)
-        repair_echo = _QUALITY_REPAIR_ECHO_RE.search(normalized)
-        folded = unicodedata.normalize("NFKC", normalized)
+        boundary_view = _mask_fenced_code(normalized)
+        turn_token = _TURN_TOKEN_RE.search(boundary_view)
+        turn_start = _TURN_START_BOUNDARY_RE.search(boundary_view)
+        role_marker = _ROLE_BOUNDARY_RE.search(boundary_view)
+        reserved = _RESERVED_OUTPUT_RE.search(boundary_view)
+        presentation_wrapper = _PRESENTATION_WRAPPER_RE.search(boundary_view)
+        factbook_echo = _FACTBOOK_ECHO_RE.search(boundary_view)
+        repair_echo = _QUALITY_REPAIR_ECHO_RE.search(boundary_view)
+        folded = unicodedata.normalize("NFKC", boundary_view)
         folded_role = _ROLE_BOUNDARY_RE.search(folded)
         folded_leading = _LEADING_ASSISTANT_RE.search(folded)
         boundaries = [
@@ -1887,6 +1972,7 @@ class AgentManager:
                 turn_start,
                 role_marker,
                 reserved,
+                presentation_wrapper,
                 factbook_echo,
                 repair_echo,
                 folded_role,

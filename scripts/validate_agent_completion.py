@@ -37,6 +37,7 @@ from cogni_agent.response_quality import (  # noqa: E402
     requested_maximum_items,
     response_avoids_dangling_sentence_start,
     response_avoids_generic_outline,
+    response_avoids_meta_format_discussion,
     response_avoids_prompt_echo,
     response_avoids_unsolicited_self_intro,
     response_contract_satisfied,
@@ -127,16 +128,16 @@ DEFAULT_ANCHOR_GROUPS = (
 )
 STRESS_ANCHOR_GROUPS = (
     (
-        ("온디바이스", "기기", "로컬"),
-        ("장점", "보안", "응답", "오프라인"),
-        ("한계", "제약", "메모리", "성능", "전력"),
+        ("온디바이스", "기기", "장치", "로컬"),
+        ("장점", "보안", "보호", "응답", "오프라인", "인터넷"),
+        ("한계", "제약", "제한", "메모리", "성능", "전력"),
     ),
     (("정정", "사실", "수정"), ("확인", "검증", "반영")),
     (("사실", "확인"), ("추론", "판단")),
-    (("문장", "답변", "생성"), ("끝", "완결", "길이", "토큰", "중단")),
+    (("문장", "답변", "생성"), ("끝", "완결", "길이", "토큰", "중단", "끊")),
     (("백업",), ("검증", "테스트"), ("롤백", "복구")),
     (("재시도", "예외", "오류"), ("종료", "중단", "한도", "횟수")),
-    (("요약", "핵심 내용"), ("반복", "핵심", "간결")),
+    (("요약", "요약문", "군더더기"), ("반복", "핵심", "간결")),
     (("개인정보", "데이터"), ("오프라인", "로컬", "장치")),
     (("측정값", "측정"), ("설계 목표", "목표"), ("메모리", "gpu")),
     (("실행", "도구", "결과"), ("확인", "검증", "성공")),
@@ -147,7 +148,7 @@ STRESS_ANCHOR_GROUPS = (
     (
         ("검증", "테스트", "확인"),
         ("수정", "기능"),
-        ("보안", "성능", "회귀", "작동"),
+        ("보안", "성능", "회귀", "작동", "오류", "예외", "안정"),
     ),
     (("한국어", "답변", "문장"), ("완결", "문장", "종결"), ("반복", "자연", "문법")),
 )
@@ -673,6 +674,10 @@ def _answer_checks(
         ),
         "no_dangling_sentence_start": response_avoids_dangling_sentence_start(text),
         "no_generic_outline": response_avoids_generic_outline(request, text),
+        "no_meta_format_discussion": response_avoids_meta_format_discussion(
+            request,
+            text,
+        ),
         "no_full_prompt_echo": response_avoids_prompt_echo(request, text),
         "request_contract_fulfilled": answer.get("generation_mode")
         != "quality_fallback"

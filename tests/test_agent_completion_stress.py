@@ -220,6 +220,35 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         )
         self.assertTrue(summary["topic_anchors_satisfied"])
 
+        observed_paraphrases = (
+            (
+                5,
+                "사용자의 정정 내용을 경청하고 수용합니다. 내부 지식 기반에서 "
+                "정보의 정확성을 검토하고 업데이트합니다. 정정된 사실을 다시 "
+                "전달합니다.",
+            ),
+            (
+                6,
+                "검증된 정보만 제시해야 합니다. 이 원칙은 답변의 신뢰성을 "
+                "유지하기 위한 핵심 기준입니다.",
+            ),
+            (
+                10,
+                "원문의 핵심 내용을 빠짐없이 담아야 합니다. 불필요한 세부 "
+                "사항과 수식어를 제거해 간결해야 합니다. 자신의 언어로 "
+                "재구성해 반복을 피해야 합니다.",
+            ),
+        )
+        for case_index, text in observed_paraphrases:
+            with self.subTest(case=cases[case_index].label):
+                checks = _answer_checks(
+                    _complete_answer(text),
+                    state,
+                    cases[case_index].prompt,
+                    required_groups=cases[case_index].required_groups,
+                )
+                self.assertTrue(checks["topic_anchors_satisfied"])
+
     def test_required_literal_period_and_factbook_values_are_exact(self):
         state = _complete_state()
         literal = _answer_checks(

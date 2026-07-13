@@ -153,7 +153,8 @@ def baseline_capability_registry() -> CapabilityRegistry:
                 True,
                 False,
                 "Causal Gemma hidden state feeds contractive CTS-DEQ; its fixed point "
-                "conditions decode through a bounded logits bias while base Gemma stays frozen.",
+                "conditions decode through a bounded logits bias while the verified "
+                "instruction-tuned Gemma checkpoint stays frozen.",
             ),
             CapabilityRecord(
                 "gemma4_e4b",
@@ -161,7 +162,8 @@ def baseline_capability_registry() -> CapabilityRegistry:
                 EvidenceClass.VERIFIED,
                 True,
                 False,
-                "Verified local base Gemma is the current natural-language answer authority.",
+                "Verified local instruction-tuned Gemma 4 E4B checkpoint is the current "
+                "natural-language answer authority.",
             ),
             CapabilityRecord(
                 "self_harness",

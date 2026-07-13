@@ -15,7 +15,7 @@ using System.Windows.Forms;
 
 internal static class CogniBoardLauncher
 {
-    private const string DefaultModel = @"C:\Project\cognios\gemma4-e4b";
+    private const string DefaultModel = @"C:\Project\cognios\gemma4-e4b-it";
 
     [STAThread]
     private static int Main()
@@ -26,7 +26,7 @@ internal static class CogniBoardLauncher
             string manifest = Path.Combine(
                 projectRoot,
                 "config",
-                "gemma4-e4b.manifest.toml"
+                "gemma4-e4b-it.manifest.toml"
             );
             string model = Environment.GetEnvironmentVariable("COGNI_OS_MODEL_DIR");
             if (String.IsNullOrWhiteSpace(model))

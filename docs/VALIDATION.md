@@ -99,28 +99,30 @@ The suite covers the following Phase 1–11 invariants:
 
 ## Local Gemma artifact and runtime
 
-The model path and manifest must be local. Run the artifact gate, experimental
-decoder-DEQ smoke, integrated CTS runtime and conversation completion
-separately:
+The model path and manifest must be local. The product runtime and conversation
+gates require the exact pinned Gemma 4 E4B-it artifact and its seven-file
+manifest. The pretrained base checkpoint is retained only for the explicitly
+uncertified research/canary decoder-DEQ smoke:
 
 ```powershell
 python scripts\validate_gemma4.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml
 
+# Research/canary only; never a public conversation checkpoint.
 python scripts\validate_gemma4_deq.py `
   --model C:\Project\cognios\gemma4-e4b `
   --manifest config\gemma4-e4b.manifest.toml `
   --allow-uncertified-experimental
 
 python scripts\validate_gemma4_runtime.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
   --event-stream
 
 python scripts\validate_agent_completion.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml
 ```
 
 The second command is explicitly an **uncertified convergence smoke test**.
@@ -140,7 +142,8 @@ The integrated runtime gate must:
 - report allocated and reserved CUDA memory plus the physical device;
 - fail if the configured 16.7 GiB allocated-VRAM postcondition is exceeded.
 
-The retained integrated run verified 6 manifest files and loaded
+The retained historical base-checkpoint canary run verified 6 manifest files
+and loaded
 `Gemma4ForConditionalGeneration` with hidden size 2560. Model load took
 22.532 seconds and integrated inference took 12.818 seconds. CTS reached depth
 100/100 with 301/301 nodes and allocated 57,243,710 search bytes. The final DEQ
@@ -154,9 +157,9 @@ Laptop GPU. The retained trace digest begins `77dcdadc`.
 This is a scoped measurement on the development GPU, not RTX 4090
 certification.
 
-The product factory keeps Gemma last-known-good/base-only generation fallback
+The product factory keeps Gemma last-known-good/backbone-only generation fallback
 disabled. A response is published atomically only after Cogni-Core terminal
-success and base-integrity checks. Core failure must fail closed; the bounded
+success and backbone-integrity checks. Core failure must fail closed; the bounded
 static quality response used after response-repair exhaustion is not a Gemma
 base-model fallback.
 

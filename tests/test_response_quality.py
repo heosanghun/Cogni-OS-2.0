@@ -1153,6 +1153,473 @@ class ResponseQualityTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             inspect_response(123)  # type: ignore[arg-type]
 
+    def test_single_question_contract_rejects_explanation_and_multiple_questions(
+        self,
+    ) -> None:
+        from cogni_agent.response_quality import (
+            requested_exact_question_count,
+            response_contract_satisfied,
+        )
+
+        request = "생각을 풀 수 있도록 질문 하나를 자연스럽게 해 주세요."
+        self.assertEqual(requested_exact_question_count(request), 1)
+        self.assertTrue(
+            response_contract_satisfied(
+                request,
+                "어떤 사용자를 위한 프로젝트를 만들고 싶으신가요?",
+            )
+        )
+        self.assertFalse(
+            response_contract_satisfied(
+                request,
+                "먼저 목표를 정해 보세요. 어떤 프로젝트를 만들고 싶으신가요?",
+            )
+        )
+        self.assertFalse(
+            response_contract_satisfied(
+                request,
+                "어떤 분야인가요? 누구를 위한 것인가요?",
+            )
+        )
+
+    def test_meta_count_announcements_are_not_counted_as_content(self) -> None:
+        from cogni_agent.response_quality import (
+            response_avoids_meta_format_discussion,
+            response_contract_satisfied,
+        )
+
+        two_sentences = (
+            "3가지로 요약할 수 있습니다. 첫째, 오류 횟수를 확인해 종료합니다."
+        )
+        self.assertFalse(
+            response_avoids_meta_format_discussion(
+                "안전 종료 기준을 두 문장으로 답하세요.",
+                two_sentences,
+            )
+        )
+        self.assertFalse(
+            response_contract_satisfied(
+                "안전 종료 기준을 두 문장으로 답하세요.",
+                two_sentences,
+            )
+        )
+        trailing_promise = (
+            "회귀 테스트를 실행합니다. 사용자께서 요청하신 검증 사항을 "
+            "최대 4개까지 작성하겠습니다."
+        )
+        self.assertFalse(
+            response_avoids_meta_format_discussion(
+                "자체 검증을 네 항목 이내로 정리하세요.",
+                trailing_promise,
+            )
+        )
+        self.assertFalse(
+            response_avoids_meta_format_discussion(
+                "모델 품질을 세 문장으로 설명하세요.",
+                "정확성을 평가합니다. 완결성을 확인합니다. 사용자의 요청이 완벽히 "
+                "충족되는 답변을 제출하세요: 서론과 맺음말 없이 정확히 3개의 문장.",
+            )
+        )
+
+    def test_semantic_redundancy_detects_reordered_fact_but_not_distinct_checks(
+        self,
+    ) -> None:
+        from cogni_agent.response_quality import has_semantic_redundancy
+
+        self.assertTrue(
+            has_semantic_redundancy(
+                "개인정보를 안전하게 처리해야 합니다. "
+                "요청을 오프라인 환경에서 처리할 때 개인정보를 보호해야 합니다. "
+                "개인정보를 처리할 때 요청을 안전하게 처리해야 합니다."
+            )
+        )
+        self.assertFalse(
+            has_semantic_redundancy(
+                "수정된 기능이 예상대로 작동하는지 확인합니다. "
+                "기존 기능과 충돌하지 않는지 회귀 테스트를 실행합니다. "
+                "성능과 메모리 상한을 측정합니다."
+            )
+        )
+
+    def test_placeholder_scaffolding_and_example_intent_are_bounded(self) -> None:
+        from cogni_agent.response_quality import (
+            response_avoids_placeholder_scaffolding,
+        )
+
+        self.assertFalse(
+            response_avoids_placeholder_scaffolding(
+                "[사용자 상황 파악]\n어떤 기능이 필요한가요?"
+            )
+        )
+        self.assertFalse(response_avoids_placeholder_scaffolding("...\n질문입니다?"))
+
+    def test_shared_conversation_intents_reject_the_reported_bad_outputs(self) -> None:
+        from cogni_agent.response_quality import (
+            ResponseIntent,
+            compile_response_intent,
+            normalize_single_question_response,
+            response_respects_airgap_scope,
+            response_satisfies_intent,
+        )
+
+        proposal_request = (
+            "안녕하세요! 정해진 인사말 말고, 오늘 함께 이야기해 볼 주제를 하나 "
+            "자연스럽게 제안해 주세요."
+        )
+        proposal = (
+            '오늘 함께 이야기해 볼 주제로는 "AI와 인간의 협업"을 제안해볼까요? '
+            "어떤 분야에서 협력이 효과적일지 함께 생각해봐요."
+        )
+        self.assertIs(
+            compile_response_intent(proposal_request),
+            ResponseIntent.ONE_TOPIC_PROPOSAL,
+        )
+        self.assertTrue(response_satisfies_intent(proposal_request, proposal))
+
+        question_request = (
+            "프로잭트 아이디어가 막혔어요. 생각을 풀 수 있도록 질문 하나를 "
+            "자연스럽게 해 주세요."
+        )
+        self.assertIs(
+            compile_response_intent(question_request),
+            ResponseIntent.SINGLE_QUESTION,
+        )
+        self.assertTrue(
+            response_satisfies_intent(
+                question_request,
+                "이 아이디어에서 가장 먼저 해결하고 싶은 문제는 무엇인가요?",
+            )
+        )
+        self.assertFalse(
+            response_satisfies_intent(
+                question_request,
+                "요청을 먼저 파악하고 자연스럽게 답하십시오.",
+            )
+        )
+        self.assertEqual(
+            normalize_single_question_response(
+                question_request,
+                "먼저 상황을 살펴볼게요. 이 아이디어에서 해결하고 싶은 문제는 "
+                "무엇인가요? 다른 설명입니다.",
+            ),
+            "이 아이디어에서 해결하고 싶은 문제는 무엇인가요?",
+        )
+
+        capability_request = (
+            "제가 도움을 부탁할 수 있는 범위를 예시와 함께 편한 말로 설명해 주세요."
+        )
+        reported_bad = (
+            "제 이름은 Cogni Agent이고 질문의 의도를 파악해 답하고 싶어요. "
+            "예를 들어 파이썬 함수 정의 문법을 설명할 수 있어요."
+        )
+        useful = (
+            "도움을 부탁할 수 있는 일은 코드 검토, 문서 정리, 아이디어 구체화처럼 "
+            "다양해요. 예를 들어 오류가 난 함수를 함께 고치거나 보고서를 짧게 "
+            "정리할 수 있어요."
+        )
+        self.assertIs(
+            compile_response_intent(capability_request),
+            ResponseIntent.CAPABILITY_SCOPE_EXAMPLES,
+        )
+        self.assertFalse(response_satisfies_intent(capability_request, reported_bad))
+        self.assertTrue(response_satisfies_intent(capability_request, useful))
+
+        flow_request = (
+            "오프라인 AI 데모에서 개인정보 보호를 가장 먼저 보여주고 싶어요. "
+            "어떤 흐름이 자연스러울까요?"
+        )
+        useful_flow = (
+            "먼저 네트워크 차단 상태와 로컬 처리를 보여줍니다. "
+            "그 뒤 외부 전송이 없다는 실행 기록을 확인합니다."
+        )
+        self.assertIs(
+            compile_response_intent(flow_request),
+            ResponseIntent.DEMONSTRATION_FLOW,
+        )
+        self.assertTrue(response_satisfies_intent(flow_request, useful_flow))
+        self.assertTrue(
+            response_satisfies_intent(
+                flow_request,
+                "첫 화면에서 오프라인 상태와 개인정보의 로컬 처리를 보여줍니다. "
+                "이어서 외부 전송 기록이 0건인지 확인합니다.",
+            )
+        )
+        self.assertFalse(
+            response_satisfies_intent(
+                flow_request,
+                "온라인 날씨를 조회할 수 있고 여러 기능이 있습니다.",
+            )
+        )
+        contradictory_flow = (
+            "먼저 네트워크 차단 상태를 보여줍니다. 다음으로 네트워크 연결을 "
+            "설정하고 외부 정보를 자동으로 불러옵니다."
+        )
+        self.assertFalse(
+            response_respects_airgap_scope(flow_request, contradictory_flow)
+        )
+        self.assertFalse(response_satisfies_intent(flow_request, contradictory_flow))
+        self.assertTrue(
+            response_respects_airgap_scope(
+                flow_request,
+                "먼저 네트워크 연결을 차단합니다. 다음으로 외부 전송 0건을 확인합니다.",
+            )
+        )
+        for unsafe in (
+            "먼저 웹에서 최신 날씨를 검색하고 다음으로 API에서 정보를 가져옵니다.",
+            "네트워크는 차단되어 있지만 클라우드 서비스를 호출합니다.",
+            "먼저 원격 서버에 접속하고 다음으로 결과를 보여줍니다.",
+        ):
+            with self.subTest(unsafe=unsafe):
+                self.assertFalse(response_respects_airgap_scope(flow_request, unsafe))
+        self.assertTrue(
+            response_respects_airgap_scope(
+                flow_request,
+                "먼저 인터넷 연결 상태가 오프라인인지 점검해 보여주고, "
+                "다음으로 외부 전송 0건을 확인합니다.",
+            )
+        )
+        self.assertFalse(
+            response_satisfies_intent(
+                flow_request,
+                "가장 자연스러운 데모 흐름은 먼저 네트워크 차단 상태와 데이터가 "
+                "PC 밖으로 나가지 않는 모습을 보여주고, 끝입니다.",
+            )
+        )
+        self.assertIs(
+            compile_response_intent("오프라인 AI를 어떻게 시연하면 자연스러울까요?"),
+            ResponseIntent.DEMONSTRATION_FLOW,
+        )
+        self.assertIs(
+            compile_response_intent("데모 실행 화면을 보여 주세요."),
+            ResponseIntent.GENERAL,
+        )
+        self.assertFalse(
+            response_satisfies_intent(
+                capability_request,
+                "도움을 부탁할 수 있는 일은 코드 검토, 문서 정리, "
+                "아이디어 구체화처럼 여러 가지입니다.",
+            )
+        )
+
+    def test_negated_structural_requests_do_not_activate_opposite_intent(self) -> None:
+        from cogni_agent.response_quality import (
+            ResponseIntent,
+            compile_response_intent,
+            requested_exact_question_count,
+        )
+
+        general_requests = (
+            "질문 하나만 하지 말고 바로 답을 설명해 주세요.",
+            "질문 하나만으로는 부족하니 예시도 설명해 주세요.",
+            "주제를 하나만 제안하지 말고 여러 개를 추천해 주세요.",
+            "오프라인 데모 흐름은 설명하지 말고 코드를 작성해 주세요.",
+            "도움 범위를 예시 없이 설명해 주세요.",
+        )
+        for request in general_requests:
+            with self.subTest(request=request):
+                self.assertIs(compile_response_intent(request), ResponseIntent.GENERAL)
+        self.assertIsNone(
+            requested_exact_question_count(
+                "질문 하나만 하지 말고 바로 답을 설명해 주세요."
+            )
+        )
+
+        positive_requests = (
+            ("질문을 하나만 해 주세요.", ResponseIntent.SINGLE_QUESTION),
+            (
+                "오늘 이야기할 주제를 하나 제안해 주세요.",
+                ResponseIntent.ONE_TOPIC_PROPOSAL,
+            ),
+            (
+                "오프라인 AI 데모 흐름을 단계별로 설명해 주세요.",
+                ResponseIntent.DEMONSTRATION_FLOW,
+            ),
+            (
+                "도움을 부탁할 수 있는 범위를 예시와 함께 설명해 주세요.",
+                ResponseIntent.CAPABILITY_SCOPE_EXAMPLES,
+            ),
+        )
+        for request, expected in positive_requests:
+            with self.subTest(request=request):
+                self.assertIs(compile_response_intent(request), expected)
+
+    def test_instruction_echo_and_extended_self_intro_are_rejected(self) -> None:
+        from cogni_agent.response_quality import (
+            response_avoids_instruction_echo,
+            response_avoids_unsolicited_self_intro,
+            response_fulfills_examples_request,
+        )
+
+        instructions = (
+            "당신은 로컬 AI 동료입니다.\n"
+            "사용자의 현재 질문과 의도를 먼저 파악하고 자연스럽고 직접적인 "
+            "한국어로 답하십시오."
+        )
+        copied = (
+            "사용자의 현재 질문과 의도를 먼저 파악하고 자연스럽고 직접적인 "
+            "한국어로 답하십시오."
+        )
+        self.assertFalse(response_avoids_instruction_echo(instructions, copied))
+        self.assertTrue(
+            response_avoids_instruction_echo(
+                instructions,
+                "이 아이디어에서 해결하고 싶은 핵심 문제는 무엇인가요?",
+            )
+        )
+        self.assertFalse(
+            response_avoids_unsolicited_self_intro(
+                "도움 범위를 알려 주세요.",
+                "안녕하세요, 사용자님! 제 이름은 Cogni Agent이고 도움을 드려요.",
+            )
+        )
+        self.assertTrue(
+            response_fulfills_examples_request(
+                "예시와 함께 설명해 주세요.",
+                "코드 검토나 문서 정리처럼 구체적인 작업을 도울 수 있습니다.",
+            )
+        )
+        self.assertFalse(
+            response_fulfills_examples_request(
+                "예시와 함께 설명해 주세요.",
+                "여러 작업을 도울 수 있습니다.",
+            )
+        )
+        self.assertTrue(
+            response_fulfills_examples_request(
+                "예시 없이 원칙만 설명하세요.",
+                "핵심 원칙만 설명합니다.",
+            )
+        )
+
+    def test_topic_anchor_tolerates_one_general_hangul_typo(self) -> None:
+        from cogni_agent.response_quality import response_topically_anchored
+
+        self.assertTrue(
+            response_topically_anchored(
+                "프로잭트 아이디어가 막혀 생각을 풀고 싶습니다.",
+                "어떤 프로젝트를 만들고 싶으신가요?",
+            )
+        )
+        self.assertFalse(
+            response_topically_anchored(
+                "프로잭트 아이디어가 막혀 생각을 풀고 싶습니다.",
+                "오늘 날씨는 어떤가요?",
+            )
+        )
+        self.assertFalse(
+            response_topically_anchored(
+                "개인정보와 데이터보안, 접근통제의 차이를 한 문장으로 설명해 주세요.",
+                "개인정보는 중요합니다.",
+            )
+        )
+
+    def test_explicit_request_facets_must_survive_generation(self) -> None:
+        from cogni_agent.response_quality import (
+            missing_request_facets,
+            request_required_facets,
+            response_covers_request_facets,
+            response_satisfies_intent,
+        )
+
+        cases = (
+            (
+                "개인정보가 포함된 요청을 오프라인 환경에서 처리할 때 지켜야 할 "
+                "원칙을 세 문장으로 답하세요.",
+                "개인정보는 암호화하고 최소 범위에서만 접근해야 합니다. "
+                "처리 뒤에는 안전하게 삭제해야 합니다. 보관 기간을 기록해야 합니다.",
+                "개인정보는 로컬 장치 안에서 암호화해 처리해야 합니다. "
+                "필요한 최소 범위에서만 접근해야 합니다. 처리 뒤에는 안전하게 "
+                "삭제해야 합니다.",
+                "오프라인·로컬 처리",
+            ),
+            (
+                "제한된 GPU 메모리에서 추론할 때 측정값과 설계 목표를 구분해야 "
+                "하는 이유를 설명하세요.",
+                "품질 검증을 통과하지 못해 이번에는 추측해서 답하지 않았습니다.",
+                "GPU 메모리 실측값은 현재 실행의 관측 결과이고 설계 목표는 "
+                "달성해야 할 상한이므로 둘을 구분해야 합니다.",
+                "측정값",
+            ),
+            (
+                "불확실한 답변을 사실처럼 단정하지 않기 위한 표현 원칙을 두 "
+                "문장으로 설명하세요.",
+                "사실 여부를 검증하고 단정하지 않아야 합니다. 독자에게 확인을 "
+                "권장해야 합니다.",
+                "불확실한 내용은 추정이나 가능성이라고 명시해야 합니다. 확인된 "
+                "근거가 없으면 사실로 단정하지 않아야 합니다.",
+                "불확실성",
+            ),
+            (
+                "사용자 권한과 시스템 안전 경계를 함께 지키는 작업 실행 원칙을 "
+                "세 문장으로 답하세요.",
+                "요청을 수행할 때 안전 경계를 넘지 않아야 합니다. 위험하면 "
+                "거절해야 합니다. 모호하면 질문해야 합니다.",
+                "작업은 사용자가 허용한 권한 안에서만 실행해야 합니다. 시스템 "
+                "안전 경계를 넘는 명령은 차단해야 합니다. 실행 결과를 기록해야 "
+                "합니다.",
+                "사용자 권한",
+            ),
+            (
+                "소프트웨어 수정 완료를 선언하기 전에 필요한 자체 검증을 네 "
+                "항목 이내로 정리하세요.",
+                "계정 입력을 검사합니다. 예외 처리 코드를 확인합니다. 테스트 "
+                "문서를 작성합니다. 성공 메시지를 표시합니다.",
+                "수정된 기능을 직접 실행합니다. 전체 회귀 테스트를 수행합니다. "
+                "오류 로그와 성능을 확인합니다. 검증이 통과했을 때만 완료를 "
+                "선언합니다.",
+                "소프트웨어 수정",
+            ),
+            (
+                "자연스러운 한국어 답변의 완결성을 판정할 때 확인할 사항을 세 "
+                "문장으로 설명하세요.",
+                "100자 이내로 요약하세요. 답변의 완결성을 판정할 사항을 "
+                "설명하세요. 준비가 완료되었습니다.",
+                "한국어 문장은 서술어와 마침표로 완결되어야 합니다. 같은 뜻의 "
+                "반복이 없어야 합니다. 문법과 표현이 자연스러운지 확인해야 "
+                "합니다.",
+                "자연스러움·반복 방지",
+            ),
+        )
+        for request, bad, good, expected_missing in cases:
+            with self.subTest(request=request):
+                self.assertIn(expected_missing, request_required_facets(request))
+                self.assertIn(expected_missing, missing_request_facets(request, bad))
+                self.assertFalse(response_covers_request_facets(request, bad))
+                self.assertFalse(response_satisfies_intent(request, bad))
+                self.assertEqual(missing_request_facets(request, good), ())
+                self.assertTrue(response_covers_request_facets(request, good))
+                self.assertTrue(response_satisfies_intent(request, good))
+
+    def test_facet_gate_is_inactive_for_ordinary_conversation(self) -> None:
+        from cogni_agent.response_quality import (
+            request_required_facets,
+            response_covers_request_facets,
+        )
+
+        request = "오늘 기분이 어때요? 자연스럽게 이야기해 주세요."
+        self.assertEqual(request_required_facets(request), ())
+        self.assertTrue(
+            response_covers_request_facets(request, "좋아요, 함께 이야기해요.")
+        )
+
+    def test_paraphrased_prompt_echo_and_readiness_meta_are_rejected(self) -> None:
+        from cogni_agent.response_quality import (
+            response_avoids_meta_format_discussion,
+            response_avoids_prompt_echo,
+        )
+
+        request = (
+            "자연스러운 한국어 답변의 완결성을 판정할 때 확인할 사항을 세 "
+            "문장으로 설명하세요."
+        )
+        response = (
+            "100자 이내로 요약하세요. 사용자가 요청한 답변의 완결성을 판정할 "
+            "때 확인할 사항을 세 문장으로 설명하세요. 사용자의 요청을 이해하고 "
+            "답변을 작성할 준비가 완료되었습니다."
+        )
+        self.assertFalse(response_avoids_prompt_echo(request, response))
+        self.assertFalse(response_avoids_meta_format_discussion(request, response))
+
 
 if __name__ == "__main__":
     unittest.main()

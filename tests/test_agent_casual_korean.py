@@ -4,6 +4,7 @@ import unittest
 
 from scripts.validate_agent_casual_korean import (
     CASUAL_CASES,
+    REQUIRED_CASUAL_CHECKS,
     REQUIRED_CATEGORIES,
     _casual_checks,
     _casual_summary,
@@ -237,6 +238,7 @@ class TestCasualKoreanReleaseGate(unittest.TestCase):
                     "generation_mode": case.expected_mode,
                     "elapsed_seconds": 10.0 + index,
                     "checks": {
+                        **{name: True for name in REQUIRED_CASUAL_CHECKS},
                         "exactly_one_assistant": True,
                         "korean_complete": True,
                         "lexically_non_degenerate": True,
@@ -251,6 +253,13 @@ class TestCasualKoreanReleaseGate(unittest.TestCase):
         self.assertEqual(passed["quality_fallback_turns"], 0)
         self.assertEqual(passed["fastpath_turns"], 2)
         self.assertTrue(passed["fastpath_ratio_gate_passed"])
+        self.assertTrue(passed["checks_schema_gate_passed"])
+
+        missing = turns[3]["checks"].pop("request_contract_fulfilled")
+        incomplete_schema = _casual_summary(turns, latency_limit_seconds=120.0)
+        self.assertFalse(incomplete_schema["checks_schema_gate_passed"])
+        self.assertFalse(incomplete_schema["strict_casual_gate_passed"])
+        turns[3]["checks"]["request_contract_fulfilled"] = missing
 
         turns[2]["generation_mode"] = "conversation_fastpath"
         over_routed = _casual_summary(turns, latency_limit_seconds=120.0)

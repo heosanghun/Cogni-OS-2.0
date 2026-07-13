@@ -11,9 +11,12 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows_launcher.ps1 `
 ```
 
 launcher는 standalone model bundle이 아니라 console-free bootstrapper다. 동일
-source tree, 로컬 Python/CUDA dependency, 검증된 모델과 manifest가 필요하다. 기본
-모델 위치는 `C:\Project\cognios\gemma4-e4b`이며 다른 위치는 실행 전
+source tree, 로컬 Python/CUDA dependency, 검증된 instruction-tuned 모델과 manifest가
+필요하다. 제품 대화용 기본 모델 위치는 `C:\Project\cognios\gemma4-e4b-it`이며 다른
+위치는 실행 전
 `COGNI_OS_MODEL_DIR`로 지정한다. runtime download와 외부 API는 허용하지 않는다.
+`C:\Project\cognios\gemma4-e4b` base 체크포인트는 명시적인 연구·canary 재현용이며
+제품 대화 경로에는 사용할 수 없다.
 
 ## 대화
 
@@ -61,21 +64,25 @@ host-filesystem isolation, immutable image와 command digest가 독립 검증되
 
 ```powershell
 python scripts\validate_agent_completion.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml
 
 python scripts\validate_agent_casual_korean.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
   --timeout 120 `
   --output C:\Project\cognios-evidence\casual-korean-v0.3.2.json
 
 python scripts\validate_agent_runtime.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
-  --prompt "Cogni-OS의 현재 권한과 제한을 설명해 주세요." `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
+  --prompt "사용자에게 자연스러운 한국어 한 문장으로 인사하세요." `
   --max-new-tokens 64
 ```
+
+`validate_agent_runtime.py`는 채팅 직렬화·공개 응답 채널·종료 토큰·한 턴 품질
+계약과 작업자 정리를 확인하는 저수준 GPU smoke다. 전체 자연 대화 품질의 근거는
+별도의 10턴 casual gate와 20턴 completion stress 결과를 사용한다.
 
 첫 명령은 네 번의 형식 중심 실제 오프라인 대화를 검사한다. 두 번째 명령은 보고된
 협업 대화 원문, 오타, 바꿔 말하기, 후속 질문과 문맥 전환을 포함한 10턴에서

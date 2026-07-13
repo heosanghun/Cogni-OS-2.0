@@ -52,6 +52,16 @@ class QualityAction(str, Enum):
     CONTINUE = "continue"
 
 
+class ResponseIntent(str, Enum):
+    """Small, shared output contract compiled from one user turn."""
+
+    GENERAL = "general"
+    ONE_TOPIC_PROPOSAL = "one_topic_proposal"
+    SINGLE_QUESTION = "single_question"
+    CAPABILITY_SCOPE_EXAMPLES = "capability_scope_examples"
+    DEMONSTRATION_FLOW = "demonstration_flow"
+
+
 class ResponseQualityError(RuntimeError):
     """Raised when no complete, non-degenerate answer can be published."""
 
@@ -230,12 +240,300 @@ _FENCE_LINE_RE = re.compile(
 _META_FORMAT_DISCUSSION_RE = re.compile(
     r"(?:질문의\s*(?:형식|구조|요청\s*형식).{0,40}(?:정리|해석|설명)|"
     r"사용자는.{0,64}(?:항목|문장|개수|수량|형식).{0,32}(?:요청|제한)|"
-    r"\d+개\s*항목만\s*요청|(?:이는|이것은).{0,32}형식으로\s*해석)"
+    r"\d+개\s*항목만\s*요청|(?:이는|이것은).{0,32}형식으로\s*해석|"
+    r"(?:사용자께서|사용자가|요청하신|질문하신).{0,80}"
+    r"(?:최대\s*)?(?:10|[1-9]|한|하나|두|세|네|다섯|여섯|일곱|여덟|아홉|열)"
+    r"\s*(?:개|가지|항목|문장)(?:까지|만)?\s*.{0,32}"
+    r"(?:작성|정리|제시|나열|요약|답변)하겠습니다|"
+    r"사용자(?:의|가|께서).{0,40}요청.{0,48}(?:충족|답변|제출).{0,80}"
+    r"(?:서론|맺음말|정확히\s*\d+개))"
+)
+_OUTPUT_INSTRUCTION_SENTENCE_RE = re.compile(
+    r"(?:\d+\s*자|\d+\s*(?:개|문장|항목)|(?:한|두|세|네)\s*문장|이내|이하)"
+    r".{0,24}(?:요약|설명|답변|작성|정리)(?:하)?세요[.!?。！？]*$",
+    re.IGNORECASE,
+)
+_READINESS_META_RE = re.compile(
+    r"(?:답변|응답|설명|작성).{0,40}(?:준비가\s*)?(?:완료되었|되어\s*있|됐)|"
+    r"(?:준비가\s*)완료되었.{0,40}(?:답변|응답|설명|작성)",
+    re.IGNORECASE | re.DOTALL,
 )
 _META_FORMAT_REQUEST_RE = re.compile(
     r"(?:질문|답변|출력|문서|데이터).{0,16}형식"
     r"(?:이|은|을|를|에|으로)?\s*(?:자체를\s*)?"
     r"(?:설명|분석|정리|제시|작성|알려|무엇|어떤|인가|입니까)"
+)
+_COUNT_ANNOUNCEMENT_RE = re.compile(
+    r"(?:다음과\s*같은\s*)?"
+    r"(?:10|[1-9]|한|하나|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*"
+    r"(?:개|가지|항목|문장)(?:로|으로)?\s*"
+    r"(?:요약|정리|구분|나열|제시)(?:할\s*수\s*있|하겠|됩)"
+)
+_PLACEHOLDER_SCAFFOLD_RE = re.compile(
+    r"(?m)^\s*\[(?:사용자|고객|상황|요청|질문|답변|내용|주제|예시|설명|정리|"
+    r"파악|입력|출력)[^\]\r\n]{0,40}\]\s*$"
+)
+_STANDALONE_ELLIPSIS_RE = re.compile(r"(?m)^\s*(?:\.{3,}|…{2,})\s*$")
+_EXAMPLE_REQUEST_RE = re.compile(r"(?:예시|예를\s*들|예를\s*들어|가령|예컨대)")
+_EXAMPLE_EXCLUSION_RE = re.compile(
+    r"(?:예시|예를\s*드는\s*내용).{0,12}"
+    r"(?:없이|제외|빼고|생략|필요\s*없|말고)"
+)
+_EXAMPLE_RESPONSE_RE = re.compile(
+    r"(?:예를\s*들(?:어|면)?|예시(?:로|는|:|：)|가령|예컨대|"
+    r"(?:실제|구체적)\s*(?:예|사례))"
+)
+_IMPLICIT_EXAMPLE_RE = re.compile(
+    r"(?:[가-힣A-Za-z0-9+#._-]{2,24}\s+){0,2}"
+    r"[가-힣A-Za-z0-9+#._-]{2,24}(?:이나|나|과|와|·)\s*"
+    r"(?:[가-힣A-Za-z0-9+#._-]{2,24}\s+){0,2}"
+    r"[가-힣A-Za-z0-9+#._-]{2,24}(?:처럼|같은|등)"
+)
+_SINGLE_QUESTION_REQUEST_RE = re.compile(
+    r"(?:"
+    r"질문(?:을|은)?\s*(?:딱\s*)?(?:한|하나|1)\s*(?:개|가지)?(?:만)?(?:을|를)?|"
+    r"(?:딱\s*)?(?:한|하나|1)\s*(?:개|가지)?(?:만)?\s*질문(?:을|만)?"
+    r").{0,32}(?:해\s*주세요|해주세요|해\s*줘|물어|던져|질문해)",
+    re.IGNORECASE,
+)
+_SINGLE_QUESTION_EXCLUSION_RE = re.compile(
+    r"(?:"
+    r"질문(?:을|은)?\s*(?:딱\s*)?(?:한|하나|1)\s*(?:개|가지)?(?:만)?|"
+    r"(?:딱\s*)?(?:한|하나|1)\s*(?:개|가지)?(?:만)?\s*질문(?:을|은)?"
+    r")\s*(?:"
+    r"(?:을|를)?\s*하지\s*말고|(?:으로|만으로)는?\s*부족|"
+    r"(?:이|가)?\s*아니라|(?:에|으로)\s*그치지\s*말고"
+    r")",
+    re.IGNORECASE,
+)
+_ONE_TOPIC_PROPOSAL_REQUEST_RE = re.compile(
+    r"(?:주제|이야깃거리|아이디어)(?:를|을|는|은)?\s*"
+    r"(?:딱\s*)?(?:하나|한\s*(?:개|가지)?)(?:를|을)?\s*.{0,40}"
+    r"(?:제안|추천|골라)",
+    re.IGNORECASE,
+)
+_ONE_TOPIC_PROPOSAL_EXCLUSION_RE = re.compile(
+    r"(?:주제|이야깃거리|아이디어)(?:를|을|는|은)?\s*"
+    r"(?:딱\s*)?(?:하나|한\s*(?:개|가지)?)(?:만)?(?:를|을)?\s*"
+    r"(?:"
+    r"(?:제안|추천|골라)(?:하)?지\s*말고|"
+    r"(?:만으로|하나로)는?\s*부족|(?:이|가)?\s*아니라|말고"
+    r")",
+    re.IGNORECASE,
+)
+_CAPABILITY_SCOPE_REQUEST_RE = re.compile(
+    r"(?:도움|도와|지원|부탁|함께\s*할\s*수).{0,48}"
+    r"(?:범위|어떤\s*일|무슨\s*일|할\s*수|가능)|"
+    r"(?:범위|어떤\s*일|무슨\s*일).{0,48}(?:도움|도와|지원|부탁)",
+    re.IGNORECASE,
+)
+_DEMONSTRATION_FLOW_REQUEST_RE = re.compile(
+    r"(?:데모|시연).{0,160}(?:흐름|순서|단계|과정|어떻게)|"
+    r"(?:흐름|순서|단계|과정).{0,160}(?:데모|시연)|"
+    r"(?:어떻게|어떤\s*방식으로).{0,80}(?:데모|시연)|"
+    r"(?:데모|시연).{0,80}(?:어떻게|어떤\s*방식으로)",
+    re.IGNORECASE | re.DOTALL,
+)
+_DEMONSTRATION_FLOW_EXCLUSION_RE = re.compile(
+    r"(?:데모|시연).{0,160}(?:흐름|순서|단계|과정)"
+    r"(?:은|는|을|를)?\s*(?:(?:설명|제안|정리|보여)(?:하)?\s*)?"
+    r"(?:지\s*말고|말고|제외(?:하고|해)|생략(?:하고|해))",
+    re.IGNORECASE | re.DOTALL,
+)
+_AIRGAP_SCOPE_REQUEST_RE = re.compile(
+    r"(?:오프라인|폐쇄망|에어\s*갭|air[ -]?gap|"
+    r"(?:네트워크|외부망|인터넷).{0,24}(?:차단|금지|없))",
+    re.IGNORECASE,
+)
+_EXTERNAL_ACCESS_SUBJECT_RE = re.compile(
+    r"(?:네트워크|인터넷|클라우드|웹|API|원격\s*서버|"
+    r"외부(?:망|\s*서비스|\s*정보|\s*데이터)?)",
+    re.IGNORECASE,
+)
+_EXTERNAL_ACCESS_ACTION_RE = re.compile(
+    r"^.{0,36}(?:연결|접속|호출|조회|검색|불러오|가져오|주고받|송수신|"
+    r"업로드|다운로드|전송)",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXTERNAL_ACCESS_NEGATION_RE = re.compile(
+    r"(?:오프라인|차단|끊|막|비활성|금지|불가|없|않|못|0\s*건|"
+    r"나가지\s*않)",
+    re.IGNORECASE,
+)
+_EXTERNAL_STATUS_CHECK_RE = re.compile(
+    r"(?:(?:상태|여부|기록|0\s*건).{0,24}(?:확인|점검|검증|보여)|"
+    r"(?:확인|점검|검증|보여).{0,24}(?:상태|여부|기록|0\s*건))",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXTERNAL_CLAUSE_SPLIT_RE = re.compile(
+    r"(?:[.!?。！？;；\r\n]+|,\s*|(?:있지만|되지만|했지만|하지만|그러나|반면(?:에)?))",
+    re.IGNORECASE,
+)
+_CAPABILITY_PUBLIC_PREFIX = (
+    "도움을 부탁할 수 있는 일은 코드 검토, 문서 정리, 아이디어 구체화처럼 "
+)
+_DEMONSTRATION_PUBLIC_PREFIX = (
+    "가장 자연스러운 데모 흐름은 먼저 네트워크 차단 상태와 데이터가 "
+    "PC 밖으로 나가지 않는 모습을 보여주고, "
+)
+_DEMONSTRATION_STEP_RE = re.compile(
+    r"(?:보여|확인|점검|비교|표시|처리|검증|실행|설명)",
+    re.IGNORECASE,
+)
+_DEMONSTRATION_START_RE = re.compile(
+    r"(?:먼저|우선|처음(?:에는|으로)?|첫\s*(?:단계|화면|장면)?)",
+    re.IGNORECASE,
+)
+_DEMONSTRATION_SEQUENCE_RE = re.compile(
+    r"(?:다음|그\s*뒤|마지막|이후|이어서|한\s*뒤|후(?:에는|에)?|"
+    r"2\s*단계|두\s*번째)",
+    re.IGNORECASE,
+)
+_PROPOSAL_RESPONSE_RE = re.compile(
+    r"(?:제안|추천|주제로|이야기해|생각해\s*보|다뤄\s*보|어떨까요|해\s*볼까요)",
+    re.IGNORECASE,
+)
+_CAPABILITY_PREDICATE_RE = re.compile(
+    r"(?:도와|지원|함께|할\s*수|부탁|작업|해\s*드|맡겨|정리해|검토해)",
+    re.IGNORECASE,
+)
+_CAPABILITY_ACTION_RE = re.compile(
+    r"(?:검토(?:해|할|하고)|정리(?:해|할|하고)|구체화(?:해|할|하고)|"
+    r"고치|찾아|찾거나|분석(?:해|할|하고)|비교(?:해|할|하고)|"
+    r"작성(?:해|할|하고)|요약(?:해|할|하고)|수정(?:해|할|하고)|"
+    r"테스트(?:해|할|하고)|실행(?:해|할|하고))",
+    re.IGNORECASE,
+)
+_CAPABILITY_EVIDENCE_GROUPS = (
+    frozenset({"코드", "파이썬", "프로그램", "함수", "버그", "테스트", "오류"}),
+    frozenset({"문서", "보고서", "글", "요약", "정리", "교정", "검토"}),
+    frozenset({"아이디어", "기획", "설계", "계획", "브레인스토밍"}),
+    frozenset({"데이터", "자료", "리서치", "분석", "비교", "표"}),
+)
+
+# A response can share enough generic vocabulary with a request to pass the
+# broad topic-overlap gate while still dropping one of the user's explicit
+# constraints.  These bounded facets cover high-confidence compound concepts;
+# they are deliberately inactive for ordinary social/conversational wording.
+# Labels are also used to give the local model one concise, request-derived
+# repair hint.  They describe the question, not a canned answer.
+_REQUEST_FACET_SPECS = (
+    (
+        "개인정보",
+        re.compile(r"(?:개인\s*정보|민감\s*(?:정보|데이터)|개인\s*데이터)", re.I),
+        re.compile(
+            r"(?:개인\s*정보|민감\s*(?:정보|데이터)|개인\s*데이터|"
+            r"데이터\s*보호|암호화|접근\s*(?:제한|통제)|로컬\s*처리|"
+            r"외부\s*전송.{0,8}(?:없|않|0\s*건)|네트워크\s*차단)",
+            re.I,
+        ),
+    ),
+    (
+        "오프라인·로컬 처리",
+        re.compile(r"(?:오프라인|폐쇄망|에어\s*갭|air[ -]?gap)", re.I),
+        re.compile(
+            r"(?:오프라인|로컬|장치|기기|폐쇄망|에어\s*갭|air[ -]?gap|"
+            r"PC\s*(?:내부|안))",
+            re.I,
+        ),
+    ),
+    (
+        "측정값",
+        re.compile(r"(?:측정\s*값|실측(?:값|치)?)", re.I),
+        re.compile(r"(?:측정|실측|관측|실행\s*결과)", re.I),
+    ),
+    (
+        "설계 목표",
+        re.compile(r"(?:설계\s*목표|목표\s*(?:수치|값))", re.I),
+        re.compile(r"(?:설계\s*목표|목표|상한|기준)", re.I),
+    ),
+    (
+        "GPU 메모리",
+        re.compile(
+            r"(?:(?:GPU|VRAM).{0,16}메모리|메모리.{0,16}(?:GPU|VRAM)|제한된\s*GPU)",
+            re.I | re.S,
+        ),
+        re.compile(r"(?:GPU|VRAM|메모리|그래픽\s*자원)", re.I),
+    ),
+    (
+        "불확실성",
+        re.compile(r"(?:불확실|추측|확신.{0,6}(?:없|못|어렵))", re.I),
+        re.compile(
+            r"(?:불확실|추측|추정|가능성|확신.{0,8}(?:없|못|어렵)|"
+            r"확인되지|모르)",
+            re.I | re.S,
+        ),
+    ),
+    (
+        "사실 단정 방지",
+        re.compile(r"(?:사실.{0,10}(?:단정|처럼)|단정|확정적으로)", re.I | re.S),
+        re.compile(r"(?:사실|단정|확정|근거|검증|확인)", re.I),
+    ),
+    (
+        "사용자 권한",
+        re.compile(r"(?:사용자\s*)?권한|허용\s*범위|승인", re.I),
+        re.compile(r"(?:권한|허용|승인|동의)", re.I),
+    ),
+    (
+        "시스템 안전 경계",
+        re.compile(
+            r"(?:시스템\s*)?안전.{0,10}(?:경계|범위|정책)|안전\s*경계", re.I | re.S
+        ),
+        re.compile(r"(?:안전|경계|정책|규정|보안|제한)", re.I),
+    ),
+    (
+        "작업 실행",
+        re.compile(r"(?:작업.{0,10}(?:실행|수행)|실행.{0,10}원칙)", re.I | re.S),
+        re.compile(r"(?:작업|실행|수행|명령)", re.I),
+    ),
+    (
+        "소프트웨어 수정",
+        re.compile(
+            r"(?:소프트웨어.{0,16}수정|코드.{0,16}(?:수정|변경)|"
+            r"수정\s*완료|패치)",
+            re.I | re.S,
+        ),
+        re.compile(r"(?:수정|변경|패치|업데이트)", re.I),
+    ),
+    (
+        "자체 검증",
+        re.compile(r"(?:자체\s*검증|검증.{0,16}(?:항목|사항|기준))", re.I | re.S),
+        re.compile(r"(?:검증|테스트|확인|점검)", re.I),
+    ),
+    (
+        "회귀·안정성",
+        re.compile(
+            r"(?=[\s\S]{0,256}(?:수정|변경|패치))"
+            r"(?=[\s\S]{0,256}(?:완료|완성|선언|배포))"
+            r"(?=[\s\S]{0,256}(?:검증|테스트|확인|점검))",
+            re.I | re.S,
+        ),
+        re.compile(r"(?:회귀|보안|성능|오류|예외|안정|작동|기능)", re.I),
+    ),
+    (
+        "한국어 답변",
+        re.compile(
+            r"(?:한국어\s*(?:답변|문장|표현).{0,40}(?:완결|판정|확인|기준)|"
+            r"(?:완결|판정|확인|기준).{0,40}한국어\s*(?:답변|문장|표현))",
+            re.I | re.S,
+        ),
+        re.compile(r"(?:한국어|국문|문장|표현)", re.I),
+    ),
+    (
+        "문장 완결성",
+        re.compile(r"(?:완결성|(?:답변|문장|표현).{0,24}(?:완결|종결))", re.I | re.S),
+        re.compile(r"(?:완결|종결|끝|마침표|서술어)", re.I),
+    ),
+    (
+        "자연스러움·반복 방지",
+        re.compile(
+            r"(?=[\s\S]{0,256}(?:자연스러|문법|반복))"
+            r"(?=[\s\S]{0,256}(?:한국어|답변|문장|표현))"
+            r"(?=[\s\S]{0,256}(?:완결|판정|기준|확인할\s*사항|평가))",
+            re.I | re.S,
+        ),
+        re.compile(r"(?:자연|문법|반복|중복|어색|가독)", re.I),
+    ),
 )
 _INCOMPLETE_COLON_BODY_RE = re.compile(
     r"(?:[A-Za-z0-9가-힣._-]+(?:을|를)\s+\S+|"
@@ -423,6 +721,13 @@ _TOPIC_STOP_TERMS = frozenset(
         "하나",
         "항목",
         "현재",
+        "자연스럽게",
+        "부탁할",
+        "편한",
+        "말로",
+        "제가",
+        "있는",
+        "있도록",
     }
 )
 _TOPIC_SUFFIXES = (
@@ -465,8 +770,12 @@ _UNSOLICITED_SUBJECT_GROUPS = (
     frozenset({"짱구", "만화", "애니메이션"}),
 )
 _UNSOLICITED_SELF_INTRO_RE = re.compile(
-    r"^\s*(?:안녕하세요[,! ]*)?(?:저는\s*)?(?:AI\s*)?(?:어시스턴트|도우미)"
-    r"(?:입니다|예요|이에요)",
+    r"^\s*(?:안녕하세요(?:,?\s*사용자님)?[,! ]*)?"
+    r"(?:(?:저는|나는)\s*(?:(?:AI\s*)?(?:어시스턴트|도우미)|"
+    r"Cogni(?:\s*Agent)?)(?:입니다|예요|이에요|이고|이며)?|"
+    r"(?:AI\s*)?(?:어시스턴트|도우미)(?:입니다|예요|이에요|이고|이며)|"
+    r"제\s*이름은\s*(?:Cogni(?:\s*Agent)?|[A-Za-z가-힣][A-Za-z가-힣 ._-]{0,40})"
+    r"(?:입니다|예요|이에요|이고|이며)?)",
     re.IGNORECASE,
 )
 _IDENTITY_REQUEST_RE = re.compile(
@@ -497,6 +806,23 @@ _CATEGORY_STRUCTURAL_TOPIC_TERMS = frozenset(
     {"장점", "이점", "강점", "한계", "단점", "제약", "위험", "가지"}
 )
 _DISTINCTIVE_TOPIC_EQUIVALENTS = (
+    (
+        frozenset({"도움", "범위", "지원", "할수"}),
+        frozenset(
+            {
+                "도움",
+                "도와",
+                "지원",
+                "작업",
+                "코드",
+                "문서",
+                "검토",
+                "정리",
+                "오류",
+                "아이디어",
+            }
+        ),
+    ),
     (
         frozenset({"복구", "복원"}),
         frozenset({"원인", "수정", "회귀", "재시도", "오류", "롤백"}),
@@ -536,6 +862,11 @@ _COMPOUND_TOPIC_PATTERNS = (
         "자가검증",
         re.compile(r"(?<![가-힣])(?:자가|자체)\s*검증", re.IGNORECASE),
     ),
+)
+_MULTI_FACET_TOPIC_REQUEST_RE = re.compile(
+    r"(?:(?:와|과|및|,|·).{0,64}(?:차이|비교|각각|관계|구분)|"
+    r"(?:차이|비교|각각|관계|구분).{0,64}(?:와|과|및|,|·))",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -612,6 +943,63 @@ def _topic_terms(text: str) -> frozenset[str]:
     return frozenset(terms)
 
 
+def _one_edit_hangul_match_count(
+    requested: frozenset[str],
+    observed: frozenset[str],
+) -> int:
+    """Count distinct bounded Hangul typo pairs without a phrase dictionary."""
+
+    def within_one_edit(first: str, second: str) -> bool:
+        if first == second:
+            return False
+        if abs(len(first) - len(second)) > 1:
+            return False
+        if len(first) == len(second):
+            return sum(a != b for a, b in zip(first, second, strict=True)) == 1
+        shorter, longer = (
+            (first, second) if len(first) < len(second) else (second, first)
+        )
+        left = right = edits = 0
+        while left < len(shorter) and right < len(longer):
+            if shorter[left] == longer[right]:
+                left += 1
+                right += 1
+                continue
+            edits += 1
+            right += 1
+            if edits > 1:
+                return False
+        return True
+
+    request_terms = sorted(
+        term
+        for term in requested - observed
+        if len(term) >= 4 and re.fullmatch(r"[가-힣]+", term)
+    )[:32]
+    response_terms = sorted(
+        term
+        for term in observed - requested
+        if len(term) >= 4 and re.fullmatch(r"[가-힣]+", term)
+    )[:64]
+    used_response_terms: set[int] = set()
+    matches = 0
+    for request_term in request_terms:
+        for index, response_term in enumerate(response_terms):
+            if index in used_response_terms:
+                continue
+            if within_one_edit(request_term, response_term):
+                used_response_terms.add(index)
+                matches += 1
+                break
+    return matches
+
+
+def _one_edit_hangul_match(requested: frozenset[str], observed: frozenset[str]) -> bool:
+    """Match one actual bounded Hangul typo, excluding exact shared terms."""
+
+    return _one_edit_hangul_match_count(requested, observed) > 0
+
+
 def response_topically_anchored(request: str, response: str) -> bool:
     """Reject obvious subject drift without pretending to judge semantics.
 
@@ -624,14 +1012,28 @@ def response_topically_anchored(request: str, response: str) -> bool:
 
     if not isinstance(request, str) or not isinstance(response, str):
         raise TypeError("request and response must be strings")
+    if compile_response_intent(request) is ResponseIntent.ONE_TOPIC_PROPOSAL:
+        return response_satisfies_intent(request, response)
     requested = _topic_terms(request)
     if len(requested) < 4:
         return True
     observed = _topic_terms(response)
     required = 3 if len(requested) >= 6 else max(2, (len(requested) + 1) // 2)
-    if len(requested & observed) >= required:
+    exact_overlap = len(requested & observed)
+    if exact_overlap >= required:
         return True
-    return _topic_equivalent_match(request, observed)
+    typo_matches = _one_edit_hangul_match_count(requested, observed)
+    if _MULTI_FACET_TOPIC_REQUEST_RE.search(request[:MAX_INSPECT_CHARS]) is not None:
+        return exact_overlap + typo_matches >= required
+    exact_distinctive = any(
+        len(term) >= 4 and re.fullmatch(r"[가-힣]+", term)
+        for term in requested & observed
+    )
+    return (
+        exact_distinctive
+        or _topic_equivalent_match(request, observed)
+        or typo_matches > 0
+    )
 
 
 def request_topic_terms(request: str, *, limit: int = 8) -> tuple[str, ...]:
@@ -656,7 +1058,9 @@ def response_preserves_distinctive_topic(request: str, response: str) -> bool:
         return True
     if distinctive & observed:
         return True
-    return _topic_equivalent_match(request, observed)
+    return _topic_equivalent_match(request, observed) or _one_edit_hangul_match(
+        distinctive, observed
+    )
 
 
 def response_preserves_category_subject(request: str, response: str) -> bool:
@@ -685,6 +1089,8 @@ def response_avoids_unsolicited_subjects(request: str, response: str) -> bool:
 
     if not isinstance(request, str) or not isinstance(response, str):
         raise TypeError("request and response must be strings")
+    if compile_response_intent(request) is ResponseIntent.ONE_TOPIC_PROPOSAL:
+        return True
     requested = unicodedata.normalize("NFKC", request).casefold()
     observed = unicodedata.normalize("NFKC", response).casefold()
     for group in _UNSOLICITED_SUBJECT_GROUPS:
@@ -708,7 +1114,62 @@ def response_avoids_prompt_echo(request: str, response: str) -> bool:
     normalized_response = " ".join(
         unicodedata.normalize("NFKC", response).casefold().split()
     ).strip()
-    return normalized_request not in normalized_response
+    if normalized_request in normalized_response:
+        return False
+    requested_terms = _topic_terms(request)
+    if len(requested_terms) < 4:
+        return True
+    for sentence in _raw_completed_sentences(response):
+        if not re.search(
+            r"(?:설명|정리|답변|작성|요약|알려)(?:하)?세요[.!?。！？]*$",
+            sentence,
+        ):
+            continue
+        observed_terms = _topic_terms(sentence)
+        required = max(3, (len(requested_terms) * 3 + 4) // 5)
+        if len(requested_terms & observed_terms) >= required:
+            return False
+    return True
+
+
+def response_avoids_instruction_echo(instructions: str, response: str) -> bool:
+    """Reject copied instruction lines without relying on fixed prompt wording."""
+
+    if not isinstance(instructions, str) or not isinstance(response, str):
+        raise TypeError("instructions and response must be strings")
+    observed = " ".join(
+        unicodedata.normalize("NFKC", response[:MAX_INSPECT_CHARS]).casefold().split()
+    )
+    if not observed:
+        return True
+    units = re.split(r"[\r\n]+|(?<=[.!?。！？])\s+", instructions[:MAX_INSPECT_CHARS])
+    for unit in units[:MAX_ANALYSIS_UNITS]:
+        normalized = " ".join(unicodedata.normalize("NFKC", unit).casefold().split())
+        if (
+            len(normalized) >= 24
+            and len(normalized.split()) >= 4
+            and normalized in observed
+        ):
+            return False
+    instruction_tokens = [
+        match.group(0)
+        for match in _LEXEME_RE.finditer(
+            unicodedata.normalize("NFKC", instructions[:MAX_INSPECT_CHARS]).casefold()
+        )
+    ][:MAX_ANALYSIS_TOKENS]
+    response_tokens = [match.group(0) for match in _LEXEME_RE.finditer(observed)][
+        :MAX_ANALYSIS_TOKENS
+    ]
+    if len(instruction_tokens) < 10 or len(response_tokens) < 10:
+        return True
+    instruction_ngrams = {
+        tuple(instruction_tokens[index : index + 10])
+        for index in range(len(instruction_tokens) - 9)
+    }
+    return not any(
+        tuple(response_tokens[index : index + 10]) in instruction_ngrams
+        for index in range(len(response_tokens) - 9)
+    )
 
 
 def response_avoids_unsolicited_self_intro(request: str, response: str) -> bool:
@@ -765,7 +1226,162 @@ def response_avoids_meta_format_discussion(request: str, response: str) -> bool:
         raise TypeError("request and response must be strings")
     if _META_FORMAT_REQUEST_RE.search(request) is not None:
         return True
-    return _META_FORMAT_DISCUSSION_RE.search(response) is None
+    if _META_FORMAT_DISCUSSION_RE.search(response) is not None:
+        return False
+    if _READINESS_META_RE.search(response) is not None:
+        return False
+    if any(
+        _OUTPUT_INSTRUCTION_SENTENCE_RE.search(sentence) is not None
+        for sentence in _raw_completed_sentences(response)
+    ):
+        return False
+    return not any(
+        _is_meta_content_sentence(sentence)
+        for sentence in _raw_completed_sentences(response)
+    )
+
+
+def response_avoids_placeholder_scaffolding(response: str) -> bool:
+    """Reject unfinished planning labels and ellipsis-only template lines."""
+
+    if not isinstance(response, str):
+        raise TypeError("response must be a string")
+    masked = _mask_code(response[:MAX_INSPECT_CHARS])
+    return (
+        _PLACEHOLDER_SCAFFOLD_RE.search(masked) is None
+        and _STANDALONE_ELLIPSIS_RE.search(masked) is None
+    )
+
+
+def response_fulfills_examples_request(request: str, response: str) -> bool:
+    """Require visible example evidence only when the user explicitly asks."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    if _EXAMPLE_EXCLUSION_RE.search(request) is not None:
+        return True
+    if _EXAMPLE_REQUEST_RE.search(request) is None:
+        return True
+    masked = _mask_code(response[:MAX_INSPECT_CHARS])
+    return (
+        _EXAMPLE_RESPONSE_RE.search(masked) is not None
+        or _IMPLICIT_EXAMPLE_RE.search(masked) is not None
+    )
+
+
+def _raw_completed_sentences(text: str) -> list[str]:
+    sentences: list[str] = []
+    for match in _COMPLETE_SENTENCE_RE.finditer(_mask_code(text[:MAX_INSPECT_CHARS])):
+        sentence = " ".join(match.group(0).split()).strip()
+        if sentence:
+            sentences.append(sentence)
+        if len(sentences) >= MAX_ANALYSIS_UNITS:
+            break
+    return sentences
+
+
+def _is_meta_content_sentence(sentence: str) -> bool:
+    normalized = " ".join(sentence.split()).strip()
+    return bool(
+        normalized.endswith(_META_SENTENCE_ENDINGS)
+        or _COUNT_ANNOUNCEMENT_RE.search(normalized) is not None
+        or _META_FORMAT_DISCUSSION_RE.search(normalized) is not None
+    )
+
+
+_SEMANTIC_TOKEN_STOP = frozenset(
+    {
+        "그리고",
+        "그러나",
+        "하지만",
+        "또한",
+        "먼저",
+        "다음",
+        "합니다",
+        "됩니다",
+        "입니다",
+        "있습니다",
+        "없습니다",
+    }
+)
+_SEMANTIC_SUFFIXES = (
+    "해야합니다",
+    "해야",
+    "합니다",
+    "됩니다",
+    "입니다",
+    "습니다",
+    "에서",
+    "으로",
+    "에게",
+    "까지",
+    "부터",
+    "처럼",
+    "보다",
+    "이랑",
+    "하고",
+    "하며",
+    "랑",
+    "과",
+    "와",
+    "의",
+    "이",
+    "가",
+    "은",
+    "는",
+    "을",
+    "를",
+    "도",
+    "만",
+)
+
+
+def _semantic_sentence_terms(sentence: str) -> frozenset[str]:
+    normalized = unicodedata.normalize("NFKC", sentence).casefold()
+    terms: set[str] = set()
+    for match in _LEXEME_RE.finditer(normalized):
+        term = match.group(0).strip(".,")
+        if re.fullmatch(r"[가-힣]+", term):
+            for suffix in _SEMANTIC_SUFFIXES:
+                if term.endswith(suffix) and len(term) - len(suffix) >= 2:
+                    term = term[: -len(suffix)]
+                    break
+        if len(term) >= 2 and term not in _SEMANTIC_TOKEN_STOP:
+            terms.add(term)
+        if len(terms) >= MAX_UNIT_TOKENS:
+            break
+    return frozenset(terms)
+
+
+def has_semantic_redundancy(text: str) -> bool:
+    """Detect a sentence that merely reorders the same small fact set.
+
+    This complements the character-level near-duplicate check.  It is
+    deliberately conservative: one sentence's content set must be almost
+    contained by another and still cover most of their union.
+    """
+
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    term_sets: list[frozenset[str]] = []
+    for sentence in _raw_completed_sentences(text):
+        if _is_meta_content_sentence(sentence):
+            continue
+        terms = _semantic_sentence_terms(sentence)
+        if len(terms) >= 3:
+            term_sets.append(terms)
+        if len(term_sets) >= MAX_ANALYSIS_UNITS:
+            break
+    for index, first in enumerate(term_sets):
+        for second in term_sets[index + 1 :]:
+            overlap = len(first & second)
+            if not overlap:
+                continue
+            containment = overlap / min(len(first), len(second))
+            union_ratio = overlap / len(first | second)
+            if containment >= 0.80 and union_ratio >= 0.55:
+                return True
+    return False
 
 
 def has_near_duplicate_sentences(text: str) -> bool:
@@ -1584,6 +2200,177 @@ def requested_exact_sentence_count(request: str) -> int | None:
     return None
 
 
+def requested_exact_question_count(request: str) -> int | None:
+    """Return one when the user explicitly asks for exactly one question."""
+
+    if not isinstance(request, str):
+        raise TypeError("request must be a string")
+    bounded = request[:MAX_INSPECT_CHARS]
+    if _SINGLE_QUESTION_EXCLUSION_RE.search(bounded) is not None:
+        return None
+    return 1 if _SINGLE_QUESTION_REQUEST_RE.search(bounded) else None
+
+
+def compile_response_intent(request: str) -> ResponseIntent:
+    """Compile the few structural conversational intents used by all gates."""
+
+    if not isinstance(request, str):
+        raise TypeError("request must be a string")
+    bounded = request[:MAX_INSPECT_CHARS]
+    if requested_exact_question_count(bounded) == 1:
+        return ResponseIntent.SINGLE_QUESTION
+    if (
+        _ONE_TOPIC_PROPOSAL_REQUEST_RE.search(bounded) is not None
+        and _ONE_TOPIC_PROPOSAL_EXCLUSION_RE.search(bounded) is None
+    ):
+        return ResponseIntent.ONE_TOPIC_PROPOSAL
+    if (
+        _DEMONSTRATION_FLOW_REQUEST_RE.search(bounded) is not None
+        and _DEMONSTRATION_FLOW_EXCLUSION_RE.search(bounded) is None
+    ):
+        return ResponseIntent.DEMONSTRATION_FLOW
+    if (
+        _CAPABILITY_SCOPE_REQUEST_RE.search(bounded) is not None
+        and _EXAMPLE_REQUEST_RE.search(bounded) is not None
+        and _EXAMPLE_EXCLUSION_RE.search(bounded) is None
+    ):
+        return ResponseIntent.CAPABILITY_SCOPE_EXAMPLES
+    return ResponseIntent.GENERAL
+
+
+def request_required_facets(request: str) -> tuple[str, ...]:
+    """Return explicit compound request concepts that must survive generation."""
+
+    if not isinstance(request, str):
+        raise TypeError("request must be a string")
+    bounded = request[:MAX_INSPECT_CHARS]
+    return tuple(
+        label
+        for label, request_pattern, _response_pattern in _REQUEST_FACET_SPECS
+        if request_pattern.search(bounded) is not None
+    )
+
+
+def missing_request_facets(request: str, response: str) -> tuple[str, ...]:
+    """Return explicit request concepts that have no semantic response evidence."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    bounded_request = request[:MAX_INSPECT_CHARS]
+    bounded_response = response[:MAX_INSPECT_CHARS]
+    return tuple(
+        label
+        for label, request_pattern, response_pattern in _REQUEST_FACET_SPECS
+        if request_pattern.search(bounded_request) is not None
+        and response_pattern.search(bounded_response) is None
+    )
+
+
+def response_covers_request_facets(request: str, response: str) -> bool:
+    """Require every high-confidence explicit request facet in the answer."""
+
+    return not missing_request_facets(request, response)
+
+
+def response_respects_airgap_scope(request: str, response: str) -> bool:
+    """Reject positive external-access claims for an explicit air-gapped task."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    if _AIRGAP_SCOPE_REQUEST_RE.search(request[:MAX_INSPECT_CHARS]) is None:
+        return True
+    bounded = response[:MAX_INSPECT_CHARS]
+    for clause in _EXTERNAL_CLAUSE_SPLIT_RE.split(bounded):
+        for subject in _EXTERNAL_ACCESS_SUBJECT_RE.finditer(clause):
+            tail = clause[subject.start() : min(len(clause), subject.start() + 72)]
+            action = _EXTERNAL_ACCESS_ACTION_RE.search(tail)
+            if action is None:
+                continue
+            claim_end = subject.start() + action.end()
+            local = clause[
+                max(0, subject.start() - 16) : min(len(clause), claim_end + 24)
+            ]
+            if _EXTERNAL_STATUS_CHECK_RE.search(local) is not None:
+                continue
+            if _EXTERNAL_ACCESS_NEGATION_RE.search(local) is None:
+                return False
+    return True
+
+
+def response_satisfies_intent(request: str, response: str) -> bool:
+    """Apply one shared semantic-shape gate for bounded conversational intents."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    candidate = response.strip()
+    if not candidate:
+        return False
+    if not response_respects_airgap_scope(request, candidate):
+        return False
+    if not response_covers_request_facets(request, candidate):
+        return False
+    intent = compile_response_intent(request)
+    if intent is ResponseIntent.GENERAL:
+        return True
+    if intent is ResponseIntent.SINGLE_QUESTION:
+        return response_contract_satisfied(request, candidate)
+    if intent is ResponseIntent.ONE_TOPIC_PROPOSAL:
+        completed = _contract_sentence_count(candidate[:MAX_INSPECT_CHARS])
+        return (
+            1 <= completed <= 3
+            and len(candidate) <= 480
+            and _PROPOSAL_RESPONSE_RE.search(candidate) is not None
+            and len(_topic_terms(candidate) - _GENERIC_TOPIC_TERMS) >= 1
+        )
+    if intent is ResponseIntent.DEMONSTRATION_FLOW:
+        completed = _contract_sentence_count(candidate[:MAX_INSPECT_CHARS])
+        semantic_tail = (
+            candidate[len(_DEMONSTRATION_PUBLIC_PREFIX) :]
+            if candidate.startswith(_DEMONSTRATION_PUBLIC_PREFIX)
+            else candidate
+        )
+        return (
+            1 <= completed <= 4
+            and len(candidate) <= 520
+            and _DEMONSTRATION_START_RE.search(candidate) is not None
+            and _DEMONSTRATION_SEQUENCE_RE.search(candidate) is not None
+            and len(_DEMONSTRATION_STEP_RE.findall(candidate)) >= 2
+            and _DEMONSTRATION_SEQUENCE_RE.search(semantic_tail) is not None
+            and _DEMONSTRATION_STEP_RE.search(semantic_tail) is not None
+        )
+    if not response_avoids_unsolicited_self_intro(request, candidate):
+        return False
+    if not response_fulfills_examples_request(request, candidate):
+        return False
+    if _CAPABILITY_PREDICATE_RE.search(candidate) is None:
+        return False
+    if _CAPABILITY_ACTION_RE.search(candidate) is None:
+        return False
+    semantic_candidate = (
+        candidate[len(_CAPABILITY_PUBLIC_PREFIX) :]
+        if candidate.startswith(_CAPABILITY_PUBLIC_PREFIX)
+        else candidate
+    )
+    if candidate.startswith(_CAPABILITY_PUBLIC_PREFIX):
+        if _CAPABILITY_ACTION_RE.search(semantic_candidate) is None:
+            return False
+        if not response_fulfills_examples_request(request, semantic_candidate):
+            return False
+    observed = _topic_terms(candidate)
+    concrete_groups = sum(
+        bool(group & observed) for group in _CAPABILITY_EVIDENCE_GROUPS
+    )
+    if concrete_groups < 2:
+        return False
+    if candidate.startswith(_CAPABILITY_PUBLIC_PREFIX):
+        tail_observed = _topic_terms(semantic_candidate)
+        return (
+            sum(bool(group & tail_observed) for group in _CAPABILITY_EVIDENCE_GROUPS)
+            >= 2
+        )
+    return True
+
+
 def _requested_maximum_spec(request: str) -> tuple[int, int, int] | None:
     bounded = request[:MAX_INSPECT_CHARS]
     for match in _MAXIMUM_UNIT_REQUEST_RE.finditer(bounded):
@@ -1645,18 +2432,28 @@ def response_contract_satisfied(request: str, response: str) -> bool:
     if not isinstance(response, str):
         raise TypeError("response must be a string")
     exact = requested_exact_sentence_count(request)
+    exact_questions = requested_exact_question_count(request)
     exact_items = requested_exact_item_count(request)
     maximum_items = requested_maximum_items(request)
     minimum = requested_minimum_units(request)
     categories = _requested_category_counts(request)
     if (
         minimum is None
+        and exact_questions is None
         and exact_items is None
         and maximum_items is None
         and categories is None
     ):
         return True
     completed = _contract_sentence_count(response[:MAX_INSPECT_CHARS])
+    if exact_questions is not None:
+        question_marks = len(
+            re.findall(r"[?？]+(?=\s|$)", response[:MAX_INSPECT_CHARS])
+        )
+        # "질문 하나만" means one public utterance, not an explanation plus
+        # one trailing question.
+        if question_marks != exact_questions or completed != exact_questions:
+            return False
     if categories is not None and not _category_contract_satisfied(
         response,
         categories,
@@ -1704,7 +2501,7 @@ def _contract_sentence_count(text: str) -> int:
         if (
             not sentence
             or sentence in _CLOSING_SENTENCES
-            or sentence.endswith(_META_SENTENCE_ENDINGS)
+            or _is_meta_content_sentence(sentence)
         ):
             continue
         count += 1
@@ -1730,6 +2527,8 @@ def _completed_content_sentences(text: str) -> list[str]:
         ):
             continue
         if sentence.endswith(_META_SENTENCE_ENDINGS):
+            continue
+        if _is_meta_content_sentence(sentence):
             continue
         key = unicodedata.normalize("NFKC", sentence).casefold()
         if key in seen:
@@ -1965,6 +2764,33 @@ def _split_inline_numbered_sentences(
     return result
 
 
+def normalize_single_question_response(request: str, response: str) -> str | None:
+    """Extract the first complete public question for an exact-one request."""
+
+    if not isinstance(request, str) or not isinstance(response, str):
+        raise TypeError("request and response must be strings")
+    if requested_exact_question_count(request) != 1 or not response.strip():
+        return None
+    for sentence in _raw_completed_sentences(response):
+        candidate = re.sub(
+            r"^(?:[-*+]\s+|\d{1,4}[.)]\s+)",
+            "",
+            sentence,
+        ).strip()
+        if not candidate.endswith(("?", "？")):
+            continue
+        if not 8 <= len(candidate) <= 320:
+            continue
+        if not response_contract_satisfied(request, candidate):
+            continue
+        if (
+            inspect_response(candidate, final=True).recommended_action
+            is QualityAction.ACCEPT
+        ):
+            return candidate
+    return None
+
+
 def normalize_exact_sentence_response(request: str, response: str) -> str | None:
     """Salvage only complete content from an overlong exact-count candidate.
 
@@ -2067,32 +2893,45 @@ __all__ = [
     "QualityAction",
     "QualityCode",
     "QualityFinding",
+    "ResponseIntent",
     "ResponseQualityError",
     "ResponseQualityReport",
     "compose_observed_contract_response",
+    "compile_response_intent",
     "inspect_response",
     "has_near_duplicate_sentences",
+    "has_semantic_redundancy",
     "normalize_exact_sentence_response",
+    "normalize_single_question_response",
     "normalize_exact_item_response",
     "normalize_maximum_item_response",
     "mask_fenced_code",
+    "missing_request_facets",
     "nfkc_search_original_span",
     "request_topic_terms",
+    "request_required_facets",
     "requested_exact_sentence_count",
+    "requested_exact_question_count",
     "requested_exact_item_count",
     "requested_category_counts",
     "requested_maximum_items",
     "requested_maximum_item_span",
     "requested_minimum_units",
     "response_avoids_prompt_echo",
+    "response_avoids_instruction_echo",
     "response_avoids_dangling_sentence_start",
     "response_avoids_generic_outline",
     "response_avoids_meta_format_discussion",
+    "response_avoids_placeholder_scaffolding",
     "response_avoids_unsolicited_self_intro",
     "response_avoids_unsolicited_subjects",
     "response_contract_satisfied",
+    "response_covers_request_facets",
+    "response_satisfies_intent",
+    "response_fulfills_examples_request",
     "response_preserves_distinctive_topic",
     "response_preserves_category_subject",
+    "response_respects_airgap_scope",
     "response_topically_anchored",
     "salvage_complete_prefix",
 ]

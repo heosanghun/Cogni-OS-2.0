@@ -1,9 +1,9 @@
 """Pinned text-only Gemma 4 chat and response contract.
 
-The shipped local E4B mirror intentionally stays offline, but it currently
-does not contain ``chat_template.jinja`` or a response schema.  This module
-implements the documented, text-only, thinking-disabled turn contract without
-falling back to transcript-like ``USER:/ASSISTANT:`` labels.
+The shipped local E4B-it mirror intentionally stays offline and includes the
+official chat template. This module independently enforces the audited,
+text-only, thinking-disabled turn contract without falling back to
+transcript-like ``USER:/ASSISTANT:`` labels.
 
 Rendered prompts deliberately omit ``<bos>``.  ``ModelService`` tokenizes the
 string with ``add_special_tokens=True`` and therefore inserts BOS exactly once.
@@ -185,7 +185,7 @@ def render_chat_prompt(
 def stop_token_ids(tokenizer: Any) -> Tensor:
     """Return official stops plus quarantined reserved text tokens.
 
-    The local six-file mirror does not declare every reserved ``<unusedN>``
+    The pinned E4B-it tokenizer does not declare every reserved ``<unusedN>``
     token as special. A greedy decoder can emit and repeat one after an
     otherwise complete answer. Treating such tokens as terminal keeps them out
     of the public response and prevents a false length continuation.

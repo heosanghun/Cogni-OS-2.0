@@ -3,7 +3,7 @@ param(
     [string]$Treeish = 'HEAD',
     [string]$OutputDirectory,
     [switch]$RunModelSmoke,
-    [string]$ModelPath = 'C:\Project\cognios\gemma4-e4b',
+    [string]$ModelPath = 'C:\Project\cognios\gemma4-e4b-it',
     [string]$ManualPdfPath
 )
 
@@ -237,9 +237,8 @@ try {
             }
             & $python -u scripts\validate_agent_runtime.py `
                 --model $ModelPath `
-                --manifest config\gemma4-e4b.manifest.toml `
-                --prompt 'Explain the local runtime path in one sentence.' `
-                --max-new-tokens 16
+                --manifest config\gemma4-e4b-it.manifest.toml `
+                --max-new-tokens 96
             if ($LASTEXITCODE -ne 0) {
                 throw 'Extracted bundle model smoke failed.'
             }

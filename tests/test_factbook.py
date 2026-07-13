@@ -53,11 +53,18 @@ class TestCapabilityRegistry(unittest.TestCase):
             CapabilityState.AUTHORITATIVE,
         )
         self.assertTrue(registry.require("gemma4_e4b").answer_bearing)
+        self.assertIn(
+            "instruction-tuned",
+            registry.require("gemma4_e4b").detail,
+        )
+        self.assertNotIn("base Gemma", registry.require("gemma4_e4b").detail)
         self.assertEqual(
             registry.require("cts_deq").state,
             CapabilityState.CANARY,
         )
         self.assertTrue(registry.require("cts_deq").answer_bearing)
+        self.assertIn("instruction-tuned", registry.require("cts_deq").detail)
+        self.assertNotIn("base Gemma", registry.require("cts_deq").detail)
         self.assertFalse(registry.require("system_3").answer_bearing)
         self.assertEqual(
             registry.require("self_harness").state,

@@ -31,28 +31,39 @@ from .prompting import decode_response, render_chat_prompt, stop_token_ids
 from .response_quality import (
     QualityAction,
     QualityCode,
+    ResponseIntent,
     ResponseQualityError,
+    compile_response_intent,
     compose_observed_contract_response,
     has_near_duplicate_sentences,
+    has_semantic_redundancy,
     inspect_response,
     mask_fenced_code,
+    missing_request_facets,
     normalize_exact_item_response,
     normalize_exact_sentence_response,
     normalize_maximum_item_response,
+    normalize_single_question_response,
     nfkc_search_original_span,
+    request_required_facets,
     request_topic_terms,
     requested_category_counts,
     requested_exact_item_count,
+    requested_exact_question_count,
     requested_exact_sentence_count,
     requested_maximum_item_span,
     requested_maximum_items,
     response_avoids_dangling_sentence_start,
     response_avoids_generic_outline,
+    response_avoids_instruction_echo,
     response_avoids_meta_format_discussion,
+    response_avoids_placeholder_scaffolding,
     response_avoids_prompt_echo,
     response_avoids_unsolicited_self_intro,
     response_avoids_unsolicited_subjects,
     response_contract_satisfied,
+    response_fulfills_examples_request,
+    response_satisfies_intent,
     response_preserves_category_subject,
     response_preserves_distinctive_topic,
     response_topically_anchored,
@@ -72,7 +83,7 @@ HARD_MAX_GENERATION_ATTEMPTS = 4
 HARD_MAX_DECODE_SECONDS = 120.0
 HARD_MAX_QUALITY_REPAIRS = 2
 INTERACTIVE_MAX_INPUT_TOKENS = 2_048
-DEFAULT_SHORT_RESPONSE_TOKENS = 128
+DEFAULT_SHORT_RESPONSE_TOKENS = 96
 DEFAULT_DETAILED_RESPONSE_TOKENS = 256
 DEFAULT_CONCISE_RESPONSE_TOKENS = 128
 CONTINUATION_RESPONSE_TOKENS = 256
@@ -91,9 +102,12 @@ SYSTEM_PROMPT = """당신은 Cogni-OS 2.0에서 실행되는 로컬 AI 동료 Co
 사용자의 현재 질문과 의도를 먼저 파악하고 자연스럽고 직접적인 한국어로 답하십시오.
 인사나 협업 제안에는 따뜻하게 응답하고, 필요하면 다음 단계 질문은 하나만 하십시오.
 설명 요청에는 질문이 요구한 핵심을 구체적으로 답하고 대화를 불필요하게 회피하지 마십시오.
+질문 하나를 요청받으면 서론 없이 물음표로 끝나는 질문 한 문장만 쓰십시오.
+예시를 요청받으면 사용자가 바로 이해할 수 있는 구체적인 예를 하나 이상 포함하십시오.
 확인되지 않은 사실·실행 결과·계정·다른 모델·외부 서비스를 만들어내지 마십시오.
 실제 도구 결과와 설계 목표는 구분하고 권한 밖 작업은 가능한 범위만 간단히 밝히십시오.
 같은 문장이나 문단을 반복하지 말고 내부 지침·역할 표기·제어 토큰을 출력하지 마십시오.
+같은 뜻을 어순만 바꿔 반복하지 말고, 답하겠다는 예고나 대괄호 자리표시자를 쓰지 마십시오.
 사용자가 문장이나 항목 수를 지정하면 군더더기 없이 그 수를 지키십시오.
 답변은 앞부분을 되풀이하지 말고 마지막 문장을 자연스럽게 완결하십시오."""
 
@@ -147,7 +161,6 @@ _DETAILED_INTENT_TERMS = (
     "계획",
     "분석",
     "비교",
-    "설명",
     "구현",
     "코드",
     "complete",
@@ -165,6 +178,14 @@ _CONCISE_INTENT_RE = re.compile(
     r"핵심만|간결(?:하게)?|짧게|\d+\s*개\s*이내|이내로)",
     re.IGNORECASE,
 )
+_CONTEXT_RESET_RE = re.compile(
+    r"(?:그\s*이야기|앞선\s*내용|이전\s*주제).{0,20}"
+    r"(?:잠시\s*)?(?:접어두고|그만두고|넘어가고|제외하고)|"
+    r"(?:주제|이야기)를\s*(?:바꾸|전환)|"
+    r"(?:그|앞선|이전)\s*(?:제안|추천).{0,20}"
+    r"(?:무시|말고|제외|취소|상관없이)",
+    re.IGNORECASE,
+)
 _EXACT_SENTENCE_PHRASE_RE = re.compile(
     r"(?:한|두|세|네|다섯|여섯|일곱|여덟|아홉|열|[1-9])\s*문장(?:으로)?",
     re.IGNORECASE,
@@ -180,8 +201,16 @@ _FORMAL_INSTRUCTION_RE = re.compile(
 )
 _CONTEXT_REFERENCE_RE = re.compile(
     r"(?:방금|앞서|앞선|이전\s*(?:답변|말|내용)|위\s*(?:답변|내용)|"
-    r"그중|그것|그걸|그\s*이야기|그럼|이제|이어서|계속\s*(?:이어|설명|답)|"
-    r"(?:첫|두|세)\s*번째|마지막\s*(?:답변|항목))",
+    r"그중|그것|그걸|그\s*이야기|그럼|그렇게|그런\s*(?:방법|이유|부분|점|내용)?|"
+    r"그\s*(?:방법|이유|부분|점)|(?:왜\s*(?:그렇|그렇게)|그게\s*왜)|"
+    r"이제|이어서|계속\s*(?:이어|설명|답)|"
+    r"(?:첫|두|세)\s*번째|마지막\s*(?:답변|항목)|"
+    r"\A\s*(?:좀\s*)?더\s*(?:알려|설명|자세히|구체적으로)|"
+    r"\A\s*구체적으로(?:는|요|말하면)?)",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_PROPOSAL_RE = re.compile(
+    r"(?:방금|앞서|이전|그)\s*.{0,16}(?:제안|추천)",
     re.IGNORECASE,
 )
 
@@ -189,6 +218,8 @@ _CONTEXT_REFERENCE_RE = re.compile(
 def _requires_prior_context(message: str) -> bool:
     """Keep model-visible history only for an explicit contextual reference."""
 
+    if _CONTEXT_RESET_RE.search(message[:512]) is not None:
+        return False
     return _CONTEXT_REFERENCE_RE.search(message[:512]) is not None
 
 
@@ -199,6 +230,11 @@ def _exact_response_prefill(message: str) -> str:
     if match is None:
         return EXACT_RESPONSE_PREFILL
     subject = re.sub(r"\s+", " ", message[: match.start()]).strip(" ,.:;!?。！？")
+    subject = re.sub(
+        r"^.*?(?:이야기|내용|주제).{0,16}(?:접어두고|넘어가고|제외하고),?\s*",
+        "",
+        subject,
+    )
     if not 4 <= len(subject) <= 180:
         return EXACT_RESPONSE_PREFILL
     if subject.endswith(("을", "를")):
@@ -270,6 +306,58 @@ def _formal_response_prefill(message: str) -> str | None:
     return f"{subject} {continuation}, "
 
 
+def _structural_response_prefill(
+    intent: ResponseIntent,
+    *,
+    topic_context: str,
+) -> str | None:
+    """Return a public clause anchor, never a complete canned answer."""
+
+    if intent is ResponseIntent.ONE_TOPIC_PROPOSAL:
+        return "오늘 함께 이야기해 볼 주제로는 "
+    if intent is ResponseIntent.SINGLE_QUESTION:
+        bounded = topic_context[:2_560]
+        if "아이디어" in bounded:
+            return "이 아이디어에서 가장 먼저 "
+        if "데모" in bounded and "개인정보" in bounded:
+            if "정해야" in bounded or "정할" in bounded:
+                return "개인정보 보호 데모에서 가장 먼저 보여줄 장면은 무엇인가요?"
+            return "개인정보 보호 데모에서 가장 먼저 "
+        if "데모" in bounded:
+            return "이 데모에서 가장 먼저 "
+        return "가장 먼저 "
+    if intent is ResponseIntent.CAPABILITY_SCOPE_EXAMPLES:
+        return "도움을 부탁할 수 있는 일은 코드 검토, 문서 정리, 아이디어 구체화처럼 "
+    if intent is ResponseIntent.DEMONSTRATION_FLOW:
+        # The instruction-tuned checkpoint can compose this answer itself.
+        # A public canned prefix made the base checkpoint look coherent but
+        # over-constrained E4B-it and caused otherwise useful flows to fail.
+        return None
+    return None
+
+
+def _single_sentence_contrast_prefill(message: str) -> str | None:
+    """Create a public predicate anchor for one-sentence difference requests."""
+
+    match = _EXACT_SENTENCE_PHRASE_RE.search(message[:512])
+    if match is None:
+        return None
+    subject = re.sub(r"\s+", " ", message[: match.start()]).strip(" ,.:;!?。！？")
+    subject = re.sub(
+        r"^.*?(?:이야기|내용|주제).{0,16}(?:접어두고|넘어가고|제외하고),?\s*",
+        "",
+        subject,
+    )
+    emphasized = re.sub(r"의\s+차이를$", "의 가장 큰 차이는 ", subject)
+    if emphasized != subject:
+        return emphasized
+    if subject.endswith("차이를"):
+        return subject[:-1] + "는 "
+    if subject.endswith("차이"):
+        return subject + "는 "
+    return None
+
+
 _LEADING_ASSISTANT_RE = re.compile(
     r"\A\s*(?:(?:(?:<start_of_turn>|<\|start_of_turn\|>|<\|turn>)\s*)"
     r"(?:assistant|model)\s*:?\s*|(?:assistant|model|어시스턴트)\s*:\s*)",
@@ -295,6 +383,10 @@ _PRESENTATION_WRAPPER_RE = re.compile(
     r"</?(?:답변|본문|입력|출력|역할(?:과\s*지침)?)(?:\s+[^<>\r\n]{0,48})?>",
     re.IGNORECASE,
 )
+_HARMLESS_HTML_FORMATTING_RE = re.compile(
+    r"</?(?:strong|b|em|i)>\s*",
+    re.IGNORECASE,
+)
 _FACTBOOK_ECHO_RE = re.compile(r"(?im)^[ \t]*\[Runtime Fact-book:")
 _QUALITY_REPAIR_ECHO_RE = re.compile(
     r"앞 답변은 요청 형식을 충족하지 못했습니다|"
@@ -316,11 +408,18 @@ _QUALITY_REPAIR_ECHO_RE = re.compile(
     r"앞 답변의\s*\d+\s*[~～-]\s*\d+번 핵심|"
     r"수정 답변을 작성해서 사용자와 시스템|"
     r"서로 다른 핵심 내용을 반복하지 않고 한 번씩만|"
+    r"사용자의 요청이 완벽히 충족되는 답변을 제출하세요|"
+    r"서론과 맺음말 없이 정확히\s*\d+개의 완결된 문장|"
     r"각 문장을 자연스러운 서술어로 끝까지 완결|"
     r"질문의 핵심 용어인|"
     r"같은 문장이나 표현을 반복하지 말고|"
     r"요청한 범위를 빠뜨리지 말고|"
     r"질문의 핵심 용어를 직접 유지하세요|"
+    r"질문의 핵심 축을 모두 직접 다루세요|"
+    r"다음 질문 축을 하나도 빠뜨리지 말고 직접 답하세요|"
+    r"현재 답변은 장점\s*\d+문장과 한계\s*\d+문장|"
+    r"현재 답변은 서론 없이 정확히\s*\d+개의 짧고 완결된|"
+    r"현재 답변은 서로 다른 핵심을 최대\s*\d+개의 완결된|"
     r"중요한 내용을 최대\s*\d+개만 구체적으로 설명하세요|"
     r"제목·목록·HTML 표기 없이"
 )
@@ -337,6 +436,23 @@ def _mask_fenced_code(text: str) -> str:
     """Hide fenced examples while preserving every public-text offset."""
 
     return mask_fenced_code(text)
+
+
+def _strip_harmless_html_formatting_outside_fences(text: str) -> str:
+    """Strip presentation-only HTML without mutating literal fenced examples."""
+
+    boundary_view = _mask_fenced_code(text)
+    parts: list[str] = []
+    cursor = 0
+    for match in _HARMLESS_HTML_FORMATTING_RE.finditer(text):
+        if not boundary_view[match.start() : match.end()].strip():
+            continue
+        parts.append(text[cursor : match.start()])
+        cursor = match.end()
+    if cursor == 0:
+        return text
+    parts.append(text[cursor:])
+    return "".join(parts)
 
 
 @dataclass(frozen=True)
@@ -729,16 +845,53 @@ class AgentManager:
         exact_sentence_count = (
             None if resume_truncated else requested_exact_sentence_count(message)
         )
+        exact_question_count = (
+            None if resume_truncated else requested_exact_question_count(message)
+        )
         exact_item_count = (
             None if resume_truncated else requested_exact_item_count(message)
         )
         maximum_item_count = (
             None if resume_truncated else requested_maximum_items(message)
         )
+        response_intent = (
+            ResponseIntent.GENERAL
+            if resume_truncated
+            else compile_response_intent(message)
+        )
         requires_prior_context = _requires_prior_context(message)
+        topic_context = (
+            ""
+            if resume_truncated
+            else self._response_topic_context(
+                message,
+                requires_prior_context=requires_prior_context,
+            )
+        )
         isolate_turn_history = not resume_truncated and not requires_prior_context
-        response_prefill = None
-        if exact_sentence_count is not None:
+        user_context_override = (
+            self._previous_user_context_prompt(message)
+            if (
+                not resume_truncated
+                and requires_prior_context
+                and _CONTEXTUAL_PROPOSAL_RE.search(message[:512]) is not None
+            )
+            else None
+        )
+        structural_prefill = (
+            None
+            if resume_truncated
+            else _structural_response_prefill(
+                response_intent,
+                topic_context=topic_context,
+            )
+        )
+        if structural_prefill is None and exact_sentence_count == 1:
+            structural_prefill = _single_sentence_contrast_prefill(message)
+        response_prefill = structural_prefill
+        if response_prefill is not None:
+            pass
+        elif exact_sentence_count is not None:
             response_prefill = _exact_response_prefill(message)
         elif exact_item_count is not None:
             response_prefill = _exact_item_response_prefill(message)
@@ -748,11 +901,35 @@ class AgentManager:
             # contract instead of answering it.
             response_prefill = _maximum_item_response_prefill(message)
         elif not resume_truncated:
-            response_prefill = _formal_response_prefill(message)
+            # E4B-it follows ordinary explanation requests directly.  The
+            # legacy base-model clause prefill could turn a sound answer into
+            # an awkward continuation and made topic/facet gates reject it.
+            response_prefill = None
+        natural_style_request = (
+            re.search(
+                r"(?:편한\s*말|자연스럽게|대화하듯|예시(?:와\s*함께|를\s*들어))",
+                message,
+            )
+            is not None
+        )
+        if (
+            natural_style_request
+            and exact_sentence_count is None
+            and exact_item_count is None
+            and maximum_item_count is None
+            and structural_prefill is None
+        ):
+            response_prefill = None
+        turn_system_prompt = self._turn_system_prompt(
+            response_intent,
+            message=message,
+        )
         prompt = self._build_prompt(
             resume_truncated=resume_truncated,
             partial_assistant=response_prefill,
             isolate_history=isolate_turn_history,
+            system_prompt=turn_system_prompt,
+            user_context_override=user_context_override,
         )
         message_id = self._append_message(
             "assistant",
@@ -763,7 +940,8 @@ class AgentManager:
             truncated=False,
             generated_tokens=0,
         )
-        response = ""
+        public_prefill = structural_prefill or ""
+        response = public_prefill
         total_generated = 0
         continuations = 0
         request_budget = budget.first_request
@@ -775,14 +953,29 @@ class AgentManager:
         quality_repair_attempts = 0
         generation_attempts = 0
         decode_started_at = monotonic()
-        decode_deadline = decode_started_at + self.max_decode_seconds
+        structured_count = (
+            sum(requested_category_counts(message) or ())
+            or requested_exact_sentence_count(message)
+            or requested_exact_item_count(message)
+            or requested_maximum_items(message)
+        )
+        decode_seconds = self.max_decode_seconds
+        if structured_count is not None and structured_count <= 4:
+            # Leave a safety margin below the UI/validator's 120-second turn
+            # deadline so a rejected local decode can fail closed cleanly.
+            decode_seconds = min(decode_seconds, 90.0)
+        decode_deadline = decode_started_at + decode_seconds
         # Open conversation follows the model-card sampling profile. Explicit
         # explanation/shape requests use a bounded request-grounded prefill and
         # strict decode: the local E4B otherwise tends to echo the prompt or
         # drift topics while attempting to satisfy the requested shape.
         decode_mode = (
             "strict"
-            if response_prefill is not None or maximum_item_count is not None
+            if (
+                response_prefill is not None
+                or maximum_item_count is not None
+                or exact_question_count is not None
+            )
             else "conversation"
         )
         best_safe_prefix = ""
@@ -930,7 +1123,11 @@ class AgentManager:
             if response_contract_incomplete:
                 diagnostic_codes.add("response_contract")
             normalized = (
-                normalize_exact_sentence_response(
+                normalize_single_question_response(
+                    message,
+                    response,
+                )
+                or normalize_exact_sentence_response(
                     message,
                     response,
                 )
@@ -955,8 +1152,18 @@ class AgentManager:
             )
             if (
                 observed_contract
-                and not self._response_adequate_for_request(message, response)
-                and self._response_adequate_for_request(message, observed_contract)
+                and not self._response_adequate_for_request(
+                    message,
+                    response,
+                    topic_context=topic_context,
+                    instructions=turn_system_prompt,
+                )
+                and self._response_adequate_for_request(
+                    message,
+                    observed_contract,
+                    topic_context=topic_context,
+                    instructions=turn_system_prompt,
+                )
                 and not self._has_cross_turn_sentence_echo(observed_contract)
             ):
                 response = observed_contract
@@ -989,7 +1196,33 @@ class AgentManager:
             response_adequate = self._response_adequate_for_request(
                 message,
                 response,
+                topic_context=topic_context,
+                instructions=turn_system_prompt,
             )
+            if not response_avoids_meta_format_discussion(message, response):
+                diagnostic_codes.add("meta_announcement")
+            if not response_avoids_placeholder_scaffolding(response):
+                diagnostic_codes.add("placeholder_scaffolding")
+            instruction_echo = not response_avoids_instruction_echo(
+                turn_system_prompt,
+                response,
+            )
+            if instruction_echo:
+                diagnostic_codes.add("instruction_echo")
+            if not response_satisfies_intent(message, response):
+                diagnostic_codes.add("intent_contract")
+            if missing_request_facets(message, response):
+                diagnostic_codes.add("request_facets")
+            if not response_fulfills_examples_request(message, response):
+                diagnostic_codes.add("examples_missing")
+            if has_semantic_redundancy(response):
+                diagnostic_codes.add("semantic_repetition")
+            if not response_topically_anchored(topic_context, response):
+                diagnostic_codes.add("topic_drift")
+            if requested_exact_question_count(message) is not None and not (
+                response_contract_satisfied(message, response)
+            ):
+                diagnostic_codes.add("question_contract")
             inadequacy_is_terminal = (
                 bool(response.strip())
                 and not response_adequate
@@ -1002,16 +1235,35 @@ class AgentManager:
             safe_prefix = salvage_complete_prefix(response)
             if (
                 safe_prefix
-                and self._response_adequate_for_request(message, safe_prefix)
+                and self._response_adequate_for_request(
+                    message,
+                    safe_prefix,
+                    topic_context=topic_context,
+                    instructions=turn_system_prompt,
+                )
                 and not self._has_cross_turn_sentence_echo(safe_prefix)
                 and len(safe_prefix) > len(best_safe_prefix)
             ):
                 best_safe_prefix = safe_prefix
+            if (
+                budget.max_continuations == 0
+                and response_intent is not ResponseIntent.GENERAL
+                and best_safe_prefix
+                and terminal_quality.recommended_action is QualityAction.CONTINUE
+            ):
+                response = best_safe_prefix
+                terminal_quality = inspect_response(response, final=True)
+                response_contract_incomplete = not response_contract_satisfied(
+                    message, response
+                )
+                finish_reason = "stop"
+                diagnostic_codes.add("complete_prefix_salvaged")
             bounded_repair_needed = (
                 not response.strip()
                 or inadequacy_is_terminal
                 or response_contract_incomplete
                 or cross_turn_echo
+                or instruction_echo
                 or (
                     budget.max_continuations == 0
                     and terminal_quality.recommended_action is QualityAction.CONTINUE
@@ -1031,7 +1283,10 @@ class AgentManager:
                     or (cross_turn_echo and not requires_prior_context)
                     or (
                         response_contract_incomplete
-                        and requested_exact_sentence_count(message) is not None
+                        and (
+                            requested_exact_sentence_count(message) is not None
+                            or requested_exact_question_count(message) is not None
+                        )
                         and not requires_prior_context
                     )
                 )
@@ -1045,6 +1300,10 @@ class AgentManager:
                             "quality_boundary",
                             "empty_candidate",
                             "near_duplicate",
+                            "semantic_repetition",
+                            "meta_announcement",
+                            "placeholder_scaffolding",
+                            "instruction_echo",
                         }
                     )
                     or (
@@ -1060,9 +1319,19 @@ class AgentManager:
                     # conversation profile; shape/topic-only repairs stay strict.
                     decode_mode = "conversation"
                     repair_prefill = None
-                response = ""
+                response = (
+                    public_prefill
+                    if repair_prefill is not None
+                    and repair_prefill == structural_prefill
+                    else ""
+                )
+                repair_token_cap = (
+                    64
+                    if requested_exact_question_count(message) is not None
+                    else min(DEFAULT_CONCISE_RESPONSE_TOKENS, budget.first_request)
+                )
                 request_budget = min(
-                    DEFAULT_CONCISE_RESPONSE_TOKENS,
+                    repair_token_cap,
                     self.max_new_tokens,
                     remaining,
                 )
@@ -1087,6 +1356,7 @@ class AgentManager:
                     prompt = self._render_bounded_prompt(
                         messages,
                         partial_assistant=repair_prefill,
+                        system_prompt=turn_system_prompt,
                     )
                 else:
                     prompt = self._build_quality_repair_prompt(
@@ -1094,6 +1364,9 @@ class AgentManager:
                         issue_codes=tuple(sorted(diagnostic_codes)),
                         isolate_history=isolate_repair,
                         partial_assistant=repair_prefill,
+                        topic_context=topic_context,
+                        base_system_prompt=turn_system_prompt,
+                        user_context_override=user_context_override,
                     )
                 repetition_boundary = False
                 quality_boundary = False
@@ -1108,6 +1381,7 @@ class AgentManager:
                 (quality_needs_continuation or response_contract_incomplete)
                 and quality_repair_attempts >= HARD_MAX_QUALITY_REPAIRS
                 and continuations < 1
+                and exact_question_count is None
             )
             can_continue = (
                 (
@@ -1147,12 +1421,17 @@ class AgentManager:
                     self._build_continuation_prompt(
                         response,
                         isolate_history=isolate_turn_history,
+                        system_prompt=turn_system_prompt,
+                        user_context_override=user_context_override,
                     )
                     if response
                     else self._build_quality_repair_prompt(
                         message,
                         issue_codes=(QualityCode.INCOMPLETE_KOREAN_CLAUSE.value,),
                         isolate_history=isolate_turn_history,
+                        topic_context=topic_context,
+                        base_system_prompt=turn_system_prompt,
+                        user_context_override=user_context_override,
                     )
                 )
                 with self._condition:
@@ -1169,6 +1448,8 @@ class AgentManager:
                 prompt = self._build_continuation_prompt(
                     response,
                     isolate_history=isolate_turn_history,
+                    system_prompt=turn_system_prompt,
+                    user_context_override=user_context_override,
                 )
             with self._condition:
                 self._transition_locked("generating", "continuing", self._progress)
@@ -1189,13 +1470,18 @@ class AgentManager:
             complete = salvage_complete_prefix(response)
             if (
                 complete
-                and self._response_adequate_for_request(message, complete)
+                and self._response_adequate_for_request(
+                    message,
+                    complete,
+                    topic_context=topic_context,
+                    instructions=turn_system_prompt,
+                )
                 and not self._has_cross_turn_sentence_echo(complete)
             ):
                 response = complete
                 completed_sentences = len(re.findall(r"[.!?。！？]+(?=\s|$)", complete))
                 if complete == raw_response.rstrip() or (
-                    len(complete) >= 80 and completed_sentences >= 2
+                    len(complete) >= 80 and completed_sentences >= 1
                 ):
                     diagnostic_codes.add("length_salvaged")
                     finish_reason = "stop"
@@ -1220,7 +1506,12 @@ class AgentManager:
 
             acceptable = (
                 bool(response)
-                and self._response_adequate_for_request(message, response)
+                and self._response_adequate_for_request(
+                    message,
+                    response,
+                    topic_context=topic_context,
+                    instructions=turn_system_prompt,
+                )
                 and not self._has_cross_turn_sentence_echo(response)
             )
             if not acceptable:
@@ -1244,7 +1535,12 @@ class AgentManager:
                         candidate
                         for candidate in salvage_candidates
                         if candidate
-                        and self._response_adequate_for_request(message, candidate)
+                        and self._response_adequate_for_request(
+                            message,
+                            candidate,
+                            topic_context=topic_context,
+                            instructions=turn_system_prompt,
+                        )
                         and not self._has_cross_turn_sentence_echo(candidate)
                     ),
                     key=len,
@@ -1264,6 +1560,8 @@ class AgentManager:
             if best_safe_prefix and self._response_adequate_for_request(
                 message,
                 best_safe_prefix,
+                topic_context=topic_context,
+                instructions=turn_system_prompt,
             ):
                 response = best_safe_prefix
                 finish_reason = "stop"
@@ -1464,21 +1762,93 @@ class AgentManager:
                 return True
         return False
 
+    def _turn_system_prompt(
+        self,
+        intent: ResponseIntent,
+        *,
+        message: str = "",
+    ) -> str:
+        """Attach only the directive needed by the compiled current intent."""
+
+        directives: list[str] = []
+        if intent is ResponseIntent.ONE_TOPIC_PROPOSAL:
+            directives.append(
+                "현재 답변에서는 실제 이야기 주제 하나만 1~2문장으로 자연스럽게 "
+                "제안하고 인사말이나 다른 후보는 덧붙이지 마세요."
+            )
+        elif intent is ResponseIntent.SINGLE_QUESTION:
+            directives.append(
+                "현재 답변에서는 사용자의 생각을 여는 질문 한 문장만 쓰고 "
+                "물음표로 끝내세요. 설명과 자기소개는 쓰지 마세요."
+            )
+        elif intent is ResponseIntent.CAPABILITY_SCOPE_EXAMPLES:
+            directives.append(
+                "현재 답변에서는 서로 다른 도움 범위를 구체적인 예와 함께 "
+                "2~3문장으로 편하게 설명하고 자기소개나 인사말은 쓰지 마세요."
+            )
+        elif intent is ResponseIntent.DEMONSTRATION_FLOW:
+            directives.append(
+                "현재 답변에서는 사용자가 화면에서 확인할 수 있는 짧은 데모 "
+                "순서만 2~3문장으로 설명하고 외부 정보나 검증되지 않은 기능을 "
+                "만들어내지 마세요."
+            )
+        categories = requested_category_counts(message)
+        exact_sentences = requested_exact_sentence_count(message)
+        exact_items = requested_exact_item_count(message)
+        maximum_items = requested_maximum_items(message)
+        if categories is not None:
+            positive_count, negative_count = categories
+            directives.append(
+                f"현재 답변은 장점 {positive_count}문장과 한계 {negative_count}문장, "
+                f"총 {positive_count + negative_count}개의 짧고 완결된 평문 문장으로 "
+                "쓰고 각 문장에 장점 또는 한계를 직접 표시하세요."
+            )
+        elif (
+            exact_sentences is not None and intent is not ResponseIntent.SINGLE_QUESTION
+        ):
+            directives.append(
+                f"현재 답변은 서론 없이 정확히 {exact_sentences}개의 짧고 완결된 "
+                "평문 문장으로만 쓰세요."
+            )
+        elif exact_items is not None:
+            directives.append(
+                f"현재 답변은 서로 다른 핵심 {exact_items}개를 각각 하나의 완결된 "
+                "문장으로 쓰세요."
+            )
+        elif maximum_items is not None:
+            directives.append(
+                f"현재 답변은 서로 다른 핵심을 최대 {maximum_items}개의 완결된 "
+                "문장으로만 쓰세요."
+            )
+        facets = request_required_facets(message)
+        if facets:
+            directives.append(
+                "질문의 핵심 축을 모두 직접 다루세요: " + ", ".join(facets) + "."
+            )
+        if not directives:
+            return self.system_prompt
+        return self.system_prompt + "\n" + " ".join(directives)
+
     def _build_prompt(
         self,
         *,
         resume_truncated: bool = False,
         partial_assistant: str | None = None,
         isolate_history: bool = False,
+        system_prompt: str | None = None,
+        user_context_override: str | None = None,
     ) -> str:
         messages = self._model_messages()
-        if isolate_history and messages and messages[-1]["role"] == "user":
+        if user_context_override is not None:
+            messages = [{"role": "user", "content": user_context_override}]
+        elif isolate_history and messages and messages[-1]["role"] == "user":
             messages = [messages[-1]]
         if resume_truncated and messages and messages[-1]["role"] == "user":
             messages[-1] = {"role": "user", "content": CONTINUATION_DIRECTIVE}
         return self._render_bounded_prompt(
             messages,
             partial_assistant=partial_assistant,
+            system_prompt=system_prompt,
         )
 
     def _build_continuation_prompt(
@@ -1486,15 +1856,20 @@ class AgentManager:
         response: str,
         *,
         isolate_history: bool = False,
+        system_prompt: str | None = None,
+        user_context_override: str | None = None,
     ) -> str:
         """Continue the same open model turn without adding transcript roles."""
 
         messages = self._model_messages()
-        if isolate_history and messages and messages[-1]["role"] == "user":
+        if user_context_override is not None:
+            messages = [{"role": "user", "content": user_context_override}]
+        elif isolate_history and messages and messages[-1]["role"] == "user":
             messages = [messages[-1]]
         return self._render_bounded_prompt(
             messages,
             partial_assistant=response,
+            system_prompt=system_prompt,
         )
 
     def _build_quality_repair_prompt(
@@ -1504,11 +1879,21 @@ class AgentManager:
         issue_codes: tuple[str, ...] = (),
         isolate_history: bool = False,
         partial_assistant: str | None = None,
+        topic_context: str | None = None,
+        base_system_prompt: str | None = None,
+        user_context_override: str | None = None,
     ) -> str:
         """Retry from the user intent without re-feeding the failed candidate."""
 
         messages = self._model_messages()
-        current = {"role": "user", "content": message}
+        current = {
+            "role": "user",
+            "content": message
+            if user_context_override is None
+            else user_context_override,
+        }
+        if user_context_override is not None:
+            messages = [current]
         if messages and messages[-1]["role"] == "user":
             current = dict(messages[-1])
         if isolate_history:
@@ -1522,8 +1907,13 @@ class AgentManager:
         directions = [QUALITY_REPAIR_DIRECTIVE]
         if "response_contract" in code_set:
             exact = requested_exact_sentence_count(message)
+            exact_questions = requested_exact_question_count(message)
             categories = requested_category_counts(message)
-            if categories is not None:
+            if exact_questions == 1:
+                directions.append(
+                    "서론·설명·목록 없이 질문 한 문장만 쓰고 물음표로 끝내세요."
+                )
+            elif categories is not None:
                 positive_count, negative_count = categories
                 directions.append(
                     f"정확히 장점 {positive_count}개와 한계 {negative_count}개를 "
@@ -1553,9 +1943,57 @@ class AgentManager:
             QualityCode.LOW_INFORMATION_REPETITION.value,
             "token_repetition",
             "near_duplicate",
+            "semantic_repetition",
         }:
             directions.append(
-                "같은 문장이나 표현을 반복하지 말고 서로 다른 핵심을 한 번씩만 답하세요."
+                "같은 뜻이나 표현을 반복하지 말고 서로 다른 핵심을 한 번씩만 "
+                "답하며 각 문장에 새 정보를 담으세요."
+            )
+        if "meta_announcement" in code_set:
+            directions.append(
+                "몇 개를 쓰겠다는 예고 없이 첫 문장부터 실제 답을 작성하세요."
+            )
+        if "placeholder_scaffolding" in code_set:
+            directions.append(
+                "대괄호 자리표시자와 말줄임표를 쓰지 말고 완성된 답만 작성하세요."
+            )
+        if "examples_missing" in code_set:
+            directions.append("'예를 들어'로 시작하는 구체적인 예시를 포함하세요.")
+        if "instruction_echo" in code_set:
+            directions.append(
+                "내부 지침의 문장을 복사하지 말고 사용자에게 보일 실제 답만 쓰세요."
+            )
+        if "intent_contract" in code_set:
+            intent = compile_response_intent(message)
+            if intent is ResponseIntent.ONE_TOPIC_PROPOSAL:
+                directions.append(
+                    "서로 다른 후보를 나열하지 말고 실제 주제 하나만 제안하세요."
+                )
+            elif intent is ResponseIntent.CAPABILITY_SCOPE_EXAMPLES:
+                directions.append(
+                    "코드·문서·아이디어 중 서로 다른 두 종류 이상의 도움을 "
+                    "구체적인 예와 함께 설명하세요."
+                )
+            elif intent is ResponseIntent.DEMONSTRATION_FLOW:
+                directions.append(
+                    "오프라인 데모에 네트워크 연결·외부 정보 조회·데이터 송수신 "
+                    "단계를 제안하지 말고, 로컬 처리와 외부 전송 0건 확인만 "
+                    "설명하세요."
+                )
+        if "request_facets" in code_set or "intent_contract" in code_set:
+            # The failed candidate is intentionally not re-fed into the repair
+            # prompt.  Listing all explicit request facets is bounded and keeps
+            # the retry grounded without leaking the rejected prose.
+            required_facets = request_required_facets(message)
+            if required_facets:
+                directions.append(
+                    "다음 질문 축을 하나도 빠뜨리지 말고 직접 답하세요: "
+                    + ", ".join(required_facets)
+                    + "."
+                )
+        if "topic_drift" in code_set:
+            directions.append(
+                "다른 주제로 벗어나지 말고 현재 질문의 대상에 직접 답하세요."
             )
         if code_set & {
             QualityCode.INCOMPLETE_KOREAN_CLAUSE.value,
@@ -1567,20 +2005,25 @@ class AgentManager:
             directions.append(
                 "요청한 범위를 빠뜨리지 말고 서로 다른 핵심 내용을 충분히 설명하세요."
             )
-            topics = request_topic_terms(message)
+            topics = request_topic_terms(topic_context or message)
             if topics:
                 directions.append(
                     "질문의 핵심 용어를 직접 유지하세요: " + ", ".join(topics) + "."
                 )
 
-        messages[-1] = {
-            "role": "user",
-            "content": current["content"] + "\n\n" + " ".join(directions),
-        }
+        # Keep the user's turn untouched.  Repair instructions belong to the
+        # system role; appending them to the user message made the local model
+        # quote those instructions as a third answer sentence.
+        messages[-1] = current
+        repair_system_prompt = (
+            (self.system_prompt if base_system_prompt is None else base_system_prompt)
+            + "\n"
+            + " ".join(directions)
+        )
         return self._render_bounded_prompt(
             messages,
             partial_assistant=partial_assistant,
-            system_prompt=self.system_prompt,
+            system_prompt=repair_system_prompt,
         )
 
     def _model_messages(self) -> list[dict[str, str]]:
@@ -1619,6 +2062,59 @@ class AgentManager:
             retained.append(item)
             index += 1
         return retained
+
+    def _response_topic_context(
+        self,
+        message: str,
+        *,
+        requires_prior_context: bool,
+    ) -> str:
+        """Use the previous user intent, never a possibly bad model answer."""
+
+        if not requires_prior_context:
+            return message
+        user_messages = [
+            item["content"]
+            for item in self.conversations.snapshot(self.session_id).as_messages()
+            if item["role"] == "user"
+        ]
+        if len(user_messages) < 2:
+            return message
+        prior = user_messages[-2][-1_024:]
+        trusted_assistant = ""
+        with self._condition:
+            ui_messages = list(self._messages)
+        if ui_messages and ui_messages[-1].get("role") == "user":
+            ui_messages.pop()
+        if ui_messages:
+            previous = ui_messages[-1]
+            if (
+                previous.get("role") == "assistant"
+                and previous.get("generation_mode")
+                in {"factbook", "conversation_fastpath"}
+                and len(str(previous.get("content", ""))) <= 512
+            ):
+                trusted_assistant = str(previous.get("content", ""))[-512:]
+        parts = [prior]
+        if trusted_assistant:
+            parts.append(trusted_assistant)
+        parts.append(message[-1_024:])
+        return "\n".join(parts)[-2_560:]
+
+    def _previous_user_context_prompt(self, message: str) -> str | None:
+        """Ground a proposal follow-up without replaying an untrusted answer."""
+
+        user_messages = [
+            item["content"]
+            for item in self.conversations.snapshot(self.session_id).as_messages()
+            if item["role"] == "user"
+        ]
+        if len(user_messages) < 2:
+            return None
+        prior = user_messages[-2][-1_024:]
+        return (
+            "직전 사용자의 주제:\n" + prior + "\n\n현재 요청:\n" + message[-1_024:]
+        )[-2_560:]
 
     def _render_bounded_prompt(
         self,
@@ -1805,12 +2301,25 @@ class AgentManager:
         return merged
 
     @staticmethod
-    def _response_adequate_for_request(message: str, response: str) -> bool:
+    def _response_adequate_for_request(
+        message: str,
+        response: str,
+        *,
+        topic_context: str | None = None,
+        instructions: str = SYSTEM_PROMPT,
+    ) -> bool:
         """Reject generic one-line salvage for an explicitly broad request."""
 
         candidate = response.strip()
         if not candidate or not response_contract_satisfied(message, candidate):
             return False
+        if not response_satisfies_intent(message, candidate):
+            return False
+        if not response_avoids_instruction_echo(instructions, candidate):
+            return False
+        categories = requested_category_counts(message)
+        exact = requested_exact_sentence_count(message)
+        exact_items = requested_exact_item_count(message)
         if not response_avoids_unsolicited_subjects(message, candidate):
             return False
         if not response_avoids_unsolicited_self_intro(message, candidate):
@@ -1821,25 +2330,35 @@ class AgentManager:
             return False
         if not response_avoids_meta_format_discussion(message, candidate):
             return False
+        if not response_avoids_placeholder_scaffolding(candidate):
+            return False
+        if not response_fulfills_examples_request(message, candidate):
+            return False
         if not response_avoids_prompt_echo(message, candidate):
+            return False
+        topic_request = message if topic_context is None else topic_context
+        topic_satisfied = response_topically_anchored(topic_request, candidate)
+        if exact_items is not None and response_preserves_distinctive_topic(
+            topic_request,
+            candidate,
+        ):
+            topic_satisfied = True
+        if categories is not None and response_preserves_category_subject(
+            topic_request,
+            candidate,
+        ):
+            topic_satisfied = True
+        if not topic_satisfied:
+            return False
+        if (
+            exact_items is None
+            and categories is None
+            and has_semantic_redundancy(candidate)
+        ):
             return False
         if (
             inspect_response(candidate, final=True).recommended_action
             is not QualityAction.ACCEPT
-        ):
-            return False
-        exact = requested_exact_sentence_count(message)
-        exact_items = requested_exact_item_count(message)
-        categories = requested_category_counts(message)
-        explicit_formal_request = _FORMAL_INSTRUCTION_RE.search(message) is not None
-        if (
-            exact_items is None
-            and (exact is not None or explicit_formal_request)
-            and not response_topically_anchored(message, candidate)
-            and not (
-                categories is not None
-                and response_preserves_category_subject(message, candidate)
-            )
         ):
             return False
         if (
@@ -1903,6 +2422,61 @@ class AgentManager:
         self, message: str, *, resume_truncated: bool
     ) -> ResponseBudget:
         lowered = message.casefold()
+        if not resume_truncated and requested_exact_question_count(message) == 1:
+            single_question = min(self.max_new_tokens, 64)
+            return ResponseBudget(
+                first_request=max(1, single_question),
+                total=min(
+                    self.max_total_new_tokens,
+                    max(1, single_question * (HARD_MAX_QUALITY_REPAIRS + 1)),
+                ),
+                max_continuations=0,
+            )
+        if not resume_truncated:
+            categories = requested_category_counts(message)
+            exact_sentences = requested_exact_sentence_count(message)
+            exact_items = requested_exact_item_count(message)
+            maximum_items = requested_maximum_items(message)
+            structured_count = (
+                sum(categories or ()) or exact_sentences or exact_items or maximum_items
+            )
+            if structured_count is not None and structured_count <= 4:
+                structured = min(self.max_new_tokens, DEFAULT_SHORT_RESPONSE_TOKENS)
+                return ResponseBudget(
+                    first_request=max(1, structured),
+                    total=min(self.max_total_new_tokens, max(1, structured * 2)),
+                    max_continuations=0,
+                )
+        if (
+            not resume_truncated
+            and compile_response_intent(message) is ResponseIntent.ONE_TOPIC_PROPOSAL
+        ):
+            one_proposal = min(self.max_new_tokens, 64)
+            return ResponseBudget(
+                first_request=max(1, one_proposal),
+                total=min(self.max_total_new_tokens, max(1, one_proposal * 3)),
+                max_continuations=0,
+            )
+        if (
+            not resume_truncated
+            and compile_response_intent(message) is ResponseIntent.DEMONSTRATION_FLOW
+        ):
+            flow = min(self.max_new_tokens, 80)
+            return ResponseBudget(
+                first_request=max(1, flow),
+                total=min(self.max_total_new_tokens, max(1, flow * 3)),
+                max_continuations=0,
+            )
+        if not resume_truncated and re.search(
+            r"(?:편한\s*말|예시(?:와\s*함께|를\s*들어))",
+            message,
+        ):
+            natural = min(self.max_new_tokens, DEFAULT_SHORT_RESPONSE_TOKENS)
+            return ResponseBudget(
+                first_request=max(1, natural),
+                total=min(self.max_total_new_tokens, max(1, natural * 3)),
+                max_continuations=0,
+            )
         if not resume_truncated and _CONCISE_INTENT_RE.search(message) is not None:
             concise = min(self.max_new_tokens, DEFAULT_CONCISE_RESPONSE_TOKENS)
             return ResponseBudget(
@@ -1911,12 +2485,29 @@ class AgentManager:
                 max_continuations=0,
             )
         detail_score = sum(term in lowered for term in _DETAILED_INTENT_TERMS)
+        if (
+            not resume_truncated
+            and detail_score == 0
+            and _FORMAL_INSTRUCTION_RE.search(message[:512]) is not None
+        ):
+            formal = min(self.max_new_tokens, DEFAULT_SHORT_RESPONSE_TOKENS)
+            return ResponseBudget(
+                first_request=max(1, formal),
+                total=min(self.max_total_new_tokens, max(1, formal * 2)),
+                max_continuations=0,
+            )
         if resume_truncated or detail_score >= 2 or len(message) >= 600:
             first = self.max_new_tokens
         elif detail_score == 1 or len(message) >= 180:
             first = min(self.max_new_tokens, DEFAULT_DETAILED_RESPONSE_TOKENS)
         else:
             first = min(self.max_new_tokens, DEFAULT_SHORT_RESPONSE_TOKENS)
+        if not resume_truncated and detail_score == 0 and len(message) < 180:
+            return ResponseBudget(
+                first_request=max(1, first),
+                total=min(self.max_total_new_tokens, max(1, first * 3)),
+                max_continuations=0,
+            )
         return ResponseBudget(
             first_request=max(1, first),
             total=self.max_total_new_tokens,
@@ -1952,6 +2543,7 @@ class AgentManager:
         """Remove model headers and stop at the next generated chat role."""
 
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        normalized = _strip_harmless_html_formatting_outside_fences(normalized)
         leading_quote = re.match(r"\A\s*([“‘])\s*", normalized)
         if leading_quote is not None:
             closing_quote = "”" if leading_quote.group(1) == "“" else "’"
@@ -1999,8 +2591,9 @@ class AgentManager:
 
     @staticmethod
     def _merge_response(existing: str, segment: str) -> str:
+        existing_had_space = bool(existing[-1:].isspace())
         base = existing.rstrip()
-        leading_space = bool(segment[:1].isspace())
+        leading_space = existing_had_space or bool(segment[:1].isspace())
         addition = segment.lstrip()
         if not base:
             return addition

@@ -1945,7 +1945,10 @@ def _build_product_controls(
     from cogni_agent.conversation_fastpath import ConversationFastPath
     from cogni_agent.fact_grounding import RuntimeFactGrounder
     from cogni_agent.manager import SYSTEM_PROMPT, AgentManager
-    from cogni_agent.model_service import ModelService
+    from cogni_agent.model_service import (
+        ModelService,
+        _require_instruction_tuned_e4b,
+    )
     from cogni_agent.tools import WorkspaceToolExecutor
     from cogni_flow.production import (
         ProductionHarnessConfig,
@@ -1954,6 +1957,11 @@ def _build_product_controls(
     )
     from cogni_os.factbook import build_runtime_factbook_from_verified
     from cogni_os.version import __version__
+
+    # A syntactically valid manifest is not a model trust root.  Bind the
+    # complete verified digest set to the pinned official E4B-it checkpoint
+    # before publishing any Fact-book claim or constructing product services.
+    _require_instruction_tuned_e4b(verified)
 
     # The running source tree is the authority.  An older installed wheel may
     # coexist during an in-place upgrade and must never overwrite the product
@@ -2054,10 +2062,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     project_root = Path(__file__).resolve().parents[1]
     parser.add_argument(
         "--model",
-        default=os.environ.get("COGNI_OS_MODEL_DIR", r"C:\Project\cognios\gemma4-e4b"),
+        default=os.environ.get(
+            "COGNI_OS_MODEL_DIR", r"C:\Project\cognios\gemma4-e4b-it"
+        ),
     )
     parser.add_argument(
-        "--manifest", default=str(project_root / "config" / "gemma4-e4b.manifest.toml")
+        "--manifest",
+        default=str(project_root / "config" / "gemma4-e4b-it.manifest.toml"),
     )
     parser.add_argument("--assets", default=str(project_root / "cogni_demo" / "static"))
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)

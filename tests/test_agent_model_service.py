@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from hashlib import sha256
 import os
 from pathlib import Path
 from queue import Queue
@@ -22,11 +23,14 @@ from cogni_agent.model_service import (
     LocalGemmaModelFactory,
     ModelService,
     PRODUCTION_CTS_ACT_HARD_FLOOR,
+    TRUSTED_GEMMA4_E4B_IT_DIGESTS,
+    TRUSTED_GEMMA4_E4B_IT_REVISION,
     RequestLimitError,
     WorkerExecutionError,
     WorkerAuthorityError,
     WorkerStartupError,
     _TokenRepetitionGuard,
+    _require_instruction_tuned_e4b,
     _VerifiedMetaControllerV2,
     _parameter_signature,
     _prepare_base_model,
@@ -65,6 +69,11 @@ from cogni_os.gpu_lease import (
     GPULeaseManager,
     StaleGPULeaseError,
 )
+from cogni_os.artifacts import (
+    ArtifactIdentity,
+    ArtifactVerificationError,
+    VerifiedArtifactSet,
+)
 from cogni_os.runtime import SearchCollaboratorsV2
 
 
@@ -78,6 +87,28 @@ class FakeTokenizer:
 
     def decode(self, token_ids, **_kwargs):
         return " ".join(str(token) for token in token_ids)
+
+
+def trusted_e4b_snapshot_stub(root: Path) -> VerifiedArtifactSet:
+    contents = {
+        "config.json": b'{"model_type":"gemma4"}',
+        "model.safetensors": b"weights",
+        "tokenizer.json": b"{}",
+    }
+    for relative_name, _digest in TRUSTED_GEMMA4_E4B_IT_DIGESTS:
+        (root / relative_name).write_bytes(contents.get(relative_name, b"{}"))
+    return VerifiedArtifactSet(
+        root.resolve(),
+        (),
+        ArtifactIdentity(
+            family="gemma4",
+            variant="E4B",
+            role="instruction_tuned",
+            source="google/gemma-4-E4B-it",
+            revision=TRUSTED_GEMMA4_E4B_IT_REVISION,
+        ),
+        TRUSTED_GEMMA4_E4B_IT_DIGESTS,
+    )
 
 
 class FakeConfig:
@@ -1779,6 +1810,146 @@ class TestResidentModelService(unittest.TestCase):
                     LocalGemmaModelFactory(str(root)),
                     max_input_tokens=4_097,
                 )
+
+    def test_manifest_rejects_base_checkpoint_at_chat_boundary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "model"
+            root.mkdir()
+            artifacts = {
+                "config.json": b'{"model_type":"gemma4"}',
+                "model.safetensors": b"weights",
+                "tokenizer.json": b"{}",
+            }
+            for name, content in artifacts.items():
+                (root / name).write_bytes(content)
+
+            def write_manifest(
+                role: str,
+                source: str,
+                revision: str = TRUSTED_GEMMA4_E4B_IT_REVISION,
+            ) -> Path:
+                manifest = Path(temporary) / f"{role}.toml"
+                files = "\n".join(
+                    f'"{name}" = "{sha256(content).hexdigest()}"'
+                    for name, content in artifacts.items()
+                )
+                manifest.write_text(
+                    "\n".join(
+                        (
+                            "[model]",
+                            'family = "gemma4"',
+                            'variant = "E4B"',
+                            f'role = "{role}"',
+                            f'source = "{source}"',
+                            f'revision = "{revision}"',
+                            "",
+                            "[files]",
+                            files,
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                return manifest
+
+            base_manifest = write_manifest("base", "google/gemma-4-E4B")
+            with self.assertRaisesRegex(ValueError, "instruction-tuned|E4B-it"):
+                LocalGemmaModelFactory(str(root), manifest_path=str(base_manifest))
+
+            chat_manifest = write_manifest("instruction_tuned", "google/gemma-4-E4B-it")
+            with self.assertRaisesRegex(ValueError, "untrusted.*fingerprint"):
+                LocalGemmaModelFactory(str(root), manifest_path=str(chat_manifest))
+
+    def test_chat_boundary_accepts_only_pinned_official_digest_set(self):
+        identity = ArtifactIdentity(
+            family="gemma4",
+            variant="E4B",
+            role="instruction_tuned",
+            source="google/gemma-4-E4B-it",
+            revision=TRUSTED_GEMMA4_E4B_IT_REVISION,
+        )
+        verified = VerifiedArtifactSet(
+            Path("model"),
+            (),
+            identity,
+            TRUSTED_GEMMA4_E4B_IT_DIGESTS,
+        )
+        _require_instruction_tuned_e4b(verified)
+
+        wrong_revision = VerifiedArtifactSet(
+            Path("model"),
+            (),
+            ArtifactIdentity(
+                family="gemma4",
+                variant="E4B",
+                role="instruction_tuned",
+                source="google/gemma-4-E4B-it",
+                revision="0" * 40,
+            ),
+            TRUSTED_GEMMA4_E4B_IT_DIGESTS,
+        )
+        with self.assertRaisesRegex(ValueError, "E4B-it"):
+            _require_instruction_tuned_e4b(wrong_revision)
+
+        changed_digests = list(TRUSTED_GEMMA4_E4B_IT_DIGESTS)
+        changed_digests[-1] = (changed_digests[-1][0], "0" * 64)
+        wrong_fingerprint = VerifiedArtifactSet(
+            Path("model"), (), identity, tuple(changed_digests)
+        )
+        with self.assertRaisesRegex(ValueError, "untrusted.*fingerprint"):
+            _require_instruction_tuned_e4b(wrong_fingerprint)
+
+    def test_unmanifested_overlay_is_rejected_before_tokenizer_load(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "model"
+            root.mkdir()
+            verified = trusted_e4b_snapshot_stub(root)
+            manifest = Path(temporary) / "manifest.toml"
+            manifest.write_text("[files]\n", encoding="utf-8")
+            (root / "adapter_config.json").write_text("{}", encoding="utf-8")
+
+            with (
+                patch(
+                    "cogni_agent.model_service.verify_artifact_manifest",
+                    return_value=verified,
+                ),
+                patch(
+                    "cogni_agent.model_service.load_local_tokenizer"
+                ) as tokenizer_loader,
+            ):
+                with self.assertRaisesRegex(
+                    ArtifactVerificationError, "adapter_config"
+                ):
+                    ModelService.for_local_gemma(root, manifest_path=manifest)
+            tokenizer_loader.assert_not_called()
+
+    def test_unmanifested_remote_code_is_rejected_before_model_load(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "model"
+            root.mkdir()
+            verified = trusted_e4b_snapshot_stub(root)
+            manifest = Path(temporary) / "manifest.toml"
+            manifest.write_text("[files]\n", encoding="utf-8")
+
+            with patch(
+                "cogni_agent.model_service.verify_artifact_manifest",
+                return_value=verified,
+            ):
+                factory = LocalGemmaModelFactory(str(root), manifest_path=str(manifest))
+                (root / "modeling_gemma4.py").write_text(
+                    "raise RuntimeError('must not execute')", encoding="utf-8"
+                )
+                with patch(
+                    "cogni_agent.model_service.load_local_gemma"
+                ) as model_loader:
+                    with self.assertRaisesRegex(
+                        ArtifactVerificationError, "modeling_gemma4"
+                    ):
+                        factory()
+            model_loader.assert_not_called()
+
+    def test_product_chat_requires_manifest(self):
+        with self.assertRaisesRegex(ValueError, "trusted artifact manifest"):
+            ModelService.for_local_gemma("unused", manifest_path=None)
 
 
 if __name__ == "__main__":

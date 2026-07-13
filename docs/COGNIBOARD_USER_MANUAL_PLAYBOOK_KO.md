@@ -7,7 +7,7 @@
 
 ## 1. 이 문서의 목적
 
-CogniBoard는 단순한 채팅 화면이 아니라 로컬 Gemma 4 E4B, Cogni-Core,
+CogniBoard는 단순한 채팅 화면이 아니라 검증된 로컬 Gemma 4 E4B-it, Cogni-Core,
 검증 파이프라인, 제한된 로컬 도구, Self-Harness 연구 제어면을 한곳에서 운영하는
 미션 컨트롤이다. 이 문서는 처음 실행하는 사용자, 데모 발표자, 검증 담당자,
 개발 운영자가 같은 화면을 같은 의미로 해석하도록 돕는다.
@@ -36,7 +36,8 @@ CogniBoard는 단순한 채팅 화면이 아니라 로컬 Gemma 4 E4B, Cogni-Cor
 
 - Windows 11 64-bit, Python 3.11 이상
 - CUDA를 사용할 수 있는 로컬 PyTorch와 설치된 프로젝트 의존성
-- `C:\Project\cognios\gemma4-e4b` 로컬 모델과 manifest 6개 파일
+- `C:\Project\cognios\gemma4-e4b-it` instruction-tuned 로컬 모델과 manifest
+  7개 파일
 - EXE와 나란히 있는 `Cogni-OS-2-Genesis-source` 폴더
 - 외부 다운로드가 필요 없는 완전한 로컬 실행 환경
 
@@ -62,7 +63,7 @@ flowchart LR
     D[상단 상태 바\nLOCAL ONLY · 리듬 · 검증] --> B
     E[Cogni-Flow\nCPU 제어면] --> F[Bounded Tensor IPC]
     F --> G[Cogni-Core\n단일 GPU 데이터면]
-    G --> H[Gemma 4 E4B]
+    G --> H[Gemma 4 E4B-it]
     G --> I[DEQ · CTS]
     G --> J[System 1.5 · 2.5 · 3 · 4]
 ```
@@ -315,7 +316,9 @@ proposal-only Self-Harness를 설명한다.
 1. 시스템 메시지의 구체적인 초기화 단계를 확인한다.
 2. `CTS policy checkpoint integrity verification failed`이면 배포 ZIP/소스가
    v0.3.2인지와 `SHA256SUMS.txt`를 확인한다.
-3. 모델 경로 `C:\Project\cognios\gemma4-e4b`와 manifest 6개 파일을 확인한다.
+3. 제품 대화용 모델 경로 `C:\Project\cognios\gemma4-e4b-it`와 manifest 7개 파일을
+   확인한다. pretrained base 체크포인트는 연구·canary 재현용이며 제품 대화용이
+   아니다.
 4. Python, PyTorch, Transformers, CUDA, GPU 여유 메모리를 확인한다.
 5. 배포 폴더의 source와 EXE가 같은 버전인지 확인한다.
 

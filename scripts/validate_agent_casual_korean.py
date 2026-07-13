@@ -30,9 +30,14 @@ from cogni_agent.manager import SYSTEM_PROMPT, AgentManager  # noqa: E402
 from cogni_agent.model_service import ModelService  # noqa: E402
 from cogni_agent.response_quality import (  # noqa: E402
     QualityAction,
+    ResponseIntent,
+    compile_response_intent,
     inspect_response,
     requested_exact_item_count,
+    requested_exact_question_count,
     requested_maximum_items,
+    response_avoids_instruction_echo,
+    response_satisfies_intent,
 )
 from cogni_agent.tools import WorkspaceToolExecutor  # noqa: E402
 from cogni_flow.rhythm import RhythmController  # noqa: E402
@@ -71,6 +76,7 @@ class CasualCase:
     categories: tuple[str, ...]
     expected_mode: str
     required_groups: tuple[tuple[str, ...], ...]
+    max_response_chars: int = 800
 
 
 CASUAL_CASES = (
@@ -100,6 +106,7 @@ CASUAL_CASES = (
         ("independent_casual",),
         "cogni_core",
         (("안녕", "반가", "좋"), ("이야기", "주제", "오늘", "제안")),
+        max_response_chars=320,
     ),
     CasualCase(
         "open-project-idea",
@@ -108,6 +115,7 @@ CASUAL_CASES = (
         ("typo", "collaboration_proposal"),
         "cogni_core",
         (("프로젝트", "아이디어", "주제"), ("무엇", "어떤", "누구", "까요")),
+        max_response_chars=180,
     ),
     CasualCase(
         "capability-paraphrase",
@@ -119,6 +127,7 @@ CASUAL_CASES = (
             ("도와", "할 수", "함께", "지원"),
             ("작업", "코드", "문서", "아이디어", "설명", "검토"),
         ),
+        max_response_chars=500,
     ),
     CasualCase(
         "followup-context-seed",
@@ -127,6 +136,7 @@ CASUAL_CASES = (
         ("follow_up", "collaboration_proposal"),
         "cogni_core",
         (("데모", "오프라인", "AI"), ("개인정보", "보호", "흐름", "기능")),
+        max_response_chars=500,
     ),
     CasualCase(
         "followup-first-step",
@@ -135,6 +145,7 @@ CASUAL_CASES = (
         ("follow_up",),
         "cogni_core",
         (("무엇", "어떤", "누구", "까요"), ("데모", "목표", "사용", "기능", "대상")),
+        max_response_chars=220,
     ),
     CasualCase(
         "context-transition",
@@ -143,6 +154,7 @@ CASUAL_CASES = (
         ("context_transition",),
         "cogni_core",
         (("리스트",), ("튜플",), ("변경", "불변", "수정", "mutable", "immutable")),
+        max_response_chars=220,
     ),
     CasualCase(
         "formal-quality-regression",
@@ -172,6 +184,23 @@ REQUIRED_CATEGORIES = frozenset(
         "follow_up",
         "context_transition",
         "formal_regression",
+    }
+)
+REQUIRED_CASUAL_CHECKS = frozenset(
+    {
+        "exactly_one_assistant",
+        "zero_quality_fallback",
+        "request_contract_fulfilled",
+        "no_placeholder_scaffolding",
+        "requested_examples_present",
+        "no_semantic_redundancy",
+        "bounded_response_size",
+        "case_relevance",
+        "bounded_latency",
+        "single_question_no_continuation",
+        "intent_contract_satisfied",
+        "no_instruction_echo",
+        "airgap_scope_respected",
     }
 )
 
@@ -240,6 +269,7 @@ def _casual_checks(
         requested_exact_item_count(case.prompt) is not None
         or requested_maximum_items(case.prompt) is not None
     )
+    response_intent = compile_response_intent(case.prompt)
     checks = _answer_checks(
         answer,
         state,
@@ -260,7 +290,7 @@ def _casual_checks(
             ),
             "not_prompt_echo": bool(text)
             and prompt_folded not in re.sub(r"\s+", " ", text).strip().casefold(),
-            "bounded_response_size": 8 <= len(text) <= 2_000,
+            "bounded_response_size": 8 <= len(text) <= case.max_response_chars,
             "lexically_non_degenerate": _lexical_diversity(text) >= 0.20,
             "quality_report_accepts": inspect_response(
                 text,
@@ -276,6 +306,16 @@ def _casual_checks(
             "case_relevance": all(
                 any(term.casefold() in folded for term in group)
                 for group in case.required_groups
+            )
+            if response_intent is not ResponseIntent.ONE_TOPIC_PROPOSAL
+            else response_satisfies_intent(case.prompt, text),
+            "intent_contract_satisfied": response_satisfies_intent(
+                case.prompt,
+                text,
+            ),
+            "no_instruction_echo": response_avoids_instruction_echo(
+                SYSTEM_PROMPT,
+                text,
             ),
             "intent_alignment": "collaboration_proposal" not in case.categories
             or _COLLABORATION_NEGATION_RE.search(text) is None,
@@ -285,6 +325,10 @@ def _casual_checks(
             "bounded_latency": 0.0
             <= float(elapsed_seconds)
             <= float(latency_limit_seconds),
+            "single_question_no_continuation": (
+                requested_exact_question_count(case.prompt) is None
+                or int(answer.get("continuations", 0)) == 0
+            ),
         }
     )
     return checks
@@ -314,6 +358,9 @@ def _casual_summary(
     ]
     expected_count = len(CASUAL_CASES)
     passed_turns = sum(turn.get("passed") is True for turn in turns)
+    checks_schema_complete = len(turns) == expected_count and all(
+        REQUIRED_CASUAL_CHECKS.issubset(set(turn.get("checks", {}))) for turn in turns
+    )
     strict = (
         len(turns) == expected_count
         and passed_turns == expected_count
@@ -322,6 +369,7 @@ def _casual_summary(
         and all(turn.get("passed") is True for turn in exact_turns)
         and fastpath_turns <= MAX_FAST_PATH_RELEASE_TURNS
         and REQUIRED_CATEGORIES.issubset(categories_seen)
+        and checks_schema_complete
     )
     return {
         "expected_turns": expected_count,
@@ -363,6 +411,8 @@ def _casual_summary(
         "observed_categories": sorted(categories_seen),
         "category_coverage_gate_passed": REQUIRED_CATEGORIES.issubset(categories_seen),
         "failed_check_counts": failed_checks,
+        "required_checks": sorted(REQUIRED_CASUAL_CHECKS),
+        "checks_schema_gate_passed": checks_schema_complete,
         "strict_casual_gate_passed": strict,
     }
 

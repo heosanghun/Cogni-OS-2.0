@@ -4,6 +4,7 @@ from hashlib import sha256
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from zipfile import ZipFile
 
@@ -14,6 +15,44 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestReleaseBundleIntegrity(unittest.TestCase):
+    def test_product_smoke_is_bound_to_the_pinned_instruction_checkpoint(self) -> None:
+        script = (ROOT / "scripts" / "build_release_bundle.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "[string]$ModelPath = 'C:\\Project\\cognios\\gemma4-e4b-it'",
+            script,
+        )
+        self.assertIn("--manifest config\\gemma4-e4b-it.manifest.toml", script)
+        self.assertIn("--max-new-tokens 96", script)
+        self.assertNotIn("--prompt", script)
+
+        manifest_path = ROOT / "config" / "gemma4-e4b-it.manifest.toml"
+        with manifest_path.open("rb") as stream:
+            manifest = tomllib.load(stream)
+        self.assertEqual(
+            manifest["model"],
+            {
+                "family": "gemma4",
+                "variant": "E4B",
+                "role": "instruction_tuned",
+                "source": "google/gemma-4-E4B-it",
+                "revision": "a4c2d58be94dda072b918d9db64ee85c8ed34e3f",
+            },
+        )
+        self.assertEqual(
+            set(manifest["files"]),
+            {
+                "chat_template.jinja",
+                "config.json",
+                "generation_config.json",
+                "model.safetensors",
+                "processor_config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+            },
+        )
+
     def test_checkpoint_is_exported_as_an_opaque_git_artifact(self) -> None:
         attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
         self.assertIn("/cogni_core/cts_policy_checkpoint.json -text", attributes)

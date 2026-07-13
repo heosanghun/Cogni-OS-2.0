@@ -31,16 +31,26 @@ from cogni_agent.manager import (  # noqa: E402
 from cogni_agent.model_service import ModelService  # noqa: E402
 from cogni_agent.response_quality import (  # noqa: E402
     QualityAction,
+    ResponseIntent,
+    compile_response_intent,
     has_near_duplicate_sentences,
+    has_semantic_redundancy,
     inspect_response,
+    requested_category_counts,
     requested_exact_item_count,
     requested_maximum_items,
     response_avoids_dangling_sentence_start,
     response_avoids_generic_outline,
+    response_avoids_instruction_echo,
     response_avoids_meta_format_discussion,
+    response_avoids_placeholder_scaffolding,
     response_avoids_prompt_echo,
     response_avoids_unsolicited_self_intro,
     response_contract_satisfied,
+    response_covers_request_facets,
+    response_fulfills_examples_request,
+    response_respects_airgap_scope,
+    response_satisfies_intent,
 )
 from cogni_agent.tools import WorkspaceToolExecutor  # noqa: E402
 from cogni_flow.rhythm import RhythmController  # noqa: E402
@@ -132,12 +142,21 @@ STRESS_ANCHOR_GROUPS = (
         ("장점", "보안", "보호", "응답", "오프라인", "인터넷"),
         ("한계", "제약", "제한", "메모리", "성능", "전력"),
     ),
-    (("정정", "사실", "수정"), ("확인", "검증", "반영")),
-    (("사실", "확인"), ("추론", "판단")),
+    (
+        ("정정", "사실", "수정"),
+        ("확인", "검증", "검토", "반영", "수용", "업데이트", "전달"),
+    ),
+    (
+        ("사실", "확인", "검증된 정보"),
+        ("추론", "판단", "정보만", "구분", "근거", "원칙"),
+    ),
     (("문장", "답변", "생성"), ("끝", "완결", "길이", "토큰", "중단", "끊")),
     (("백업",), ("검증", "테스트"), ("롤백", "복구")),
     (("재시도", "예외", "오류"), ("종료", "중단", "한도", "횟수")),
-    (("요약", "요약문", "군더더기"), ("반복", "핵심", "간결")),
+    (
+        ("요약", "요약문", "군더더기", "원문", "세부 사항", "수식어"),
+        ("반복", "핵심", "간결"),
+    ),
     (("개인정보", "데이터"), ("오프라인", "로컬", "장치")),
     (("측정값", "측정"), ("설계 목표", "목표"), ("메모리", "gpu")),
     (("실행", "도구", "결과"), ("확인", "검증", "성공")),
@@ -663,11 +682,22 @@ def _answer_checks(
             text,
             structured_items=parallel_item_shape,
         ),
+        "no_semantic_redundancy": (
+            parallel_item_shape
+            or requested_category_counts(request) is not None
+            or not has_semantic_redundancy(text)
+        ),
         "quality_report_accepts": quality.recommended_action is QualityAction.ACCEPT,
         "balanced_smart_quotes": _smart_quotes_balanced(text),
         "contains_korean": bool(korean["contains_korean"]),
         "korean_complete": bool(korean["complete"]),
-        "topic_anchors_satisfied": _topic_anchors_satisfied(text, required_groups),
+        "topic_anchors_satisfied": (
+            _topic_anchors_satisfied(text, required_groups)
+            or (
+                compile_response_intent(request) is ResponseIntent.ONE_TOPIC_PROPOSAL
+                and response_satisfies_intent(request, text)
+            )
+        ),
         "no_unsolicited_self_intro": response_avoids_unsolicited_self_intro(
             request,
             text,
@@ -678,7 +708,19 @@ def _answer_checks(
             request,
             text,
         ),
+        "no_placeholder_scaffolding": response_avoids_placeholder_scaffolding(text),
+        "requested_examples_present": response_fulfills_examples_request(
+            request,
+            text,
+        ),
         "no_full_prompt_echo": response_avoids_prompt_echo(request, text),
+        "no_instruction_echo": response_avoids_instruction_echo(
+            SYSTEM_PROMPT,
+            text,
+        ),
+        "airgap_scope_respected": response_respects_airgap_scope(request, text),
+        "request_facets_covered": response_covers_request_facets(request, text),
+        "intent_contract_satisfied": response_satisfies_intent(request, text),
         "request_contract_fulfilled": answer.get("generation_mode")
         != "quality_fallback"
         and response_contract_satisfied(request, text),

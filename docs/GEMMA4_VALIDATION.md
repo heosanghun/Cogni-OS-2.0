@@ -1,9 +1,10 @@
-# Local Gemma 4 E4B Validation — v0.3.2
+# Local Gemma 4 E4B Base Canary Validation — v0.3.2
 
 ## Scope
 
-This record describes one local developer canary, not a universal performance
-claim. The artifact was loaded from `C:\Project\cognios\gemma4-e4b` only after
+This record describes one historical local **pretrained-base research canary**,
+not a universal performance claim or the public conversation runtime. The
+artifact was loaded from `C:\Project\cognios\gemma4-e4b` only after
 all six entries in `config/gemma4-e4b.manifest.toml` passed SHA-256
 verification. No model weight is distributed in this repository.
 
@@ -68,23 +69,29 @@ claim.
 
 ## Conversation completion
 
+Product conversation validation uses only the exact pinned instruction-tuned
+checkpoint and its seven-file manifest. The pretrained base artifact above is
+not an accepted public conversation checkpoint.
+
 ```powershell
 python scripts\validate_agent_completion.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
+  --turns 20
 ```
 
-The current script runs four offline turns and checks clean terminal reasons,
+The recommended release run executes 20 offline turns and checks clean terminal
+reasons,
 no truncation, no public role/control markers, no repetitive output, truthful
-identity grounding and worker cleanup. It is a regression canary, not the
-Phase 1 requirement for an independently reviewed 20-turn corpus.
+identity grounding and worker cleanup. It is release regression evidence, not
+a substitute for independently reviewed task-quality evaluation.
 
 Natural Korean conversation is a separate mandatory gate:
 
 ```powershell
 python scripts\validate_agent_casual_korean.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
   --timeout 120 `
   --output C:\Project\cognios-evidence\casual-korean-v0.3.2.json
 ```
@@ -96,6 +103,9 @@ assistant message per user turn, natural Korean completion, no loops, and a
 bounded per-turn latency. See [CASUAL_KOREAN_VALIDATION.md](CASUAL_KOREAN_VALIDATION.md).
 
 ## Experimental decoder-DEQ smoke
+
+This section intentionally retains the pretrained base checkpoint to reproduce
+the historical research canary. It is not a product conversation command.
 
 ```powershell
 python scripts\validate_gemma4_deq.py `

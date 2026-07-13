@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from html.parser import HTMLParser
+import os
 from pathlib import Path
 import re
+import subprocess
 import unittest
 
 
@@ -375,6 +377,10 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("validate_gemma4_runtime.py", diagnostic)
         self.assertIn("HF_HUB_OFFLINE", graphical)
         self.assertIn("HF_HUB_OFFLINE", diagnostic)
+        for launcher in (graphical, diagnostic, native):
+            with self.subTest(launcher=launcher[:32]):
+                self.assertIn("gemma4-e4b-it", launcher)
+                self.assertIn("gemma4-e4b-it.manifest.toml", launcher)
         self.assertIn("cogni_demo.server", native)
         self.assertIn("CreateNoWindow = true", native)
         self.assertIn("HF_HUB_OFFLINE", native)
@@ -392,6 +398,37 @@ class TestCogniBoardUI(unittest.TestCase):
         )
         http_bind = server.index("server = DemoHTTPServer(", backend_preflight)
         self.assertLess(backend_preflight, http_bind)
+
+    def test_compiled_launcher_matches_the_instruction_tuned_source(self) -> None:
+        binary = ROOT / "CogniBoard.exe"
+        self.assertTrue(binary.is_file())
+        self.assertGreater(binary.stat().st_size, 0)
+        decoded = binary.read_bytes().decode("utf-16-le", errors="ignore")
+        old_model = r"C:\Project\cognios\gemma4-e4b"
+        new_model = old_model + "-it"
+        self.assertIn(new_model, decoded)
+        self.assertEqual(decoded.count(old_model), decoded.count(new_model))
+        self.assertIn("gemma4-e4b-it.manifest.toml", decoded)
+        self.assertNotIn("gemma4-e4b.manifest.toml", decoded)
+
+        if os.name != "nt":
+            self.skipTest("native assembly metadata inspection requires Windows")
+        environment = dict(os.environ)
+        environment["COGNI_EXE"] = str(binary)
+        version = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "[Reflection.AssemblyName]::GetAssemblyName($env:COGNI_EXE).Version.ToString()",
+            ],
+            check=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=environment,
+            timeout=30,
+        ).stdout.strip()
+        self.assertEqual(version, "0.3.2.0")
 
 
 if __name__ == "__main__":

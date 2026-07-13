@@ -12,8 +12,14 @@ requires independently attested kernel isolation.
 
 ### Model, network, and process
 
-- model loading accepts a verified local filesystem artifact only;
-- SHA-256 manifest verification precedes model use;
+- product conversation loading accepts only the code-pinned Gemma 4 E4B-it
+  revision and exact seven-file SHA-256 set;
+- the loader directory is closed-world: only the seven manifest files plus
+  inert `README.md` and `.cache` metadata are accepted, so adapter, tokenizer,
+  or remote-code overlays fail before load;
+- SHA-256 and closed-world verification run before and after tokenizer/model
+  loading; OS read-only controls are still required to defend an adversarial
+  swap-and-restore race that user-space pre/post checks cannot prove absent;
 - Hub IDs, URLs, remote code, force-download, telemetry and external APIs are
   rejected or disabled;
 - the HTTP server binds to loopback, validates Host/Origin, uses an HttpOnly

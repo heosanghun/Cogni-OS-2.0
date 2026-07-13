@@ -13,6 +13,10 @@ from unittest.mock import patch
 import torch
 
 from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError, SYSTEM_PROMPT
+from cogni_agent.model_service import (
+    TRUSTED_GEMMA4_E4B_IT_DIGESTS,
+    TRUSTED_GEMMA4_E4B_IT_REVISION,
+)
 from cogni_demo.server import (
     ComputeBusyError,
     DemoHTTPServer,
@@ -27,6 +31,7 @@ from cogni_flow.production import BoundedLogDB, PromotionMode
 from cogni_flow.rhythm import RhythmController
 from cogni_flow.scheduler import ScheduleDecision, ScheduleTick
 from cogni_os.gpu_lease import GPULeaseManager
+from cogni_os.artifacts import ArtifactIdentity, VerifiedArtifactSet
 from tests.test_demo_server import manager_for, wait_for_terminal
 
 
@@ -419,7 +424,18 @@ class TestEvolutionAndPatchServiceIntegration(unittest.TestCase):
         with (
             patch(
                 "cogni_demo.server.verify_artifact_manifest",
-                return_value=object(),
+                return_value=VerifiedArtifactSet(
+                    root=Path("local-model"),
+                    files=(),
+                    identity=ArtifactIdentity(
+                        family="gemma4",
+                        variant="e4b",
+                        role="instruction_tuned",
+                        source="google/gemma-4-E4B-it",
+                        revision=TRUSTED_GEMMA4_E4B_IT_REVISION,
+                    ),
+                    digests=TRUSTED_GEMMA4_E4B_IT_DIGESTS,
+                ),
             ),
             patch(
                 "cogni_os.factbook.build_runtime_factbook_from_verified",

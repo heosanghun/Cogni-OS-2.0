@@ -29,19 +29,21 @@ python -m ruff format --check cogni_agent cogni_core cogni_demo cogni_flow cogni
 python -m pytest -q
 
 python scripts\validate_agent_casual_korean.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
   --timeout 120 `
   --output C:\Project\cognios-evidence\casual-korean-v0.3.2.json
 
 python scripts\validate_agent_completion.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
   --turns 20
 ```
 
 10턴 자연 대화 게이트, 20턴 실모델 completion stress, 전체 회귀, UI HTTP smoke,
 릴리스 checksum이 모두 통과한 동일 commit만 v0.3.2 배포 후보로 인정한다.
+공개 대화에는 공식 instruction-tuned E4B-it와 코드에 고정된 정확한 매니페스트만
+허용한다. pretrained base E4B는 연구·canary 전용이며 제품 대화 경로에서 거부한다.
 
 ## 경계
 

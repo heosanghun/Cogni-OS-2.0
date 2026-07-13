@@ -375,7 +375,7 @@ TensorService를 띄우지 않고 validation child 안의 in-process integrated 
 | RTX 5090 최신 CTS V2 peak allocated 14.8469 GiB | 실측 스냅샷 | exact run scope와 integrated 구간 명시 |
 | CUDA reserved/process-wide maximum | 측정 필요 | 같은 run의 원시 시계열 없이 추정 금지 |
 | depth 100 / 301 nodes / residual | 실측 스냅샷 또는 live 실측 | source와 measured_at으로 구분 |
-| manifest 6 files와 finite/converged postcondition | 실측 + 검증 | 관측값과 gate 판정을 분리 가능 |
+| E4B-it manifest 7 files와 finite/converged postcondition | 실측 + 검증 | 관측값과 gate 판정을 분리 가능 |
 | 전체 회귀 suite PASS/FAIL | 검증 스냅샷 | 개수는 계약이 아니며 source digest와 원시 출력 첨부 |
 | 주·야간 상호배제 | 검증 | component tests 및 state machine 범위 |
 | 4-텐서 process boundary | 검증 | real Gemma live UI 경로가 아닌 CPU toy gate |

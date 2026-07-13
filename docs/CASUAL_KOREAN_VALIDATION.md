@@ -38,14 +38,15 @@
 
 ```powershell
 python scripts\validate_agent_casual_korean.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
   --timeout 120 `
   --output C:\Project\cognios-evidence\casual-korean-v0.3.2.json
 ```
 
-증거 JSON은 소스 트리 밖에 원자적으로 기록한다. 모델과 manifest 여섯 파일은 로드
-전에 검증되며, 네트워크를 사용하지 않는다.
+증거 JSON은 소스 트리 밖에 원자적으로 기록한다. 제품 대화용 E4B-it 모델과
+manifest의 일곱 파일은 로드 전에 검증되며, 네트워크를 사용하지 않는다. pretrained
+base 체크포인트는 이 제품 대화 게이트의 입력으로 허용하지 않는다.
 
 ## 합격 조건
 

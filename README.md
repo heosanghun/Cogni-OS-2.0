@@ -1,7 +1,7 @@
 # Cogni-OS 2.0 Genesis — v0.3.2
 
 Cogni-OS 2.0 is an offline, bounded research runtime for a verified local
-dense Gemma 4 E4B artifact. Version 0.3.2 connects conversation integrity,
+dense Gemma 4 E4B-it artifact. Version 0.3.2 connects conversation integrity,
 causal DEQ/CTS conditioning, typed local tasks, bounded research workflows,
 and a **proposal-only** Self-Harness behind explicit capability and evidence
 states.
@@ -14,7 +14,7 @@ passing component test never upgrades a capability by itself.
 
 | Capability | v0.3.2 state | May affect the answer? | What is still required |
 |---|---|---:|---|
-| verified local Gemma 4 E4B | `authoritative` | yes | exact local artifact and manifest |
+| verified local Gemma 4 E4B-it | `authoritative` | yes | exact pinned instruction-tuned artifact and seven-file manifest |
 | bounded conversation fast path | `product_ux` | yes, narrow social turns only | must never intercept general knowledge/code/format requests |
 | causal CTS/DEQ bridge | `canary` | yes, bounded logits bias | trained adapter/Wproj and independent held-out evidence for promotion |
 | BIO-HAMA | `advisory` | no | calibrated routing-quality evidence |
@@ -67,8 +67,8 @@ Verify the actual local model and bounded depth-100 runtime:
 
 ```powershell
 python scripts\validate_gemma4_runtime.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
   --event-stream
 ```
 
@@ -76,15 +76,19 @@ Run the recommended 20-turn completion stress and the natural Korean gate:
 
 ```powershell
 python scripts\validate_agent_completion.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
   --turns 20
 
 python scripts\validate_agent_casual_korean.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
   --timeout 120
 ```
+
+The pretrained base checkpoint at `C:\Project\cognios\gemma4-e4b` is retained
+only for explicit research/canary reproduction. It is not accepted as the
+public conversation runtime.
 
 Run the System 4 stress benchmark. Its output separates instantaneous
 hysteresis mismatch from post-settling PCAS errors:
@@ -127,11 +131,12 @@ The v0.3.2 validation addendum is
 - The graphical server is loopback-only, uses per-session authentication and
   local allowlisted assets, and has no CDN or analytics dependency.
 
-The latest local depth-100 run recorded 14.8469 GiB peak allocated VRAM on an
-RTX 5090 Laptop GPU. That is a scoped canary observation, not a guarantee for
-other prompts, software stacks, reserved memory, or the target RTX 4090. The
-16.7 GiB postcondition still fails closed and must be repeated on the target
-device.
+The latest retained pretrained-base depth-100 canary recorded 14.8469 GiB peak
+allocated VRAM on an RTX 5090 Laptop GPU. That historical, scoped observation
+is not E4B-it product-runtime evidence or a guarantee for other prompts,
+software stacks, reserved memory, or the target RTX 4090. The 16.7 GiB
+postcondition still fails closed and must be repeated with the pinned E4B-it
+artifact on the target device.
 
 ## Documentation
 

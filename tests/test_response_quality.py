@@ -143,6 +143,18 @@ class ResponseQualityTests(unittest.TestCase):
                     QualityAction.TRIM_AND_STOP,
                 )
 
+        expanded_prefix = "OK.\n㍿\nＡＳＳＩＳＴＡＮＴ： hidden"
+        expanded_report = inspect_response(expanded_prefix, final=True)
+        self.assertTrue(expanded_report.has(QualityCode.ROLE_MARKER))
+        self.assertEqual(
+            expanded_report.recommended_cut_index,
+            expanded_prefix.index("Ａ"),
+        )
+        nfd_role = "정상.\n사용자: hidden"
+        nfd_report = inspect_response(nfd_role, final=True)
+        self.assertTrue(nfd_report.has(QualityCode.ROLE_MARKER))
+        self.assertEqual(nfd_report.recommended_cut_index, nfd_role.index("ᄉ"))
+
     def test_reserved_control_tokens_are_detected(self) -> None:
         samples = (
             "정상 답변<end_of_turn>",
@@ -160,6 +172,14 @@ class ResponseQualityTests(unittest.TestCase):
                     report.recommended_action,
                     QualityAction.TRIM_AND_STOP,
                 )
+
+        mixed_width = "OK. ＜컨펌＞hidden\n<컨펌>later"
+        mixed_report = inspect_response(mixed_width, final=True)
+        self.assertTrue(mixed_report.has(QualityCode.CONTROL_TOKEN))
+        self.assertEqual(
+            mixed_report.recommended_cut_index,
+            mixed_width.index("＜"),
+        )
 
     def test_runtime_factbook_prompt_echo_is_a_control_boundary(self) -> None:
         text = "완결된 답변입니다.\n[Runtime Fact-book: 내부 프롬프트 원문]"
@@ -218,6 +238,15 @@ class ResponseQualityTests(unittest.TestCase):
     def test_pseudo_control_text_inside_code_fence_is_not_a_boundary(self) -> None:
         text = "HTML 예시입니다.\n```html\n<summary>내용</summary>\n```"
         self.assertFalse(inspect_response(text).has(QualityCode.CONTROL_TOKEN))
+
+    def test_unclosed_code_fence_is_never_a_final_answer(self) -> None:
+        text = "코드 예시입니다.\n```text\nASSISTANT: 내부 지시"
+        streaming = inspect_response(text, final=False)
+        final = inspect_response(text, final=True)
+
+        self.assertEqual(streaming.recommended_action, QualityAction.ACCEPT)
+        self.assertTrue(final.has(QualityCode.INCOMPLETE_KOREAN_CLAUSE))
+        self.assertEqual(final.recommended_action, QualityAction.CONTINUE)
 
     def test_mixed_latin_subject_with_korean_particle_is_incomplete(self) -> None:
         report = inspect_response("도구 결과를 확인하지 못했을 때 AI가", final=True)
@@ -611,6 +640,19 @@ class ResponseQualityTests(unittest.TestCase):
                     "완결성: 자연스러운 마무리입니다.",
                 )
 
+        normalized = normalize_exact_item_response(
+            "요약 조건을 세 가지 제시하세요.",
+            "1. 정확성: 확인된 사실\n"
+            "2. 간결성: 핵심 정보\n"
+            "3. 완결성: 자연스러운 마무리\n"
+            "후속 문단입니다.",
+        )
+        self.assertEqual(
+            normalized,
+            "정확성: 확인된 사실입니다. 간결성: 핵심 정보입니다. "
+            "완결성: 자연스러운 마무리입니다.",
+        )
+
     def test_explicit_cutoff_does_not_publish_a_noun_fragment(self) -> None:
         from cogni_agent.response_quality import salvage_complete_prefix
 
@@ -627,6 +669,18 @@ class ResponseQualityTests(unittest.TestCase):
 
         text = "회귀 테스트를 모두 실행했습니다"
         self.assertEqual(salvage_complete_prefix(text, cutoff=len(text)), text)
+        for status in (
+            "회귀 테스트 완료",
+            "자체 검증 PASS",
+            "검증 성공",
+            "Regression tests passed",
+            "**회귀 테스트를 모두 실행했습니다**",
+        ):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    salvage_complete_prefix(status, cutoff=len(status)),
+                    status,
+                )
 
     def test_inline_numbered_normalizer_uses_first_complete_sequence(self) -> None:
         from cogni_agent.response_quality import normalize_exact_sentence_response
@@ -820,8 +874,30 @@ class ResponseQualityTests(unittest.TestCase):
         )
         self.assertTrue(
             response_avoids_generic_outline(
+                "보고서의 서론, 개요, 결론을 세 문장으로 설명하세요.",
+                "서론: 배경을 설명합니다.\n개요: 핵심을 정리합니다.\n"
+                "결론: 결과를 요약합니다.",
+            )
+        )
+        self.assertTrue(
+            response_avoids_generic_outline(
                 request,
                 "기능 테스트를 수행합니다. 회귀 테스트를 수행합니다.",
+            )
+        )
+        self.assertFalse(
+            response_avoids_generic_outline(
+                "자체 검증을 세 문장으로 정리하세요.",
+                "서론: 자체 검증의 배경을 정리합니다. "
+                "개요: 자체 검증의 기능 단계입니다. "
+                "결론: 자체 검증 결과를 확인합니다.",
+            )
+        )
+        self.assertFalse(
+            response_avoids_generic_outline(
+                "자체 검증을 세 항목으로 정리하세요.",
+                "표기 ``` 를 설명합니다.\n### 개요\n"
+                "자체 검증 기능을 점검합니다. 회귀 테스트 결과를 확인합니다.\n```",
             )
         )
 
@@ -886,6 +962,12 @@ class ResponseQualityTests(unittest.TestCase):
                 "모델 응답의 정확성과 다양성을 검증합니다.",
             )
         )
+        self.assertFalse(
+            response_preserves_distinctive_topic(
+                "투자가 검증할 재무 지표와 수익 조건을 설명하세요.",
+                "코드 오류를 점검하고 기능 결과를 확인합니다.",
+            )
+        )
         self.assertTrue(
             response_preserves_distinctive_topic(
                 "온디바이스 AI의 장점과 한계를 설명해 주세요.",
@@ -896,6 +978,45 @@ class ResponseQualityTests(unittest.TestCase):
             response_topically_anchored(
                 "소프트웨어 수정 완료 전에 필요한 자체 검증을 정리하세요.",
                 "실제 결과를 확인하고 테스트 환경과 코드 오류를 점검합니다.",
+            )
+        )
+        self.assertFalse(
+            response_topically_anchored(
+                "이 제품 자체의 배터리 수명과 충전 시간을 설명하세요.",
+                "코드 오류를 점검하고 기능 결과를 확인합니다.",
+            )
+        )
+        self.assertFalse(
+            response_topically_anchored(
+                "email 보안 정책과 로그인 절차를 설명하세요.",
+                "로컬 데이터와 장치 오프라인 처리를 사용합니다.",
+            )
+        )
+        self.assertFalse(
+            response_preserves_distinctive_topic(
+                "자체 검증을 세 항목으로 정리하세요.",
+                "음식을 준비합니다. 물을 끓입니다. 그릇에 담습니다.",
+            )
+        )
+        self.assertFalse(
+            response_preserves_distinctive_topic(
+                "자체 검증을 세 항목으로 정리하세요.",
+                "음식 조리 기능을 준비합니다. 조리 결과를 확인합니다. "
+                "그릇에 음식을 담습니다.",
+            )
+        )
+        self.assertFalse(
+            response_preserves_distinctive_topic(
+                "자체 검증을 세 항목으로 정리하세요.",
+                "배터리 기능을 확인합니다. 충전 결과를 점검합니다. 전력을 측정합니다.",
+            )
+        )
+        self.assertTrue(
+            response_preserves_distinctive_topic(
+                "자체 검증을 세 항목으로 정리하세요.",
+                "수정된 기능이 예상대로 작동하는지 확인합니다. "
+                "기존 기능과 충돌하지 않는지 확인합니다. "
+                "성능과 보안 영향을 점검합니다.",
             )
         )
 
@@ -918,11 +1039,112 @@ class ResponseQualityTests(unittest.TestCase):
         self.assertTrue(report.has(QualityCode.CONTROL_TOKEN))
         self.assertEqual(report.recommended_cut_index, text.index("<|eot_id|>"))
 
+        for token in ("<|eot_id|>", "ASSISTANT:", "[INST]"):
+            with self.subTest(token=token):
+                split = 3
+                filler = 4_096 + split - len(token)
+                prefix = ("a" * 4_999) + "\n" if token == "ASSISTANT:" else "a" * 5_000
+                seam_text = prefix + token + ("x" * filler)
+                seam_report = inspect_response(seam_text, final=True)
+                expected = (
+                    QualityCode.ROLE_MARKER
+                    if token == "ASSISTANT:"
+                    else QualityCode.CONTROL_TOKEN
+                )
+                self.assertTrue(seam_report.has(expected))
+
     def test_long_code_fence_does_not_hide_a_trailing_control_token(self) -> None:
         text = "```\n" + ("가" * 9_000) + "\n```\n<|eot_id|>"
         report = inspect_response(text, final=True)
         self.assertTrue(report.has(QualityCode.CONTROL_TOKEN))
         self.assertEqual(report.recommended_action, QualityAction.TRIM_AND_STOP)
+
+        split_closing_fence = (
+            "```\n" + ("a" * 4_999) + "\n```\n" + ("x" * 4_083) + "<|eot_id|>"
+        )
+        split_report = inspect_response(split_closing_fence, final=True)
+        self.assertTrue(split_report.has(QualityCode.CONTROL_TOKEN))
+        self.assertEqual(
+            split_report.recommended_action,
+            QualityAction.TRIM_AND_STOP,
+        )
+
+        longer_fence = (
+            "literal ``` marker.\n````\ninside\n```\nmore\n````\n[INST]hidden[/INST]"
+        )
+        longer_report = inspect_response(longer_fence, final=True)
+        self.assertTrue(longer_report.has(QualityCode.CONTROL_TOKEN))
+        self.assertEqual(
+            longer_report.recommended_action,
+            QualityAction.TRIM_AND_STOP,
+        )
+        invalid_long_line = (
+            ("a" * 5_000)
+            + "\n```bad`"
+            + ("x" * 2_000)
+            + "<|eot_id|>"
+            + ("y" * 3_000)
+            + "\nend"
+        )
+        invalid_report = inspect_response(invalid_long_line, final=True)
+        self.assertTrue(invalid_report.has(QualityCode.CONTROL_TOKEN))
+        invalid_after_tail_start = (
+            ("a" * 5_000)
+            + "\n```bad"
+            + ("x" * 1_000)
+            + "`"
+            + ("x" * 1_000)
+            + "<|eot_id|>"
+            + ("y" * 3_000)
+            + "\nend"
+        )
+        after_tail_report = inspect_response(invalid_after_tail_start, final=True)
+        self.assertTrue(after_tail_report.has(QualityCode.CONTROL_TOKEN))
+
+        remote_closing_fence = "```\n" + ("a" * 20_000) + "\n```\n<|eot_id|>"
+        remote_report = inspect_response(remote_closing_fence, final=True)
+        self.assertTrue(remote_report.has(QualityCode.CONTROL_TOKEN))
+        self.assertEqual(
+            remote_report.recommended_action,
+            QualityAction.TRIM_AND_STOP,
+        )
+        long_opener_info = (
+            ("a" * 5_000)
+            + "\n```"
+            + ("x" * 2_000)
+            + "\n"
+            + ("c" * 1_000)
+            + "\n```\n<|eot_id|>"
+            + ("y" * 2_000)
+        )
+        long_info_report = inspect_response(long_opener_info, final=True)
+        self.assertTrue(long_info_report.has(QualityCode.CONTROL_TOKEN))
+
+    def test_multiline_last_item_preserves_its_continuation(self) -> None:
+        from cogni_agent.response_quality import normalize_exact_item_response
+
+        continued = normalize_exact_item_response(
+            "검증 조건을 세 가지 제시하세요.",
+            "1. 기능을 확인합니다.\n"
+            "2. 회귀 테스트를 실행합니다.\n"
+            "3. 결과를 확인하고\n로그에 기록합니다.",
+        )
+        self.assertEqual(
+            continued,
+            "기능을 확인합니다. 회귀 테스트를 실행합니다. "
+            "결과를 확인하고 로그에 기록합니다.",
+        )
+        noun_continuation = normalize_exact_item_response(
+            "검증 조건을 세 가지 제시하세요.",
+            "1. 기능을 확인합니다.\n"
+            "2. 회귀 테스트를 실행합니다.\n"
+            "3. 완결성: 자연스러운\n마무리를 보장합니다.",
+        )
+        self.assertEqual(
+            noun_continuation,
+            "기능을 확인합니다. 회귀 테스트를 실행합니다. "
+            "완결성: 자연스러운 마무리를 보장합니다.",
+        )
 
     def test_reports_are_deterministic_and_input_type_is_checked(self) -> None:
         text = "첫 번째 결과는 매우 빠릅니다. 두 번째 결과는 정말 안전합니다."

@@ -31,6 +31,7 @@ MAX_UNIT_TOKENS = 64
 MAX_ANALYSIS_TOKENS = 1_024
 MAX_TEMPLATE_BLOCK_UNITS = 4
 MAX_LOW_INFORMATION_PERIOD = 4
+MAX_BOUNDARY_SEAM_CHARS = 128
 
 
 class QualityCode(str, Enum):
@@ -220,8 +221,11 @@ _META_SENTENCE_ENDINGS = (
     "다음과 같아요.",
 )
 _GENERIC_OUTLINE_HEADING_RE = re.compile(
-    r"(?im)^\s*(?:#{1,6}\s*)?(?:서론|목적|개요|배경|결론)\s*"
+    r"(?im)^\s*(?:#{1,6}\s*)?(?P<heading>서론|목적|개요|배경|결론)\s*"
     r"(?:[:：]\s*[^\r\n]*|입니다[.]?|$)"
+)
+_FENCE_LINE_RE = re.compile(
+    r"(?m)^(?P<indent>[ ]{0,3})(?P<run>`{3,}|~{3,})(?P<rest>[^\r\n]*)"
 )
 _META_FORMAT_DISCUSSION_RE = re.compile(
     r"(?:질문의\s*(?:형식|구조|요청\s*형식).{0,40}(?:정리|해석|설명)|"
@@ -483,6 +487,8 @@ _GENERIC_TOPIC_TERMS = frozenset(
         "응답",
         "절차",
         "질문",
+        "자가",
+        "자체",
         "확인",
         "검증",
     }
@@ -500,8 +506,22 @@ _DISTINCTIVE_TOPIC_EQUIVALENTS = (
         frozenset({"핵심", "군더더기", "완결", "문장", "반복"}),
     ),
     (
-        frozenset({"자가검증", "자체검증", "자가", "자체"}),
-        frozenset({"테스트", "점검", "회귀", "결과", "기능", "오류", "코드"}),
+        frozenset({"자가검증", "자체검증"}),
+        frozenset(
+            {
+                "테스트",
+                "점검",
+                "회귀",
+                "결과",
+                "기능",
+                "오류",
+                "코드",
+                "작동",
+                "충돌",
+                "성능",
+                "보안",
+            }
+        ),
     ),
     (
         frozenset({"온디바이스", "ai"}),
@@ -511,10 +531,73 @@ _DISTINCTIVE_TOPIC_EQUIVALENTS = (
     ),
 )
 
+_COMPOUND_TOPIC_PATTERNS = (
+    (
+        "자가검증",
+        re.compile(r"(?<![가-힣])(?:자가|자체)\s*검증", re.IGNORECASE),
+    ),
+)
+
+
+def _request_contains_topic_trigger(normalized_request: str, trigger: str) -> bool:
+    """Match a topic trigger without treating substrings as whole concepts."""
+
+    if re.fullmatch(r"[a-z0-9]+", trigger):
+        return (
+            re.search(
+                rf"(?<![a-z0-9]){re.escape(trigger)}(?![a-z0-9])",
+                normalized_request,
+            )
+            is not None
+        )
+    compact_request = re.sub(r"\s+", "", normalized_request)
+    return trigger in compact_request
+
+
+def _topic_equivalent_match(request: str, observed: frozenset[str]) -> bool:
+    """Match only a complete request concept to its bounded paraphrases."""
+
+    normalized_request = unicodedata.normalize(
+        "NFKC", request[:MAX_INSPECT_CHARS]
+    ).casefold()
+    for triggers, equivalents in _DISTINCTIVE_TOPIC_EQUIVALENTS:
+        if "자가검증" in triggers or "자체검증" in triggers:
+            requested = "자가검증" in _topic_terms(request)
+        else:
+            requested = any(
+                _request_contains_topic_trigger(normalized_request, trigger)
+                for trigger in triggers
+            )
+        if not requested:
+            continue
+        evidence = observed & equivalents
+        if "자가검증" in triggers or "자체검증" in triggers:
+            strong = evidence & frozenset(
+                {
+                    "테스트",
+                    "회귀",
+                    "오류",
+                    "코드",
+                    "작동",
+                    "충돌",
+                    "성능",
+                    "보안",
+                }
+            )
+            if len(evidence) >= 2 and strong:
+                return True
+            continue
+        if evidence:
+            return True
+    return False
+
 
 def _topic_terms(text: str) -> frozenset[str]:
     terms: set[str] = set()
     normalized = unicodedata.normalize("NFKC", text[:MAX_INSPECT_CHARS]).casefold()
+    for concept, pattern in _COMPOUND_TOPIC_PATTERNS:
+        if pattern.search(normalized) is not None:
+            terms.add(concept)
     for match in _TOPIC_TERM_RE.finditer(normalized):
         term = match.group(0)
         if re.fullmatch(r"[가-힣]+", term):
@@ -548,10 +631,7 @@ def response_topically_anchored(request: str, response: str) -> bool:
     required = 3 if len(requested) >= 6 else max(2, (len(requested) + 1) // 2)
     if len(requested & observed) >= required:
         return True
-    return any(
-        requested & triggers and observed & equivalents
-        for triggers, equivalents in _DISTINCTIVE_TOPIC_EQUIVALENTS
-    )
+    return _topic_equivalent_match(request, observed)
 
 
 def request_topic_terms(request: str, *, limit: int = 8) -> tuple[str, ...]:
@@ -576,10 +656,7 @@ def response_preserves_distinctive_topic(request: str, response: str) -> bool:
         return True
     if distinctive & observed:
         return True
-    return any(
-        requested & triggers and observed & equivalents
-        for triggers, equivalents in _DISTINCTIVE_TOPIC_EQUIVALENTS
-    )
+    return _topic_equivalent_match(request, observed)
 
 
 def response_preserves_category_subject(request: str, response: str) -> bool:
@@ -594,10 +671,7 @@ def response_preserves_category_subject(request: str, response: str) -> bool:
         return True
     if subject & observed:
         return True
-    return any(
-        subject & triggers and observed & equivalents
-        for triggers, equivalents in _DISTINCTIVE_TOPIC_EQUIVALENTS
-    )
+    return _topic_equivalent_match(request, observed)
 
 
 def response_avoids_unsolicited_subjects(request: str, response: str) -> bool:
@@ -662,11 +736,26 @@ def response_avoids_generic_outline(request: str, response: str) -> bool:
     if not isinstance(request, str) or not isinstance(response, str):
         raise TypeError("request and response must be strings")
     structured_request = (
-        requested_exact_item_count(request) is not None
+        requested_exact_sentence_count(request) is not None
+        or requested_exact_item_count(request) is not None
         or requested_maximum_items(request) is not None
     )
     masked = _mask_code(response[:MAX_INSPECT_CHARS])
-    return not structured_request or _GENERIC_OUTLINE_HEADING_RE.search(masked) is None
+    if not structured_request:
+        return True
+    headings = tuple(_GENERIC_OUTLINE_HEADING_RE.finditer(masked))
+    if not headings:
+        return True
+    for match in headings:
+        heading = match.group("heading")
+        mentioned = heading in request
+        excluded = re.search(
+            rf"{re.escape(heading)}.{{0,12}}(?:없이|제외|빼고|생략)",
+            request,
+        )
+        if not mentioned or excluded is not None:
+            return False
+    return True
 
 
 def response_avoids_meta_format_discussion(request: str, response: str) -> bool:
@@ -730,8 +819,25 @@ def inspect_response(text: str, *, final: bool = False) -> ResponseQualityReport
     remaining_tokens = MAX_ANALYSIS_TOKENS
 
     for offset, region in regions:
-        inside_fence = text.count("```", 0, offset) % 2 == 1
-        masked = _mask_code(region, inside_fence=inside_fence)
+        if offset <= MAX_INSPECT_CHARS:
+            fence_state_known, fence_state = _trusted_bounded_fence_state(
+                text,
+                offset,
+            )
+        else:
+            fence_state_known, fence_state = False, None
+        # For a remote suffix whose opening state cannot be established within
+        # the hard work bound, inspect public boundaries fail-closed instead of
+        # guessing that a closing marker starts a new hidden fence.
+        masked = (
+            _mask_code(
+                region,
+                inside_fence=fence_state,
+                starts_at_line_boundary=(offset == 0 or text[offset - 1] in "\r\n"),
+            )
+            if fence_state_known
+            else region
+        )
         findings.extend(_boundary_findings(masked, offset))
         if remaining_units <= 0 or remaining_tokens <= 0:
             continue
@@ -755,6 +861,30 @@ def inspect_response(text: str, *, final: bool = False) -> ResponseQualityReport
         numbering_restart = _numbering_restart(masked, offset)
         if numbering_restart is not None:
             findings.append(numbering_restart)
+
+    if len(text) > MAX_INSPECT_CHARS:
+        suffix_boundary = len(text) - (MAX_INSPECT_CHARS // 2)
+        seam_start = max(0, suffix_boundary - MAX_BOUNDARY_SEAM_CHARS)
+        seam_end = min(len(text), suffix_boundary + MAX_BOUNDARY_SEAM_CHARS)
+        # Boundary-only overlap prevents a reserved marker from being split by
+        # the head/suffix sampling seam.  It is intentionally fail-closed and
+        # does not feed repetition analysis or alter the reported work budget.
+        findings.extend(_boundary_findings(text[seam_start:seam_end], seam_start))
+
+    final_fence_state = (
+        _fence_state_at(text, len(text))
+        if final and text and len(text) <= MAX_INSPECT_CHARS
+        else None
+    )
+    if final_fence_state is not None:
+        fence_start = final_fence_state[2]
+        findings.append(
+            QualityFinding(
+                QualityCode.INCOMPLETE_KOREAN_CLAUSE,
+                fence_start,
+                len(text),
+            )
+        )
 
     if final and text:
         incomplete = _incomplete_korean_clause(text)
@@ -823,6 +953,7 @@ def salvage_complete_prefix(text: str, *, cutoff: int | None = None) -> str:
         candidate
         and (
             cutoff is None
+            or cutoff >= len(text)
             or candidate.endswith((".", "!", "?", "。", "！", "？"))
             or _KOREAN_COMPLETE_PREDICATE_RE.search(candidate[-128:]) is not None
         )
@@ -859,7 +990,87 @@ def _bounded_regions(text: str) -> tuple[tuple[int, str], ...]:
     if len(text) <= MAX_INSPECT_CHARS:
         return ((0, text),)
     half = MAX_INSPECT_CHARS // 2
-    return ((0, text[:half]), (len(text) - half, text[-half:]))
+    tail_start = len(text) - half
+    # Never begin a suffix partway through a fence marker line.  The state
+    # parser must see that line atomically to decide whether it opens or closes.
+    window_start = max(0, tail_start - 256)
+    previous_newline = text.rfind("\n", window_start, tail_start)
+    line_start = (
+        previous_newline + 1
+        if previous_newline >= 0
+        else (0 if window_start == 0 else None)
+    )
+    window_end = min(len(text), tail_start + 257)
+    next_newline = text.find("\n", tail_start, window_end)
+    line_end = (
+        next_newline
+        if next_newline >= 0
+        else (len(text) if window_end == len(text) else None)
+    )
+    marker = (
+        _FENCE_LINE_RE.match(text, line_start, line_end)
+        if line_start is not None and line_end is not None
+        else None
+    )
+    atomic_marker_line = (
+        marker is not None
+        and marker.start() < tail_start
+        and line_end - line_start <= 256
+        and _valid_fence_opener(marker.group("run"), marker.group("rest"))
+    )
+    if atomic_marker_line:
+        tail_start = line_end
+        if tail_start < len(text) and text[tail_start] == "\n":
+            tail_start += 1
+    return ((0, text[:half]), (tail_start, text[tail_start:]))
+
+
+def nfkc_search_original_span(
+    text: str,
+    pattern: re.Pattern[str],
+) -> tuple[int, int] | None:
+    """Search an NFKC view and return offsets into the original string.
+
+    Compatibility characters can expand during normalization (for example,
+    ``㍿`` becomes four characters).  Applying a match offset from the folded
+    string directly to the source can therefore expose part of a role marker.
+    This bounded character map keeps every folded character tied to its source
+    code point.
+    """
+
+    folded_parts: list[str] = []
+    source_starts: list[int] = []
+    source_ends: list[int] = []
+    index = 0
+    while index < len(text):
+        start = index
+        codepoint = ord(text[index])
+        index += 1
+        leading_jamo = (0x1100 <= codepoint <= 0x115F) or (
+            0xA960 <= codepoint <= 0xA97F
+        )
+        if leading_jamo and index < len(text):
+            vowel = ord(text[index])
+            if (0x1160 <= vowel <= 0x11A7) or (0xD7B0 <= vowel <= 0xD7C6):
+                index += 1
+                if index < len(text):
+                    trailing = ord(text[index])
+                    if (0x11A8 <= trailing <= 0x11FF) or (0xD7CB <= trailing <= 0xD7FB):
+                        index += 1
+        while index < len(text) and unicodedata.combining(text[index]):
+            index += 1
+        folded = unicodedata.normalize("NFKC", text[start:index])
+        if not folded:
+            continue
+        folded_parts.append(folded)
+        source_starts.extend([start] * len(folded))
+        source_ends.extend([index] * len(folded))
+    if not source_starts:
+        return None
+    match = pattern.search("".join(folded_parts))
+    if match is None or match.start() == match.end():
+        return None
+    return source_starts[match.start()], source_ends[match.end() - 1]
 
 
 def _boundary_findings(text: str, offset: int) -> list[QualityFinding]:
@@ -882,46 +1093,127 @@ def _boundary_findings(text: str, offset: int) -> list[QualityFinding]:
                 offset + control.end(),
             )
         )
-    folded = unicodedata.normalize("NFKC", text)
-    if folded != text:
-        folded_role = _ROLE_MARKER_RE.search(folded)
-        if folded_role is not None and role is None:
+    folded_role = nfkc_search_original_span(text, _ROLE_MARKER_RE)
+    if folded_role is not None:
+        raw_role_span = None if role is None else (role.start(), role.end())
+        if folded_role != raw_role_span:
             findings.append(
                 QualityFinding(
                     QualityCode.ROLE_MARKER,
-                    offset + min(folded_role.start(), len(text)),
-                    offset + min(folded_role.end(), len(text)),
+                    offset + folded_role[0],
+                    offset + folded_role[1],
                 )
             )
-        folded_control = _CONTROL_TOKEN_RE.search(folded)
-        if folded_control is not None and control is None:
+    folded_control = nfkc_search_original_span(text, _CONTROL_TOKEN_RE)
+    if folded_control is not None:
+        raw_control_span = None if control is None else (control.start(), control.end())
+        if folded_control != raw_control_span:
             findings.append(
                 QualityFinding(
                     QualityCode.CONTROL_TOKEN,
-                    offset + min(folded_control.start(), len(text)),
-                    offset + min(folded_control.end(), len(text)),
+                    offset + folded_control[0],
+                    offset + folded_control[1],
                 )
             )
     return findings
 
 
-def _mask_code(text: str, *, inside_fence: bool = False) -> str:
-    if "```" not in text and not inside_fence:
+def _valid_fence_opener(run: str, rest: str) -> bool:
+    return run.startswith("~") or "`" not in rest
+
+
+def _valid_fence_close(
+    run: str,
+    rest: str,
+    state: tuple[str, int, int],
+) -> bool:
+    return run[0] == state[0] and len(run) >= state[1] and not rest.strip(" \t")
+
+
+def _fence_state_at(text: str, offset: int) -> tuple[str, int, int] | None:
+    """Return ``(marker, length, opener_offset)`` at an original offset."""
+
+    state: tuple[str, int, int] | None = None
+    for match in _FENCE_LINE_RE.finditer(text, 0, offset):
+        run = match.group("run")
+        rest = match.group("rest")
+        if state is None:
+            if _valid_fence_opener(run, rest):
+                state = (run[0], len(run), match.start("run"))
+        elif _valid_fence_close(run, rest, state):
+            state = None
+    return state
+
+
+def _trusted_bounded_fence_state(
+    text: str,
+    offset: int,
+) -> tuple[bool, tuple[str, int, int] | None]:
+    """Return ``(known, state)`` without conflating outside and unknown."""
+
+    state = _fence_state_at(text, offset)
+    if state is None:
+        return True, None
+    run_end = state[2] + state[1]
+    search_end = min(len(text), run_end + 257)
+    line_end = text.find("\n", run_end, search_end)
+    if line_end < 0:
+        if search_end < len(text):
+            return False, None
+        line_end = len(text)
+    rest = text[run_end:line_end].rstrip("\r")
+    run = state[0] * state[1]
+    return (True, state) if _valid_fence_opener(run, rest) else (True, None)
+
+
+def _mask_code(
+    text: str,
+    *,
+    inside_fence: tuple[str, int, int] | None = None,
+    starts_at_line_boundary: bool = True,
+) -> str:
+    if not re.search(r"[`~]{3,}", text) and inside_fence is None:
         return text
     characters = list(text)
-    in_fence = inside_fence
-    index = 0
-    while index < len(text):
-        if text.startswith("```", index):
-            for marker_index in range(index, min(index + 3, len(text))):
-                characters[marker_index] = " "
-            in_fence = not in_fence
-            index += 3
+    state = inside_fence
+    cursor = 0
+
+    def mask(start: int, end: int) -> None:
+        for index in range(start, end):
+            if characters[index] not in "\r\n":
+                characters[index] = " "
+
+    for match in _FENCE_LINE_RE.finditer(text):
+        if match.start() == 0 and not starts_at_line_boundary:
             continue
-        if in_fence and characters[index] not in "\r\n":
-            characters[index] = " "
-        index += 1
+        run = match.group("run")
+        rest = match.group("rest")
+        if state is not None:
+            mask(cursor, match.end())
+            cursor = match.end()
+            if _valid_fence_close(run, rest, state):
+                state = None
+            continue
+        if not _valid_fence_opener(run, rest):
+            continue
+        state = (run[0], len(run), match.start("run"))
+        mask(match.start(), match.end())
+        cursor = match.end()
+    if state is not None:
+        mask(cursor, len(text))
     return "".join(characters)
+
+
+def mask_fenced_code(text: str) -> str:
+    """Mask closed fenced code while preserving original text offsets."""
+
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    open_state = _fence_state_at(text, len(text))
+    if open_state is not None:
+        opener = open_state[2]
+        return _mask_code(text[:opener]) + text[opener:]
+    return _mask_code(text)
 
 
 def _units(
@@ -1292,11 +1584,7 @@ def requested_exact_sentence_count(request: str) -> int | None:
     return None
 
 
-def requested_maximum_items(request: str) -> int | None:
-    """Return an explicit Korean output maximum such as ``네 가지 이내``."""
-
-    if not isinstance(request, str):
-        raise TypeError("request must be a string")
+def _requested_maximum_spec(request: str) -> tuple[int, int, int] | None:
     bounded = request[:MAX_INSPECT_CHARS]
     for match in _MAXIMUM_UNIT_REQUEST_RE.finditer(bounded):
         if match.group("prefix") is None and match.group("suffix") is None:
@@ -1305,8 +1593,27 @@ def requested_maximum_items(request: str) -> int | None:
         if _EXACT_ITEM_OUTPUT_CUE_RE.match(output_tail) is None:
             continue
         raw = match.group("count")
-        return int(raw) if raw.isdigit() else _KOREAN_COUNTS[raw]
+        count = int(raw) if raw.isdigit() else _KOREAN_COUNTS[raw]
+        return count, match.start(), match.end()
     return None
+
+
+def requested_maximum_items(request: str) -> int | None:
+    """Return an explicit Korean output maximum such as ``네 가지 이내``."""
+
+    if not isinstance(request, str):
+        raise TypeError("request must be a string")
+    spec = _requested_maximum_spec(request)
+    return None if spec is None else spec[0]
+
+
+def requested_maximum_item_span(request: str) -> tuple[int, int] | None:
+    """Return the exact source span of a verified maximum-output phrase."""
+
+    if not isinstance(request, str):
+        raise TypeError("request must be a string")
+    spec = _requested_maximum_spec(request)
+    return None if spec is None else (spec[1], spec[2])
 
 
 def requested_exact_item_count(request: str) -> int | None:
@@ -1589,6 +1896,23 @@ def _split_inline_numbered_sentences(
         trailing_marker = _TRAILING_EXPLANATION_MARKER_RE.search(raw_clause)
         if trailing_marker is not None:
             raw_clause = raw_clause[: trailing_marker.start()].rstrip()
+        if index + 1 == len(matches):
+            followup_line = re.search(r"\r?\n(?=\s*\S)", raw_clause)
+            if followup_line is not None:
+                first_line = raw_clause[: followup_line.start()].rstrip()
+                following_line = raw_clause[followup_line.end() :].lstrip()
+                explicit_followup = re.match(
+                    r"(?:후속|추가|보충|참고|상세)(?:\s*문단|\s*설명)?(?:은|는|:|：|\s)",
+                    following_line,
+                )
+                if (
+                    first_line.endswith((".", "!", "?", "。", "！", "？"))
+                    or _KOREAN_COMPLETE_PREDICATE_RE.search(first_line) is not None
+                    or explicit_followup is not None
+                ):
+                    raw_clause = first_line
+                else:
+                    raw_clause = re.sub(r"\s*\r?\n\s*", " ", raw_clause)
         boundaries = _content_sentence_boundaries(raw_clause)
         # A small local model may omit the space after a completed Korean
         # sentence (``확인합니다.이러한``).  Within a numbered item, a
@@ -1751,11 +2075,14 @@ __all__ = [
     "normalize_exact_sentence_response",
     "normalize_exact_item_response",
     "normalize_maximum_item_response",
+    "mask_fenced_code",
+    "nfkc_search_original_span",
     "request_topic_terms",
     "requested_exact_sentence_count",
     "requested_exact_item_count",
     "requested_category_counts",
     "requested_maximum_items",
+    "requested_maximum_item_span",
     "requested_minimum_units",
     "response_avoids_prompt_echo",
     "response_avoids_dangling_sentence_start",

@@ -718,12 +718,57 @@ class TestAgentManager(unittest.TestCase):
                 self.assertTrue(boundary)
                 self.assertEqual(cleaned, "")
 
+        expanded = "OK.\n㍿\nＡＳＳＩＳＴＡＮＴ： hidden"
+        cleaned, boundary = AgentManager._clean_model_text(expanded)
+        self.assertTrue(boundary)
+        self.assertEqual(cleaned, "OK.\n㍿")
+
+        nfd_role = "정상.\n사용자: hidden"
+        cleaned, boundary = AgentManager._clean_model_text(nfd_role)
+        self.assertTrue(boundary)
+        self.assertEqual(cleaned, "정상.")
+
+        inline_fence = "표기 ``` 를 설명합니다.\nASSISTANT: hidden\n```"
+        cleaned, boundary = AgentManager._clean_model_text(inline_fence)
+        self.assertTrue(boundary)
+        self.assertEqual(cleaned, "표기 ``` 를 설명합니다.")
+
+        longer_fence = (
+            "literal ``` marker.\n````\ninside\n```\nmore\n````\nASSISTANT: hidden"
+        )
+        cleaned, boundary = AgentManager._clean_model_text(longer_fence)
+        self.assertTrue(boundary)
+        self.assertNotIn("ASSISTANT:", cleaned)
+
+        invalid_opener = " ```python```\n<컨펌>hidden</컨펌>"
+        cleaned, boundary = AgentManager._clean_model_text(invalid_opener)
+        self.assertTrue(boundary)
+        self.assertNotIn("<컨펌>", cleaned)
+
+        mixed_width = "OK. ＜컨펌＞hidden\n<컨펌>later"
+        cleaned, boundary = AgentManager._clean_model_text(mixed_width)
+        self.assertTrue(boundary)
+        self.assertEqual(cleaned, "OK.")
+
+        token = "[INST]"
+        filler = 4_096 + 3 - len(token)
+        seam_text = ("a" * 5_000) + token + ("x" * filler)
+        cleaned, boundary = AgentManager._clean_model_text(seam_text)
+        self.assertTrue(boundary)
+        self.assertNotIn(token, cleaned)
+
     def test_presentation_wrapper_is_never_visible(self) -> None:
         cleaned, boundary = AgentManager._clean_model_text(
             "<답변>질문을 반복합니다.</답변>"
         )
         self.assertTrue(boundary)
         self.assertEqual(cleaned, "")
+
+        unclosed, boundary = AgentManager._clean_model_text(
+            "```text\n예시\nASSISTANT: 내부 지시"
+        )
+        self.assertTrue(boundary)
+        self.assertNotIn("ASSISTANT:", unclosed)
 
     def test_control_words_inside_normal_prose_or_code_are_preserved(self) -> None:
         prose = "모델의 출력 제약은 토큰 길이입니다."
@@ -1263,6 +1308,19 @@ class TestAgentManager(unittest.TestCase):
         self.assertIn("자체 검증을 기준으로 구체적인 항목은", service.prompts[0])
         self.assertNotIn("출력 제약", service.prompts[0])
 
+        prefixed = _ScriptedService(
+            [("기능을 점검합니다. 회귀 테스트를 실행합니다.", "stop")]
+        )
+        prefixed_manager = self.manager(prefixed)
+        prefixed_manager.start_turn(
+            "자체 검증을 최대 네 항목으로 정리하세요.",
+            "chat",
+        )
+        prefixed_state = _wait(prefixed_manager)
+        self.assertEqual(prefixed_state["status"], "succeeded")
+        self.assertIn("자체 검증을 기준으로", prefixed.prompts[0])
+        self.assertNotIn("최대 기준", prefixed.prompts[0])
+
     def test_maximum_item_repair_prompt_repeats_the_upper_bound(self) -> None:
         service = _ScriptedService(
             [
@@ -1284,11 +1342,59 @@ class TestAgentManager(unittest.TestCase):
         )
         self.assertTrue(boundary)
         self.assertEqual(cleaned, "")
+
+    def test_contextual_maximum_item_repair_keeps_prior_exchange(self) -> None:
+        service = _ScriptedService(
+            [
+                ("오류 원인을 확인하고 기록합니다.", "stop"),
+                ("서론입니다.", "stop"),
+                ("오류를 확인합니다. 회귀 테스트를 실행합니다.", "stop"),
+            ]
+        )
+        manager = self.manager(service)
+
+        manager.start_turn("오류 원인을 설명하세요.", "chat")
+        self.assertEqual(_wait(manager)["status"], "succeeded")
+        manager.start_turn(
+            "방금 답변에서 자체 검증을 네 항목 이내로 정리하세요.",
+            "chat",
+        )
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertIn("오류 원인을 확인하고 기록합니다.", service.prompts[2])
+        self.assertIn("중요한 내용을 최대 4개만", service.prompts[2])
         cleaned, boundary = AgentManager._clean_model_text(
             "물음의 핵심과 요청 형식에 맞게 아래 내용을 두 문장으로 작성하세요."
         )
         self.assertTrue(boundary)
         self.assertEqual(cleaned, "")
+
+    def test_contextual_maximum_echo_repair_keeps_prior_exchange(self) -> None:
+        prior = (
+            "오류 원인을 재현 가능한 조건과 함께 확인하고 기록합니다. "
+            "수정 뒤에는 같은 조건으로 회귀 테스트를 실행합니다."
+        )
+        service = _ScriptedService(
+            [
+                (prior, "stop"),
+                (prior, "stop"),
+                ("기능을 점검합니다. 회귀 테스트를 실행합니다.", "stop"),
+            ]
+        )
+        manager = self.manager(service)
+
+        manager.start_turn("오류 원인을 설명하세요.", "chat")
+        self.assertEqual(_wait(manager)["status"], "succeeded")
+        manager.start_turn(
+            "방금 답변에서 자체 검증을 네 항목 이내로 정리하세요.",
+            "chat",
+        )
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertIn(prior, service.prompts[2])
+        self.assertIn("중요한 내용을 최대 4개만", service.prompts[2])
 
     def test_orphan_leading_smart_quote_is_removed(self) -> None:
         cleaned, boundary = AgentManager._clean_model_text(
@@ -1380,6 +1486,38 @@ class TestAgentManager(unittest.TestCase):
             manager._response_adequate_for_request(
                 "로컬 모델 응답의 반복과 중단 오류 복구 절차를 세 단계로 답하세요.",
                 "재료를 고릅니다. 물을 끓입니다. 음식을 담습니다.",
+            )
+        )
+        self.assertFalse(
+            manager._response_adequate_for_request(
+                "이 제품 자체의 배터리 수명과 충전 시간을 설명하세요.",
+                "코드 오류를 점검하고 기능 결과를 확인합니다.",
+            )
+        )
+        self.assertFalse(
+            manager._response_adequate_for_request(
+                "email 보안 정책과 로그인 절차를 설명하세요.",
+                "로컬 데이터와 장치 오프라인 처리를 사용합니다.",
+            )
+        )
+        self.assertFalse(
+            manager._response_adequate_for_request(
+                "자체 검증을 세 항목으로 정리하세요.",
+                "음식을 준비합니다. 물을 끓입니다. 그릇에 담습니다.",
+            )
+        )
+        self.assertFalse(
+            manager._response_adequate_for_request(
+                "자체 검증을 세 항목으로 정리하세요.",
+                "배터리 기능을 확인합니다. 충전 결과를 점검합니다. 전력을 측정합니다.",
+            )
+        )
+        self.assertTrue(
+            manager._response_adequate_for_request(
+                "자체 검증을 세 항목으로 정리하세요.",
+                "수정된 기능이 예상대로 작동하는지 확인합니다. "
+                "기존 기능과 충돌하지 않는지 확인합니다. "
+                "성능과 보안 영향을 점검합니다.",
             )
         )
 

@@ -14,7 +14,6 @@ import secrets
 from threading import Condition, Event, RLock, Thread
 from time import monotonic
 from typing import Any, Protocol
-import unicodedata
 
 import torch
 
@@ -36,13 +35,16 @@ from .response_quality import (
     compose_observed_contract_response,
     has_near_duplicate_sentences,
     inspect_response,
+    mask_fenced_code,
     normalize_exact_item_response,
     normalize_exact_sentence_response,
     normalize_maximum_item_response,
+    nfkc_search_original_span,
     request_topic_terms,
     requested_category_counts,
     requested_exact_item_count,
     requested_exact_sentence_count,
+    requested_maximum_item_span,
     requested_maximum_items,
     response_avoids_dangling_sentence_start,
     response_avoids_generic_outline,
@@ -219,10 +221,10 @@ def _exact_item_response_prefill(message: str) -> str:
 def _maximum_item_response_prefill(message: str) -> str:
     """Start an at-most response from its subject rather than its format."""
 
-    match = _EXACT_ITEM_PHRASE_RE.search(message[:512])
-    if match is None:
+    span = requested_maximum_item_span(message)
+    if span is None:
         return EXACT_RESPONSE_PREFILL
-    subject = re.sub(r"\s+", " ", message[: match.start()]).strip(" ,.:;!?。！？")
+    subject = re.sub(r"\s+", " ", message[: span[0]]).strip(" ,.:;!?。！？")
     if not 4 <= len(subject) <= 180:
         return EXACT_RESPONSE_PREFILL
     if subject.endswith("항목을"):
@@ -233,10 +235,10 @@ def _maximum_item_response_prefill(message: str) -> str:
 def _maximum_item_repair_message(message: str, maximum: int) -> str:
     """Rephrase one failed at-most request around meaning, not formatting."""
 
-    match = _EXACT_ITEM_PHRASE_RE.search(message[:512])
-    if match is None:
+    span = requested_maximum_item_span(message)
+    if span is None:
         return message
-    subject = re.sub(r"\s+", " ", message[: match.start()]).strip(" ,.:;!?。！？")
+    subject = re.sub(r"\s+", " ", message[: span[0]]).strip(" ,.:;!?。！？")
     if not subject:
         return message
     if subject.endswith("항목을"):
@@ -329,18 +331,12 @@ _SENTENCE_UNIT_RE = re.compile(
 _STRUCTURED_REPEAT_RE = re.compile(
     r"(?m)^\s*(?:```|\||[-*+]\s+|\d+[.)]\s+)",
 )
-_FENCED_CODE_RE = re.compile(r"```[^\r\n]*\r?\n.*?(?:```|\Z)", re.DOTALL)
 
 
 def _mask_fenced_code(text: str) -> str:
     """Hide fenced examples while preserving every public-text offset."""
 
-    masked = list(text)
-    for match in _FENCED_CODE_RE.finditer(text):
-        for index in range(match.start(), match.end()):
-            if masked[index] not in "\r\n":
-                masked[index] = " "
-    return "".join(masked)
+    return mask_fenced_code(text)
 
 
 @dataclass(frozen=True)
@@ -739,9 +735,8 @@ class AgentManager:
         maximum_item_count = (
             None if resume_truncated else requested_maximum_items(message)
         )
-        isolate_turn_history = not resume_truncated and not _requires_prior_context(
-            message
-        )
+        requires_prior_context = _requires_prior_context(message)
+        isolate_turn_history = not resume_truncated and not requires_prior_context
         response_prefill = None
         if exact_sentence_count is not None:
             response_prefill = _exact_response_prefill(message)
@@ -1033,10 +1028,11 @@ class AgentManager:
                 last_candidate = response
                 isolate_repair = (
                     isolate_turn_history
-                    or cross_turn_echo
+                    or (cross_turn_echo and not requires_prior_context)
                     or (
                         response_contract_incomplete
                         and requested_exact_sentence_count(message) is not None
+                        and not requires_prior_context
                     )
                 )
                 adaptive_sampling_repair = decode_mode == "strict" and (
@@ -1080,8 +1076,16 @@ class AgentManager:
                         maximum_item_count,
                     )
                     repair_prefill = _formal_response_prefill(semantic_repair)
+                    messages = self._model_messages()
+                    current = {"role": "user", "content": semantic_repair}
+                    if isolate_repair:
+                        messages = [current]
+                    elif messages and messages[-1]["role"] == "user":
+                        messages[-1] = current
+                    else:
+                        messages.append(current)
                     prompt = self._render_bounded_prompt(
-                        [{"role": "user", "content": semantic_repair}],
+                        messages,
                         partial_assistant=repair_prefill,
                     )
                 else:
@@ -1962,9 +1966,16 @@ class AgentManager:
         presentation_wrapper = _PRESENTATION_WRAPPER_RE.search(boundary_view)
         factbook_echo = _FACTBOOK_ECHO_RE.search(boundary_view)
         repair_echo = _QUALITY_REPAIR_ECHO_RE.search(boundary_view)
-        folded = unicodedata.normalize("NFKC", boundary_view)
-        folded_role = _ROLE_BOUNDARY_RE.search(folded)
-        folded_leading = _LEADING_ASSISTANT_RE.search(folded)
+        folded_role = nfkc_search_original_span(boundary_view, _ROLE_BOUNDARY_RE)
+        folded_leading = nfkc_search_original_span(
+            boundary_view,
+            _LEADING_ASSISTANT_RE,
+        )
+        quality_boundaries = (
+            finding.start
+            for finding in inspect_response(boundary_view).findings
+            if finding.code in {QualityCode.ROLE_MARKER, QualityCode.CONTROL_TOKEN}
+        )
         boundaries = [
             match.start()
             for match in (
@@ -1975,11 +1986,13 @@ class AgentManager:
                 presentation_wrapper,
                 factbook_echo,
                 repair_echo,
-                folded_role,
-                folded_leading,
             )
             if match is not None
         ]
+        boundaries.extend(
+            span[0] for span in (folded_role, folded_leading) if span is not None
+        )
+        boundaries.extend(quality_boundaries)
         if boundaries:
             return normalized[: min(boundaries)].rstrip(), True
         return normalized.rstrip(), False

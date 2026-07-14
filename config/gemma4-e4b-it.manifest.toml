@@ -1,0 +1,15 @@
+[model]
+family = "gemma4"
+variant = "E4B"
+role = "instruction_tuned"
+source = "google/gemma-4-E4B-it"
+revision = "a4c2d58be94dda072b918d9db64ee85c8ed34e3f"
+
+[files]
+"chat_template.jinja" = "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082"
+"config.json" = "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4"
+"generation_config.json" = "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"
+"model.safetensors" = "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503"
+"processor_config.json" = "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c"
+"tokenizer.json" = "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+"tokenizer_config.json" = "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df"

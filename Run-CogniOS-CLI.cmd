@@ -24,11 +24,11 @@ goto fail_project
 
 :root_ready
 set "DEMO_SCRIPT=%PROJECT_ROOT%\scripts\validate_gemma4_runtime.py"
-set "MANIFEST=%PROJECT_ROOT%\config\gemma4-e4b.manifest.toml"
+set "MANIFEST=%PROJECT_ROOT%\config\gemma4-e4b-it.manifest.toml"
 if defined COGNI_OS_MODEL_DIR (
     set "MODEL_DIR=%COGNI_OS_MODEL_DIR%"
 ) else (
-    set "MODEL_DIR=C:\Project\cognios\gemma4-e4b"
+    set "MODEL_DIR=C:\Project\cognios\gemma4-e4b-it"
 )
 
 if not exist "%DEMO_SCRIPT%" goto fail_project

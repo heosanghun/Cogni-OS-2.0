@@ -26,11 +26,19 @@ from .harness import (
     SafeHarnessPatcher,
     SandboxResult,
     SandboxRunner,
+    WeaknessCluster,
 )
 from .local_proposer import LocalGemmaPatchProposer, ResolvedPatchTarget
 from .logdb import LogDB
 from .rhythm import RhythmController, SystemMode
 from .scheduler import IdleNightScheduler, ScheduleTick
+from .proposals import (
+    CandidateDraft,
+    NegativeProposalV1,
+    PatchProposalV1,
+    ProposalOnlyError,
+    ProposalOnlySelfHarness,
+)
 
 
 _DIGEST_LENGTH = 64
@@ -183,6 +191,13 @@ class ProductionHarnessStatus:
     blocked_reason: str | None
     pending_proposals: int
     failure_cursor: float
+    evidence_failures: int
+    evidence_successes: int
+    evidence_capture_ratio: float
+    rich_pending_proposals: int
+    negative_proposals: int
+    unreviewable_proposals: int
+    proposal_integrity_errors: tuple[tuple[str, str], ...]
 
 
 class _VerifiedRunner:
@@ -405,17 +420,137 @@ class AllowlistedTargetResolver:
 
 
 class RecordingProposer:
-    """Keep a bounded in-memory review queue without persisting source text."""
+    """Keep a bounded review queue backed by inert content-addressed blobs."""
 
-    def __init__(self, proposer: LocalGemmaPatchProposer, capacity: int) -> None:
+    def __init__(
+        self,
+        proposer: LocalGemmaPatchProposer,
+        capacity: int,
+        *,
+        evidence_ledger: ProposalOnlySelfHarness | None = None,
+    ) -> None:
         self.proposer = proposer
+        self.capacity = capacity
+        self.evidence_ledger = evidence_ledger
         self._pending: deque[PatchProposal] = deque(maxlen=capacity)
+        self._rich_pending: deque[PatchProposalV1] = deque(
+            maxlen=0 if evidence_ledger is None else capacity
+        )
+        self._candidate_bank: dict[tuple[str, str, str], dict[str, PatchProposal]] = {}
+        self._negative_replacements: set[tuple[tuple[str, str, str], str]] = set()
+        self._persisted_replacements: set[tuple[tuple[str, str, str], str]] = set()
         self._lock = RLock()
+        if evidence_ledger is not None:
+            proposal_by_id = {
+                item.proposal_id: item for item in evidence_ledger.proposals
+            }
+            if len(proposal_by_id) != len(evidence_ledger.proposals):
+                raise ProposalOnlyError(
+                    "hydrated proposal queue contains duplicate IDs"
+                )
+            self._persisted_replacements.update(
+                (item.signature, item.replacement_sha256)
+                for item in evidence_ledger.proposals
+            )
+            rejected_ids: set[str] = set()
+            for negative in evidence_ledger.negative_archive:
+                proposal = proposal_by_id.get(negative.proposal_id)
+                if proposal is None:
+                    raise ProposalOnlyError(
+                        "hydrated suppression references an unknown proposal"
+                    )
+                rejected_ids.add(proposal.proposal_id)
+                self._negative_replacements.add(
+                    (proposal.signature, proposal.replacement_sha256)
+                )
+            reviewable_patches = dict(evidence_ledger.reviewable_patches)
+            if not set(reviewable_patches).issubset(proposal_by_id):
+                raise ProposalOnlyError(
+                    "hydrated review queue references an unknown proposal"
+                )
+            active = tuple(
+                proposal
+                for proposal in evidence_ledger.proposals
+                if proposal.proposal_id not in rejected_ids
+                and proposal.proposal_id in reviewable_patches
+            )
+            if len(active) > capacity:
+                raise ProposalOnlyError(
+                    "hydrated pending proposal queue crossed its configured capacity"
+                )
+            active_replacements: set[tuple[tuple[str, str, str], str]] = set()
+            for proposal in active:
+                key = (proposal.signature, proposal.replacement_sha256)
+                if key in self._negative_replacements:
+                    raise ProposalOnlyError(
+                        "hydrated pending proposal conflicts with negative suppression"
+                    )
+                if key in active_replacements:
+                    raise ProposalOnlyError(
+                        "hydrated pending queue repeats a replacement"
+                    )
+                active_replacements.add(key)
+                self._pending.append(reviewable_patches[proposal.proposal_id])
+                self._rich_pending.append(proposal)
 
     def __call__(self, cluster) -> tuple[PatchProposal, ...]:
         proposals = tuple(self.proposer(cluster))
         with self._lock:
-            self._pending.extend(proposals)
+            ledger = self.evidence_ledger
+            if ledger is None:
+                self._pending.extend(proposals)
+            else:
+                signature = cluster.signature
+                if (
+                    signature not in self._candidate_bank
+                    and len(self._candidate_bank) >= self.capacity
+                ):
+                    self._candidate_bank.pop(next(iter(self._candidate_bank)))
+                bank = self._candidate_bank.setdefault(signature, {})
+                for proposal in proposals:
+                    replacement_digest = sha256(
+                        proposal.replacement.encode("utf-8")
+                    ).hexdigest()
+                    if (
+                        len(bank) < 8
+                        and (signature, replacement_digest)
+                        not in self._negative_replacements
+                        and (signature, replacement_digest)
+                        not in self._persisted_replacements
+                    ):
+                        bank.setdefault(replacement_digest, proposal)
+                available = self.capacity - len(self._rich_pending)
+                if (
+                    len(bank) >= ledger.minimum_candidates
+                    and available >= ledger.minimum_candidates
+                ):
+                    reproduction = (
+                        cluster.traces[0].excerpt
+                        if cluster.traces and cluster.traces[0].excerpt
+                        else f"reproduce verifier {signature[1]}"
+                    )
+                    drafts = tuple(
+                        CandidateDraft(
+                            patch,
+                            expected_behavior=(
+                                f"terminal verifier {signature[0]} no longer reproduces"
+                            ),
+                            risk="unexecuted local-model source proposal",
+                            reproduction_test=reproduction[:4_096],
+                            rollback_trigger=(
+                                "reject on stale digest, policy failure, or held-out regression"
+                            ),
+                        )
+                        for patch in tuple(bank.values())[: min(8, available)]
+                    )
+                    rich = ledger.submit_cluster_candidates(cluster, drafts)
+                    reviewable = dict(ledger.reviewable_patches)
+                    self._pending.extend(reviewable[item.proposal_id] for item in rich)
+                    self._rich_pending.extend(rich)
+                    self._persisted_replacements.update(
+                        (item.signature, item.replacement_sha256) for item in rich
+                    )
+                    self._candidate_bank.pop(signature, None)
         return proposals
 
     @property
@@ -423,9 +558,62 @@ class RecordingProposer:
         with self._lock:
             return tuple(self._pending)
 
+    @property
+    def rich_pending(self) -> tuple[PatchProposalV1, ...]:
+        with self._lock:
+            return tuple(self._rich_pending)
+
+    def reject_rich(
+        self,
+        proposal_id: str,
+        *,
+        reason_code: str,
+        evidence_sha256: str,
+    ) -> NegativeProposalV1:
+        with self._lock:
+            ledger = self.evidence_ledger
+            proposal = next(
+                (
+                    item
+                    for item in self._rich_pending
+                    if item.proposal_id == proposal_id
+                ),
+                None,
+            )
+            if ledger is None or proposal is None:
+                raise ValueError("review proposal is not pending")
+            negative = ledger.archive_negative(
+                proposal_id,
+                reason_code=reason_code,
+                evidence_sha256=evidence_sha256,
+            )
+            self._negative_replacements.add(
+                (proposal.signature, proposal.replacement_sha256)
+            )
+            retained = tuple(
+                item for item in self._rich_pending if item.proposal_id != proposal_id
+            )
+            self._rich_pending.clear()
+            self._rich_pending.extend(retained)
+            retained_patches = tuple(
+                patch
+                for patch in self._pending
+                if not (
+                    patch.relative_path == proposal.relative_path
+                    and patch.base_sha256.lower() == proposal.base_sha256
+                    and sha256(patch.replacement.encode("utf-8")).hexdigest()
+                    == proposal.replacement_sha256
+                )
+            )
+            self._pending.clear()
+            self._pending.extend(retained_patches)
+            return negative
+
     def clear(self) -> None:
         with self._lock:
             self._pending.clear()
+            self._rich_pending.clear()
+            self._candidate_bank.clear()
 
 
 @dataclass(frozen=True)
@@ -830,8 +1018,11 @@ class ProductionSelfHarness:
         logdb: BoundedLogDB,
         daemon: FailureCaptureDaemon,
         proposer: RecordingProposer,
+        proposal_ledger: ProposalOnlySelfHarness,
         harness: SelfHarness,
         journal: BackupJournal,
+        source_digest_resolver: Callable[[tuple[str, str, str]], str],
+        source_surface_digest: Callable[[], str],
         clock: Callable[[], float],
     ) -> None:
         self.config = config
@@ -839,8 +1030,11 @@ class ProductionSelfHarness:
         self.logdb = logdb
         self.failure_daemon = daemon
         self.proposer = proposer
+        self.proposal_ledger = proposal_ledger
         self.harness = harness
         self.journal = journal
+        self._source_digest_resolver = source_digest_resolver
+        self._source_surface_digest = source_surface_digest
         self._failure_cursor = 0.0
         self._lock = RLock()
         self.scheduler = IdleNightScheduler(
@@ -860,11 +1054,85 @@ class ProductionSelfHarness:
             self.harness.proposal_only_reason,
             len(self.proposer.pending),
             self._failure_cursor,
+            len(self.proposal_ledger.failures),
+            len(self.proposal_ledger.successes),
+            self.proposal_ledger.capture_coverage.ratio,
+            len(self.proposer.rich_pending),
+            len(self.proposal_ledger.negative_archive),
+            len(self.proposal_ledger.unreviewable_proposals),
+            self.proposal_ledger.unreviewable_proposals,
         )
 
     @property
     def pending_proposals(self) -> tuple[PatchProposal, ...]:
         return self.proposer.pending
+
+    @property
+    def evidence_proposals(self) -> tuple[PatchProposalV1, ...]:
+        return self.proposer.rich_pending
+
+    def reject_evidence_proposal(
+        self,
+        proposal_id: str,
+        *,
+        reason_code: str,
+        evidence_sha256: str,
+    ) -> NegativeProposalV1:
+        """Archive review/held-out rejection and suppress the same replacement."""
+
+        return self.proposer.reject_rich(
+            proposal_id,
+            reason_code=reason_code,
+            evidence_sha256=evidence_sha256,
+        )
+
+    def _record_failure_evidence(
+        self,
+        workflow_id: str,
+        error: BaseException,
+        *,
+        verifier_code: str,
+        mechanism: str,
+    ) -> None:
+        signature = (type(error).__name__, verifier_code, mechanism)
+        message = str(error) or type(error).__name__
+        evidence = sha256(
+            "\0".join((workflow_id, *signature, message)).encode("utf-8")
+        ).hexdigest()
+        reproduction = (
+            f"workflow={workflow_id}; verifier={verifier_code}; "
+            f"mechanism={mechanism}; failure={type(error).__name__}: {message}"
+        )[:4_096]
+        with self._lock:
+            self.proposal_ledger.record_failure(
+                terminal_verifier_cause=signature[0],
+                causal_status=signature[1],
+                agent_mechanism=signature[2],
+                primary_evidence_sha256=evidence,
+                source_sha256=self._source_digest_resolver(signature),
+                reproduction=reproduction,
+            )
+
+    def _record_success_evidence(
+        self,
+        workflow_id: str,
+        *,
+        verifier_code: str,
+        mechanism: str,
+        evidence_payload: str,
+    ) -> None:
+        evidence = sha256(
+            "\0".join((workflow_id, verifier_code, mechanism, evidence_payload)).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        with self._lock:
+            self.proposal_ledger.record_success(
+                verifier_code=verifier_code,
+                causal_status="verified_success",
+                agent_mechanism=mechanism,
+                primary_evidence_sha256=evidence,
+            )
 
     def start(self) -> ProductionSelfHarness:
         with self._lock:
@@ -909,6 +1177,12 @@ class ProductionSelfHarness:
         verifier_code: str = "workflow_runtime",
         mechanism: str = "workflow",
     ) -> None:
+        self._record_failure_evidence(
+            workflow_id,
+            error,
+            verifier_code=verifier_code,
+            mechanism=mechanism,
+        )
         self.failure_daemon.capture_exception(
             workflow_id,
             error,
@@ -925,6 +1199,13 @@ class ProductionSelfHarness:
         verifier_code: str = "workflow_deadline",
         mechanism: str = "workflow",
     ) -> None:
+        timeout_error = TimeoutError(f"deadline exceeded after {timeout_seconds:g}s")
+        self._record_failure_evidence(
+            workflow_id,
+            timeout_error,
+            verifier_code=verifier_code,
+            mechanism=mechanism,
+        )
         self.failure_daemon.capture_timeout(
             workflow_id,
             timeout_seconds,
@@ -943,12 +1224,28 @@ class ProductionSelfHarness:
     ) -> Iterator[None]:
         self.note_activity()
         try:
-            with self.failure_daemon.observe(
-                workflow_id,
-                verifier_code=verifier_code,
-                mechanism=mechanism,
-            ):
-                yield
+            try:
+                with self.failure_daemon.observe(
+                    workflow_id,
+                    verifier_code=verifier_code,
+                    mechanism=mechanism,
+                ):
+                    yield
+            except BaseException as error:
+                self._record_failure_evidence(
+                    workflow_id,
+                    error,
+                    verifier_code=verifier_code,
+                    mechanism=mechanism,
+                )
+                raise
+            else:
+                self._record_success_evidence(
+                    workflow_id,
+                    verifier_code=verifier_code,
+                    mechanism=mechanism,
+                    evidence_payload=self._source_surface_digest(),
+                )
         finally:
             self.note_activity()
 
@@ -965,9 +1262,75 @@ class ProductionSelfHarness:
 
     def _run_cycle(self) -> EvolutionReport:
         cutoff = time()
+        source_before = self._source_surface_digest()
         report = self.harness.run_night_cycle(since=self._failure_cursor)
+        source_after = self._source_surface_digest()
+        if (
+            self.config.promotion_mode == PromotionMode.PROPOSAL_ONLY
+            and source_before != source_after
+        ):
+            self.rhythm.transition(
+                SystemMode.SAFE_MODE,
+                "proposal-only source surface changed",
+            )
+            raise JournalIntegrityError(
+                "proposal-only cycle changed the active source surface"
+            )
+        if self.config.promotion_mode == PromotionMode.PROPOSAL_ONLY:
+            self._record_success_evidence(
+                "proposal-only-night-cycle",
+                verifier_code="source_surface_immutable",
+                mechanism="self_harness",
+                evidence_payload=source_before + source_after,
+            )
         self._failure_cursor = cutoff
         return report
+
+
+def _source_surface_sha256(
+    project_root: Path,
+    allowed_roots: tuple[str, ...],
+    *,
+    max_files: int = 4_096,
+    max_total_bytes: int = 128 * 1024**2,
+) -> str:
+    """Hash the bounded mutable Python surface without following links."""
+
+    digest = sha256()
+    file_count = 0
+    total_bytes = 0
+    for root_name in sorted(allowed_roots):
+        source_root = project_root / root_name
+        if source_root.is_symlink():
+            raise JournalIntegrityError("mutable source root is linked")
+        if not source_root.exists():
+            continue
+        if not source_root.is_dir():
+            raise JournalIntegrityError("mutable source root is not a directory")
+        for unresolved in sorted(source_root.rglob("*.py")):
+            if unresolved.is_symlink():
+                raise JournalIntegrityError("mutable source surface contains a link")
+            stat = os.lstat(unresolved)
+            if getattr(stat, "st_file_attributes", 0) & 0x400:
+                raise JournalIntegrityError(
+                    "mutable source surface contains a reparse point"
+                )
+            path = unresolved.resolve(strict=True)
+            if project_root not in path.parents or not path.is_file():
+                raise JournalIntegrityError(
+                    "mutable source surface escaped the project"
+                )
+            payload = path.read_bytes()
+            file_count += 1
+            total_bytes += len(payload)
+            if file_count > max_files or total_bytes > max_total_bytes:
+                raise JournalIntegrityError("mutable source surface exceeded its bound")
+            relative = path.relative_to(project_root).as_posix().encode("utf-8")
+            digest.update(len(relative).to_bytes(4, "big"))
+            digest.update(relative)
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(sha256(payload).digest())
+    return digest.hexdigest()
 
 
 def build_production_self_harness(
@@ -1012,13 +1375,34 @@ def build_production_self_harness(
         policy,
         max_targets=selected.max_target_mappings,
     )
+
+    def source_surface_digest() -> str:
+        return _source_surface_sha256(root, selected.allowed_roots)
+
+    def source_digest_resolver(signature: tuple[str, str, str]) -> str:
+        target = resolver(WeaknessCluster(signature, ()))
+        return source_surface_digest() if target is None else target.base_sha256
+
     local_proposer = LocalGemmaPatchProposer(
         model,
         tokenizer,
         resolver,
         policy=policy,
     )
-    proposer = RecordingProposer(local_proposer, selected.max_pending_proposals)
+    proposal_ledger = ProposalOnlySelfHarness(
+        root,
+        state_root / "proposal-ledger-v1",
+        policy=policy,
+        minimum_candidates=3,
+        max_events=min(4_096, selected.max_failure_records),
+        max_proposals=max(3, min(256, selected.max_pending_proposals * 8)),
+        max_negatives=min(512, selected.max_audit_records),
+    )
+    proposer = RecordingProposer(
+        local_proposer,
+        selected.max_pending_proposals,
+        evidence_ledger=proposal_ledger,
+    )
     active_rhythm = rhythm or RhythmController()
     logdb = BoundedLogDB(
         state_root / "events.sqlite3",
@@ -1077,8 +1461,11 @@ def build_production_self_harness(
         logdb=logdb,
         daemon=daemon,
         proposer=proposer,
+        proposal_ledger=proposal_ledger,
         harness=harness,
         journal=journal,
+        source_digest_resolver=source_digest_resolver,
+        source_surface_digest=source_surface_digest,
         clock=clock or monotonic,
     )
 

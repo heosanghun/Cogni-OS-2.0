@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import RLock
 from time import time
 from typing import Iterator
+
+
+MAX_RHYTHM_HISTORY = 64
 
 
 class SystemMode(str, Enum):
@@ -63,7 +67,9 @@ class Transition:
 class RhythmController:
     mode: SystemMode = SystemMode.INFERENCE
     active_requests: int = 0
-    history: list[Transition] = field(default_factory=list)
+    history: deque[Transition] = field(
+        default_factory=lambda: deque(maxlen=MAX_RHYTHM_HISTORY)
+    )
     active_evolution_tasks: int = field(default=0, init=False)
     _lock: RLock = field(default_factory=RLock, repr=False)
 

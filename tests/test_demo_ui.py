@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from html.parser import HTMLParser
+import os
 from pathlib import Path
 import re
+import subprocess
 import unittest
 
 
@@ -112,6 +114,10 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn('aria-keyshortcuts="Control+Enter Meta+Enter"', html)
         self.assertIn('id="agent-char-count" for="agent-input"', html)
         self.assertRegex(
+            html,
+            r'data-action="agent-focus"[^>]*aria-controls="agent-input"[^>]*disabled',
+        )
+        self.assertRegex(
             html, r'data-agent-mode="chat"[^>]*aria-pressed="true"[^>]*disabled'
         )
         self.assertRegex(html, r'id="agent-input"[^>]*maxlength="4096"[^>]*disabled')
@@ -159,6 +165,21 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn('data-action="agent-cancel"', html)
         self.assertIn('.agent-heading-state[data-state="cancelling"]', stylesheet)
 
+    def test_evolution_count_prefers_source_bearing_review_queue(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        pending_branch = script.index(
+            "const pending = Number.isInteger(evolution.pending_proposals)"
+        )
+        rich_fallback = script.index(
+            ": evolution.rich_pending_proposals;", pending_branch
+        )
+        self.assertLess(pending_branch, rich_fallback)
+        self.assertIn("evolution.unreviewable_proposals", script)
+        self.assertIn(
+            'badge.dataset.integrity = degraded ? "degraded" : "healthy"', script
+        )
+        self.assertIn("무결성 제외", script)
+
     def test_answer_completion_and_truncation_are_visible_and_actionable(self) -> None:
         script = (STATIC / "app.js").read_text(encoding="utf-8")
         stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
@@ -175,6 +196,52 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn(".chat-completion-status", stylesheet)
         self.assertIn(".chat-message.is-truncated", stylesheet)
         self.assertIn(".chat-continue-button", stylesheet)
+
+    def test_factbook_and_model_generation_are_visibly_distinct(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn("검증 READY", html)
+        self.assertIn("Runtime Fact-book", script)
+        self.assertIn("FACT-BOOK · 검증된 사실", script)
+        self.assertIn(
+            '["cogni_core", "conversation_fastpath", "factbook", "quality_fallback"]',
+            script,
+        )
+        self.assertIn("대화 FAST PATH · 완료", script)
+        self.assertIn("CONVERSATION READY", script)
+        self.assertIn("MODEL STANDBY", script)
+        self.assertIn("NOT LOADED", script)
+        self.assertIn('generationMode === "factbook"', script)
+        self.assertIn(
+            '.chat-message[data-generation-mode="factbook"] .chat-avatar',
+            stylesheet,
+        )
+        self.assertIn(
+            '.chat-message[data-generation-mode="factbook"] .chat-completion-status',
+            stylesheet,
+        )
+        self.assertIn(
+            '.chat-message[data-generation-mode="conversation_fastpath"] .chat-avatar',
+            stylesheet,
+        )
+        self.assertIn(
+            '.chat-message[data-generation-mode="conversation_fastpath"] .chat-completion-status',
+            stylesheet,
+        )
+
+    def test_quality_fallback_is_presented_as_failure_not_completion(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn("품질 검증 실패 · 복구 필요", script)
+        self.assertIn("RESPONSE FAILED", script)
+        self.assertNotIn("품질 안전 응답 · 완료", script)
+        self.assertIn(
+            '.chat-message[data-generation-mode="quality_fallback"]',
+            stylesheet,
+        )
 
     def test_api_error_copy_and_connection_recovery_are_actionable(self) -> None:
         script = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -197,6 +264,7 @@ class TestCogniBoardUI(unittest.TestCase):
         self,
     ) -> None:
         stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
         self.assertEqual(stylesheet.count("{"), stylesheet.count("}"))
         for query in (
             "@media (min-width: 1181px) and (max-height: 820px)",
@@ -214,6 +282,23 @@ class TestCogniBoardUI(unittest.TestCase):
             stylesheet,
             r"(?s)\.chat-workspace\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*hidden;",
         )
+        self.assertRegex(
+            stylesheet,
+            r"(?s)\.assistant-layout\s*\{[^}]*align-items:\s*start;",
+        )
+        self.assertRegex(
+            stylesheet,
+            r"(?s)@media \(min-width: 901px\)\s*\{\s*\.chat-workspace\s*\{"
+            r"[^}]*height:\s*clamp\(500px, calc\(100dvh - var\(--topbar\) - 230px\), 620px\);"
+            r"[^}]*min-height:\s*0;",
+        )
+        self.assertRegex(
+            stylesheet,
+            r"(?s)\.chat-transcript\s*\{[^}]*min-height:\s*0;"
+            r"[^}]*overflow-y:\s*auto;[^}]*scrollbar-gutter:\s*stable;",
+        )
+        self.assertIn('[data-action="agent-focus"]', script)
+        self.assertIn("input.focus({ preventScroll: true })", script)
         self.assertRegex(
             stylesheet,
             r"(?s)\.chat-bubble p\s*\{[^}]*overflow-wrap:\s*anywhere;"
@@ -236,12 +321,46 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("실행 이벤트 보기", html)
         self.assertNotIn("원본 실행 로그 보기", html)
 
+    def test_live_measurements_start_unverified_and_require_current_success(
+        self,
+    ) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        for placeholder in (
+            'id="metric-vram">—</b>',
+            'id="metric-depth">—</b>',
+            'id="metric-residual">—</b>',
+            'id="reactor-depth">—</strong>',
+            'id="telemetry-vram">—</em>',
+            'id="rail-device">실행 전 미측정</strong>',
+            'id="rail-verdict">NOT VERIFIED</strong>',
+        ):
+            with self.subTest(placeholder=placeholder):
+                self.assertIn(placeholder, html)
+        for stale_claim in (
+            "14.8469",
+            "0.000230",
+            "3.906e-3",
+            "RTX 5090 Laptop GPU",
+            "6.091ms",
+        ):
+            with self.subTest(stale_claim=stale_claim):
+                self.assertNotIn(stale_claim, html)
+                self.assertNotIn(stale_claim, script)
+        self.assertIn('metrics.evidence_kind === "live_runtime_validation"', script)
+        self.assertIn("if (!live) {", script)
+        self.assertIn("data-live-evidence-badge", html)
+        self.assertIn('class="rail-seal" data-state="ready"', html)
+        self.assertIn('App external calls</dt><dd class="positive">DISABLED', html)
+        self.assertNotIn('<dt>Network</dt><dd class="positive">BLOCKED', html)
+        self.assertNotIn("100% 폐쇄망", html)
+
     def test_business_claims_preserve_integrity_boundaries(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
-        self.assertIn("RTX 5090 Laptop GPU", html)
+        self.assertIn("실행 전 미측정", html)
         self.assertIn("목표 장치", html)
         self.assertIn("RTX 4090", html)
-        self.assertIn("현재 실측은 목표 RTX 4090 결과가 아닙니다", html)
+        self.assertIn("라이브 검증 전에는 과거 장치 수치를 표시하지 않습니다", html)
         self.assertIn("전체 시스템 O(1) 주장이 아닙니다", html)
         self.assertIn("컨텍스트 길이별 메모리 비교", html)
         self.assertIn("6.3ms 설계 목표", html)
@@ -258,10 +377,58 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("validate_gemma4_runtime.py", diagnostic)
         self.assertIn("HF_HUB_OFFLINE", graphical)
         self.assertIn("HF_HUB_OFFLINE", diagnostic)
+        for launcher in (graphical, diagnostic, native):
+            with self.subTest(launcher=launcher[:32]):
+                self.assertIn("gemma4-e4b-it", launcher)
+                self.assertIn("gemma4-e4b-it.manifest.toml", launcher)
         self.assertIn("cogni_demo.server", native)
         self.assertIn("CreateNoWindow = true", native)
         self.assertIn("HF_HUB_OFFLINE", native)
+        self.assertIn("load_default_bounded_cts_controller", native)
+        self.assertIn("DriveType.Fixed", native)
+        self.assertIn("FileAttributes.ReparsePoint", native)
+        self.assertIn("QuoteArgument", native)
+        self.assertIn("BeginErrorReadLine", native)
         self.assertNotIn("validate_gemma4_runtime.py", native)
+
+        server = (ROOT / "cogni_demo" / "server.py").read_text(encoding="utf-8")
+        backend_preflight = server.index(
+            'load_default_bounded_cts_controller(device="cpu")',
+            server.index("def main("),
+        )
+        http_bind = server.index("server = DemoHTTPServer(", backend_preflight)
+        self.assertLess(backend_preflight, http_bind)
+
+    def test_compiled_launcher_matches_the_instruction_tuned_source(self) -> None:
+        binary = ROOT / "CogniBoard.exe"
+        self.assertTrue(binary.is_file())
+        self.assertGreater(binary.stat().st_size, 0)
+        decoded = binary.read_bytes().decode("utf-16-le", errors="ignore")
+        old_model = r"C:\Project\cognios\gemma4-e4b"
+        new_model = old_model + "-it"
+        self.assertIn(new_model, decoded)
+        self.assertEqual(decoded.count(old_model), decoded.count(new_model))
+        self.assertIn("gemma4-e4b-it.manifest.toml", decoded)
+        self.assertNotIn("gemma4-e4b.manifest.toml", decoded)
+
+        if os.name != "nt":
+            self.skipTest("native assembly metadata inspection requires Windows")
+        environment = dict(os.environ)
+        environment["COGNI_EXE"] = str(binary)
+        version = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "[Reflection.AssemblyName]::GetAssemblyName($env:COGNI_EXE).Version.ToString()",
+            ],
+            check=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=environment,
+            timeout=30,
+        ).stdout.strip()
+        self.assertEqual(version, "0.3.2.0")
 
 
 if __name__ == "__main__":

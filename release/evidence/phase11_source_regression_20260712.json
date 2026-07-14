@@ -1,0 +1,21 @@
+{
+  "status": "passed",
+  "commands": [
+    "python -m ruff check .",
+    "python -m ruff format --check .",
+    "node --check cogni_demo\\static\\app.js",
+    "python -m pytest -q"
+  ],
+  "results": {
+    "ruff_check": "passed",
+    "ruff_format_files": 126,
+    "javascript_syntax": "passed",
+    "pytest_passed": 599,
+    "pytest_skipped": 3,
+    "pytest_failed": 0,
+    "pytest_warnings": 3,
+    "pytest_subtests_passed": 482,
+    "pytest_elapsed_seconds": 97.67
+  },
+  "warning_note": "The three warnings are deprecation notices from compatibility APIs in tests/test_extensions.py, not failures."
+}

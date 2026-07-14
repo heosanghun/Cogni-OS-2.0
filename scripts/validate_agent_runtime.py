@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,18 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from cogni_agent.manager import SYSTEM_PROMPT  # noqa: E402
 from cogni_agent.model_service import ModelService  # noqa: E402
+from cogni_agent.prompting import (  # noqa: E402
+    decode_response,
+    render_chat_prompt,
+    stop_token_ids,
+)
+from cogni_agent.response_quality import (  # noqa: E402
+    QualityAction,
+    inspect_response,
+    response_contract_satisfied,
+)
 from cogni_os.artifacts import verify_artifact_manifest  # noqa: E402
 
 
@@ -61,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prompt",
         type=_bounded_prompt,
-        default="Cogni-OS의 현재 안전 상태를 한 문장으로 설명하세요.",
+        default="사용자에게 자연스러운 한국어 한 문장으로 인사하세요.",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -91,6 +103,14 @@ def _bounded_error(error: BaseException) -> str:
     return text[:256]
 
 
+def _sha256_file(path: str | Path) -> str:
+    digest = sha256()
+    with Path(path).expanduser().resolve(strict=True).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def execute_validation(
     args: argparse.Namespace,
     *,
@@ -113,6 +133,8 @@ def execute_validation(
         "cuda_worker_cleaned": True,
         "response": "",
         "response_tokens": 0,
+        "finish_reason": None,
+        "quality_gate": "not_run",
         "core_path": "BIO-HAMA>Gemma-feature>DEQ/CTS>System4>System3>Gemma-decode",
         "use_cache": False,
         "fast_weight": "gated_off",
@@ -129,6 +151,8 @@ def execute_validation(
         load_started = perf_counter()
         service = service_factory(
             args.model,
+            manifest_path=args.manifest,
+            artifact_digest=_sha256_file(args.manifest),
             max_new_tokens=args.max_new_tokens,
         )
         service.start()
@@ -137,13 +161,34 @@ def execute_validation(
         metrics["worker_start_seconds"] = perf_counter() - load_started
 
         turn_started = perf_counter()
+        prompt = render_chat_prompt(
+            service.tokenizer,
+            SYSTEM_PROMPT,
+            ({"role": "user", "content": args.prompt},),
+        )
+        stops = stop_token_ids(service.tokenizer)
         result = service.generate(
-            args.prompt,
+            prompt,
             max_new_tokens=args.max_new_tokens,
+            stop_token_ids=stops,
         )
         metrics["turn_seconds"] = perf_counter() - turn_started
-        metrics["response"] = result.text
+        response = decode_response(service.tokenizer, result.token_ids, stops)
+        metrics["response"] = response
         metrics["response_tokens"] = int(result.token_ids.numel())
+        metrics["finish_reason"] = result.finish_reason
+        if result.finish_reason != "stop":
+            metrics["quality_gate"] = "failed"
+            raise RuntimeError("runtime smoke requires a terminal stop result")
+        quality = inspect_response(response, final=True)
+        if quality.recommended_action is not QualityAction.ACCEPT:
+            findings = ",".join(finding.code.value for finding in quality.findings)
+            metrics["quality_gate"] = "failed"
+            raise RuntimeError(f"response quality gate rejected output: {findings}")
+        if not response_contract_satisfied(args.prompt, response):
+            metrics["quality_gate"] = "failed"
+            raise RuntimeError("response quality gate rejected the request contract")
+        metrics["quality_gate"] = "passed"
         metrics["status"] = "ok"
         exit_code = 0
     except (Exception, KeyboardInterrupt) as error:
@@ -172,6 +217,8 @@ def emit_metrics(metrics: dict[str, Any], stream: TextIO = sys.stdout) -> None:
         "worker_start_seconds",
         "turn_seconds",
         "response_tokens",
+        "finish_reason",
+        "quality_gate",
         "use_cache",
         "fast_weight",
         "fp_ewc",

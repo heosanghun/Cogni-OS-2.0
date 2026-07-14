@@ -1,90 +1,197 @@
-# Cogni-OS 2.0 Architecture
+# Cogni-OS 2.0 v0.3.2 Architecture
 
-## Trust boundaries
+## Authority and evidence first
 
-The system is split into two processes or deployment units:
+The architecture separates three facts that the UI must not conflate:
 
-- **Cogni-Core** owns tensor inference, DEQ solves, CTS, session overlays, FP-EWC statistics, and PCAS.
-- **Cogni-Flow** owns state transitions, logs, candidate generation, sandbox validation, promotion, and rollback.
+1. **service readiness** — a process is alive and can accept a request;
+2. **capability state** — `research`, `advisory`, `canary`, `authoritative`,
+   `gated`, `night_only`, or `proposal_only`;
+3. **evidence class** — `measured`, `verified`, `target`, or `plan`.
 
-`TensorService` provides the concrete local process boundary. A single spawned
-Cogni-Core worker owns the GPU model; Cogni-Flow remains CPU-side. Every data
-plane request and response is exactly four CPU tensors carrying numeric opcode,
-request id, payload/result, and status. The bounded queues carry no JSON,
-strings, exception objects, or network traffic. PAUSE/RESUME opcodes align the
-worker with the day/night controller.
+`RuntimeFactBook` and `CapabilityRegistry` describe authority. `EvidenceRecordV1`
+binds a claim to exact model, code, configuration and device digests. The
+external `FactBookSnapshotStore` accepts only valid content-addressed records,
+selects one snapshot through an atomic last-known-good pointer, and rejects
+evidence when its scope becomes stale.
 
-The local generation protocol is version 2. Its fourth response tensor carries
-a closed terminal reason (`stop`, `length`, `cancelled`, or `error`), so a
-token-budget boundary cannot be committed as a successful model stop.
+## System structure
 
-Natural language, source code, paths, JSON, and subprocess results never enter the Cogni-Core hot path. Core modules exchange tensors and fixed Python dataclasses whose fields are tensors or bounded numeric metadata. Cogni-Flow may use structured control data because it is outside the sub-millisecond tensor path.
+```mermaid
+flowchart TB
+    subgraph UI["Local user boundary"]
+        BOARD["CogniBoard desktop UI"]
+        HTTP["Loopback API + session authentication"]
+        DISPLAY["Capability and evidence display"]
+    end
 
-## Day path
+    subgraph FLOW["Cogni-Flow / CPU control plane"]
+        LIFE["Lifecycle authority + GPU lease"]
+        AGENT["Conversation and response-quality controller"]
+        FACT["Runtime Fact-book + LKG evidence store"]
+        TASK["Typed TaskPlan policy and executor"]
+        AFLOW["Sealed AFlow research archive"]
+        LEDGER["Proposal-only Self-Harness ledger"]
+    end
 
-1. `RhythmController.inference_slot()` prevents evolution from starting.
-2. `VRAMGuard` performs admission control against the configured 16.7 GiB envelope.
-3. One resident spawned worker owns both the verified local Gemma model and the
-   Cogni-Core runtime. The browser and HTTP control plane never own CUDA.
-4. A bounded multi-turn controller renders the prompt locally and sends only
-   CPU `int64` tensors across the worker boundary.
-5. BIO-HAMA routes the turn. The local Gemma embedding is attention-pooled to
-   one fixed-size advisory latent before PUCT CTS plus DEQ performs
-   fixed-width, bounded-node search; CTS arena storage does not scale with the
-   conversation sequence length.
-6. System 4 and System 3 produce detached advisory telemetry. They cannot alter
-   Gemma logits or decoded answer tokens.
-7. Deterministic Gemma decoding runs with `use_cache=False` and streams bounded
-   token tensors back to the controller. Native Gemma 4 EOT and quarantined
-   reserved markers are stopped before public decode.
-8. A bounded latent bottleneck compiles only converged states into low-rank
-   Fast Weight overlays. External held-out quality, composed operator norm, and
-   Near-OOD gates must all pass; overlays remain session-only.
-9. PCAS can select a precompiled topology without changing parameters.
-10. Failures are appended to the local LogDB.
+    subgraph CORE["Cogni-Core / single GPU owner"]
+        GEMMA["Verified dense Gemma 4 E4B"]
+        BIO["BIO-HAMA advisory router"]
+        CTS["Fixed-arena CTS V2"]
+        DEQ["Limited-Broyden equilibrium reasoner"]
+        BRIDGE["Bounded causal logits conditioner"]
+        FW["System 1.5 session overlay gate"]
+        S4["System 4 28-agent tensor swarm"]
+        S3["System 3 bounded experts"]
+        DECODE["Deterministic no-cache decode"]
+    end
 
-## Night path
+    subgraph NIGHT["Exclusive evolution window"]
+        EWC["System 2.5 FP-EWC"]
+        CFIRE["C-FIRE spectral projection"]
+        EXPERT["Expert candidate lifecycle"]
+        PROPOSAL["K>=3 inert patch proposals"]
+    end
 
-1. The caller drains active requests, then inference enters `DRAINING`; new
-   requests are rejected. A non-zero active count aborts the night transition.
-2. State is checkpointed only after the zero-active-request check.
-3. Failure traces are clustered by verifier-grounded signatures.
-4. The bounded failure daemon persists exceptions/timeouts locally, and the
-   idle scheduler permits at most one night cycle.
-5. A hash-verified local model may emit replacement text, but a trusted resolver
-   selects the target path and base digest.
-6. Static air-gap and AST policy checks run before execution.
-7. Each candidate is tested only by a kernel-isolated runner over a staging copy;
-   process-only runners are rejected before execution.
-8. By default the production assembly is proposal-only, so candidate source is
-   never installed.
-9. Promotion requires an operator-allowlisted runner attestation proving a
-   separate kernel, no network, no host-filesystem access, an ephemeral
-   workspace, and exact command digests.
-10. A passing candidate is journaled, atomically promoted, health-checked in a
-    fresh isolated snapshot, and digest-verified rollback is automatic on
-    failure. Unknown live-file digests are never overwritten.
+    BOARD --> HTTP --> AGENT
+    AGENT --> FACT --> DISPLAY --> BOARD
+    AGENT --> LIFE --> GEMMA
+    GEMMA --> BIO --> CTS --> DEQ --> BRIDGE --> DECODE
+    FW -. "gated unless admitted" .-> DEQ
+    S4 -. "advisory telemetry" .-> DEQ
+    S3 -. "advisory telemetry" .-> DEQ
+    DECODE --> AGENT
+    AGENT --> TASK
+    TASK -. "T2 proposal only" .-> LEDGER
+    LIFE --> AFLOW --> LEDGER
+    LIFE --> EWC --> CFIRE --> EXPERT
+    LEDGER --> PROPOSAL
+```
 
-## Memory claims
+Solid arrows are active product flow. Dotted arrows retain the capability
+state written on the edge; the existence of an edge is not answer authority.
 
-The implementation claims bounded **solver history and active search state**
-under fixed width, hidden size, history rank, and node capacity. `max_depth` does
-not size any CTS tensor; a fixed arena and frontier rollout handle capacity
-exhaustion. It does not claim constant total memory for model weights, expert
-banks, log databases, or unbounded external data. Those resources have separate
-capacities and eviction policies.
+## Process and IPC boundary
+
+- Cogni-Flow owns HTTP/UI state, conversations, typed tasks, evidence, logs and
+  proposal records. It does not own a CUDA model.
+- One spawned Cogni-Core worker loads the manifest-verified model and is the
+  only CUDA owner.
+- Model IPC v4 carries bounded CPU tensors. Every request binds the operation
+  to a job id, lease epoch, request/lease deadline, artifact digest, session
+  digest, decode policy and request-scoped sampling seed. Stale epochs, late
+  frames, artifact mismatch and cross-session frames fail closed.
+- PAUSE/RESUME align the worker with the day/night state machine. A night
+  transition first blocks admission, drains work, releases the lease, and then
+  checkpoints.
+- Natural language, paths, source code and JSON remain in Cogni-Flow. They do
+  not enter the high-speed tensor data plane.
+
+## Inference path
+
+1. The controller validates the current Fact-book and acquires an inference
+   lease.
+2. A bounded conversation is rendered with the local Gemma 4 turn contract.
+3. The verified Gemma feature state feeds BIO-HAMA and SearchRequestV2.
+4. CTS uses a fixed 301-node arena, rank-16 limited solver history, bounded
+   semantic retrieval, separate policy/critic surfaces, and an explicit MAC
+   budget. Search depth never sizes an arena tensor.
+5. Unsafe/non-finite transition edges produce explicit failure telemetry and
+   zero-value backup; silent fallback is not accepted.
+6. A converged terminal latent produces a bounded causal logits bias. The base
+   Gemma weights remain frozen. This path is `canary`, not a trained-quality
+   claim.
+7. System 4 and System 3 run with session isolation, but remain detached
+   `advisory` telemetry. System 1.5 is used only when a trained checkpoint and
+   AQ/OOD/session admission gates all succeed; no such product artifact is
+   supplied by default.
+8. Decode runs with `use_cache=False`. EOS/EOT/control markers stop at token
+   boundaries. Repetition, role leakage, false identity, and incomplete output
+   are checked before a turn is committed.
+9. The lease and all session-scoped activation are released on completion,
+   cancellation, timeout, or error.
+
+## Local task path
+
+```mermaid
+flowchart LR
+    TEXT["Slash command or deterministic safe grammar"]
+    REQUEST["Typed request"]
+    PLAN["Immutable content-addressed TaskPlan"]
+    POLICY["Risk/path/resource policy"]
+    TOKEN["One-use capability"]
+    RUN["Bounded executor"]
+    VERIFY["Artifact verifier + SHA-256 read-back"]
+
+    TEXT --> REQUEST --> PLAN --> POLICY --> TOKEN --> RUN --> VERIFY
+```
+
+- T0 is bounded read/list/search/status.
+- T1 is fixed pytest and output-only artifact creation.
+- T2 can stage an inert Self-Harness proposal but cannot mutate source.
+- T3, arbitrary shell, network, security/evaluator mutation and unrestricted
+  paths are permanently denied.
+- Free-form Gemma output is never execution authority.
+
+## Evolution and research path
+
+System 2.5, System 3 candidate work, AFlow, and Self-Harness are allowed only in
+an exclusive evolution window.
+
+- FP-EWC uses bounded empirical Fisher state and a generation transaction.
+  C-FIRE reprojects updates and restored checkpoints below the configured
+  spectral margin.
+- The System 3 lifecycle operates on an eight-slot preallocated pool and
+  orders calibration, candidate selection, C-FIRE, isolated candidate
+  training, held-out checks, routed Fisher, canary and independent authority.
+  No verified trained expert artifact ships with v0.3.2, so the product state
+  remains `advisory`.
+- AFlow accepts only six typed operators, a sealed evaluator/policy/suite,
+  bounded DAGs and budgets, repeated held-in/out metrics, and single-parent
+  lineage. Its sole output is `research_archive_only`.
+- Self-Harness persists both success and failure evidence, forms exact causal
+  signatures, requires at least three distinct candidates per signature, and
+  links every proposal to primary evidence. Stale hashes, forbidden AST,
+  immutable-surface changes and path escapes are rejected. Rejected
+  replacements enter a negative archive.
+- The production assembly hashes mutable source before and after a night
+  proposal cycle. Any change enters safe mode. There is no v0.3.2 install or
+  promotion path.
+
+Phase 12 attested sandbox and safe promotion are deliberately outside the
+Phase 1–11 release boundary. Prior promotion primitives are not product
+authority and must not be presented as automatic self-modification.
+
+## Memory claim
+
+The implementation claims a bounded **solver history and active search working
+set** for fixed batch, width, hidden size, solver rank and arena capacity.
+`max_depth` does not allocate CTS tensors. It does not claim constant total
+memory for model weights, CUDA allocator reserves, expert/checkpoint banks,
+conversation history, logs or external data.
+
+The 16.7 GiB limit is an admission and postcondition guard. A current canary
+measurement on the attached RTX 5090 Laptop GPU does not certify the target RTX
+4090; allocator and kernel workspaces must be measured again on that device.
+
+## Phase dependencies
+
+```mermaid
+flowchart LR
+    P1["P1 integrity and facts"] --> P9["P9 typed tasks"]
+    P2["P2 lifecycle and lease"] --> P3["P3 causal DEQ"] --> P4["P4 CTS V2"]
+    P4 --> P5["P5 Fast Weight"]
+    P3 --> P6["P6 FP-EWC/C-FIRE"] --> P7["P7 System 4"]
+    P5 --> P8["P8 System 3"]
+    P6 --> P8
+    P7 --> P8
+    P2 --> P9 --> P10["P10 AFlow research"] --> P11["P11 proposal-only harness"]
+    P6 --> P11
+```
 
 ## Reference lineage
 
-The implementation was compared with the owner's public repositories:
-
-- `Cognitive-Tree-Search`
-- `System1.5_260515`
-- `System2.5`
-- `System3`, `System3.5`
-- `System4`, `System5`
-- `BIO-HAMA_MAIN`
-
-Runtime code does not import from the reference checkouts under `work/upstream`.
-The complete repository review and the resulting constraints are recorded in
+The implementation was compared with the owner's public CTS, System 1.5,
+System 2.5, System 3/3.5, System 4/5, and BIO-HAMA repositories. Runtime code
+does not import from the review checkouts under `work/upstream`. See
 [`UPSTREAM_AUDIT.md`](UPSTREAM_AUDIT.md).

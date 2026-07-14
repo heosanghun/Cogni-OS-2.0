@@ -1,9 +1,9 @@
 """Pinned text-only Gemma 4 chat and response contract.
 
-The shipped local E4B mirror intentionally stays offline, but it currently
-does not contain ``chat_template.jinja`` or a response schema.  This module
-implements the documented, text-only, thinking-disabled turn contract without
-falling back to transcript-like ``USER:/ASSISTANT:`` labels.
+The shipped local E4B-it mirror intentionally stays offline and includes the
+official chat template. This module independently enforces the audited,
+text-only, thinking-disabled turn contract without falling back to
+transcript-like ``USER:/ASSISTANT:`` labels.
 
 Rendered prompts deliberately omit ``<bos>``.  ``ModelService`` tokenizes the
 string with ``add_special_tokens=True`` and therefore inserts BOS exactly once.
@@ -75,14 +75,18 @@ def _token_id(tokenizer: Any, token: str) -> int | None:
 def is_gemma4_tokenizer(tokenizer: Any) -> bool:
     """Return True only when the tokenizer exposes the required turn tokens."""
 
-    return all(_token_id(tokenizer, token) is not None for token in _REQUIRED_CONTROL_TOKENS)
+    return all(
+        _token_id(tokenizer, token) is not None for token in _REQUIRED_CONTROL_TOKENS
+    )
 
 
 def _neutralize_control_tokens(text: str, tokenizer: Any) -> str:
     if not isinstance(text, str) or not text:
         raise PromptContractError("chat content must be non-empty text")
     if any(ord(character) < 32 and character not in "\t\r\n" for character in text):
-        raise PromptContractError("chat content contains unsupported control characters")
+        raise PromptContractError(
+            "chat content contains unsupported control characters"
+        )
     candidates = list(_KNOWN_CONTROL_TOKENS)
     extra = getattr(tokenizer, "all_special_tokens", ())
     if isinstance(extra, (list, tuple)):
@@ -117,6 +121,8 @@ def render_gemma4_chat(
             raise PromptContractError("chat message role or content is invalid")
         if role == previous_role:
             raise PromptContractError("chat roles must alternate")
+        # External chat APIs call this role ``assistant``; Gemma 4's native
+        # control-token contract maps it to the literal ``model`` turn label.
         gemma_role = "user" if role == "user" else "model"
         safe = _neutralize_control_tokens(content, tokenizer)
         parts.append(f"{SOT}{gemma_role}\n{safe}{EOT}\n")
@@ -179,7 +185,7 @@ def render_chat_prompt(
 def stop_token_ids(tokenizer: Any) -> Tensor:
     """Return official stops plus quarantined reserved text tokens.
 
-    The local six-file mirror does not declare every reserved ``<unusedN>``
+    The pinned E4B-it tokenizer does not declare every reserved ``<unusedN>``
     token as special. A greedy decoder can emit and repeat one after an
     otherwise complete answer. Treating such tokens as terminal keeps them out
     of the public response and prevents a false length continuation.
@@ -252,17 +258,25 @@ def reserved_stop_sequences(tokenizer: Any) -> Tensor:
 
 
 def final_channel_tokens(tokenizer: Any, token_ids: Tensor) -> Tensor:
-    """Extract a structured final channel, suppressing any analysis channel."""
+    """Extract public output while suppressing structured reasoning channels.
+
+    Gemma 4 may either emit an explicit ``final`` channel or close a
+    ``thought``/``analysis`` channel and continue with the public answer as
+    plain tokens.  Prefer an explicit final channel, then support the latter
+    official layout without ever returning the channel body itself.
+    """
 
     tokens = torch.as_tensor(token_ids).detach().to("cpu", dtype=torch.int64).flatten()
     soc = _token_id(tokenizer, SOC)
     eoc = _token_id(tokenizer, EOC)
     if soc is None or eoc is None or soc not in tokens.tolist():
         return tokens.contiguous()
-    positions = [index for index, value in enumerate(tokens.tolist()) if value == soc]
+    values = tokens.tolist()
+    positions = [index for index, value in enumerate(values) if value == soc]
+    parsed: list[tuple[str, int, int]] = []
     for position_index, start in enumerate(positions):
         try:
-            label_end = tokens.tolist().index(eoc, start + 1)
+            label_end = values.index(eoc, start + 1)
         except ValueError:
             return torch.empty(0, dtype=torch.int64)
         label = tokenizer.decode(
@@ -270,13 +284,21 @@ def final_channel_tokens(tokenizer: Any, token_ids: Tensor) -> Tensor:
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        if isinstance(label, str) and label.strip().lower() == "final":
-            end = (
-                positions[position_index + 1]
-                if position_index + 1 < len(positions)
-                else tokens.numel()
-            )
+        normalized = ""
+        if isinstance(label, str):
+            channel_text = label.strip().lower()
+            normalized = channel_text.split(maxsplit=1)[0] if channel_text else ""
+        end = (
+            positions[position_index + 1]
+            if position_index + 1 < len(positions)
+            else tokens.numel()
+        )
+        parsed.append((normalized, label_end + 1, end))
+        if normalized == "final":
             return tokens[label_end + 1 : end].contiguous()
+    for label, public_start, public_end in reversed(parsed):
+        if label in {"thought", "analysis"} and public_start < public_end:
+            return tokens[public_start:public_end].contiguous()
     return torch.empty(0, dtype=torch.int64)
 
 

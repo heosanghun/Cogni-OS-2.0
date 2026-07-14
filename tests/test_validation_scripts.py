@@ -12,6 +12,8 @@ class TestValidationScriptBootstrap(unittest.TestCase):
     def test_readme_direct_commands_import_checkout_from_any_working_directory(self):
         root = Path(__file__).resolve().parents[1]
         scripts = (
+            "validate_agent_casual_korean.py",
+            "validate_agent_completion.py",
             "validate_gemma4.py",
             "validate_gemma4_deq.py",
             "validate_gemma4_runtime.py",
@@ -41,6 +43,79 @@ class TestValidationScriptBootstrap(unittest.TestCase):
                         msg=completed.stdout + completed.stderr,
                     )
                     self.assertIn("usage:", completed.stdout.lower())
+
+    def test_agent_completion_checks_reject_repeated_sentences(self):
+        from scripts.validate_agent_completion import _answer_checks
+
+        state = {"status": "succeeded", "stage": "complete"}
+        answer = {
+            "content": "한 번만 자연스럽게 설명하고 끝냅니다.",
+            "finish_reason": "stop",
+            "truncated": False,
+        }
+        self.assertTrue(all(_answer_checks(answer, state).values()))
+        answer["content"] = (
+            "같은 문장을 반복해서 출력하면 안 됩니다. "
+            "같은 문장을 반복해서 출력하면 안 됩니다"
+        )
+        self.assertFalse(_answer_checks(answer, state)["no_repeated_sentence"])
+
+    def test_agent_completion_checks_reject_empty_list_and_underfilled_request(self):
+        from scripts.validate_agent_completion import _answer_checks
+
+        state = {"status": "succeeded", "stage": "complete"}
+        answer = {
+            "content": "원칙은 다음과 같습니다:\n\n1.",
+            "finish_reason": "stop",
+            "truncated": False,
+        }
+        checks = _answer_checks(answer, state, "원칙을 두 문장으로 설명하세요.")
+        self.assertFalse(checks["korean_complete"])
+        self.assertFalse(checks["request_contract_fulfilled"])
+
+    def test_agent_completion_checks_reject_observed_false_pass_patterns(self):
+        from scripts.validate_agent_completion import _answer_checks
+
+        state = {"status": "succeeded", "stage": "complete"}
+
+        def checks(request: str, content: str):
+            return _answer_checks(
+                {
+                    "content": content,
+                    "finish_reason": "stop",
+                    "truncated": False,
+                    "generation_mode": "cogni_core",
+                },
+                state,
+                request,
+            )
+
+        announced = checks(
+            "안전 종료 기준을 두 문장으로 답하세요.",
+            "3가지로 요약할 수 있습니다. 첫째, 오류 횟수를 확인해 종료합니다.",
+        )
+        self.assertFalse(announced["no_meta_format_discussion"])
+        self.assertFalse(announced["request_contract_fulfilled"])
+
+        redundant = checks(
+            "개인정보 처리 원칙을 세 문장으로 답하세요.",
+            "개인정보를 안전하게 처리해야 합니다. 개인정보 보호가 필요합니다. "
+            "개인정보를 처리할 때 안전하게 처리해야 합니다.",
+        )
+        self.assertFalse(redundant["no_semantic_redundancy"])
+
+        scaffold = checks(
+            "제가 먼저 정해야 할 것 하나만 질문해 주세요.",
+            "무엇을 원하시나요? 어떤 기능이 필요한가요?\n[사용자 상황 파악]",
+        )
+        self.assertFalse(scaffold["request_contract_fulfilled"])
+        self.assertFalse(scaffold["no_placeholder_scaffolding"])
+
+        missing_example = checks(
+            "도울 수 있는 일을 예시와 함께 설명해 주세요.",
+            "여러 작업을 도울 수 있습니다.",
+        )
+        self.assertFalse(missing_example["requested_examples_present"])
 
 
 if __name__ == "__main__":

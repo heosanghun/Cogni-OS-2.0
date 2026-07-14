@@ -1,108 +1,150 @@
-# Cogni-OS 2.0 — Genesis
+# Cogni-OS 2.0 Genesis — v0.3.2
 
-This repository starts from three executable gates before integrating a large language model:
+Cogni-OS 2.0 is an offline, bounded research runtime for a verified local
+dense Gemma 4 E4B-it artifact. Version 0.3.2 connects conversation integrity,
+causal DEQ/CTS conditioning, typed local tasks, bounded research workflows,
+and a **proposal-only** Self-Harness behind explicit capability and evidence
+states.
 
-1. implicit DEQ forward and IFT backward must match a long explicit unroll;
-2. CUDA active memory must remain flat as CTS depth grows at fixed width;
-3. non-contractive transitions must hard-stop or enter an explicit damped fallback.
+This release is not an AGI claim, an RTX 4090 certification, or evidence that
+every research module improves model quality. A Python implementation or a
+passing component test never upgrades a capability by itself.
 
-The gates now pass, and the repository includes a resident local Gemma chat
-worker, fixed-arena CTS, Fast Weight, FP-EWC, bounded sparse experts,
-System4-style tensor swarms, BIO-HAMA routing, day/night exclusion, bounded
-workspace tools, AFlow, and a fail-closed Self-Harness control plane.
+## Product authority at a glance
 
-## Run
+| Capability | v0.3.2 state | May affect the answer? | What is still required |
+|---|---|---:|---|
+| verified local Gemma 4 E4B-it | `authoritative` | yes | exact pinned instruction-tuned artifact and seven-file manifest |
+| bounded conversation fast path | `product_ux` | yes, narrow social turns only | must never intercept general knowledge/code/format requests |
+| causal CTS/DEQ bridge | `canary` | yes, bounded logits bias | trained adapter/Wproj and independent held-out evidence for promotion |
+| BIO-HAMA | `advisory` | no | calibrated routing-quality evidence |
+| System 1.5 Fast Weight | `gated` | no by default | trained checkpoint, AQ/OOD and held-out admission evidence |
+| System 2.5 FP-EWC/C-FIRE | `night_only` | no during inference | multi-domain external effectiveness evidence |
+| System 3 experts | `advisory` | no | calibrated/trained expert checkpoint and independent verifier |
+| System 4 swarm/PCAS | `advisory` | no | production PCAS calibration and answer-quality evidence |
+| AFlow/ADAS | `research` | no | attested real evaluator and held-out evidence |
+| Self-Harness | `proposal_only` | no runtime mutation | Phase 12 attested sandbox and safe-promotion evidence |
+
+The runtime Fact-book is the authority for the live process. Evidence records
+are content-addressed and bound to the exact model, code, configuration, and
+device scope; a scope change invalidates prior measured claims. The Fact-book
+snapshot store uses an external last-known-good pointer and rejects stale or
+malformed evidence.
+
+## Phase 1–11 status
+
+| Phase | Implemented software path | Evidence boundary |
+|---:|---|---|
+| 1 | Fact-book identity grounding, narrow social fast path, repetition/completion/relevance guards, bounded retry | 10-turn casual and 20-turn local-Gemma gates must both pass on the frozen release commit |
+| 2 | lifecycle/GPU lease authority, IPC v4 job/epoch/deadline/artifact/session/decode-policy binding | fault-injection tests are repository evidence; target-hardware endurance remains external |
+| 3 | frozen Gemma features feed a bounded equilibrium reasoner and causal decode bias | `canary`; no trained DEQ/Wproj quality artifact |
+| 4 | fixed 301-node CTS V2, rank-16 solver history, bounded retrieval/policy/critic surfaces | depth-100 was measured on the attached RTX 5090 Laptop GPU, not RTX 4090 |
+| 5 | strict Fast Weight checkpoint, AQ/OOD, norm, TTL and session gates | no admitted trained product checkpoint; remains `gated` |
+| 6 | empirical Fisher, FP-EWC, C-FIRE and generation transaction/checkpoint | `night_only`; no three-seed BWT/FWT claim |
+| 7 | exact 28-agent tensor swarm, certified topologies, sessions and PCAS controls | `advisory`; production calibration/quality evidence absent |
+| 8 | bounded 8-slot, top-k=2 expert candidate lifecycle with quarantine and rollback | `advisory`; no independently verified trained expert artifact |
+| 9 | immutable typed plans, one-use capabilities, bounded T0/T1 execution and T2 proposal staging | T3/network/arbitrary shell are denied; free-form model plans have no authority |
+| 10 | sealed, replayable, held-in/out AFlow research evaluator and archive | `research_archive_only`; no production installation path |
+| 11 | persistent success/failure ledger, causal signatures, K≥3 distinct proposals and negative archive | `proposal_only`; active source mutation is forbidden |
+
+Detailed gates and commands are in
+[Validation](docs/VALIDATION.md) and
+[Gemma validation](docs/GEMMA4_VALIDATION.md).
+
+## Run from source
+
+Requirements are Python 3.11+, a compatible local PyTorch/CUDA environment,
+and a complete local model artifact. Runtime downloads, Hub IDs, remote code,
+telemetry, and external APIs are not permitted.
 
 ```powershell
-python -m unittest discover -s tests -v
+python -m pytest -q
+python -m ruff check .
+python -m ruff format --check cogni_agent cogni_core cogni_demo cogni_flow cogni_os scripts tests
 ```
 
-## Windows double-click demo
+Verify the actual local model and bounded depth-100 runtime:
 
-Double-click `CogniBoard.exe` from the repository root for the console-free
-experience, or use `Run-CogniOS-Demo.cmd` as the transparent diagnostic
-launcher. The CMD launcher performs an explicit Python/CUDA dependency
-preflight; the native launcher locates the same local runtime without showing a
-console. The server verifies the local model artifact manifest before opening
-**CogniBoard**, a loopback-only graphical
-mission-control interface. Its six views connect a real local AI workspace,
-the customer problem, measured evidence, live Gemma 4 + CTS validation,
-architecture, business model, and execution roadmap. Selecting
-`실제 통합 검증 시작` launches the existing
-Depth-100 worker as the sole CUDA owner; the UI never reimplements or simulates
-the validation path.
+```powershell
+python scripts\validate_gemma4_runtime.py `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
+  --event-stream
+```
 
-The default `AI 워크스페이스` view supports bounded multi-turn conversation and
-token streaming from the verified local Gemma artifact. Every chat turn runs
-the advisory Cogni-Core route in this order:
-
-`BIO-HAMA → Gemma feature backbone + DEQ/CTS → System 4 → System 3 → Gemma decode`
-
-The final answer is produced only by deterministic base Gemma decoding with
-`use_cache=False`; untrained Fast Weight overlays remain gated, and FP-EWC is
-reserved for the evolution path. Task mode exposes only `/help`, `/list`,
-`/read`, `/search`, `/status`, `/test`, and `/save`. It never exposes arbitrary
-shell, network, or unrestricted source writes.
-
-Gemma 4 chat uses the native `<|turn>` / `<turn|>` contract even when the local
-artifact mirror has no serialized chat template. EOS, end-of-turn, tool handoff,
-and quarantined reserved markers are stopped at token boundaries. A 512-token
-segment that ends by length is continued in the same open model turn, up to a
-hard 1,536-token aggregate; only a real stop is recorded as complete. The UI
-publishes the finish reason, continuation count, and any hard-limit truncation
-instead of silently treating a cut sentence as success.
-
-Run the real-model multi-turn regression with:
+Run the recommended 20-turn completion stress and the natural Korean gate:
 
 ```powershell
 python scripts\validate_agent_completion.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
+  --turns 20
+
+python scripts\validate_agent_casual_korean.py `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
+  --timeout 120
 ```
 
-Self-Harness records bounded runtime failures and can generate local patch
-proposals during an exclusive evolution cycle. Source promotion is disabled by
-default. It becomes possible only when an operator supplies an explicitly
-trusted, kernel-isolated runner attestation covering network isolation, host
-filesystem isolation, an ephemeral workspace, and the exact regression and
-health-check command digests. Promotion then uses a digest-verified backup
-journal, atomic replacement, post-promotion health checking, and rollback.
+The pretrained base checkpoint at `C:\Project\cognios\gemma4-e4b` is retained
+only for explicit research/canary reproduction. It is not accepted as the
+public conversation runtime.
 
-`Run-CogniOS-CLI.cmd` retains the console diagnostic flow for operators. The
-graphical server binds only to `127.0.0.1`, serves an exact local asset allowlist,
-uses a per-session authentication token, and applies a restrictive CSP. It has
-no CDN, analytics SDK, external API, or remote font dependency.
+Run the System 4 stress benchmark. Its output separates instantaneous
+hysteresis mismatch from post-settling PCAS errors:
 
-The default local model path is `C:\Project\cognios\gemma4-e4b`. Set
-`COGNI_OS_MODEL_DIR` before launching to select another verified local path.
-All Hugging Face network access and telemetry are disabled by the launcher.
+```powershell
+python scripts\benchmark_system4.py `
+  --device cuda --iterations 10000 --stress-switch --switch-block 32
+```
 
-The CUDA gate is skipped only when CUDA is unavailable. It reports a real failure when a CUDA
-device exists but peak active allocation grows by more than 8 MiB between depth 8 and depth 64.
+## Windows launcher
 
-## Scope
+Build the v0.3.2 launcher from the exact source tree:
 
-This is a bounded research runtime, not a claim of AGI or O(1) total system
-memory. Solver history and CTS working tensors are fixed-capacity; model weights,
-expert banks, logs, and external data remain separately budgeted resources. On
-the attached RTX 5090 Laptop GPU, the verified local Gemma artifact plus the
-integrated depth-100/301-node runtime reached a 14.8560 GiB inference peak. The
-RTX 4090 target still requires the same hardware gate.
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_windows_launcher.ps1 `
+  -OutputPath release\CogniBoard-v0.3.2.exe
+```
 
-Reference implementations reviewed during development are kept under `work/upstream/` and are
-not imported at runtime. In particular: `Cognitive-Tree-Search`, `System1.5_260515`, `System2.5`,
-`System3`, `System4`, `System5`, and `BIO-HAMA_MAIN`.
+The launcher is a console-free bootstrapper, not a standalone model bundle. It
+requires this source tree, local Python/CUDA dependencies, and the verified
+model plus manifest. The binary is not code-signed in this research release.
+Do not use older release assets as v0.3.2 evidence.
 
-See [architecture](docs/ARCHITECTURE.md), [security model](docs/SECURITY.md), and
-[validation gates](docs/VALIDATION.md) before connecting a large local backbone or enabling
-autonomous patch promotion.
+Korean operator documentation: [`docs/COGNIBOARD_USER_MANUAL_PLAYBOOK_KO.md`](docs/COGNIBOARD_USER_MANUAL_PLAYBOOK_KO.md).
 
-한국어 실행·대화·작업·Self-Harness 안내는
-[CogniBoard AI 워크스페이스 사용 안내](docs/AGENT_WORKSPACE_KO.md)를 참고하십시오.
+The v0.3.2 validation addendum is
+[`release/COGNI_OS_0.3.2_VALIDATION_ADDENDUM_KO.md`](release/COGNI_OS_0.3.2_VALIDATION_ADDENDUM_KO.md).
 
-The verified local Gemma 4 procedure and measured hardware results are documented in
-[Gemma 4 integration](docs/GEMMA4.md).
+## Runtime boundaries
 
-The customer positioning, evidence taxonomy, three-minute judging script, and
-30/60/90-day commercialization plan are documented in the
-[CogniBoard business demo plan](docs/COGNIBOARD_BUSINESS_DEMO_PLAN_KO.md).
+- One spawned worker owns the model and CUDA. Model IPC is bounded,
+  tensor-only and bound to a lease epoch, job, deadline, artifact and session.
+- Gemma decoding uses `use_cache=False`; CTS does not accumulate a KV cache.
+- Solver history and active CTS search state are fixed-capacity. This is not an
+  O(1) claim for model weights, logs, expert banks, or unbounded external data.
+- Local tasks execute only typed, allowlisted operations. Natural language is
+  never passed to a shell.
+- AFlow can only create a bounded research archive.
+- Self-Harness stores inert proposals and cannot install them in v0.3.2.
+- The graphical server is loopback-only, uses per-session authentication and
+  local allowlisted assets, and has no CDN or analytics dependency.
+
+The latest retained pretrained-base depth-100 canary recorded 14.8469 GiB peak
+allocated VRAM on an RTX 5090 Laptop GPU. That historical, scoped observation
+is not E4B-it product-runtime evidence or a guarantee for other prompts,
+software stacks, reserved memory, or the target RTX 4090. The 16.7 GiB
+postcondition still fails closed and must be repeated with the pinned E4B-it
+artifact on the target device.
+
+## Documentation
+
+- [Architecture and Phase 1–11 data flow](docs/ARCHITECTURE.md)
+- [Security and authority boundaries](docs/SECURITY.md)
+- [Validation gates and evidence classes](docs/VALIDATION.md)
+- [Local Gemma validation record](docs/GEMMA4_VALIDATION.md)
+- [Korean AI workspace guide](docs/AGENT_WORKSPACE_KO.md)
+- [Phase 8 System 3](docs/PHASE8_SYSTEM3.md)
+- [Phase 9 typed task plan](docs/PHASE9_TYPED_TASK_PLAN.md)
+- [Phase 10 AFlow research executor](docs/PHASE10_AFLOW_RESEARCH.md)

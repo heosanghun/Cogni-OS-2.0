@@ -1,89 +1,91 @@
-# CogniBoard AI 워크스페이스 사용 안내
+# CogniBoard v0.3.2 AI 워크스페이스 사용 안내
 
 ## 실행
 
-저장소 루트의 `CogniBoard.exe`를 더블클릭합니다. 콘솔 진단이 필요하면
-`Run-CogniOS-Demo.cmd`를 실행합니다. 기본 모델 위치는
-`C:\Project\cognios\gemma4-e4b`이며 다른 위치를 쓰려면 실행 전에
-`COGNI_OS_MODEL_DIR` 환경 변수를 설정합니다.
+최종 검증 후 생성된 `release\CogniBoard-v0.3.2.exe`를 더블클릭한다. 개발 소스에서
+직접 빌드하려면 다음 명령을 사용한다.
 
-서버는 브라우저를 열기 전에 manifest에 선언된 로컬 모델 6개 파일의
-SHA-256을 검사합니다. 첫 대화는 단일 CUDA worker에서 모델과 Cogni-Core를
-적재하므로 장치와 디스크 상태에 따라 약 1분 이상 걸릴 수 있습니다. 이후
-worker가 살아 있는 동안에는 재적재하지 않고 토큰을 순차 표시합니다.
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_windows_launcher.ps1 `
+  -OutputPath release\CogniBoard-v0.3.2.exe
+```
 
-## 대화 모드
+launcher는 standalone model bundle이 아니라 console-free bootstrapper다. 동일
+source tree, 로컬 Python/CUDA dependency, 검증된 instruction-tuned 모델과 manifest가
+필요하다. 제품 대화용 기본 모델 위치는 `C:\Project\cognios\gemma4-e4b-it`이며 다른
+위치는 실행 전
+`COGNI_OS_MODEL_DIR`로 지정한다. runtime download와 외부 API는 허용하지 않는다.
+`C:\Project\cognios\gemma4-e4b` base 체크포인트는 명시적인 연구·canary 재현용이며
+제품 대화 경로에는 사용할 수 없다.
 
-대화는 다음 실제 경로를 거칩니다.
+## 대화
 
-1. bounded 멀티턴 기록과 고정된 Gemma 4 native turn contract
-2. BIO-HAMA 인지 라우팅
-3. Gemma feature backbone과 DEQ/CTS Depth 100
-4. System 4 텐서 swarm과 System 3 bounded expert 관측
-5. `use_cache=False`, deterministic Gemma 답변 생성
-6. CPU `int64` 토큰 텐서 스트리밍과 대화 commit
+1. manifest와 Runtime Fact-book을 검증한다.
+2. 하나의 CUDA worker와 lease를 사용한다.
+3. Gemma feature를 bounded CTS/DEQ canary에 전달한다.
+4. 안전한 terminal latent가 non-zero bounded logits bias로 답변에 기여한다.
+5. System 3/4는 advisory telemetry로만 실행된다. 학습된 Fast Weight artifact가
+   없으면 System 1.5는 gated 상태다.
+6. 일반 대화는 bounded sampling, 정확한 문장 수 요청은 grounded strict decode를
+   사용하며, `use_cache=False` 뒤 반복·역할 토큰·거짓 정체성·미완성 문장을 검사한다.
+7. 완전한 답변만 대화 기록에 commit한다. 실패 시 복구 generation은 최대 한 번이다.
 
-응답은 모델이 실제 종료 토큰을 낸 경우에만 `완료`로 기록합니다. 512토큰
-세그먼트가 길이 경계에서 끝나면 동일한 model turn에서 최대 두 번 자동으로
-이어 쓰며, 총 1,536토큰 상한에 도달하면 `길이 한계`를 명시합니다. CogniBoard는
-종료 사유와 이어쓰기 횟수를 답변 아래에 표시합니다. 입력은 4,096자, 공개 출력은
-8,192자로 서로 분리되어 있습니다.
+답변이 중간에서 잘리거나 반복 guard가 동작한 경우 UI는 정상 완료로 표시하지 않고
+finish/quality reason을 공개한다. Agent의 모델 크기와 기능 설명은 언어 모델의 기억이
+아니라 현재 artifact의 Fact-book을 기준으로 한다.
 
-System 4와 System 3는 현재 advisory-only입니다. 검증되지 않은 보조 모듈이
-Gemma의 답변 토큰을 바꾸지 못합니다. Fast Weight는 외부 품질·OOD·스펙트럼
-게이트를 통과한 세션 overlay가 없으므로 기본 비활성이고, FP-EWC는 주간 대화
-경로에서 제외됩니다.
+## 작업
 
-## 작업 모드
+결정론적으로 해석 가능한 slash command와 안전 문장만 immutable TypedTaskPlan으로
+변환된다. 대표 명령은 `/help`, `/list`, `/read`, `/search`, `/status`, 고정 `/test`,
+output-only `/save`다.
 
-작업 모드는 임의 셸 문장을 실행하지 않습니다. 아래 명시 명령만 허용합니다.
+- T0: bounded read/list/search/status
+- T1: 고정 pytest와 `outputs/agent-workspace` 산출물
+- T2: source를 바꾸지 않는 inert Self-Harness proposal staging
+- T3: network, arbitrary shell, evaluator/security/updater mutation 영구 거부
 
-- `/help`
-- `/list [상대경로]`
-- `/read <상대파일>`
-- `/search <검색어> [--in <상대경로>]`
-- `/status`
-- `/test [tests/파일.py]`
-- `/save <파일명>` 뒤에 저장할 내용
-
-`/save` 결과는 `outputs/agent-workspace`에만 기록됩니다. 절대경로, `..`,
-symlink/junction, 바이너리, 과대 파일, 소스 확장자 저장은 거부됩니다. 소스
-변경은 작업 모드가 아니라 Self-Harness 경계를 통해서만 가능합니다.
+절대/UNC/device 경로, `..`, ADS, junction/symlink escape, 임의 executable은
+거부한다. 모델의 자유 형식 plan은 실행 권한이 아니다.
 
 ## Self-Harness
 
-실행 실패와 timeout은 bounded SQLite에 수집됩니다. `안전 진화 주기 실행`은
-활성 대화와 검증이 모두 끝난 뒤에만 시작되며, 로컬 Gemma가 운영자 지정
-실패 signature와 소스 allowlist를 기반으로 inert patch proposal을 만듭니다.
+실패와 성공을 bounded local evidence로 저장하고, 정확한 causal signature별로 최소
+세 개의 서로 다른 후보가 모일 때만 rich proposal을 만든다. 모든 후보는 primary
+evidence, expected behavior, risk, reproduction test와 rollback trigger를 가진다.
+거부된 후보는 negative archive에 남는다.
 
-현재 기본 제품 구성은 `proposal_only`입니다. 이 PC에서 별도 커널, 네트워크
-차단, host filesystem 차단, ephemeral workspace를 증명하는 실행기가 확인되지
-않았기 때문에 UI나 모델이 임의로 소스를 덮어쓰지 않습니다. 실제 자동 승격은
-운영자가 독립 감사한 runner id/evidence digest와 정확한 회귀·health 명령 digest를
-신뢰 목록에 넣은 경우에만 켜집니다. 그때도 staging 회귀, backup journal,
-atomic replace, 별도 health snapshot, SHA-256 rollback을 모두 통과해야 합니다.
+v0.3.2 지원 profile은 `proposal_only`다. source는 실행·덮어쓰기·승격되지 않는다.
+야간 주기 전후 source digest가 달라지면 safe mode로 진입한다. 별도 kernel, network/
+host-filesystem isolation, immutable image와 command digest가 독립 검증되는 Phase 12
+이전에는 자동 승격을 기능으로 표시하지 않는다.
 
-## 재현 검증
-
-대화 완결성 3턴 검증:
+## 재현
 
 ```powershell
 python scripts\validate_agent_completion.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml
-```
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml
 
-단일 Cogni-Core 경로 검증:
+python scripts\validate_agent_casual_korean.py `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
+  --timeout 120 `
+  --output C:\Project\cognios-evidence\casual-korean-v0.3.2.json
 
-```powershell
 python scripts\validate_agent_runtime.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
-  --prompt "Cogni-OS 안전 경계를 설명해 주세요." `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
+  --prompt "사용자에게 자연스러운 한국어 한 문장으로 인사하세요." `
   --max-new-tokens 64
 ```
 
-2026-07-11 내부 RTX 5090 Laptop GPU 재현에서는 전체 Cogni-Core+Gemma 경로가
-통과했고, WDDM 총 GPU 메모리의 실행 전 대비 관측 증가는 15.397 GiB였습니다.
-worker 종료 후 실행 전 기준값으로 복귀했습니다. 이는 이 장비의 내부 실측이며
-목표 RTX 4090 결과나 AGI 성능 주장이 아닙니다.
+`validate_agent_runtime.py`는 채팅 직렬화·공개 응답 채널·종료 토큰·한 턴 품질
+계약과 작업자 정리를 확인하는 저수준 GPU smoke다. 전체 자연 대화 품질의 근거는
+별도의 10턴 casual gate와 20턴 completion stress 결과를 사용한다.
+
+첫 명령은 네 번의 형식 중심 실제 오프라인 대화를 검사한다. 두 번째 명령은 보고된
+협업 대화 원문, 오타, 바꿔 말하기, 후속 질문과 문맥 전환을 포함한 10턴에서
+fallback 0회와 자연스러운 완결성을 검사한다. 어느 명령도 RTX 4090 인증을 대신하지
+않는다. 최신 scoped GPU 관측과 정확한 제한은
+[GEMMA4_VALIDATION.md](GEMMA4_VALIDATION.md)를 참고한다.

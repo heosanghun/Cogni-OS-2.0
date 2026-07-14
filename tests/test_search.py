@@ -5,14 +5,21 @@ import torch
 
 from cogni_core.search import (
     BoundedPUCTSearch,
+    BoundedPUCTSearchV2,
+    CertifiedBroydenTransitionV2,
+    CertifiedPUCTConfigV2,
+    CertifiedTransitionBatchV2,
     ContractiveBroydenTransition,
+    FixedCapacityTreeRetriever,
     PUCTConfig,
+    SearchControlsV2,
+    SearchRequestV2,
     SemanticAncestorRetriever,
     TransitionContractError,
     deq_tensor_transition,
     puct_scores,
 )
-from cogni_core.deq import ContractivityError
+from cogni_core.deq import BroydenWarmStart, ContractivityError
 
 
 @deq_tensor_transition
@@ -24,6 +31,89 @@ def _transition(state: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
 
 def _uniform_policy_value(state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.zeros(3, device=state.device), state.float().mean()
+
+
+class _DeterministicCertifiedTransition:
+    __cogni_tensor_transition__ = True
+    __cogni_deq_transition__ = True
+    __cogni_stateless__ = True
+    __cogni_uses_kv_cache__ = False
+    __cogni_broyden_solver__ = True
+    width = 3
+    rank = 16
+    operator_id = "test-certified-v2"
+
+    def __init__(self, failed_actions: tuple[int, ...] = ()) -> None:
+        self.failed_actions = frozenset(failed_actions)
+        self.calls = 0
+        self.warm_inputs: list[BroydenWarmStart | None] = []
+
+    def __call__(
+        self,
+        parent: torch.Tensor,
+        actions: torch.Tensor,
+        *,
+        tolerance: float,
+        warm_start: BroydenWarmStart | None,
+    ) -> CertifiedTransitionBatchV2:
+        del tolerance
+        self.calls += 1
+        self.warm_inputs.append(warm_start)
+        view = (3,) + (1,) * parent.ndim
+        states = parent.unsqueeze(0) + (actions + 1).to(parent.dtype).view(view)
+        success = torch.tensor(
+            [action not in self.failed_actions for action in range(3)],
+            dtype=torch.bool,
+        )
+        warm_starts: list[BroydenWarmStart | None] = []
+        for action in range(3):
+            if not bool(success[action]):
+                states[action].copy_(parent)
+                warm_starts.append(None)
+                continue
+            empty = torch.empty(
+                (0, *parent.shape), device=parent.device, dtype=parent.dtype
+            )
+            warm_starts.append(
+                BroydenWarmStart(
+                    state=states[action].clone(),
+                    x_history=empty,
+                    f_history=empty.clone(),
+                    rank=16,
+                    operator_id=self.operator_id,
+                )
+            )
+        return CertifiedTransitionBatchV2(
+            states=states,
+            success=success,
+            residuals=torch.where(
+                success,
+                torch.zeros(3, dtype=torch.float32),
+                torch.full((3,), float("inf"), dtype=torch.float32),
+            ),
+            iterations=torch.ones(3, dtype=torch.int64),
+            linear_solve_fallbacks=torch.zeros(3, dtype=torch.int64),
+            warm_used=torch.full((3,), warm_start is not None, dtype=torch.bool),
+            warm_rejected=torch.zeros(3, dtype=torch.int64),
+            warm_starts=tuple(warm_starts),
+        )
+
+
+def _deep_policy(state: torch.Tensor) -> torch.Tensor:
+    return torch.tensor([100.0, -100.0, -100.0], device=state.device)
+
+
+def _negative_critic(state: torch.Tensor) -> torch.Tensor:
+    return torch.tensor(-5.0, device=state.device)
+
+
+def _controls(simulations: int) -> SearchControlsV2:
+    return SearchControlsV2(
+        exploration=0.0,
+        tolerance=1.0e-4,
+        policy_temperature=1.0,
+        act_simulations=simulations,
+    )
 
 
 class PUCTMathTests(unittest.TestCase):
@@ -414,6 +504,275 @@ class BoundedSearchTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "mutating its input"):
             BoundedPUCTSearch(strict_cfg).search(
                 torch.zeros(1), mutating_transition, policy_value
+            )
+
+
+class CertifiedSearchV2Tests(unittest.TestCase):
+    def test_certified_broyden_transition_emits_rank16_action_diagnostics(
+        self,
+    ) -> None:
+        transition = CertifiedBroydenTransitionV2(max_iter=24)
+        parent = torch.zeros(1, 2)
+        actions = torch.arange(3, dtype=torch.int64)
+        cold = transition(
+            parent,
+            actions,
+            tolerance=1.0e-3,
+            warm_start=None,
+        )
+        self.assertTrue(bool(cold.success.all()))
+        self.assertEqual(cold.states.shape, (3, 1, 2))
+        self.assertTrue(bool((cold.residuals <= 1.0e-3).all()))
+        self.assertTrue(all(item is not None for item in cold.warm_starts))
+        for item in cold.warm_starts:
+            assert item is not None
+            self.assertEqual(item.rank, 16)
+            self.assertLessEqual(item.history_size, 17)
+
+        warm = transition(
+            parent,
+            actions,
+            tolerance=1.0e-3,
+            warm_start=cold.warm_starts[0],
+        )
+        self.assertTrue(bool(warm.warm_used.all()))
+        self.assertTrue(bool(warm.success.all()))
+
+    def test_fixed_tree_retrieval_includes_sibling_and_excludes_failed(self) -> None:
+        arena = torch.zeros(301, 2)
+        arena[0] = torch.tensor([1.0, 0.0])
+        arena[1] = torch.tensor([1.0, 0.1])
+        arena[2] = torch.tensor([1.0, 0.0])
+        arena[3] = torch.tensor([0.8, 0.2])
+        arena[4] = torch.tensor([0.0, 1.0])
+        store = FixedCapacityTreeRetriever(arena)
+        store.add(0, arena[0], success=True)
+        store.add(1, arena[1], success=True)  # sibling in whole-tree scope
+        store.add(2, arena[2], success=False)  # failed edge state
+        store.add(3, arena[3], success=True)
+        store.add(4, arena[4], success=True)
+
+        result = store.retrieve(arena[0], current_node=0)
+        handles = result.handles[result.valid.cpu()].tolist()
+        self.assertIn(1, handles)
+        self.assertNotIn(0, handles)
+        self.assertNotIn(2, handles)
+        self.assertEqual(handles, [1, 3, 4])
+
+    def test_retrieval_starts_at_depth_ten_not_depth_nine(self) -> None:
+        def run(simulations: int):
+            cfg = CertifiedPUCTConfigV2(
+                max_depth=20,
+                simulations=simulations,
+            )
+            return BoundedPUCTSearchV2(cfg).search(
+                SearchRequestV2(torch.zeros(1), mac_budget=10_000, seed=7),
+                _DeterministicCertifiedTransition(),
+                _deep_policy,
+                lambda state: torch.tensor(1.0, device=state.device),
+                lambda state: _controls(simulations),
+            )
+
+        through_depth_nine = run(10)
+        at_depth_ten = run(11)
+        self.assertEqual(through_depth_nine.telemetry.max_depth_reached, 10)
+        self.assertEqual(through_depth_nine.telemetry.retrieval_queries, 0)
+        self.assertEqual(at_depth_ten.telemetry.retrieval_queries, 1)
+        self.assertEqual(at_depth_ten.telemetry.retrieval_hits, 3)
+
+    def test_failed_edge_gets_q_zero_once_and_is_masked_with_negative_critic(
+        self,
+    ) -> None:
+        cfg = CertifiedPUCTConfigV2(max_depth=5, simulations=8)
+        transition = _DeterministicCertifiedTransition(failed_actions=(0,))
+        result = BoundedPUCTSearchV2(cfg).search(
+            SearchRequestV2(torch.zeros(1), mac_budget=100),
+            transition,
+            _deep_policy,
+            _negative_critic,
+            lambda state: _controls(8),
+        )
+        self.assertEqual(int(result.root_visit_counts[0]), 1)
+        self.assertEqual(float(result.root_q_values[0]), 0.0)
+        self.assertNotEqual(int(result.best_action), 0)
+        self.assertEqual(result.telemetry.failed_edges, transition.calls)
+        self.assertEqual(result.telemetry.q_zero_backups, transition.calls)
+        self.assertEqual(result.telemetry.nodes_used, 1 + 2 * transition.calls)
+        self.assertTrue(result.telemetry.safe_for_decode)
+
+    def test_all_failed_parent_is_terminal_and_never_materializes_child(self) -> None:
+        cfg = CertifiedPUCTConfigV2(max_depth=5, simulations=3)
+        result = BoundedPUCTSearchV2(cfg).search(
+            SearchRequestV2(torch.zeros(1), mac_budget=100),
+            _DeterministicCertifiedTransition(failed_actions=(0, 1, 2)),
+            _deep_policy,
+            _negative_critic,
+            lambda state: _controls(3),
+        )
+        self.assertEqual(result.telemetry.nodes_used, 1)
+        self.assertEqual(result.telemetry.all_fail_terminals, 1)
+        self.assertEqual(result.telemetry.failed_edges, 3)
+        self.assertEqual(result.root_visit_counts.tolist(), [1, 1, 1])
+        self.assertEqual(int(result.best_action), -1)
+        self.assertFalse(result.telemetry.safe_for_decode)
+
+    def test_mac_denial_prevents_every_later_callback(self) -> None:
+        cfg = CertifiedPUCTConfigV2(
+            max_depth=3,
+            simulations=3,
+            meta_policy_macs=5,
+            action_policy_macs=7,
+            critic_macs=11,
+            transition_macs=13,
+        )
+        calls = {"meta": 0, "policy": 0, "critic": 0}
+        transition = _DeterministicCertifiedTransition()
+
+        def meta(state: torch.Tensor) -> SearchControlsV2:
+            calls["meta"] += 1
+            return _controls(3)
+
+        def policy(state: torch.Tensor) -> torch.Tensor:
+            calls["policy"] += 1
+            return _deep_policy(state)
+
+        def critic(state: torch.Tensor) -> torch.Tensor:
+            calls["critic"] += 1
+            return _negative_critic(state)
+
+        result = BoundedPUCTSearchV2(cfg).search(
+            # Meta fits, but the atomic policy+critic reservation does not.
+            SearchRequestV2(torch.zeros(1), mac_budget=12),
+            transition,
+            policy,
+            critic,
+            meta,
+        )
+        self.assertEqual(calls, {"meta": 1, "policy": 0, "critic": 0})
+        self.assertEqual(transition.calls, 0)
+        self.assertEqual(result.telemetry.mac_reserved, 5)
+        self.assertTrue(result.telemetry.mac_budget_exhausted)
+        self.assertEqual(result.telemetry.simulations_completed, 0)
+
+        calls.update(meta=0, policy=0, critic=0)
+        transition = _DeterministicCertifiedTransition()
+        result = BoundedPUCTSearchV2(cfg).search(
+            # Policy and critic fit; the transition is denied before callback.
+            SearchRequestV2(torch.zeros(1), mac_budget=23),
+            transition,
+            policy,
+            critic,
+            meta,
+        )
+        self.assertEqual(calls, {"meta": 1, "policy": 1, "critic": 1})
+        self.assertEqual(transition.calls, 0)
+        self.assertEqual(result.telemetry.mac_reserved, 23)
+        self.assertTrue(result.telemetry.mac_budget_exhausted)
+
+    def test_same_seed_replays_trace_and_act_is_hard_clamped(self) -> None:
+        cfg = CertifiedPUCTConfigV2(max_depth=4, simulations=5, seed=91)
+
+        def run():
+            return BoundedPUCTSearchV2(cfg).search(
+                SearchRequestV2(torch.zeros(1), mac_budget=1_000),
+                _DeterministicCertifiedTransition(),
+                _deep_policy,
+                _negative_critic,
+                lambda state: SearchControlsV2(0.0, 1.0e-4, 1.0, 10_000),
+            )
+
+        first = run()
+        second = run()
+        self.assertEqual(first.telemetry.trace_digest, second.telemetry.trace_digest)
+        self.assertTrue(torch.equal(first.root_visit_counts, second.root_visit_counts))
+        self.assertTrue(torch.equal(first.best_path, second.best_path))
+        self.assertEqual(first.telemetry.act_requested, 10_000)
+        self.assertEqual(first.telemetry.act_applied, 5)
+        self.assertTrue(first.telemetry.act_clamped)
+
+    def test_depth_15_35_100_150_share_exact_preallocation(self) -> None:
+        root = torch.zeros(1, 2)
+        allocated: list[int] = []
+        estimates: list[int] = []
+        for depth in (15, 35, 100, 150):
+            simulations = min(depth + 1, 101)
+            search = BoundedPUCTSearchV2(
+                CertifiedPUCTConfigV2(
+                    max_depth=depth,
+                    simulations=simulations,
+                )
+            )
+            result = search.search(
+                SearchRequestV2(root, mac_budget=10_000),
+                _DeterministicCertifiedTransition(),
+                _deep_policy,
+                lambda state: torch.tensor(1.0, device=state.device),
+                lambda state: _controls(simulations),
+            )
+            allocated.append(result.telemetry.allocated_bytes)
+            estimates.append(search.estimated_preallocated_bytes(root))
+            self.assertEqual(
+                result.telemetry.max_depth_reached,
+                min(depth, 100),
+            )
+            self.assertEqual(
+                result.telemetry.capacity_exhausted,
+                depth == 150,
+            )
+        self.assertEqual(len(set(allocated)), 1)
+        self.assertEqual(allocated, estimates)
+
+    def test_saturated_breadth_search_uses_certified_frontier_to_depth_100(
+        self,
+    ) -> None:
+        root = torch.zeros(1, 2)
+        search = BoundedPUCTSearchV2(
+            CertifiedPUCTConfigV2(max_depth=100, simulations=301)
+        )
+
+        result = search.search(
+            SearchRequestV2(root, mac_budget=10_000),
+            _DeterministicCertifiedTransition(),
+            lambda state: torch.zeros(3, device=state.device),
+            lambda state: torch.zeros((), device=state.device),
+            lambda state: SearchControlsV2(1.0, 1.0e-4, 1.0, 301),
+        )
+
+        self.assertEqual(result.telemetry.nodes_used, 301)
+        self.assertTrue(result.telemetry.capacity_exhausted)
+        self.assertGreater(result.telemetry.frontier_rollouts, 0)
+        self.assertEqual(result.telemetry.max_depth_reached, 100)
+        self.assertEqual(
+            result.telemetry.allocated_bytes,
+            search.estimated_preallocated_bytes(root),
+        )
+        self.assertTrue(result.telemetry.safe_for_decode)
+        self.assertTrue(torch.isfinite(result.best_state).all())
+
+    def test_programming_shape_error_fails_closed_globally(self) -> None:
+        class InvalidTransition(_DeterministicCertifiedTransition):
+            def __call__(self, *args, **kwargs):
+                batch = super().__call__(*args, **kwargs)
+                return CertifiedTransitionBatchV2(
+                    states=batch.states[:2],
+                    success=batch.success,
+                    residuals=batch.residuals,
+                    iterations=batch.iterations,
+                    linear_solve_fallbacks=batch.linear_solve_fallbacks,
+                    warm_used=batch.warm_used,
+                    warm_rejected=batch.warm_rejected,
+                    warm_starts=batch.warm_starts,
+                )
+
+        with self.assertRaisesRegex(ValueError, "transition states"):
+            BoundedPUCTSearchV2(
+                CertifiedPUCTConfigV2(max_depth=2, simulations=1)
+            ).search(
+                SearchRequestV2(torch.zeros(1), mac_budget=100),
+                InvalidTransition(),
+                _deep_policy,
+                _negative_critic,
+                lambda state: _controls(1),
             )
 
 

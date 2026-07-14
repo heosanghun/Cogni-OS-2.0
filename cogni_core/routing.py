@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from threading import RLock
 
 import torch
 from torch import Tensor
@@ -40,6 +41,23 @@ class ContrastiveSessionRouter:
         self.max_sessions = max_sessions
         self.minimum_threshold = minimum_threshold
         self._sessions: OrderedDict[str, _SessionDistribution] = OrderedDict()
+        self._lock = RLock()
+
+    @property
+    def session_ids(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._sessions)
+
+    def discard_many(self, session_ids: tuple[str, ...]) -> None:
+        """Remove cache-evicted sessions from the OOD control plane atomically."""
+
+        if not isinstance(session_ids, tuple) or any(
+            not isinstance(session_id, str) for session_id in session_ids
+        ):
+            raise TypeError("session_ids must be a tuple of strings")
+        with self._lock:
+            for session_id in session_ids:
+                self._sessions.pop(session_id, None)
 
     @staticmethod
     def _normalize(values: Tensor) -> Tensor:
@@ -65,14 +83,15 @@ class ContrastiveSessionRouter:
             distances.new_tensor(self.minimum_threshold),
         )
         evicted = []
-        self._sessions.pop(session_id, None)
-        while len(self._sessions) >= self.max_sessions:
-            old, _ = self._sessions.popitem(last=False)
-            evicted.append(old)
-        self._sessions[session_id] = _SessionDistribution(
-            centroid.cpu(), threshold.detach().cpu()
-        )
-        return tuple(evicted)
+        with self._lock:
+            self._sessions.pop(session_id, None)
+            while len(self._sessions) >= self.max_sessions:
+                old, _ = self._sessions.popitem(last=False)
+                evicted.append(old)
+            self._sessions[session_id] = _SessionDistribution(
+                centroid.cpu(), threshold.detach().cpu()
+            )
+            return tuple(evicted)
 
     @torch.no_grad()
     def route_tensor(
@@ -80,15 +99,16 @@ class ContrastiveSessionRouter:
     ) -> TensorOODDecision:
         """Route without extracting Python scalars or synchronizing a GPU."""
 
-        try:
-            distribution = self._sessions.pop(session_id)
-        except KeyError:
-            return TensorOODDecision(
-                query_embedding.new_tensor(False, dtype=torch.bool),
-                query_embedding.new_tensor(float("inf"), dtype=torch.float32),
-                query_embedding.new_tensor(0.0, dtype=torch.float32),
-            )
-        self._sessions[session_id] = distribution
+        with self._lock:
+            try:
+                distribution = self._sessions.pop(session_id)
+            except KeyError:
+                return TensorOODDecision(
+                    query_embedding.new_tensor(False, dtype=torch.bool),
+                    query_embedding.new_tensor(float("inf"), dtype=torch.float32),
+                    query_embedding.new_tensor(0.0, dtype=torch.float32),
+                )
+            self._sessions[session_id] = distribution
         query = (
             query_embedding.detach()
             .float()

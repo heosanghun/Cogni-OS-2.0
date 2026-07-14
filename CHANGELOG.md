@@ -1,46 +1,108 @@
 # Changelog
 
-## 0.2.1 — 2026-07-11
+## 0.3.2 — 2026-07-12
 
-- replaced the missing-template transcript fallback with a pinned text-only
-  Gemma 4 turn contract and exactly one BOS token;
-- added EOS/EOT/tool and reserved-token quarantine stops, structured public
-  response parsing, and protocol-v2 terminal finish reasons;
-- increased the bounded answer envelope to 512 tokens per request and 1,536
-  tokens per turn, with up to two same-turn continuations only after `length`;
-- changed generation timeout handling from one absolute deadline to a resettable
-  worker-idle deadline;
-- batched streaming renders, flushed empty terminal frames, and exposed
-  completion/truncation metadata plus an explicit continue action in CogniBoard;
-- pooled the advisory Gemma embedding to a fixed-size CTS root so conversation
-  length no longer multiplies the 301-node arena allocation;
-- added a real-GPU three-turn completion validator. On the attached RTX 5090
-  Laptop GPU all three turns ended with `stop`, no truncation, no role leakage,
-  no public control tokens, and a clean worker shutdown.
+### Natural conversation and completion integrity
 
-## 0.2.0 — 2026-07-11
+- aligned local Gemma prompts with the model's turn contract and separated
+  hidden thought content from the published answer;
+- added request-seeded bounded sampling for ordinary conversation and grounded
+  strict decoding for exact sentence-count requests;
+- added a narrow, NFKC-normalized conversation fast path for greetings,
+  project/demo collaboration, bounded capability guidance, and an immediate
+  context-bound first-step follow-up;
+- kept general knowledge, code and formatting questions on the Fact-book or
+  Cogni-Core path instead of allowing the fast path to overroute them;
+- isolated long Runtime Fact-book answers from later generative context and
+  added bounded relevance, repetition, control-token and completion guards;
+- retained only complete safe prefixes when a generated tail fails, while
+  publishing quality failure as a failure rather than a successful answer.
 
-- added the CogniBoard local AI workspace and native Windows launcher;
-- added bounded multi-turn conversation and streamed token-tensor responses;
-- integrated the resident Gemma worker with BIO-HAMA, DEQ/CTS, System 4, and
-  System 3 advisory execution;
-- kept unverified Fast Weight overlays gated and FP-EWC evolution-only;
-- added typed local workspace tools without arbitrary shell or network access;
-- added exact agent/evolution HTTP APIs and single-compute ownership arbitration;
-- added production Self-Harness composition with bounded failure storage,
-  proposal-only default, runner attestation, journaled atomic promotion, health
-  checking, and digest-verified rollback;
-- added model manifest verification before the chat path can load Gemma;
-- added the full GPU agent validation script and Korean operator guide;
-- expanded security, mixed-precision, cancellation, UI accessibility, and
-  responsive-layout regression coverage.
+### Runtime, UI and release gates
 
-Internal verification on an RTX 5090 Laptop GPU completed the full
-Cogni-Core-to-Gemma path with a 15.397 GiB observed GPU-memory increase over the
-WDDM baseline, then returned to baseline after worker cleanup. This measurement
-is not an RTX 4090 certification or an AGI claim.
+- upgraded tensor IPC to v4 with explicit conversation/strict decode policy
+  and request-scoped sampling seeds while preserving job, lease, deadline,
+  artifact and session binding;
+- bounded total decode time, generation attempts, cooperative cancellation,
+  worker retirement and GPU lease cleanup;
+- distinguished Cogni-Core, Conversation Fast Path, Runtime Fact-book and
+  quality-failure responses in CogniBoard;
+- added the exact reported Korean exchange, typo/paraphrase cases, context
+  transitions and formal regressions to a 10-turn release gate alongside the
+  existing 20-turn local-model completion stress gate.
 
-## 0.1.0 — 2026-07-11
+## 0.3.0 — 2026-07-12
 
-- initial bounded DEQ/CTS, Fast Weight, FP-EWC, System 3/4, BIO-HAMA, AFlow,
-  Self-Harness research runtime, validation CLI, and mission-control demo.
+### Runtime truth and evidence
+
+- added manifest-derived Runtime Fact-book identity and exact safetensors
+  inventory so the agent cannot invent a 7B parameter count;
+- separated service readiness, capability authority and evidence class;
+- added content-addressed `EvidenceRecordV1` records scoped to exact model,
+  code, configuration and device digests;
+- added external Fact-book snapshots with an atomic last-known-good pointer,
+  stale-scope invalidation and strict evidence JSON schema.
+
+### Conversation and causal Cogni-Core
+
+- added response-quality checks for token/sentence cycles, low-information
+  repetition, role/control leakage, false completion and incomplete Korean;
+- limited recovery to one bounded regeneration and prevented failed turns from
+  being committed;
+- upgraded model IPC to job/lease epoch/deadline/artifact/session-bound v3
+  frames with stale/late/cross-session rejection;
+- replaced telemetry-only CTS output with a bounded causal logits conditioner;
+- implemented CTS V2 with a fixed 301-node arena, rank-16 solver history,
+  bounded retrieval, separate policy/critic surfaces, explicit failed-edge
+  telemetry and ACT/MAC budget;
+- preserved the frozen verified local Gemma as answer authority while the
+  untrained causal reasoner remains a canary.
+
+### Systems 1.5, 2.5, 3 and 4
+
+- made Fast Weight activation require a trained checkpoint, AQ/OOD, quality,
+  composed-norm and session admission gates; no default product overlay is
+  admitted;
+- added bounded empirical Fisher, FP-EWC, C-FIRE and atomic evolution
+  generation checkpoints;
+- implemented an exact 28-agent System 4 profile, topology certificates,
+  global norm/spectral checks, session state and PCAS stress telemetry;
+- implemented the bounded eight-slot, top-k=2 System 3 candidate lifecycle with
+  calibration, candidate-only training, held-out/Fisher/canary stages,
+  quarantine, checkpoint rollback and independent authority separation;
+- retained System 3 and System 4 as advisory because trained/calibrated product
+  artifacts and independent quality evidence are not bundled.
+
+### Local tasks, AFlow and Self-Harness
+
+- replaced direct natural-language execution with immutable typed task plans,
+  exact risk tiers, one-use capabilities, resource/path budgets and artifact
+  SHA-256 read-back;
+- allowed bounded T0/T1 operations, restricted T2 to inert proposal staging,
+  and permanently denied T3/network/arbitrary shell authority;
+- added a sealed, replayable AFlow research executor with six typed operators,
+  bounded DAG/search/archive, repeated held-in/out metrics and
+  `research_archive_only` output;
+- added an evidence-linked proposal-only Self-Harness with persistent success
+  and failure records, exact causal signatures, K≥3 distinct candidates,
+  immutable control surfaces, negative archive and zero active-source mutation;
+- labelled previous candidate-execution/replacement primitives as research
+  components, not v0.3.0 product authority.
+
+### Release and UI
+
+- aligned runtime/package/launcher metadata at version 0.3.0;
+- changed UI wording to expose `gated`, `advisory`, `night_only`, `research` and
+  `proposal_only` states instead of implying every loaded module is active;
+- documented the console-free launcher as a source-tree bootstrapper rather
+  than a standalone signed appliance;
+- replaced historical fixed test counts and old GPU snapshots with scoped,
+  reproducible validation commands and evidence requirements.
+
+## Before 0.3.0 — historical research prototypes
+
+Earlier local artifacts demonstrated initial DEQ/CTS primitives, the graphical
+mission-control shell, bounded chat and safety experiments. They are retained
+only for repository history. Their embedded metrics, capability labels and
+launcher metadata are not valid v0.3.0 evidence and must not be distributed as
+the current release.

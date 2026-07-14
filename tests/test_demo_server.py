@@ -4,19 +4,22 @@ from http.client import HTTPConnection
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
-from threading import Thread
+from threading import Event, Thread
 from time import monotonic, sleep
 import unittest
 from unittest.mock import patch
 
 from cogni_demo.server import (
+    _agent_failure_route,
     DemoHTTPServer,
     JobAlreadyRunningError,
     JobManager,
     SessionMetadata,
     WorkerLaunch,
+    WorkerTerminationError,
     find_live_session,
     open_graphical_app,
     ping_session,
@@ -25,6 +28,10 @@ from cogni_demo.server import (
     remove_session_metadata,
     write_session_metadata,
     main,
+)
+from cogni_os.gpu_lease import (
+    GPULeaseBusyError,
+    GPULeaseManager,
 )
 
 
@@ -47,6 +54,64 @@ def manager_for(mode: str, *, timeout: float = 10.0) -> JobManager:
     return JobManager(launch_factory_for(mode), max_runtime_seconds=timeout)
 
 
+class _RecordingLeaseManager(GPULeaseManager):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.events = events
+        self.status_at_release: str | None = None
+        self.process_code_at_release: int | None = None
+        self.job_manager: JobManager | None = None
+
+    def acquire(self, *args, **kwargs):
+        self.events.append("acquire")
+        return super().acquire(*args, **kwargs)
+
+    def release(self, lease):
+        self.events.append("release")
+        manager = self.job_manager
+        if manager is not None:
+            self.status_at_release = manager.snapshot()["status"]
+            process = manager._process
+            self.process_code_at_release = None if process is None else process.poll()
+        return super().release(lease)
+
+
+class _PreSpawnPausingLeaseManager(GPULeaseManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.acquired = Event()
+        self.continue_spawn = Event()
+
+    def acquire(self, *args, **kwargs):
+        lease = super().acquire(*args, **kwargs)
+        self.acquired.set()
+        if not self.continue_spawn.wait(timeout=5.0):
+            raise RuntimeError("test did not release the pre-spawn lease gate")
+        return lease
+
+
+class _UnkillableProcess:
+    def __init__(self) -> None:
+        self.signals = 0
+        self.terminations = 0
+        self.kills = 0
+
+    def poll(self):
+        return None
+
+    def send_signal(self, _signal) -> None:
+        self.signals += 1
+
+    def terminate(self) -> None:
+        self.terminations += 1
+
+    def kill(self) -> None:
+        self.kills += 1
+
+    def wait(self, timeout=None):
+        raise subprocess.TimeoutExpired("unkillable", timeout)
+
+
 def wait_for_terminal(manager: JobManager, timeout: float = 10.0) -> dict:
     deadline = monotonic() + timeout
     while monotonic() < deadline:
@@ -58,6 +123,15 @@ def wait_for_terminal(manager: JobManager, timeout: float = 10.0) -> dict:
 
 
 class TestDemoJobManager(unittest.TestCase):
+    def test_agent_failure_causes_keep_distinct_self_harness_signatures(self) -> None:
+        quality = _agent_failure_route("ResponseQualityError")
+        worker = _agent_failure_route("WorkerExecutionError")
+        unknown = _agent_failure_route("UnexpectedFailure")
+        self.assertNotEqual(quality[:2], worker[:2])
+        self.assertEqual(quality[2], "cogni_agent/manager.py")
+        self.assertEqual(worker[2], "cogni_agent/model_service.py")
+        self.assertEqual(unknown[0], "agent_unclassified")
+
     def test_production_command_is_absolute_shell_free_and_offline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             model = Path(temporary) / "model"
@@ -72,7 +146,7 @@ class TestDemoJobManager(unittest.TestCase):
         self.assertEqual(launch.environment["TRANSFORMERS_OFFLINE"], "1")
         self.assertEqual(launch.environment["HF_HUB_OFFLINE"], "1")
 
-    def test_initial_snapshot_has_stable_verified_evidence(self) -> None:
+    def test_initial_snapshot_has_no_stale_measured_evidence(self) -> None:
         state = manager_for("success").snapshot()
         self.assertEqual(
             set(state),
@@ -88,8 +162,20 @@ class TestDemoJobManager(unittest.TestCase):
             },
         )
         self.assertEqual(state["status"], "ready")
-        self.assertEqual(state["metrics"]["evidence_kind"], "measured_internal")
-        self.assertEqual(state["metrics"]["requested_depth"], 100)
+        self.assertEqual(state["metrics"]["evidence_kind"], "unverified")
+        for field in (
+            "measured_at",
+            "source",
+            "peak_vram_gib",
+            "requested_depth",
+            "reached_depth",
+            "transition_residual",
+            "transition_converged",
+            "verified_files",
+            "device",
+        ):
+            with self.subTest(field=field):
+                self.assertIsNone(state["metrics"][field])
 
     def test_success_requires_ordered_phases_unique_typed_terminal_and_exit_zero(
         self,
@@ -101,7 +187,7 @@ class TestDemoJobManager(unittest.TestCase):
         self.assertEqual(state["progress"], 100)
         self.assertEqual(state["metrics"]["evidence_kind"], "live_runtime_validation")
         self.assertEqual(state["metrics"]["reached_depth"], 100)
-        self.assertEqual(state["metrics"]["tests"], 178)
+        self.assertIsNone(state["metrics"]["tests"])
         self.assertEqual(state["metrics"]["target"], "RTX 4090 24GB")
         self.assertIsNone(state["active_job"])
 
@@ -113,6 +199,9 @@ class TestDemoJobManager(unittest.TestCase):
                 state = wait_for_terminal(manager)
                 self.assertEqual(state["status"], "failed")
                 self.assertIsNotNone(state["error"])
+                self.assertEqual(state["metrics"]["evidence_kind"], "unverified")
+                self.assertIsNone(state["metrics"]["peak_vram_gib"])
+                self.assertIsNone(state["metrics"]["reached_depth"])
 
     def test_stderr_flood_is_bounded_and_does_not_deadlock_success(self) -> None:
         for mode in ("stderr_flood", "stdout_flood"):
@@ -136,6 +225,113 @@ class TestDemoJobManager(unittest.TestCase):
         self.assertEqual(state["status"], "cancelled")
         self.assertIsNone(state["active_job"])
         manager.shutdown()
+
+    def test_gpu_lease_precedes_popen_and_release_precedes_terminal(self) -> None:
+        events: list[str] = []
+        authority = _RecordingLeaseManager(events)
+        manager = JobManager(
+            launch_factory_for("success"),
+            max_runtime_seconds=10.0,
+            gpu_lease_manager=authority,
+        )
+        authority.job_manager = manager
+        real_popen = subprocess.Popen
+
+        def recording_popen(*args, **kwargs):
+            events.append("popen")
+            return real_popen(*args, **kwargs)
+
+        with patch("cogni_demo.server.subprocess.Popen", side_effect=recording_popen):
+            manager.start()
+            state = wait_for_terminal(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertLess(events.index("acquire"), events.index("popen"))
+        self.assertLess(events.index("popen"), events.index("release"))
+        self.assertIn(authority.status_at_release, {"starting", "running"})
+        self.assertIsNotNone(authority.process_code_at_release)
+        self.assertIsNone(authority.active)
+        self.assertIsNone(manager._process)
+        self.assertIsNone(manager._gpu_lease)
+
+    def test_pre_spawn_health_probe_keeps_exact_validation_fence(self) -> None:
+        authority = _PreSpawnPausingLeaseManager()
+        manager = JobManager(
+            launch_factory_for("success"),
+            max_runtime_seconds=10.0,
+            gpu_lease_manager=authority,
+        )
+        try:
+            manager.start()
+            self.assertTrue(authority.acquired.wait(timeout=2.0))
+            lease = authority.active
+            self.assertIsNotNone(lease)
+            self.assertIsNone(authority.reap())
+            with self.assertRaises(GPULeaseBusyError):
+                authority.acquire(
+                    "contender",
+                    "inference",
+                    authority.max_vram_bytes,
+                    deadline=monotonic() + 10.0,
+                )
+            self.assertEqual(authority.active, lease)
+        finally:
+            authority.continue_spawn.set()
+        self.assertEqual(wait_for_terminal(manager)["status"], "succeeded")
+        self.assertIsNone(authority.active)
+
+    def test_shutdown_reaps_thread_process_and_validation_lease(self) -> None:
+        authority = GPULeaseManager()
+        manager = JobManager(
+            launch_factory_for("hang"),
+            max_runtime_seconds=10.0,
+            gpu_lease_manager=authority,
+        )
+        manager.start()
+        deadline = monotonic() + 2.0
+        while manager._process is None and monotonic() < deadline:
+            sleep(0.01)
+        self.assertIsNotNone(manager._process)
+        self.assertIsNotNone(authority.active)
+
+        manager.shutdown(timeout=5.0)
+
+        thread = manager._worker_thread
+        self.assertTrue(thread is None or not thread.is_alive())
+        self.assertIsNone(manager._process)
+        self.assertIsNone(manager._gpu_lease)
+        self.assertIsNone(authority.active)
+        self.assertEqual(manager.snapshot()["status"], "cancelled")
+
+    def test_unreapable_process_surfaces_failure_and_preserves_fence(self) -> None:
+        authority = GPULeaseManager()
+        process = _UnkillableProcess()
+        lease = authority.acquire(
+            "validation-test",
+            "validation",
+            authority.max_vram_bytes,
+            deadline=monotonic() + 10.0,
+            owner_alive=lambda: True,
+        )
+        manager = JobManager(
+            launch_factory_for("success"),
+            gpu_lease_manager=authority,
+        )
+        manager._status = "cancelling"
+        manager._active_job = "job-test"
+        manager._process = process
+        manager._gpu_lease = lease
+
+        with self.assertRaises(WorkerTerminationError):
+            manager.shutdown(timeout=0.1)
+
+        self.assertIs(manager._process, process)
+        self.assertEqual(manager._gpu_lease, lease)
+        self.assertEqual(authority.active, lease)
+        self.assertEqual(manager.snapshot()["active_job"], "job-test")
+        self.assertGreaterEqual(process.signals + process.terminations, 1)
+        self.assertEqual(process.kills, 1)
+        authority.release(lease)
 
 
 class TestDemoHTTPControlPlane(unittest.TestCase):

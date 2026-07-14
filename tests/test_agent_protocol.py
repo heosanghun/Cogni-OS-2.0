@@ -3,12 +3,19 @@ import unittest
 import torch
 
 from cogni_agent.protocol import (
+    DECODE_CONVERSATION,
+    DECODE_STRICT,
+    DIGEST_BYTES,
     FINISH_CANCELLED,
+    FINISH_ERROR,
     FINISH_LENGTH,
+    FINISH_LKG_LENGTH,
+    FINISH_LKG_STOP,
     FINISH_NONE,
     FINISH_STOP,
     HARD_MAX_INPUT_TOKENS,
     STATUS_CANCELLED,
+    STATUS_DEADLINE_EXCEEDED,
     STATUS_OK,
     TensorProtocolError,
     make_generate_request,
@@ -21,12 +28,22 @@ from cogni_agent.protocol import (
 
 class TestAgentTensorProtocol(unittest.TestCase):
     def test_generation_request_is_exactly_four_bounded_cpu_tensors(self) -> None:
+        artifact = torch.arange(DIGEST_BYTES, dtype=torch.int64)
+        session = torch.arange(DIGEST_BYTES - 1, -1, -1, dtype=torch.int64)
         message = make_generate_request(
             7,
             torch.tensor([[1, 2, 3]], dtype=torch.int64),
             torch.ones((1, 3), dtype=torch.int64),
             max_new_tokens=12,
             stop_token_ids=torch.tensor([2], dtype=torch.int64),
+            job_id=7001,
+            lease_epoch=9,
+            request_deadline_ns=1_000_000,
+            lease_deadline_ns=2_000_000,
+            artifact_digest=artifact,
+            session_digest=session,
+            decode_mode=DECODE_CONVERSATION,
+            sampling_seed=712,
         )
         self.assertEqual(len(message), 4)
         self.assertTrue(all(item.device.type == "cpu" for item in message))
@@ -34,9 +51,43 @@ class TestAgentTensorProtocol(unittest.TestCase):
         request = parse_request(message)
         self.assertIsNotNone(request)
         self.assertEqual(request.request_id, 7)
+        self.assertEqual(request.job_id, 7001)
+        self.assertEqual(request.lease_epoch, 9)
+        self.assertEqual(request.request_deadline_ns, 1_000_000)
+        self.assertTrue(torch.equal(request.artifact_digest, artifact))
+        self.assertTrue(torch.equal(request.session_digest, session))
         self.assertEqual(request.max_new_tokens, 12)
+        self.assertEqual(request.decode_mode, DECODE_CONVERSATION)
+        self.assertEqual(request.sampling_seed, 712)
         self.assertTrue(torch.equal(request.input_ids, torch.tensor([[1, 2, 3]])))
         self.assertIsNone(parse_request(make_stop_request()))
+
+    def test_decode_policy_and_seed_are_closed_bounded_scalars(self) -> None:
+        strict = parse_request(
+            make_generate_request(
+                8,
+                torch.tensor([[1]], dtype=torch.int64),
+                None,
+                max_new_tokens=1,
+                decode_mode=DECODE_STRICT,
+                sampling_seed=2**63 - 1,
+            )
+        )
+        self.assertIsNotNone(strict)
+        self.assertEqual(strict.decode_mode, DECODE_STRICT)
+        self.assertEqual(strict.sampling_seed, 2**63 - 1)
+
+        for mode, seed in ((99, 0), (DECODE_CONVERSATION, -1), (0, 2**63)):
+            with self.subTest(mode=mode, seed=seed):
+                with self.assertRaises(TensorProtocolError):
+                    make_generate_request(
+                        8,
+                        torch.tensor([[1]], dtype=torch.int64),
+                        None,
+                        max_new_tokens=1,
+                        decode_mode=mode,
+                        sampling_seed=seed,
+                    )
 
     def test_request_schema_rejects_wrong_dtype_shape_mask_and_size(self) -> None:
         with self.assertRaises(TensorProtocolError):
@@ -99,7 +150,10 @@ class TestAgentTensorProtocol(unittest.TestCase):
         cases = (
             (STATUS_OK, FINISH_STOP),
             (STATUS_OK, FINISH_LENGTH),
+            (STATUS_OK, FINISH_LKG_STOP),
+            (STATUS_OK, FINISH_LKG_LENGTH),
             (STATUS_CANCELLED, FINISH_CANCELLED),
+            (STATUS_DEADLINE_EXCEEDED, FINISH_ERROR),
         )
         for status, reason in cases:
             with self.subTest(status=status, reason=reason):
@@ -116,6 +170,32 @@ class TestAgentTensorProtocol(unittest.TestCase):
                 self.assertTrue(frame.final)
                 self.assertEqual(frame.status, status)
                 self.assertEqual(frame.finish_reason, reason)
+
+    def test_response_echoes_complete_request_authority(self) -> None:
+        artifact = torch.full((DIGEST_BYTES,), 17, dtype=torch.int64)
+        session = torch.full((DIGEST_BYTES,), 23, dtype=torch.int64)
+        frame = parse_response(
+            make_response(
+                19,
+                STATUS_OK,
+                torch.tensor([3]),
+                generated_total=1,
+                final=True,
+                finish_reason=FINISH_STOP,
+                job_id=91,
+                lease_epoch=4,
+                request_deadline_ns=8_000,
+                lease_deadline_ns=9_000,
+                artifact_digest=artifact,
+                session_digest=session,
+            )
+        )
+        self.assertEqual(frame.job_id, 91)
+        self.assertEqual(frame.lease_epoch, 4)
+        self.assertEqual(frame.request_deadline_ns, 8_000)
+        self.assertEqual(frame.lease_deadline_ns, 9_000)
+        self.assertTrue(torch.equal(frame.artifact_digest, artifact))
+        self.assertTrue(torch.equal(frame.session_digest, session))
 
     def test_finish_reason_status_pairs_are_fail_closed(self) -> None:
         invalid = (

@@ -6,8 +6,10 @@ from .conversation import (
     ConversationSnapshot,
     ConversationTurn,
 )
+from .conversation_fastpath import ConversationFastPath
 from .core_pipeline import (
     CorePipelineLimits,
+    CoreTurnAuthorityError,
     CoreTurnPipeline,
     CoreTurnRequest,
     CoreTurnResult,
@@ -30,6 +32,7 @@ from .model_service import (
     LocalGemmaModelFactory,
     ModelService,
     ModelServiceError,
+    WorkerAuthorityError,
 )
 from .tools import (
     ToolPolicyError,
@@ -46,9 +49,11 @@ __all__ = [
     "BaseModelMutationError",
     "BoundedConversationStore",
     "ConversationError",
+    "ConversationFastPath",
     "ConversationSnapshot",
     "ConversationTurn",
     "CorePipelineLimits",
+    "CoreTurnAuthorityError",
     "CoreTurnPipeline",
     "CoreTurnRequest",
     "CoreTurnResult",
@@ -67,5 +72,6 @@ __all__ = [
     "ToolRequest",
     "ToolResult",
     "WorkspaceToolExecutor",
+    "WorkerAuthorityError",
     "parse_tool_request",
 ]

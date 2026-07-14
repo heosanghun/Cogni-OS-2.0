@@ -10,6 +10,10 @@ work/
 tmp/
 outputs/*.zip
 outputs/*.sha256
+release/*.exe
+release/*.whl
+release/*.zip
+release/SHA256SUMS.txt
 *.safetensors
 *.bin
 *.pt

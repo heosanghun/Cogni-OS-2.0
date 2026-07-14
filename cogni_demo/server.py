@@ -41,7 +41,13 @@ from cogni_demo.protocol import (
     validate_terminal_metrics,
 )
 from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError
+from cogni_flow.rhythm import RhythmController, SystemMode
 from cogni_os.artifacts import verify_artifact_manifest
+from cogni_os.gpu_lease import (
+    GPULease,
+    GPULeaseManager,
+    StaleGPULeaseError,
+)
 
 
 MAX_REQUEST_BODY_BYTES = 8 * 1024
@@ -73,30 +79,89 @@ _CSP = (
 
 
 INITIAL_METRICS: dict[str, Any] = {
-    "evidence_kind": "measured_internal",
-    "measured_at": "2026-07-11T00:00:00+09:00",
-    "source": "scripts/validate_gemma4_runtime.py internal hardware validation",
-    "peak_vram_gib": 14.8560,
-    "vram_limit_gib": 16.7,
-    "requested_depth": 100,
-    "reached_depth": 100,
-    "nodes_used": 301,
-    "node_capacity": 301,
-    "transition_residual": 0.00390625,
-    "transition_converged": True,
-    "transition_used_fallback": False,
-    "finite": True,
-    "verified_files": 6,
-    "model_class": "Gemma4ForConditionalGeneration",
-    "hidden_size": 2560,
-    "search_allocated_bytes": 14_994_009,
-    "load_seconds": 19.789,
-    "inference_seconds": 3.729,
-    "tests": 178,
-    "subtests": 32,
-    "device": "RTX 5090 Laptop GPU",
+    # No historical observation is valid evidence for a newly started server.
+    # These fields are populated only after this JobManager accepts one complete,
+    # ordered, zero-exit validation result from the current process.
+    "evidence_kind": "unverified",
+    "measured_at": None,
+    "source": None,
+    "peak_vram_gib": None,
+    "vram_limit_gib": None,
+    "requested_depth": None,
+    "reached_depth": None,
+    "nodes_used": None,
+    "node_capacity": None,
+    "transition_residual": None,
+    "transition_converged": None,
+    "transition_used_fallback": None,
+    "cts_protocol_version": None,
+    "safe_for_decode": None,
+    "unsafe_silent_fallbacks": None,
+    "linear_solve_fallbacks": None,
+    "solver_rank": None,
+    "solver_history_peak": None,
+    "solver_failures": None,
+    "failed_edges": None,
+    "q_zero_backups": None,
+    "mac_budget": None,
+    "mac_reserved": None,
+    "act_applied": None,
+    "trace_digest": None,
+    "causal_bridge_answer_bearing": None,
+    "causal_bridge_bias_nonzero": None,
+    "causal_bridge_bias_max": None,
+    "conditioned_generated_tokens": None,
+    "finite": None,
+    "verified_files": None,
+    "model_class": None,
+    "hidden_size": None,
+    "search_allocated_bytes": None,
+    "load_seconds": None,
+    "inference_seconds": None,
+    # Test counts belong to a signed release-evidence snapshot.  Keeping them
+    # out of live telemetry prevents a stale build-time number being presented
+    # as if the currently running process had just executed the suite.
+    "tests": None,
+    "subtests": None,
+    "device": None,
     "target": "RTX 4090 24GB",
 }
+
+_AGENT_FAILURE_ROUTES: dict[str, tuple[str, str, str]] = {
+    "ResponseQualityError": (
+        "agent_response_quality",
+        "agent_manager",
+        "cogni_agent/manager.py",
+    ),
+    "WorkerExecutionError": (
+        "agent_worker_execution",
+        "resident_model_worker",
+        "cogni_agent/model_service.py",
+    ),
+    "ModelServiceError": (
+        "agent_model_service",
+        "resident_model_worker",
+        "cogni_agent/model_service.py",
+    ),
+    "TimeoutError": (
+        "agent_timeout",
+        "agent_manager",
+        "cogni_agent/manager.py",
+    ),
+}
+_UNCLASSIFIED_AGENT_FAILURE = (
+    "agent_unclassified",
+    "agent_manager",
+    "cogni_agent/manager.py",
+)
+
+
+def _agent_failure_route(code: str) -> tuple[str, str, str]:
+    """Keep terminal causes in distinct, bounded Self-Harness clusters."""
+
+    if not isinstance(code, str) or not code or len(code) > 128:
+        return _UNCLASSIFIED_AGENT_FAILURE
+    return _AGENT_FAILURE_ROUTES.get(code, _UNCLASSIFIED_AGENT_FAILURE)
 
 
 class DemoServerError(RuntimeError):
@@ -113,6 +178,10 @@ class NoActiveJobError(DemoServerError):
 
 class ComputeBusyError(DemoServerError):
     """Raised before a second local workload can acquire the GPU owner slot."""
+
+
+class WorkerTerminationError(DemoServerError):
+    """Raised when a validation worker cannot be proven dead within bounds."""
 
 
 class EvolutionAlreadyRunningError(DemoServerError):
@@ -497,13 +566,19 @@ class JobManager:
         *,
         max_runtime_seconds: float = 20 * 60,
         availability_check: Callable[[], bool] | None = None,
+        gpu_lease_manager: GPULeaseManager | None = None,
     ) -> None:
         if max_runtime_seconds <= 0:
             raise ValueError("max_runtime_seconds must be positive")
         if availability_check is not None and not callable(availability_check):
             raise TypeError("availability_check must be callable")
+        if gpu_lease_manager is not None and not isinstance(
+            gpu_lease_manager, GPULeaseManager
+        ):
+            raise TypeError("gpu_lease_manager must be GPULeaseManager or None")
         self._launch_factory = launch_factory
         self.availability_check = availability_check
+        self.gpu_lease_manager = gpu_lease_manager
         self.max_runtime_seconds = float(max_runtime_seconds)
         self._condition = Condition(RLock())
         self._status = "ready"
@@ -515,6 +590,7 @@ class JobManager:
         self._error: dict[str, str] | None = None
         self._active_job: str | None = None
         self._process: subprocess.Popen[bytes] | None = None
+        self._gpu_lease: GPULease | None = None
         self._cancel_event = Event()
         self._worker_thread: Thread | None = None
         self._diagnostics: deque[dict[str, str]] = deque(maxlen=MAX_DIAGNOSTIC_LINES)
@@ -559,8 +635,12 @@ class JobManager:
         with self._condition:
             if self._status in _ACTIVE_STATUSES:
                 raise JobAlreadyRunningError("a validation job is already active")
-            if self.availability_check is not None and not self.availability_check():
-                raise JobAlreadyRunningError("local compute is owned by another mode")
+            availability = self.availability_check
+        if availability is not None and not availability():
+            raise JobAlreadyRunningError("local compute is owned by another mode")
+        with self._condition:
+            if self._status in _ACTIVE_STATUSES:
+                raise JobAlreadyRunningError("a validation job is already active")
             job_id = secrets.token_hex(16)
             self._cancel_event = Event()
             self._active_job = job_id
@@ -585,6 +665,9 @@ class JobManager:
             self._cancel_event.set()
 
     def shutdown(self, timeout: float = 5.0) -> None:
+        if timeout <= 0:
+            raise ValueError("shutdown timeout must be positive")
+        deadline = monotonic() + float(timeout)
         with self._condition:
             active = self._status in _ACTIVE_STATUSES
         if active:
@@ -594,10 +677,43 @@ class JobManager:
                 pass
         thread = self._worker_thread
         if thread is not None:
-            thread.join(timeout=timeout)
+            thread.join(timeout=max(0.0, deadline - monotonic()))
         process = self._process
         if process is not None and process.poll() is None:
             self._terminate(process)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, deadline - monotonic()))
+        if thread is not None and thread.is_alive():
+            raise WorkerTerminationError(
+                "validation controller thread did not stop within its deadline"
+            )
+
+        process = self._process
+        lease = self._gpu_lease
+        if process is not None and process.poll() is None:
+            raise WorkerTerminationError(
+                "validation worker remained alive after shutdown escalation"
+            )
+        if process is not None or lease is not None:
+            self._release_job_lease(process, lease)
+        with self._condition:
+            job_id = self._active_job
+            progress = self._progress
+        if job_id is not None:
+            self._finish_job(
+                job_id,
+                "cancelled" if self._cancel_event.is_set() else "failed",
+                "cancelled" if self._cancel_event.is_set() else "shutdown_failed",
+                progress,
+                error=(
+                    None
+                    if self._cancel_event.is_set()
+                    else {
+                        "code": "WORKER_SHUTDOWN",
+                        "message": "validation worker stopped during shutdown",
+                    }
+                ),
+            )
 
     def _transition_locked(
         self,
@@ -681,6 +797,10 @@ class JobManager:
 
     def _run_job(self, job_id: str, prompt: str) -> None:
         process: subprocess.Popen[bytes] | None = None
+        lease: GPULease | None = None
+        # The health callback must fence the pre-spawn window.  It closes over
+        # this exact worker, never the mutable ``self._process`` replacement.
+        process_holder: list[subprocess.Popen[bytes] | None] = [None]
         messages: Queue[tuple[str, object]] = Queue(maxsize=MAX_EVENT_QUEUE)
         protocol_failure: str | None = None
         terminal_metrics: dict[str, Any] | None = None
@@ -690,6 +810,11 @@ class JobManager:
         last_progress = -1
         readers: list[Thread] = []
         started = monotonic()
+        terminal_status = "failed"
+        terminal_stage = "server_failed"
+        terminal_progress = 0
+        terminal_error: dict[str, str] | None = None
+        live_metrics: dict[str, Any] | None = None
         try:
             launch = self._launch_factory(prompt)
             if not launch.command or any(
@@ -697,7 +822,13 @@ class JobManager:
             ):
                 raise ValueError("worker command must be a non-empty string sequence")
             if self._cancel_event.is_set():
-                self._finish_job(job_id, "cancelled", "cancelled", 0)
+                terminal_status = "cancelled"
+                terminal_stage = "cancelled"
+                return
+            lease = self._acquire_job_lease(job_id, process_holder)
+            if self._cancel_event.is_set():
+                terminal_status = "cancelled"
+                terminal_stage = "cancelled"
                 return
             creationflags = 0
             if os.name == "nt":
@@ -714,6 +845,7 @@ class JobManager:
                 creationflags=creationflags,
                 close_fds=True,
             )
+            process_holder[0] = process
             with self._condition:
                 if self._active_job != job_id:
                     raise RuntimeError("job ownership changed during worker start")
@@ -787,31 +919,30 @@ class JobManager:
                 reader.join(timeout=1.0)
             return_code = process.wait(timeout=1.0)
             if self._cancel_event.is_set():
-                self._finish_job(job_id, "cancelled", "cancelled", self._progress)
+                terminal_status = "cancelled"
+                terminal_stage = "cancelled"
+                terminal_progress = self._progress
             elif return_code != 0:
-                self._finish_job(
-                    job_id,
-                    "failed",
-                    "worker_failed",
-                    self._progress,
-                    error={
-                        "code": "WORKER_EXIT",
-                        "message": f"validation worker exited with code {return_code}",
-                    },
-                )
+                terminal_status = "failed"
+                terminal_stage = "worker_failed"
+                terminal_progress = self._progress
+                terminal_error = {
+                    "code": "WORKER_EXIT",
+                    "message": f"validation worker exited with code {return_code}",
+                }
             elif (
                 protocol_failure is not None
                 or terminal_count != 1
                 or terminal_metrics is None
             ):
                 detail = protocol_failure or "worker emitted no unique terminal result"
-                self._finish_job(
-                    job_id,
-                    "failed",
-                    "protocol_failed",
-                    self._progress,
-                    error={"code": "WORKER_PROTOCOL", "message": detail[:256]},
-                )
+                terminal_status = "failed"
+                terminal_stage = "protocol_failed"
+                terminal_progress = self._progress
+                terminal_error = {
+                    "code": "WORKER_PROTOCOL",
+                    "message": detail[:256],
+                }
             else:
                 # Keep the dashboard evidence schema stable while replacing
                 # every metric produced by the current hardware run.
@@ -825,31 +956,135 @@ class JobManager:
                         "target": "RTX 4090 24GB",
                     }
                 )
-                with self._condition:
-                    self._metrics = live_metrics
-                self._finish_job(job_id, "succeeded", "complete", 100)
+                terminal_status = "succeeded"
+                terminal_stage = "complete"
+                terminal_progress = 100
         except BaseException as exc:
-            if process is not None and process.poll() is None:
-                self._terminate(process)
             if self._cancel_event.is_set():
-                self._finish_job(job_id, "cancelled", "cancelled", self._progress)
-                return
-            self._finish_job(
-                job_id,
-                "failed",
-                "server_failed",
-                self._progress,
-                error={
+                terminal_status = "cancelled"
+                terminal_stage = "cancelled"
+                terminal_progress = self._progress
+            else:
+                terminal_status = "failed"
+                terminal_stage = "server_failed"
+                terminal_progress = self._progress
+                terminal_error = {
                     "code": "SERVER_WORKER_FAILURE",
                     "message": f"{type(exc).__name__}: worker could not be managed"[
                         :256
                     ],
+                }
+        finally:
+            cleanup_error: BaseException | None = None
+            try:
+                if process is not None and process.poll() is None:
+                    self._terminate(process)
+                self._release_job_lease(process, lease)
+            except BaseException as exc:
+                cleanup_error = exc
+            if cleanup_error is not None:
+                self._record_cleanup_failure(
+                    job_id,
+                    cleanup_error,
+                    process=process,
+                    lease=lease,
+                )
+            else:
+                if live_metrics is not None:
+                    with self._condition:
+                        if self._active_job == job_id:
+                            self._metrics = live_metrics
+                self._finish_job(
+                    job_id,
+                    terminal_status,
+                    terminal_stage,
+                    terminal_progress,
+                    error=terminal_error,
+                )
+
+    def _acquire_job_lease(
+        self,
+        job_id: str,
+        process_holder: list[subprocess.Popen[bytes] | None],
+    ) -> GPULease | None:
+        authority = self.gpu_lease_manager
+        if authority is None:
+            return None
+
+        def owner_alive() -> bool:
+            candidate = process_holder[0]
+            # Another contender may call reap between acquire and Popen.  The
+            # exact pre-spawn owner must remain fenced during that window.
+            return candidate is None or candidate.poll() is None
+
+        lease = authority.acquire(
+            f"validation-{job_id}",
+            "validation",
+            authority.max_vram_bytes,
+            deadline=authority.deadline_after(self.max_runtime_seconds + 5.0),
+            owner_alive=owner_alive,
+        )
+        with self._condition:
+            if self._active_job != job_id:
+                authority.release(lease)
+                raise RuntimeError("job ownership changed during lease acquisition")
+            self._gpu_lease = lease
+        return lease
+
+    def _release_job_lease(
+        self,
+        process: subprocess.Popen[bytes] | None,
+        lease: GPULease | None,
+    ) -> None:
+        if process is not None and process.poll() is None:
+            raise WorkerTerminationError(
+                "validation worker must exit before its GPU lease is released"
+            )
+        authority = self.gpu_lease_manager
+        if authority is not None and lease is not None:
+            try:
+                authority.release(lease)
+            except StaleGPULeaseError:
+                # A supervisor may already have reaped this exact dead owner.
+                # Stale cleanup must never touch a replacement epoch.
+                pass
+        with self._condition:
+            if self._process is process:
+                self._process = None
+            if self._gpu_lease is lease:
+                self._gpu_lease = None
+
+    def _record_cleanup_failure(
+        self,
+        job_id: str,
+        error: BaseException,
+        *,
+        process: subprocess.Popen[bytes] | None,
+        lease: GPULease | None,
+    ) -> None:
+        with self._condition:
+            if self._active_job != job_id:
+                return
+            if process is not None:
+                self._process = process
+            if lease is not None:
+                self._gpu_lease = lease
+            code = (
+                "WORKER_TERMINATION"
+                if isinstance(error, WorkerTerminationError)
+                else "GPU_LEASE_CLEANUP"
+            )
+            self._transition_locked(
+                "cancelling",
+                "termination_failed",
+                self._progress,
+                error={
+                    "code": code,
+                    "message": f"{type(error).__name__}: cleanup did not complete"[
+                        :256
+                    ],
                 },
             )
-        finally:
-            with self._condition:
-                if self._process is process:
-                    self._process = None
 
     def _finish_job(
         self,
@@ -880,20 +1115,26 @@ class JobManager:
             else:
                 process.terminate()
             process.wait(timeout=0.75)
-            return
         except (OSError, subprocess.TimeoutExpired):
             pass
+        if process.poll() is not None:
+            return
         try:
             process.terminate()
             process.wait(timeout=1.0)
-            return
         except (OSError, subprocess.TimeoutExpired):
             pass
+        if process.poll() is not None:
+            return
         try:
             process.kill()
             process.wait(timeout=1.0)
         except (OSError, subprocess.TimeoutExpired):
             pass
+        if process.poll() is None:
+            raise WorkerTerminationError(
+                "validation worker survived graceful, terminate, and kill escalation"
+            )
 
 
 class EvolutionController:
@@ -904,13 +1145,17 @@ class EvolutionController:
         harness: Any,
         *,
         availability_check: Callable[[], bool] | None = None,
+        worker_cleanup: Callable[[], None] | None = None,
     ) -> None:
         if not callable(getattr(harness, "tick", None)):
             raise TypeError("harness must provide tick()")
         if availability_check is not None and not callable(availability_check):
             raise TypeError("availability_check must be callable")
+        if worker_cleanup is not None and not callable(worker_cleanup):
+            raise TypeError("worker_cleanup must be callable")
         self.harness = harness
         self.availability_check = availability_check
+        self.worker_cleanup = worker_cleanup
         self._condition = Condition(RLock())
         self._active = False
         self._sequence = 0
@@ -932,6 +1177,20 @@ class EvolutionController:
         promotion_mode = getattr(status, "promotion_mode", "unknown")
         if isinstance(promotion_mode, Enum):
             promotion_mode = promotion_mode.value
+        raw_integrity_errors = getattr(status, "proposal_integrity_errors", ())
+        integrity_errors: list[dict[str, str]] = []
+        if isinstance(raw_integrity_errors, (tuple, list)):
+            for item in raw_integrity_errors[:64]:
+                if (
+                    isinstance(item, (tuple, list))
+                    and len(item) == 2
+                    and isinstance(item[0], str)
+                    and isinstance(item[1], str)
+                ):
+                    integrity_errors.append(
+                        {"proposal_id": item[0][:64], "reason": item[1][:512]}
+                    )
+        unreviewable = max(0, int(getattr(status, "unreviewable_proposals", 0) or 0))
         with self._condition:
             return {
                 "running": self._active,
@@ -945,6 +1204,22 @@ class EvolutionController:
                 "promotion_enabled": bool(getattr(status, "promotion_enabled", False)),
                 "blocked_reason": getattr(status, "blocked_reason", None),
                 "pending_proposals": int(getattr(status, "pending_proposals", 0) or 0),
+                "rich_pending_proposals": int(
+                    getattr(status, "rich_pending_proposals", 0) or 0
+                ),
+                "negative_proposals": int(
+                    getattr(status, "negative_proposals", 0) or 0
+                ),
+                "unreviewable_proposals": unreviewable,
+                "proposal_integrity_errors": integrity_errors,
+                "integrity_degraded": unreviewable > 0,
+                "evidence_failures": int(getattr(status, "evidence_failures", 0) or 0),
+                "evidence_successes": int(
+                    getattr(status, "evidence_successes", 0) or 0
+                ),
+                "evidence_capture_ratio": float(
+                    getattr(status, "evidence_capture_ratio", 1.0) or 0.0
+                ),
                 "failures": self._failure_count(),
                 "daemon_running": bool(getattr(status, "running", False)),
             }
@@ -955,8 +1230,14 @@ class EvolutionController:
                 raise RuntimeError("evolution controller is stopped")
             if self._active:
                 raise EvolutionAlreadyRunningError("an evolution cycle is active")
-            if self.availability_check is not None and not self.availability_check():
-                raise ComputeBusyError("local compute is owned by another mode")
+            availability = self.availability_check
+        if availability is not None and not availability():
+            raise ComputeBusyError("local compute is owned by another mode")
+        with self._condition:
+            if self._stopped:
+                raise RuntimeError("evolution controller is stopped")
+            if self._active:
+                raise EvolutionAlreadyRunningError("an evolution cycle is active")
             job_id = secrets.token_hex(12)
             self._active = True
             self._job_id = job_id
@@ -979,12 +1260,17 @@ class EvolutionController:
         with self._condition:
             self._stopped = True
             thread = self._thread
+        stop = getattr(self.harness, "stop", None)
+        if callable(stop):
+            stop()
         if thread is not None:
             thread.join(timeout=timeout)
-        if thread is None or not thread.is_alive():
-            stop = getattr(self.harness, "stop", None)
-            if callable(stop):
-                stop()
+        if thread is not None and thread.is_alive():
+            raise WorkerTerminationError(
+                "evolution thread did not stop within its shutdown deadline"
+            )
+        if self.worker_cleanup is not None:
+            self.worker_cleanup()
 
     def _run(self, job_id: str) -> None:
         try:
@@ -998,6 +1284,16 @@ class EvolutionController:
             error = {
                 "code": type(exc).__name__,
                 "message": (str(exc) or "evolution cycle failed")[:512],
+            }
+        try:
+            if self.worker_cleanup is not None:
+                self.worker_cleanup()
+        except BaseException as exc:
+            result = None
+            status = "failed"
+            error = {
+                "code": type(exc).__name__,
+                "message": (str(exc) or "evolution worker cleanup failed")[:512],
             }
         with self._condition:
             if self._job_id != job_id:
@@ -1042,6 +1338,8 @@ class EvolutionController:
                 "proposals": int(getattr(report, "proposals", 0)),
                 "promoted": bool(getattr(report, "promoted", False)),
                 "target": getattr(report, "target", None),
+                "proposal_only": bool(getattr(report, "proposal_only", False)),
+                "blocked_reason": getattr(report, "blocked_reason", None),
             }
         return payload
 
@@ -1089,7 +1387,11 @@ class _ServiceBackedPatchModel:
         )
         if not isinstance(prompt, str) or not prompt:
             raise ValueError("patch prompt could not be decoded")
-        generated = self.service.generate(prompt, max_new_tokens=requested).token_ids
+        generated = self.service.generate(
+            prompt,
+            max_new_tokens=requested,
+            decode_mode="strict",
+        ).token_ids
         generated = generated.detach().to(
             device=input_ids.device, dtype=input_ids.dtype
         )
@@ -1168,6 +1470,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
         self._last_state_poll = monotonic()
         self._shutdown_requested = False
         self._components_shutdown = False
+        self._components_shutdown_in_progress = False
         self.manager.availability_check = self._validation_compute_available
         if self.agent_manager is not None and hasattr(
             self.agent_manager, "availability_check"
@@ -1224,6 +1527,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
         """Acquire the sole CUDA slot and start the existing validation worker."""
 
         with self._compute_lock:
+            self._require_admission_open()
             if self._agent_active() or self._evolution_active():
                 raise ComputeBusyError("agent or evolution owns local compute")
             if self.agent_manager is not None:
@@ -1234,6 +1538,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
 
     def start_agent_turn(self, message: str, mode: str) -> str:
         with self._compute_lock:
+            self._require_admission_open()
             if self.agent_manager is None:
                 raise RuntimeError("agent manager is unavailable")
             if self.manager.is_active or self._evolution_active():
@@ -1242,11 +1547,18 @@ class DemoHTTPServer(ThreadingHTTPServer):
 
     def start_evolution(self) -> str:
         with self._compute_lock:
+            self._require_admission_open()
             if self.evolution_manager is None:
                 raise RuntimeError("evolution manager is unavailable")
             if self.manager.is_active or self._agent_active():
                 raise ComputeBusyError("validation or agent owns local compute")
+            if self.agent_manager is not None:
+                self.agent_manager.stop_model()
             return self.evolution_manager.start()
+
+    def _require_admission_open(self) -> None:
+        if self._shutdown_requested or self._components_shutdown:
+            raise ComputeBusyError("local compute is shutting down")
 
     def _agent_active(self) -> bool:
         return bool(
@@ -1261,16 +1573,13 @@ class DemoHTTPServer(ThreadingHTTPServer):
         )
 
     def _validation_compute_available(self) -> bool:
-        with self._compute_lock:
-            return not self._agent_active() and not self._evolution_active()
+        return not self._agent_active() and not self._evolution_active()
 
     def _agent_compute_available(self) -> bool:
-        with self._compute_lock:
-            return not self.manager.is_active and not self._evolution_active()
+        return not self.manager.is_active and not self._evolution_active()
 
     def _evolution_compute_available(self) -> bool:
-        with self._compute_lock:
-            return not self.manager.is_active and not self._agent_active()
+        return not self.manager.is_active and not self._agent_active()
 
     def request_shutdown(self) -> None:
         with self._lifecycle_lock:
@@ -1280,30 +1589,46 @@ class DemoHTTPServer(ThreadingHTTPServer):
             self._watchdog_stop.set()
 
         def stop() -> None:
-            self.shutdown_components()
-            self.shutdown()
+            try:
+                self.shutdown_components()
+            finally:
+                self.shutdown()
 
         Thread(target=stop, name="cogni-demo-shutdown", daemon=True).start()
 
     def server_close(self) -> None:
         self._watchdog_stop.set()
-        self.shutdown_components()
-        super().server_close()
+        try:
+            self.shutdown_components()
+        finally:
+            super().server_close()
 
     def shutdown_components(self) -> None:
         with self._lifecycle_lock:
             if self._components_shutdown:
                 return
+            if self._components_shutdown_in_progress:
+                return
+            self._components_shutdown_in_progress = True
+            self._shutdown_requested = True
+            self._watchdog_stop.set()
+        try:
+            self.manager.shutdown()
+            if self.evolution_manager is not None:
+                shutdown = getattr(self.evolution_manager, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+            if self.agent_manager is not None:
+                shutdown = getattr(self.agent_manager, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+        except BaseException:
+            with self._lifecycle_lock:
+                self._components_shutdown_in_progress = False
+            raise
+        with self._lifecycle_lock:
             self._components_shutdown = True
-        self.manager.shutdown()
-        if self.evolution_manager is not None:
-            shutdown = getattr(self.evolution_manager, "shutdown", None)
-            if callable(shutdown):
-                shutdown()
-        if self.agent_manager is not None:
-            shutdown = getattr(self.agent_manager, "shutdown", None)
-            if callable(shutdown):
-                shutdown()
+            self._components_shutdown_in_progress = False
 
 
 class DemoRequestHandler(BaseHTTPRequestHandler):
@@ -1606,30 +1931,72 @@ def _build_product_controls(
     model_path: str | Path,
     manifest_path: str | Path,
     validator: JobManager,
+    *,
+    gpu_lease_manager: GPULeaseManager | None = None,
+    rhythm: RhythmController | None = None,
 ) -> tuple[Any, EvolutionController]:
     """Build lazy local chat, bounded tools, and proposal-only Self-Harness."""
 
     # Chat can load the resident model without launching the validation worker.
     # Verify the exact local artifact set before constructing any product
     # component so this path cannot bypass the signed manifest boundary.
-    verify_artifact_manifest(model_path, manifest_path)
+    verified = verify_artifact_manifest(model_path, manifest_path)
 
-    from cogni_agent.manager import AgentManager
-    from cogni_agent.model_service import ModelService
+    from cogni_agent.conversation_fastpath import ConversationFastPath
+    from cogni_agent.fact_grounding import RuntimeFactGrounder
+    from cogni_agent.manager import SYSTEM_PROMPT, AgentManager
+    from cogni_agent.model_service import (
+        ModelService,
+        _require_instruction_tuned_e4b,
+    )
     from cogni_agent.tools import WorkspaceToolExecutor
     from cogni_flow.production import (
         ProductionHarnessConfig,
         PromotionMode,
         build_production_self_harness,
     )
+    from cogni_os.factbook import build_runtime_factbook_from_verified
+    from cogni_os.version import __version__
+
+    # A syntactically valid manifest is not a model trust root.  Bind the
+    # complete verified digest set to the pinned official E4B-it checkpoint
+    # before publishing any Fact-book claim or constructing product services.
+    _require_instruction_tuned_e4b(verified)
+
+    # The running source tree is the authority.  An older installed wheel may
+    # coexist during an in-place upgrade and must never overwrite the product
+    # identity exposed by this exact code.
+    build_version = __version__
+    factbook = build_runtime_factbook_from_verified(
+        verified,
+        manifest_path,
+        build_version=build_version,
+        device="현재 프로세스 라이브 검증 전 미측정",
+    )
+    lease_authority = gpu_lease_manager or GPULeaseManager()
+    active_rhythm = rhythm or RhythmController()
+
+    def model_lease_purpose() -> str:
+        return (
+            "inference" if active_rhythm.mode is SystemMode.INFERENCE else "evolution"
+        )
 
     service = ModelService.for_local_gemma(
         model_path,
+        manifest_path=manifest_path,
+        artifact_digest=factbook.model.manifest_sha256,
         vram_limit_gib=16.7,
         max_input_tokens=4_096,
         max_new_tokens=512,
         max_prompt_chars=32_000,
         max_response_chars=32_000,
+        # Interactive requests fail closed instead of appearing frozen for many
+        # minutes when a no-KV-cache decode or driver call stalls.
+        request_timeout=180.0,
+        gpu_lease_manager=lease_authority,
+        gpu_lease_owner="cogni-resident-model",
+        gpu_lease_purpose=model_lease_purpose,
+        gpu_lease_vram_bytes=lease_authority.max_vram_bytes,
     )
     patch_model = _ServiceBackedPatchModel(service, service.tokenizer)
     config = ProductionHarnessConfig(
@@ -1638,11 +2005,11 @@ def _build_product_controls(
         promotion_mode=PromotionMode.PROPOSAL_ONLY,
     )
     target_allowlist = {
-        (
-            "RuntimeError",
-            "agent_runtime",
-            "agent_manager",
-        ): "cogni_agent/manager.py"
+        ("RuntimeError", verifier, mechanism): target
+        for verifier, mechanism, target in {
+            *_AGENT_FAILURE_ROUTES.values(),
+            _UNCLASSIFIED_AGENT_FAILURE,
+        }
     }
     harness = build_production_self_harness(
         project_root,
@@ -1651,17 +2018,19 @@ def _build_product_controls(
         target_allowlist,
         lambda: _write_product_checkpoint(project_root),
         config=config,
+        rhythm=active_rhythm,
     )
     try:
         harness.start()
-        evolution = EvolutionController(harness)
+        evolution = EvolutionController(harness, worker_cleanup=service.stop)
 
         def capture_failure(code: str, message: str) -> None:
+            verifier_code, mechanism, _target = _agent_failure_route(code)
             harness.capture_exception(
                 f"agent-{code}"[:128],
                 RuntimeError(f"{code}: {message}"[:512]),
-                verifier_code="agent_runtime",
-                mechanism="agent_manager",
+                verifier_code=verifier_code,
+                mechanism=mechanism,
             )
 
         agent = AgentManager(
@@ -1670,6 +2039,14 @@ def _build_product_controls(
             failure_sink=capture_failure,
             evolution_snapshot=evolution.snapshot,
             availability_check=lambda: not validator.is_active,
+            conversation_fast_path=ConversationFastPath(),
+            fact_grounder=RuntimeFactGrounder(factbook),
+            # Product identity and capability questions are answered by the
+            # deterministic RuntimeFactGrounder before generation.  Repeating
+            # the complete Fact-book in every ordinary Gemma prompt polluted
+            # short social turns and made the small E4B imitate status prose.
+            system_prompt=SYSTEM_PROMPT,
+            rhythm=active_rhythm,
         )
         return agent, evolution
     except BaseException:
@@ -1685,10 +2062,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     project_root = Path(__file__).resolve().parents[1]
     parser.add_argument(
         "--model",
-        default=os.environ.get("COGNI_OS_MODEL_DIR", r"C:\Project\cognios\gemma4-e4b"),
+        default=os.environ.get(
+            "COGNI_OS_MODEL_DIR", r"C:\Project\cognios\gemma4-e4b-it"
+        ),
     )
     parser.add_argument(
-        "--manifest", default=str(project_root / "config" / "gemma4-e4b.manifest.toml")
+        "--manifest",
+        default=str(project_root / "config" / "gemma4-e4b-it.manifest.toml"),
     )
     parser.add_argument("--assets", default=str(project_root / "cogni_demo" / "static"))
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -1703,11 +2083,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             open_graphical_app(existing.bootstrap_url)
         return 0
 
+    # Validate the content-addressed CTS policy in the actual backend process
+    # before binding HTTP or publishing session metadata. The native launcher
+    # preflight is diagnostic only and cannot authorize this later process.
+    from cogni_core.cts_policy import load_default_bounded_cts_controller
+
+    load_default_bounded_cts_controller(device="cpu")
+
+    gpu_lease_manager = GPULeaseManager()
+    rhythm = RhythmController()
     manager = JobManager(
-        production_launch_factory(project_root, args.model, args.manifest)
+        production_launch_factory(project_root, args.model, args.manifest),
+        gpu_lease_manager=gpu_lease_manager,
     )
     agent_manager, evolution_manager = _build_product_controls(
-        project_root, args.model, args.manifest, manager
+        project_root,
+        args.model,
+        args.manifest,
+        manager,
+        gpu_lease_manager=gpu_lease_manager,
+        rhythm=rhythm,
     )
     try:
         server = DemoHTTPServer(
@@ -1783,6 +2178,7 @@ __all__ = [
     "JobManager",
     "NoActiveJobError",
     "WorkerLaunch",
+    "WorkerTerminationError",
     "main",
     "production_launch_factory",
 ]

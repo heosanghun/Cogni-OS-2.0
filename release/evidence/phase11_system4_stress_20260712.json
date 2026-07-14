@@ -1,0 +1,50 @@
+{
+  "command": "python -u scripts\\benchmark_system4.py --device cuda --iterations 10000 --stress-switch",
+  "status": "measurement_only",
+  "batch": 1,
+  "device": "cuda",
+  "dtype": "float32",
+  "input_dim": 64,
+  "state_dim": 64,
+  "iterations": 10000,
+  "warmup": 20,
+  "switch_block": 32,
+  "latency_ms": {
+    "minimum": 2.4254,
+    "p50": 2.9157,
+    "p95": 3.893715,
+    "p99": 5.217861000000002,
+    "maximum": 7.3089
+  },
+  "safe_convergence_rate": 1.0,
+  "maximum_residual": 0.00004648032700060867,
+  "operator_norm": {
+    "normal_upper_bound": 0.32436394691467285,
+    "crisis_upper_bound": 0.40665507316589355,
+    "required_margin": 0.95
+  },
+  "spectral_radius": {
+    "normal": 0.15065038204193115,
+    "crisis": 0.15065038204193115
+  },
+  "topology": {
+    "normal_edges": 192,
+    "crisis_edges": 28,
+    "maximum_reachability_steps": 3
+  },
+  "pcas": {
+    "expected_switches": 312,
+    "observed_switches": 312,
+    "excess_switches": 0,
+    "instantaneous_phase_false_positive_rate": 0.12460063897763578,
+    "instantaneous_phase_false_negative_rate": 0.0625,
+    "settled_false_positive_rate": 0.0,
+    "settled_false_negative_rate": 0.0,
+    "transition_settling_steps": {
+      "samples": 312,
+      "mean": 4.0,
+      "maximum": 5
+    }
+  },
+  "scope_note": "Synthetic stress evidence; System 4 remains advisory pending production calibration and answer-quality ablation."
+}

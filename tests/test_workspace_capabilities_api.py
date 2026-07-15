@@ -1,0 +1,347 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from http.client import HTTPConnection
+import json
+from pathlib import Path
+import tempfile
+from threading import Thread
+import unittest
+from unittest.mock import patch
+
+from cogni_demo.server import (
+    DemoHTTPServer,
+    MAX_AGENT_CHAT_REQUEST_BODY_BYTES,
+    MAX_REQUEST_BODY_BYTES,
+)
+from cogni_demo.workspace_capabilities import WorkspaceCapabilityError
+from tests.test_demo_server import manager_for
+
+
+@dataclass(frozen=True)
+class _Evidence:
+    source_id: str
+    title: str
+    text: str
+    score: float | None = None
+
+
+class _Agent:
+    def __init__(self) -> None:
+        self.availability_check = None
+        self.evidence: tuple[object, ...] = ()
+        self.messages: list[str] = []
+        self.shutdown_called = False
+
+    @property
+    def is_active(self) -> bool:
+        return False
+
+    def start_turn(self, _message, _mode="chat", *, evidence=()):
+        self.messages.append(_message)
+        self.evidence = tuple(evidence)
+        return "turn-rag"
+
+    def snapshot(self):
+        return {"status": "ready", "seq": 1, "conversation": []}
+
+    def stop_model(self):
+        return None
+
+    def shutdown(self):
+        self.shutdown_called = True
+
+
+class _Workspace:
+    def __init__(self) -> None:
+        self.added: dict[str, object] | None = None
+        self.raise_add: WorkspaceCapabilityError | None = None
+        self.rag_results: object = [
+            {
+                "attachment_id": "a" * 24,
+                "chunk_index": 0,
+                "name": "paper.md",
+                "text": "검증된 로컬 검색 근거",
+                "score": 0.75,
+            },
+            {
+                "attachment_id": "a" * 24,
+                "chunk_index": 1,
+                "name": "paper.md",
+                "text": "무관한 근거",
+                "score": 0.0,
+            },
+        ]
+        self.queries: list[str] = []
+
+    def capability_payload(self):
+        return {"schema_version": 1, "rag": {"state": "local_index_ready"}}
+
+    def list_attachments(self):
+        return {"items": [], "count": 0}
+
+    def add_attachment(self, **body):
+        if self.raise_add is not None:
+            raise self.raise_add
+        self.added = body
+        return {"attachment_id": "abc", "storage": "local_content_addressed"}
+
+    def index_attachments(self, attachment_ids):
+        return {"results": list(attachment_ids), "answer_integration": False}
+
+    def query_rag(self, query, *, limit=5):
+        self.queries.append(query)
+        results = self.rag_results
+        return {
+            "query": query,
+            "count": len(results) if isinstance(results, list) else 0,
+            "results": results[:limit] if isinstance(results, list) else results,
+        }
+
+    def select_model(self, model_id):
+        if model_id != "verified-model":
+            raise WorkspaceCapabilityError(
+                "MODEL_NOT_VERIFIED", "C:\\private\\model must not leak"
+            )
+        return {"model_id": model_id, "selected": True}
+
+
+class TestWorkspaceHTTPAPI(unittest.TestCase):
+    def setUp(self) -> None:
+        self.assets_context = tempfile.TemporaryDirectory()
+        assets = Path(self.assets_context.name)
+        (assets / "index.html").write_text("<main>Cogni</main>", encoding="utf-8")
+        (assets / "app.css").write_text("body{}", encoding="utf-8")
+        (assets / "app.js").write_text("void 0", encoding="utf-8")
+        (assets / "favicon.svg").write_text("<svg/>", encoding="utf-8")
+        self.validator = manager_for("success")
+        self.agent = _Agent()
+        self.workspace = _Workspace()
+        self.server = DemoHTTPServer(
+            self.validator,
+            assets,
+            agent_manager=self.agent,
+            workspace_service=self.workspace,
+            port=0,
+            token="w" * 32,
+            watchdog_timeout=None,
+        )
+        self.thread = Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.cookie = self._bootstrap()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.assets_context.cleanup()
+
+    def _connection(self) -> HTTPConnection:
+        return HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+
+    def _bootstrap(self) -> str:
+        connection = self._connection()
+        connection.request("GET", "/?token=" + self.server.token)
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.status, 303)
+        cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+        connection.close()
+        return cookie
+
+    def _get(self, path: str, *, authenticated: bool = True):
+        connection = self._connection()
+        headers = {"Cookie": self.cookie} if authenticated else {}
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        status = response.status
+        connection.close()
+        return status, payload
+
+    def _post(self, path: str, body: dict[str, object]):
+        connection = self._connection()
+        connection.request(
+            "POST",
+            path,
+            body=json.dumps(body).encode("utf-8"),
+            headers={
+                "Cookie": self.cookie,
+                "Origin": self.server.origin,
+                "Content-Type": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        status = response.status
+        connection.close()
+        return status, payload
+
+    def test_authenticated_exact_get_routes(self) -> None:
+        status, payload = self._get("/api/workspace/capabilities")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["schema_version"], 1)
+        status, payload = self._get("/api/workspace/attachments")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(
+            self._get("/api/workspace/capabilities", authenticated=False)[0], 403
+        )
+        self.assertEqual(self._get("/api/workspace/capabilities?debug=1")[0], 404)
+
+    def test_workspace_post_routes_and_bounded_errors(self) -> None:
+        status, payload = self._post(
+            "/api/workspace/attachments/add",
+            {
+                "name": "paper.txt",
+                "media_type": "text/plain",
+                "content_base64": "QQ==",
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["attachment_id"], "abc")
+        self.assertEqual(
+            self._post("/api/workspace/rag/index", {"attachment_ids": ["abc"]})[0],
+            200,
+        )
+        self.assertEqual(
+            self._post("/api/workspace/rag/query", {"query": "평형", "limit": 2})[1][
+                "count"
+            ],
+            2,
+        )
+        self.assertEqual(
+            self._post("/api/workspace/models/select", {"model_id": "verified-model"})[
+                0
+            ],
+            200,
+        )
+        status, payload = self._post(
+            "/api/workspace/models/select", {"model_id": "unknown"}
+        )
+        self.assertEqual(status, 400)
+        encoded = json.dumps(payload)
+        self.assertEqual(payload["error"]["code"], "MODEL_NOT_VERIFIED")
+        self.assertNotIn("private", encoded)
+        self.assertNotIn("model must not leak", encoded)
+
+    def test_attachment_route_has_its_own_limit_without_raising_global(self) -> None:
+        self.assertEqual(MAX_REQUEST_BODY_BYTES, 8 * 1024)
+        large = "A" * (MAX_REQUEST_BODY_BYTES + 512)
+        status, _payload = self._post(
+            "/api/workspace/attachments/add",
+            {
+                "name": "large.txt",
+                "media_type": "text/plain",
+                "content_base64": large,
+            },
+        )
+        self.assertEqual(status, 201)
+        status, payload = self._post("/api/workspace/rag/query", {"query": large})
+        self.assertEqual(status, 413)
+        self.assertEqual(payload["error"]["code"], "BODY_TOO_LARGE")
+
+    def test_chat_body_and_message_boundaries_are_independent(self) -> None:
+        self.assertGreater(MAX_AGENT_CHAT_REQUEST_BODY_BYTES, MAX_REQUEST_BODY_BYTES)
+        accepted = "가" * 4_096
+        status, _payload = self._post(
+            "/api/agent/chat",
+            {"message": accepted, "mode": "chat", "rag": False},
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(self.agent.messages[-1], accepted)
+
+        status, payload = self._post(
+            "/api/agent/chat",
+            {"message": accepted + "가", "mode": "chat", "rag": False},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "INVALID_BODY")
+
+    def test_rag_chat_truncates_only_the_search_query(self) -> None:
+        import cogni_agent.manager as manager_module
+
+        for message in ("평" * 1_024, "평" * 1_025, "평형" * 2_048):
+            with patch.object(
+                manager_module, "RetrievalEvidence", _Evidence, create=True
+            ):
+                status, _payload = self._post(
+                    "/api/agent/chat",
+                    {"message": message, "mode": "chat", "rag": True},
+                )
+            self.assertEqual(status, 202)
+            self.assertEqual(self.workspace.queries[-1], message[:1_024])
+            self.assertEqual(self.agent.messages[-1], message)
+
+    def test_rag_chat_maps_only_positive_local_evidence(self) -> None:
+        import cogni_agent.manager as manager_module
+
+        with patch.object(manager_module, "RetrievalEvidence", _Evidence, create=True):
+            status, payload = self._post(
+                "/api/agent/chat",
+                {"message": "평형 검색", "mode": "chat", "rag": True},
+            )
+        self.assertEqual(status, 202)
+        self.assertTrue(payload["rag_requested"])
+        self.assertEqual(payload["rag_evidence_count"], 1)
+        self.assertEqual(len(self.agent.evidence), 1)
+        self.assertEqual(self.agent.evidence[0].source_id, f"{'a' * 24}.0")
+
+        self.workspace.rag_results = []
+        with patch.object(manager_module, "RetrievalEvidence", _Evidence, create=True):
+            status, payload = self._post(
+                "/api/agent/chat",
+                {"message": "없는 근거", "mode": "chat", "rag": True},
+            )
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["rag_evidence_count"], 0)
+
+    def test_rag_chat_bounds_five_full_chunks_to_six_thousand_characters(self) -> None:
+        self.workspace.rag_results = [
+            {
+                "attachment_id": f"{index + 1:024x}",
+                "chunk_index": index,
+                "name": f"paper-{index}.md",
+                "text": chr(65 + index) * 1_600,
+                "score": 0.9,
+            }
+            for index in range(5)
+        ]
+        status, payload = self._post(
+            "/api/agent/chat",
+            {"message": "평형 검색", "mode": "chat", "rag": True},
+        )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["rag_evidence_count"], 5)
+        self.assertEqual(len(self.agent.evidence), 5)
+        self.assertEqual(
+            sum(len(item.text) for item in self.agent.evidence),
+            6_000,
+        )
+
+    def test_malformed_rag_adapter_payload_is_bounded(self) -> None:
+        import cogni_agent.manager as manager_module
+
+        self.workspace.rag_results = [{"attachment_id": "C:\\secret"}]
+        with patch.object(manager_module, "RetrievalEvidence", _Evidence, create=True):
+            status, payload = self._post(
+                "/api/agent/chat",
+                {"message": "malformed", "mode": "chat", "rag": True},
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "WORKSPACE_RESPONSE_INVALID")
+        self.assertNotIn("secret", json.dumps(payload))
+
+    def test_workspace_routes_are_503_when_service_is_absent(self) -> None:
+        self.server.workspace_service = None
+        status, payload = self._get("/api/workspace/capabilities")
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"]["code"], "WORKSPACE_UNAVAILABLE")
+        status, payload = self._post("/api/workspace/rag/query", {"query": "local"})
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"]["code"], "WORKSPACE_UNAVAILABLE")
+
+
+if __name__ == "__main__":
+    unittest.main()

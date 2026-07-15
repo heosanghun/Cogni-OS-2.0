@@ -13,12 +13,15 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.client import HTTPConnection
+from inspect import signature
 import argparse
 import hmac
 import json
+from math import isfinite
 import os
 from pathlib import Path
 from queue import Empty, Full, Queue
+import re
 import secrets
 import shutil
 import signal
@@ -40,6 +43,12 @@ from cogni_demo.protocol import (
     parse_event_line,
     validate_terminal_metrics,
 )
+from cogni_demo.workspace_capabilities import (
+    MAX_ATTACHMENT_BASE64_CHARS,
+    WorkspaceCapabilityError,
+    WorkspaceCapabilityService,
+    web_policy_from_environment,
+)
 from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError
 from cogni_flow.rhythm import RhythmController, SystemMode
 from cogni_os.artifacts import verify_artifact_manifest
@@ -51,6 +60,13 @@ from cogni_os.gpu_lease import (
 
 
 MAX_REQUEST_BODY_BYTES = 8 * 1024
+MAX_AGENT_CHAT_REQUEST_BODY_BYTES = 64 * 1024
+MAX_ATTACHMENT_REQUEST_BODY_BYTES = MAX_ATTACHMENT_BASE64_CHARS + 4 * 1024
+MAX_AGENT_CHAT_MESSAGE_CHARS = 4_096
+MAX_RAG_QUERY_CHARS = 1_024
+MAX_RAG_EVIDENCE_CHARS = 6_000
+MAX_RAG_EVIDENCE_CHUNKS = 5
+MAX_RAG_EVIDENCE_CHUNK_CHARS = 1_600
 MAX_PROMPT_LENGTH = 256
 MAX_STATE_EVENTS = 64
 MAX_DIAGNOSTIC_LINES = 200
@@ -1443,6 +1459,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
         *,
         agent_manager: Any | None = None,
         evolution_manager: EvolutionController | Any | None = None,
+        workspace_service: WorkspaceCapabilityService | Any | None = None,
         port: int = DEFAULT_PORT,
         token: str | None = None,
         watchdog_timeout: float | None = DEFAULT_WATCHDOG_SECONDS,
@@ -1452,6 +1469,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
         self.manager = manager
         self.agent_manager = agent_manager
         self.evolution_manager = evolution_manager
+        self.workspace_service = workspace_service
         self.asset_directory = Path(asset_directory).resolve(strict=True)
         if not self.asset_directory.is_dir():
             raise ValueError("asset_directory must be a directory")
@@ -1536,13 +1554,21 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 self.agent_manager.stop_model()
             return self.manager.start(prompt)
 
-    def start_agent_turn(self, message: str, mode: str) -> str:
+    def start_agent_turn(
+        self,
+        message: str,
+        mode: str,
+        *,
+        evidence: tuple[Any, ...] = (),
+    ) -> str:
         with self._compute_lock:
             self._require_admission_open()
             if self.agent_manager is None:
                 raise RuntimeError("agent manager is unavailable")
             if self.manager.is_active or self._evolution_active():
                 raise ComputeBusyError("validation or evolution owns local compute")
+            if evidence:
+                return self.agent_manager.start_turn(message, mode, evidence=evidence)
             return self.agent_manager.start_turn(message, mode)
 
     def start_evolution(self) -> str:
@@ -1662,6 +1688,26 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/agent/state":
             self._agent_state(parsed.query)
             return
+        if parsed.path == "/api/workspace/capabilities" and not parsed.query:
+            if self.server.workspace_service is None:
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE"
+                )
+                return
+            self.server.touch_authenticated_state_poll()
+            self._json(
+                HTTPStatus.OK, self.server.workspace_service.capability_payload()
+            )
+            return
+        if parsed.path == "/api/workspace/attachments" and not parsed.query:
+            if self.server.workspace_service is None:
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE"
+                )
+                return
+            self.server.touch_authenticated_state_poll()
+            self._json(HTTPStatus.OK, self.server.workspace_service.list_attachments())
+            return
         asset = _STATIC_ASSETS.get(parsed.path)
         if asset is None or parsed.query:
             self._json_error(HTTPStatus.NOT_FOUND, "NOT_FOUND")
@@ -1699,11 +1745,22 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             "/api/agent/cancel",
             "/api/agent/reset",
             "/api/evolution/run",
+            "/api/workspace/attachments/add",
+            "/api/workspace/rag/index",
+            "/api/workspace/rag/query",
+            "/api/workspace/models/select",
         }:
             self._json_error(HTTPStatus.NOT_FOUND, "NOT_FOUND")
             return
-        body = self._read_json_body()
+        body_limit = {
+            "/api/agent/chat": MAX_AGENT_CHAT_REQUEST_BODY_BYTES,
+            "/api/workspace/attachments/add": MAX_ATTACHMENT_REQUEST_BODY_BYTES,
+        }.get(parsed.path, MAX_REQUEST_BODY_BYTES)
+        body = self._read_json_body(maximum_bytes=body_limit)
         if body is None:
+            return
+        if parsed.path.startswith("/api/workspace/"):
+            self._workspace_post(parsed.path, body)
             return
         if parsed.path == "/api/run":
             if not set(body) <= {"prompt"}:
@@ -1726,12 +1783,43 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             if self.server.agent_manager is None:
                 self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AGENT_UNAVAILABLE")
                 return
-            if not set(body) <= {"message", "mode"} or "message" not in body:
+            if not set(body) <= {"message", "mode", "rag"} or "message" not in body:
                 self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
                 return
+            rag_requested = body.get("rag", False)
+            if not isinstance(rag_requested, bool):
+                self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
+                return
+            message = body.get("message")
+            if (
+                not isinstance(message, str)
+                or not message.strip()
+                or len(message.strip()) > MAX_AGENT_CHAT_MESSAGE_CHARS
+                or any(
+                    ord(character) < 32 and character not in "\t\r\n"
+                    for character in message
+                )
+            ):
+                self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
+                return
+            evidence: tuple[Any, ...] = ()
+            if rag_requested:
+                if self.server.workspace_service is None:
+                    self._json_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE"
+                    )
+                    return
+                try:
+                    retrieved = self.server.workspace_service.query_rag(
+                        message.strip()[:MAX_RAG_QUERY_CHARS], limit=5
+                    )
+                    evidence = self._retrieval_evidence(retrieved)
+                except WorkspaceCapabilityError as exc:
+                    self._workspace_error(exc)
+                    return
             try:
                 turn_id = self.server.start_agent_turn(
-                    body["message"], body.get("mode", "chat")
+                    message, body.get("mode", "chat"), evidence=evidence
                 )
             except (AgentBusyError, ComputeBusyError):
                 self._json_error(HTTPStatus.CONFLICT, "COMPUTE_BUSY")
@@ -1741,7 +1829,12 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 return
             self._json(
                 HTTPStatus.ACCEPTED,
-                {"turn_id": turn_id, **self.server.agent_manager.snapshot()},
+                {
+                    "turn_id": turn_id,
+                    "rag_requested": rag_requested,
+                    "rag_evidence_count": len(evidence),
+                    **self.server.agent_manager.snapshot(),
+                },
             )
             return
         if body:
@@ -1878,7 +1971,151 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.OK, state)
 
-    def _read_json_body(self) -> dict[str, Any] | None:
+    def _workspace_post(self, path: str, body: dict[str, Any]) -> None:
+        workspace = self.server.workspace_service
+        if workspace is None:
+            self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE")
+            return
+        try:
+            if path == "/api/workspace/attachments/add":
+                if set(body) != {"name", "media_type", "content_base64"}:
+                    raise WorkspaceCapabilityError(
+                        "INVALID_BODY", "attachment body fields are invalid"
+                    )
+                payload = workspace.add_attachment(
+                    name=body["name"],
+                    media_type=body["media_type"],
+                    content_base64=body["content_base64"],
+                )
+                self._json(HTTPStatus.CREATED, payload)
+                return
+            if path == "/api/workspace/rag/index":
+                if set(body) != {"attachment_ids"}:
+                    raise WorkspaceCapabilityError(
+                        "INVALID_BODY", "RAG index body fields are invalid"
+                    )
+                payload = workspace.index_attachments(body["attachment_ids"])
+                self._json(HTTPStatus.OK, payload)
+                return
+            if path == "/api/workspace/rag/query":
+                if set(body) not in ({"query"}, {"query", "limit"}):
+                    raise WorkspaceCapabilityError(
+                        "INVALID_BODY", "RAG query body fields are invalid"
+                    )
+                payload = workspace.query_rag(body["query"], limit=body.get("limit", 5))
+                self._json(HTTPStatus.OK, payload)
+                return
+            if path == "/api/workspace/models/select":
+                if set(body) != {"model_id"}:
+                    raise WorkspaceCapabilityError(
+                        "INVALID_BODY", "model selection body fields are invalid"
+                    )
+                self._json(HTTPStatus.OK, workspace.select_model(body["model_id"]))
+                return
+        except (KeyError, TypeError):
+            self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
+            return
+        except WorkspaceCapabilityError as exc:
+            self._workspace_error(exc)
+            return
+        self._json_error(HTTPStatus.NOT_FOUND, "NOT_FOUND")
+
+    def _workspace_error(self, error: WorkspaceCapabilityError) -> None:
+        # Error messages can contain local context.  The browser receives only
+        # the bounded stable code; no filesystem path or credential is echoed.
+        code = error.code
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) is None:
+            code = "WORKSPACE_REQUEST_REJECTED"
+        self._json_error(HTTPStatus.BAD_REQUEST, code)
+
+    @staticmethod
+    def _retrieval_evidence(payload: object) -> tuple[Any, ...]:
+        """Validate the local adapter response before it can enter a prompt."""
+
+        from cogni_agent.manager import RetrievalEvidence
+
+        if not isinstance(payload, dict):
+            raise WorkspaceCapabilityError(
+                "WORKSPACE_RESPONSE_INVALID", "RAG response must be an object"
+            )
+        results = payload.get("results")
+        if not isinstance(results, list) or len(results) > 12:
+            raise WorkspaceCapabilityError(
+                "WORKSPACE_RESPONSE_INVALID", "RAG results are invalid"
+            )
+        candidates: list[tuple[str, int, str, str, float]] = []
+        for item in results:
+            if not isinstance(item, dict):
+                raise WorkspaceCapabilityError(
+                    "WORKSPACE_RESPONSE_INVALID", "RAG result is invalid"
+                )
+            attachment_id = item.get("attachment_id")
+            chunk_index = item.get("chunk_index")
+            title = item.get("name")
+            text = item.get("text")
+            score = item.get("score")
+            if (
+                not isinstance(attachment_id, str)
+                or re.fullmatch(r"[0-9a-f]{24}", attachment_id) is None
+                or not isinstance(chunk_index, int)
+                or isinstance(chunk_index, bool)
+                or not 0 <= chunk_index < 128
+                or not isinstance(title, str)
+                or not 1 <= len(title) <= 128
+                or any(ord(character) < 32 for character in title)
+                or not isinstance(text, str)
+                or not 1 <= len(text) <= 1_600
+                or not text.strip()
+                or any(
+                    (ord(character) < 32 and character not in "\t\r\n")
+                    or 127 <= ord(character) <= 159
+                    for character in text
+                )
+                or not isinstance(score, (int, float))
+                or isinstance(score, bool)
+                or not isfinite(float(score))
+            ):
+                raise WorkspaceCapabilityError(
+                    "WORKSPACE_RESPONSE_INVALID", "RAG result fields are invalid"
+                )
+            numeric_score = float(score)
+            if numeric_score <= 0.0:
+                continue
+            if numeric_score > 1.0:
+                raise WorkspaceCapabilityError(
+                    "WORKSPACE_RESPONSE_INVALID", "RAG score is invalid"
+                )
+            candidates.append((attachment_id, chunk_index, title, text, numeric_score))
+            if len(candidates) >= MAX_RAG_EVIDENCE_CHUNKS:
+                break
+
+        evidence: list[Any] = []
+        remaining_chars = MAX_RAG_EVIDENCE_CHARS
+        for index, (attachment_id, chunk_index, title, text, score) in enumerate(
+            candidates
+        ):
+            remaining_slots = len(candidates) - index
+            text_limit = min(
+                MAX_RAG_EVIDENCE_CHUNK_CHARS,
+                remaining_chars // remaining_slots,
+            )
+            bounded_text = text[:text_limit].rstrip()
+            if not bounded_text:
+                continue
+            evidence.append(
+                RetrievalEvidence(
+                    source_id=f"{attachment_id}.{chunk_index}",
+                    title=title,
+                    text=bounded_text,
+                    score=score,
+                )
+            )
+            remaining_chars -= len(bounded_text)
+        return tuple(evidence)
+
+    def _read_json_body(
+        self, *, maximum_bytes: int = MAX_REQUEST_BODY_BYTES
+    ) -> dict[str, Any] | None:
         if self.headers.get_content_type() != "application/json":
             self._json_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "JSON_REQUIRED")
             return None
@@ -1888,7 +2125,7 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._json_error(HTTPStatus.LENGTH_REQUIRED, "CONTENT_LENGTH_REQUIRED")
             return None
-        if not 0 <= length <= MAX_REQUEST_BODY_BYTES:
+        if not 0 <= length <= maximum_bytes:
             self._json_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "BODY_TOO_LARGE")
             return None
         try:
@@ -1973,6 +2210,24 @@ def _build_product_controls(
         build_version=build_version,
         device="현재 프로세스 라이브 검증 전 미측정",
     )
+    workspace_capabilities: WorkspaceCapabilityService | None
+    try:
+        workspace_capabilities = WorkspaceCapabilityService.from_runtime_factbook(
+            project_root,
+            model_path,
+            manifest_path,
+            factbook,
+            akasicdb_path=os.environ.get("COGNI_OS_AKASICDB_DIR") or None,
+            web_policy=web_policy_from_environment(os.environ),
+            answer_integration_enabled=(
+                "evidence" in signature(AgentManager.start_turn).parameters
+            ),
+        )
+    except (OSError, ValueError, WorkspaceCapabilityError):
+        # Chat remains available if this optional non-GPU service cannot be
+        # constructed.  The HTTP control plane then reports 503 instead of
+        # advertising an attachment or RAG capability that is not running.
+        workspace_capabilities = None
     lease_authority = gpu_lease_manager or GPULeaseManager()
     active_rhythm = rhythm or RhythmController()
 
@@ -2048,6 +2303,7 @@ def _build_product_controls(
             system_prompt=SYSTEM_PROMPT,
             rhythm=active_rhythm,
         )
+        agent.workspace_capability_service = workspace_capabilities
         return agent, evolution
     except BaseException:
         try:
@@ -2104,12 +2360,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         gpu_lease_manager=gpu_lease_manager,
         rhythm=rhythm,
     )
+    workspace_service = getattr(agent_manager, "workspace_capability_service", None)
     try:
         server = DemoHTTPServer(
             manager,
             args.assets,
             agent_manager=agent_manager,
             evolution_manager=evolution_manager,
+            workspace_service=workspace_service,
             port=args.port,
         )
     except OSError:

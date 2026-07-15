@@ -10,6 +10,7 @@ work/
 tmp/
 outputs/*.zip
 outputs/*.sha256
+outputs/agent-workspace/attachments/
 release/*.exe
 release/*.whl
 release/*.zip

@@ -122,6 +122,93 @@ class TestCogniBoardUI(unittest.TestCase):
         )
         self.assertRegex(html, r'id="agent-input"[^>]*maxlength="4096"[^>]*disabled')
 
+    def test_ai_workspace_capabilities_start_fail_closed_and_are_accessible(
+        self,
+    ) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+
+        for action in (
+            "workspace-attach",
+            "workspace-rag-toggle",
+            "workspace-web-search",
+            "workspace-microphone",
+        ):
+            with self.subTest(action=action):
+                self.assertRegex(
+                    html,
+                    rf'<button class="composer-[^"]+" type="button" '
+                    rf'data-action="{action}"[^>]*disabled',
+                )
+
+        self.assertRegex(
+            html,
+            r'id="agent-attachment-input"[^>]*type="file"[^>]*multiple[^>]*disabled',
+        )
+        self.assertIn('id="agent-attachment-tray"', html)
+        self.assertRegex(
+            html,
+            r'id="agent-attachment-live-status"[^>]*role="status"'
+            r'[^>]*aria-live="polite"',
+        )
+        for status_id in (
+            "agent-attachment-status",
+            "agent-rag-status",
+            "agent-web-status",
+            "agent-microphone-status",
+        ):
+            self.assertIn(f'id="{status_id}"', html)
+
+        self.assertIn('id="agent-model-selector"', html)
+        self.assertRegex(
+            html,
+            r'id="agent-model-selector"[^>]*aria-describedby="agent-model-status"'
+            r"[^>]*disabled",
+        )
+        self.assertIn("검증 모델 확인 중", html)
+        self.assertIn('id="agent-model-status">확인 중', html)
+        self.assertIn('id="network-mode-label">LOCAL ONLY', html)
+        self.assertIn('id="external-call-count">0', html)
+        self.assertRegex(
+            stylesheet,
+            r"(?s)\.chat-composer\s*\{[^}]*position:\s*sticky;"
+            r"[^}]*bottom:\s*0;",
+        )
+        self.assertIn(".composer-commandbar", stylesheet)
+        self.assertIn(".attachment-chip", stylesheet)
+        self.assertIn('.composer-tool-button[aria-pressed="true"]', stylesheet)
+
+    def test_workspace_ui_consumes_bounded_capability_contract(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+        for endpoint in (
+            "/api/workspace/capabilities",
+            "/api/workspace/attachments",
+            "/api/workspace/attachments/add",
+            "/api/workspace/rag/index",
+            "/api/workspace/models/select",
+        ):
+            with self.subTest(endpoint=endpoint):
+                self.assertIn(endpoint, script)
+        self.assertIn("MAX_ATTACHMENT_UPLOAD_BYTES = 8 * 1024 * 1024", script)
+        self.assertIn("WEB_SEARCH_UI_IMPLEMENTED = false", script)
+        self.assertIn("MICROPHONE_CAPTURE_UI_IMPLEMENTED = false", script)
+        self.assertIn("reader.readAsDataURL(file)", script)
+        self.assertIn("content_base64: contentBase64", script)
+        self.assertIn('attachments.state === "enabled"', script)
+        self.assertIn('rag.state === "local_index_ready"', script)
+        self.assertIn('rag: ui.agentMode === "chat" && ui.ragEnabled', script)
+        self.assertIn('if (ui.agentMode !== "chat") ui.ragEnabled = false', script)
+        self.assertIn("web.executor_implemented !== true", script)
+        self.assertIn("microphone.runtime_audio_input !== true", script)
+        self.assertIn(
+            'networkMode === "online_opt_in" ? "ONLINE OPT-IN" : "LOCAL ONLY"', script
+        )
+        self.assertIn('setText("#external-call-count", "0")', script)
+        self.assertIn("chip.append(name, state)", script)
+        self.assertIn('"로컬 저장·모델 미전달"', script)
+        self.assertIn("selector.replaceChildren(fragment)", script)
+
     def test_ai_workspace_uses_xss_safe_bounded_dom_rendering(self) -> None:
         script = (STATIC / "app.js").read_text(encoding="utf-8")
         for forbidden in (
@@ -138,8 +225,31 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("message.content.slice(0, MAX_AGENT_RESPONSE_CHARS)", script)
         self.assertIn('includes(message.role) ? message.role : "assistant"', script)
         self.assertIn("messages.slice(-MAX_AGENT_DOM_MESSAGES)", script)
+        self.assertIn('"cogni_core_rag"', script)
+        self.assertIn("normalizedRetrievalSources(message.sources)", script)
+        self.assertIn("rawTitle.replace", script)
+        self.assertIn(
+            "title.textContent = `[근거 ${source.number}] ${source.title}`", script
+        )
+        self.assertIn("sourcesList.replaceChildren(fragment)", script)
+        self.assertIn("message.sources.length === 0", script)
         self.assertIn("VIEW_IDS.has(initial)", script)
         self.assertNotIn('$(`[data-view-panel="${initial}"]`)', script)
+
+    def test_rag_provenance_uses_text_only_dom_for_malicious_titles(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        malicious_title = '<img src=x onerror="alert(1)">'
+
+        self.assertNotIn(
+            malicious_title, (STATIC / "index.html").read_text(encoding="utf-8")
+        )
+        self.assertIn("normalizedRetrievalSources(items)", script)
+        self.assertIn("rawTitle.replace", script)
+        self.assertIn(
+            "title.textContent = `[근거 ${source.number}] ${source.title}`", script
+        )
+        self.assertIn("sourcesList.replaceChildren(fragment)", script)
+        self.assertNotRegex(script, r"\.innerHTML\b|insertAdjacentHTML")
 
     def test_streaming_cancelling_and_compute_button_states_fail_closed(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
@@ -206,7 +316,7 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("Runtime Fact-book", script)
         self.assertIn("FACT-BOOK · 검증된 사실", script)
         self.assertIn(
-            '["cogni_core", "conversation_fastpath", "factbook", "quality_fallback"]',
+            '["cogni_core", "cogni_core_rag", "conversation_fastpath", "factbook", "quality_fallback"]',
             script,
         )
         self.assertIn("대화 FAST PATH · 완료", script)
@@ -289,7 +399,7 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertRegex(
             stylesheet,
             r"(?s)@media \(min-width: 901px\)\s*\{\s*\.chat-workspace\s*\{"
-            r"[^}]*height:\s*clamp\(500px, calc\(100dvh - var\(--topbar\) - 230px\), 620px\);"
+            r"[^}]*height:\s*clamp\(520px, calc\(100dvh - var\(--topbar\) - 210px\), 900px\);"
             r"[^}]*min-height:\s*0;",
         )
         self.assertRegex(

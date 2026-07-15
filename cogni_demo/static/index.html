@@ -32,8 +32,8 @@
       </a>
 
       <div class="topbar-status" aria-label="시스템 상태">
-        <span class="status-pill status-local"><i></i>LOCAL ONLY</span>
-        <span class="status-pill"><span class="status-label">외부 호출</span><b>0</b></span>
+        <span class="status-pill status-local" id="network-mode-pill"><i></i><b id="network-mode-label">LOCAL ONLY</b></span>
+        <span class="status-pill"><span class="status-label">외부 호출</span><b id="external-call-count">0</b></span>
         <span class="status-pill"><span class="status-label">리듬</span><b id="rhythm-value">INFERENCE</b></span>
         <span class="status-pill status-runtime" id="runtime-pill"><i></i><b id="runtime-label">검증 READY</b></span>
       </div>
@@ -127,6 +127,43 @@
             </div>
 
             <div class="chat-composer">
+              <div class="composer-commandbar" role="group" aria-label="대화 입력 도구">
+                <div class="composer-tools" role="group" aria-label="첨부와 지식 도구">
+                  <input class="visually-hidden" id="agent-attachment-input" type="file" multiple accept=".txt,.md,.csv,.json,.pdf,.png,.jpg,.jpeg,.webp" aria-describedby="agent-attachment-status" disabled>
+                  <button class="composer-tool-button" type="button" data-action="workspace-attach" aria-controls="agent-attachment-input agent-attachment-tray" disabled aria-label="파일 또는 이미지 첨부, 기능 확인 중" title="로컬 첨부 기능을 확인하고 있습니다.">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                    <span>파일·이미지</span><small id="agent-attachment-status">확인 중</small>
+                  </button>
+                  <button class="composer-tool-button" type="button" data-action="workspace-rag-toggle" aria-controls="agent-attachment-tray" aria-pressed="false" disabled aria-label="로컬 RAG, 기능 확인 중" title="로컬 AkasicDB 인덱스 상태를 확인하고 있습니다.">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A3.5 3.5 0 0 1 7.5 2H20v16H7.5A3.5 3.5 0 0 0 4 21.5Zm0 0v16M8 7h8m-8 4h8"/></svg>
+                    <span>로컬 RAG</span><small id="agent-rag-status">확인 중</small>
+                  </button>
+                  <button class="composer-tool-button" type="button" data-action="workspace-web-search" disabled aria-label="선택형 웹 검색, 정책 확인 중" title="외부 실행기와 명시적 온라인 정책이 모두 확인되어야 활성화됩니다.">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16.5 16.5 4 4M4 11h14M11 4a11 11 0 0 1 0 14M11 4a11 11 0 0 0 0 14"/></svg>
+                    <span>웹 검색</span><small id="agent-web-status">확인 중</small>
+                  </button>
+                </div>
+
+                <div class="composer-runtime-tools">
+                  <label class="model-selector" for="agent-model-selector">
+                    <span>로컬 모델</span>
+                    <select id="agent-model-selector" aria-describedby="agent-model-status" disabled>
+                      <option value="">검증 모델 확인 중</option>
+                    </select>
+                    <small id="agent-model-status">확인 중</small>
+                  </label>
+                  <button class="composer-icon-button" type="button" data-action="workspace-microphone" disabled aria-label="음성 입력, 기능 확인 중" title="검증된 로컬 음성 파이프라인이 확인되어야 활성화됩니다.">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-4 0h8"/></svg>
+                    <span>음성</span><small id="agent-microphone-status">확인 중</small>
+                  </button>
+                </div>
+              </div>
+
+              <div class="attachment-tray" id="agent-attachment-tray" aria-label="로컬 첨부 파일" hidden>
+                <div class="attachment-chip-list" id="agent-attachment-list" role="list"></div>
+                <p id="agent-attachment-live-status" role="status" aria-live="polite" aria-atomic="true">첨부 파일이 없습니다.</p>
+              </div>
+
               <div class="agent-mode-switch" role="group" aria-label="요청 처리 모드">
                 <button class="is-selected" type="button" data-agent-mode="chat" aria-pressed="true" disabled><i></i>대화</button>
                 <button type="button" data-agent-mode="task" aria-pressed="false" disabled><i></i>로컬 작업</button>

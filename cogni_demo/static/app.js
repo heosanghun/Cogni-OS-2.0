@@ -13,6 +13,23 @@ const AGENT_STATUSES = new Set(["offline", "starting", "loading", "ready", "gene
 const VIEW_IDS = new Set(["assistant", "mission", "inference", "architecture", "business", "evidence"]);
 const MAX_AGENT_DOM_MESSAGES = 32;
 const MAX_AGENT_RESPONSE_CHARS = 8192;
+const MAX_ATTACHMENT_UPLOAD_BYTES = 8 * 1024 * 1024;
+const MAX_ATTACHMENT_UPLOAD_COUNT = 32;
+// Capability metadata is necessary but not sufficient: controls stay fail-closed
+// until the corresponding browser-side execution path is actually implemented.
+const WEB_SEARCH_UI_IMPLEMENTED = false;
+const MICROPHONE_CAPTURE_UI_IMPLEMENTED = false;
+const ATTACHMENT_MEDIA_BY_SUFFIX = Object.freeze({
+  ".txt": "text/plain",
+  ".md": "text/markdown",
+  ".csv": "text/csv",
+  ".json": "application/json",
+  ".pdf": "application/pdf",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+});
 const API_ERROR_COPY = {
   AGENT_UNAVAILABLE: "로컬 AI 서비스가 준비되지 않았습니다. 잠시 후 다시 시도해 주세요.",
   AGENT_BUSY: "현재 AI 요청이 끝난 뒤 다시 시도해 주세요.",
@@ -23,6 +40,18 @@ const API_ERROR_COPY = {
   JOB_ALREADY_RUNNING: "이미 검증 작업이 실행 중입니다.",
   NO_ACTIVE_AGENT_TURN: "중단할 AI 요청이 없습니다.",
   NO_ACTIVE_JOB: "중단할 검증 작업이 없습니다.",
+  AKASICDB_NOT_CONFIGURED: "감사된 로컬 AkasicDB 클론이 구성되지 않았습니다.",
+  AKASICDB_UNAVAILABLE: "로컬 AkasicDB 인덱스를 사용할 수 없습니다.",
+  ATTACHMENT_LIMIT_REACHED: "로컬 첨부 파일 개수 한도에 도달했습니다.",
+  ATTACHMENT_TOTAL_BYTES_REACHED: "로컬 첨부 저장소의 전체 용량 한도에 도달했습니다.",
+  ATTACHMENT_NOT_INDEXABLE: "이 파일 형식은 현재 로컬 RAG에 인덱싱할 수 없습니다.",
+  ATTACHMENT_TOO_LARGE: "파일이 로컬 첨부 크기 한도를 초과했습니다.",
+  INVALID_ATTACHMENT: "첨부 파일을 확인할 수 없습니다.",
+  INVALID_JSON_ATTACHMENT: "JSON 파일 형식이 올바르지 않습니다.",
+  JSON_ATTACHMENT_TOO_LARGE: "JSON 파일은 1MiB 이하만 안전하게 처리합니다.",
+  JSON_NESTING_TOO_DEEP: "JSON 파일의 중첩 깊이가 안전 한도를 초과했습니다.",
+  MODEL_NOT_VERIFIED: "검증된 로컬 모델만 선택할 수 있습니다.",
+  UNSUPPORTED_MEDIA_TYPE: "현재 지원하지 않는 로컬 파일 형식입니다.",
 };
 const AGENT_MODULE_DEFAULTS = {
   gemma: "LOCAL",
@@ -148,6 +177,15 @@ const ui = {
   validationConnectionLost: false,
   lastAgentErrorKey: "",
   lastEvolutionErrorKey: "",
+  workspaceCapabilities: null,
+  workspaceCapabilitiesLoaded: false,
+  workspaceRequestPending: false,
+  workspaceAttachments: [],
+  indexedAttachmentIds: new Set(),
+  ragBackendReady: false,
+  ragDocumentCount: 0,
+  ragEnabled: false,
+  modelSelectionPending: false,
 };
 
 function $(selector, root = document) {
@@ -181,6 +219,405 @@ function showToast(message, tone = "info") {
   ui.toastTimer = setTimeout(() => {
     toast.hidden = true;
   }, 4200);
+}
+
+function attachmentMediaType(file) {
+  const name = typeof file?.name === "string" ? file.name : "";
+  const dot = name.lastIndexOf(".");
+  const suffix = dot >= 0 ? name.slice(dot).toLowerCase() : "";
+  const expected = ATTACHMENT_MEDIA_BY_SUFFIX[suffix] || "";
+  return file?.type === expected || !file?.type ? expected : "";
+}
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      const value = typeof reader.result === "string" ? reader.result : "";
+      const marker = value.indexOf(",");
+      if (marker <= 0 || !value.slice(0, marker).endsWith(";base64")) {
+        reject(new Error("INVALID_ATTACHMENT"));
+        return;
+      }
+      resolve(value.slice(marker + 1));
+    }, { once: true });
+    reader.addEventListener("error", () => reject(new Error("INVALID_ATTACHMENT")), { once: true });
+    reader.addEventListener("abort", () => reject(new Error("INVALID_ATTACHMENT")), { once: true });
+    reader.readAsDataURL(file);
+  });
+}
+
+function normalizedAttachment(item) {
+  if (!item || typeof item !== "object") return null;
+  if (typeof item.attachment_id !== "string" || !item.attachment_id) return null;
+  if (typeof item.name !== "string" || !item.name) return null;
+  return {
+    attachment_id: item.attachment_id.slice(0, 128),
+    name: item.name.slice(0, 128),
+    media_type: typeof item.media_type === "string" ? item.media_type.slice(0, 128) : "",
+    size_bytes: Number.isInteger(item.size_bytes) ? Math.max(0, item.size_bytes) : 0,
+    text_indexable: item.text_indexable === true,
+  };
+}
+
+function normalizedRetrievalSources(items) {
+  if (!Array.isArray(items)) return [];
+  const seen = new Set();
+  const sources = [];
+  items.slice(0, 5).forEach((item) => {
+    if (!item || typeof item !== "object") return;
+    const number = Number.isInteger(item.number) ? item.number : 0;
+    if (number < 1 || number > 5 || seen.has(number)) return;
+    const rawTitle = typeof item.title === "string" ? item.title : "";
+    const title = rawTitle.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim().slice(0, 160);
+    if (!title) return;
+    const score = Number.isFinite(item.score)
+      ? Math.max(0, Math.min(1, Number(item.score)))
+      : null;
+    seen.add(number);
+    sources.push({ number, title, score });
+  });
+  return sources;
+}
+
+function renderWorkspaceAttachments() {
+  const tray = $("#agent-attachment-tray");
+  const list = $("#agent-attachment-list");
+  if (!tray || !list) return;
+  const fragment = document.createDocumentFragment();
+  ui.workspaceAttachments.slice(0, MAX_ATTACHMENT_UPLOAD_COUNT).forEach((attachment) => {
+    const chip = document.createElement("span");
+    const name = document.createElement("span");
+    const state = document.createElement("small");
+    const indexed = ui.indexedAttachmentIds.has(attachment.attachment_id);
+    chip.className = "attachment-chip";
+    chip.dataset.indexed = String(indexed);
+    chip.setAttribute("role", "listitem");
+    chip.title = `${attachment.name} · ${attachment.media_type || "로컬 파일"}`.slice(0, 256);
+    name.textContent = attachment.name;
+    state.textContent = indexed
+      ? "RAG"
+      : attachment.text_indexable
+        ? "인덱스 대기"
+        : "로컬 저장·모델 미전달";
+    chip.append(name, state);
+    fragment.append(chip);
+  });
+  list.replaceChildren(fragment);
+  tray.hidden = ui.workspaceAttachments.length === 0;
+  const indexedCount = Math.max(ui.indexedAttachmentIds.size, ui.ragDocumentCount);
+  setText(
+    "#agent-attachment-live-status",
+    ui.workspaceAttachments.length
+      ? `${ui.workspaceAttachments.length}개 첨부 · ${indexedCount}개 로컬 인덱스`
+      : "첨부 파일이 없습니다.",
+  );
+  updateWorkspaceControlStates();
+}
+
+function renderWorkspaceModels(models) {
+  const selector = $("#agent-model-selector");
+  if (!selector) return;
+  const items = Array.isArray(models?.items)
+    ? models.items.filter((item) => (
+      item
+      && typeof item === "object"
+      && typeof item.model_id === "string"
+      && typeof item.label === "string"
+      && item.verification
+    )).slice(0, 16)
+    : [];
+  const fragment = document.createDocumentFragment();
+  if (!items.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "검증 모델 없음";
+    fragment.append(option);
+  } else {
+    items.forEach((item) => {
+      const option = document.createElement("option");
+      option.value = item.model_id.slice(0, 256);
+      option.textContent = item.label.slice(0, 128);
+      option.selected = item.selected === true;
+      fragment.append(option);
+    });
+  }
+  selector.replaceChildren(fragment);
+  selector.dataset.verifiedCount = String(items.length);
+  setText(
+    "#agent-model-status",
+    items.length > 1 ? `검증 모델 ${items.length}개` : items.length === 1 ? "검증 모델 고정" : "사용 불가",
+  );
+}
+
+function applyWorkspaceCapabilities(capabilities) {
+  if (!capabilities || typeof capabilities !== "object") return;
+  ui.workspaceCapabilities = capabilities;
+  ui.workspaceCapabilitiesLoaded = true;
+  const attachments = capabilities.attachments || {};
+  const rag = capabilities.rag || {};
+  const microphone = capabilities.microphone || {};
+  const web = capabilities.web_search || {};
+  ui.ragBackendReady = rag.state === "local_index_ready";
+  ui.ragDocumentCount = Number.isInteger(rag.documents) ? Math.max(0, rag.documents) : 0;
+  if (!ui.ragBackendReady || (!ui.ragDocumentCount && !ui.indexedAttachmentIds.size)) {
+    ui.ragEnabled = false;
+  }
+  const attachmentButton = $('[data-action="workspace-attach"]');
+  if (attachmentButton) {
+    const ready = attachments.state === "enabled";
+    attachmentButton.setAttribute("aria-label", ready ? "로컬 파일 또는 이미지 첨부" : "파일 또는 이미지 첨부, 사용 불가");
+    attachmentButton.title = ready
+      ? "파일은 이 PC의 content-addressed 저장소에만 보관됩니다."
+      : "백엔드가 로컬 첨부 기능을 활성화하지 않았습니다.";
+  }
+  setText("#agent-attachment-status", attachments.state === "enabled" ? "로컬" : "사용 불가");
+  setText(
+    "#agent-rag-status",
+    !ui.ragBackendReady
+      ? "미연결"
+      : ui.ragEnabled
+        ? "사용 중"
+        : ui.ragDocumentCount || ui.indexedAttachmentIds.size
+          ? "사용 가능"
+          : "문서 필요",
+  );
+  const networkMode = web.mode === "online_opt_in" ? "online_opt_in" : "air_gapped";
+  setText("#network-mode-label", networkMode === "online_opt_in" ? "ONLINE OPT-IN" : "LOCAL ONLY");
+  setText("#external-call-count", "0");
+  $("#network-mode-pill")?.classList.toggle("is-online-opt-in", networkMode === "online_opt_in");
+  const webExecutorReady = WEB_SEARCH_UI_IMPLEMENTED && web.executor_implemented === true;
+  const webButton = $('[data-action="workspace-web-search"]');
+  if (webButton) {
+    webButton.setAttribute(
+      "aria-label",
+      webExecutorReady && networkMode === "online_opt_in"
+        ? "명시적으로 허용된 웹 검색"
+        : "웹 검색, 외부 실행기 비활성",
+    );
+    webButton.title = webExecutorReady && networkMode === "online_opt_in"
+      ? "허용 목록에 포함된 온라인 검색만 실행합니다."
+      : "외부 검색 실행기가 검증·활성화되지 않았습니다.";
+  }
+  setText(
+    "#agent-web-status",
+    webExecutorReady && networkMode === "online_opt_in" ? "선택 가능" : networkMode === "online_opt_in" ? "실행기 없음" : "오프라인",
+  );
+  setText(
+    "#agent-microphone-status",
+    MICROPHONE_CAPTURE_UI_IMPLEMENTED
+      && microphone.runtime_audio_input === true
+      && microphone.capture_state === "ready"
+      && microphone.transcription_state === "ready"
+      ? "사용 가능"
+      : "미연결",
+  );
+  const microphoneButton = $('[data-action="workspace-microphone"]');
+  if (microphoneButton) {
+    const ready = MICROPHONE_CAPTURE_UI_IMPLEMENTED
+      && microphone.runtime_audio_input === true
+      && microphone.capture_state === "ready"
+      && microphone.transcription_state === "ready";
+    microphoneButton.setAttribute("aria-label", ready ? "로컬 음성 입력" : "음성 입력, 로컬 파이프라인 미연결");
+    microphoneButton.title = ready
+      ? "검증된 로컬 음성 파이프라인을 사용합니다."
+      : "체크포인트의 오디오 지원과 실제 음성 입력 파이프라인은 별개입니다.";
+  }
+  renderWorkspaceModels(capabilities.models || {});
+  renderWorkspaceAttachments();
+  updateWorkspaceControlStates();
+}
+
+function updateWorkspaceControlStates() {
+  const capabilities = ui.workspaceCapabilities || {};
+  const attachments = capabilities.attachments || {};
+  const microphone = capabilities.microphone || {};
+  const web = capabilities.web_search || {};
+  const agentBusy = AGENT_ACTIVE_STATUSES.has(ui.agentStatus) || ui.agentRequestPending;
+  const unavailable = !ui.workspaceCapabilitiesLoaded || ui.workspaceRequestPending || agentBusy;
+  const attachmentReady = attachments.state === "enabled";
+  const attachmentButton = $('[data-action="workspace-attach"]');
+  const attachmentInput = $("#agent-attachment-input");
+  if (attachmentButton) attachmentButton.disabled = unavailable || !attachmentReady;
+  if (attachmentInput) attachmentInput.disabled = unavailable || !attachmentReady;
+  const indexedDocuments = Math.max(ui.indexedAttachmentIds.size, ui.ragDocumentCount);
+  const ragButton = $('[data-action="workspace-rag-toggle"]');
+  if (ragButton) {
+    ragButton.disabled = unavailable
+      || ui.agentMode !== "chat"
+      || !ui.ragBackendReady
+      || indexedDocuments < 1;
+    ragButton.setAttribute("aria-pressed", String(ui.ragEnabled));
+    ragButton.setAttribute(
+      "aria-label",
+      !ui.ragBackendReady
+        ? "로컬 RAG, AkasicDB 미연결"
+        : indexedDocuments < 1
+          ? "로컬 RAG, 인덱싱된 문서 필요"
+          : ui.ragEnabled
+            ? "로컬 RAG 사용 중, 선택하여 해제"
+            : "로컬 RAG 사용 가능, 선택하여 활성화",
+    );
+    ragButton.title = !ui.ragBackendReady
+      ? "감사된 로컬 AkasicDB가 준비되지 않았습니다."
+      : indexedDocuments < 1
+        ? "UTF-8 텍스트 파일을 첨부하면 로컬 인덱싱을 시도합니다."
+        : "현재 대화에 로컬 AkasicDB 검색을 적용합니다.";
+  }
+  const webButton = $('[data-action="workspace-web-search"]');
+  if (webButton) {
+    webButton.disabled = unavailable
+      || !WEB_SEARCH_UI_IMPLEMENTED
+      || web.mode !== "online_opt_in"
+      || web.executor_implemented !== true;
+  }
+  const microphoneButton = $('[data-action="workspace-microphone"]');
+  if (microphoneButton) {
+    microphoneButton.disabled = unavailable
+      || !MICROPHONE_CAPTURE_UI_IMPLEMENTED
+      || microphone.runtime_audio_input !== true
+      || microphone.capture_state !== "ready"
+      || microphone.transcription_state !== "ready";
+  }
+  const modelSelector = $("#agent-model-selector");
+  if (modelSelector) {
+    const verifiedCount = Number(modelSelector.dataset.verifiedCount || "0");
+    modelSelector.disabled = unavailable || ui.modelSelectionPending || verifiedCount < 2;
+  }
+}
+
+async function loadWorkspaceCapabilities() {
+  try {
+    const capabilities = await api("/api/workspace/capabilities");
+    applyWorkspaceCapabilities(capabilities);
+    try {
+      const inventory = await api("/api/workspace/attachments");
+      ui.workspaceAttachments = Array.isArray(inventory?.items)
+        ? inventory.items.map(normalizedAttachment).filter(Boolean).slice(0, MAX_ATTACHMENT_UPLOAD_COUNT)
+        : [];
+      renderWorkspaceAttachments();
+    } catch (_) {
+      showToast("로컬 첨부 목록을 불러오지 못했습니다.", "warning");
+    }
+  } catch (_) {
+    ui.workspaceCapabilitiesLoaded = false;
+    setText("#agent-attachment-status", "사용 불가");
+    setText("#agent-rag-status", "사용 불가");
+    setText("#agent-web-status", "오프라인");
+    setText("#agent-microphone-status", "미연결");
+    setText("#agent-model-status", "확인 실패");
+    setText("#network-mode-label", "LOCAL ONLY");
+    setText("#external-call-count", "0");
+    updateWorkspaceControlStates();
+  }
+}
+
+async function indexWorkspaceAttachment(attachment) {
+  if (!ui.ragBackendReady || !attachment.text_indexable) return false;
+  const result = await api("/api/workspace/rag/index", {
+    method: "POST",
+    body: { attachment_ids: [attachment.attachment_id] },
+  });
+  const indexed = Array.isArray(result?.results)
+    && result.results.some((item) => item?.indexed === true || item?.already_indexed === true);
+  if (indexed) {
+    ui.indexedAttachmentIds.add(attachment.attachment_id);
+    ui.ragDocumentCount = Number.isInteger(result.documents)
+      ? Math.max(ui.ragDocumentCount, result.documents)
+      : Math.max(ui.ragDocumentCount, ui.indexedAttachmentIds.size);
+  }
+  return indexed;
+}
+
+async function uploadWorkspaceFiles(fileList) {
+  if (ui.workspaceRequestPending) return;
+  const files = Array.from(fileList || []).slice(0, MAX_ATTACHMENT_UPLOAD_COUNT);
+  if (!files.length) return;
+  const capabilities = ui.workspaceCapabilities?.attachments || {};
+  const accepted = new Set(Array.isArray(capabilities.accepted_media_types) ? capabilities.accepted_media_types : []);
+  const serverLimit = Number.isInteger(capabilities.max_bytes_each) ? capabilities.max_bytes_each : MAX_ATTACHMENT_UPLOAD_BYTES;
+  const byteLimit = Math.min(MAX_ATTACHMENT_UPLOAD_BYTES, Math.max(1, serverLimit));
+  ui.workspaceRequestPending = true;
+  updateWorkspaceControlStates();
+  let uploaded = 0;
+  let indexed = 0;
+  try {
+    for (const file of files) {
+      const mediaType = attachmentMediaType(file);
+      if (!mediaType || (accepted.size && !accepted.has(mediaType))) {
+        showToast(`${file.name.slice(0, 80)}: 지원하지 않는 형식입니다.`, "warning");
+        continue;
+      }
+      if (!Number.isInteger(file.size) || file.size < 1 || file.size > byteLimit) {
+        showToast(`${file.name.slice(0, 80)}: 8MiB 이하 파일만 첨부할 수 있습니다.`, "warning");
+        continue;
+      }
+      const contentBase64 = await readFileAsBase64(file);
+      const response = await api("/api/workspace/attachments/add", {
+        method: "POST",
+        body: {
+          name: file.name.slice(0, 128),
+          media_type: mediaType,
+          content_base64: contentBase64,
+        },
+      });
+      const attachment = normalizedAttachment(response);
+      if (!attachment) throw new Error("INVALID_ATTACHMENT");
+      const existing = ui.workspaceAttachments.findIndex((item) => item.attachment_id === attachment.attachment_id);
+      if (existing >= 0) ui.workspaceAttachments[existing] = attachment;
+      else ui.workspaceAttachments.push(attachment);
+      uploaded += 1;
+      try {
+        if (await indexWorkspaceAttachment(attachment)) indexed += 1;
+      } catch (_) {
+        showToast(`${attachment.name}: 로컬 첨부는 완료했지만 RAG 인덱싱은 보류되었습니다.`, "warning");
+      }
+      renderWorkspaceAttachments();
+    }
+    if (uploaded) {
+      showToast(
+        `${uploaded}개 파일을 로컬에 첨부했습니다${indexed ? ` · ${indexed}개 AkasicDB 인덱싱` : ""}.`,
+        "success",
+      );
+    }
+  } catch (error) {
+    showToast(describeApiError(error, "로컬 파일을 첨부하지 못했습니다."), "error");
+  } finally {
+    ui.workspaceRequestPending = false;
+    const input = $("#agent-attachment-input");
+    if (input) input.value = "";
+    renderWorkspaceAttachments();
+    updateWorkspaceControlStates();
+  }
+}
+
+function toggleWorkspaceRag() {
+  const indexedDocuments = Math.max(ui.indexedAttachmentIds.size, ui.ragDocumentCount);
+  if (ui.agentMode !== "chat" || !ui.ragBackendReady || indexedDocuments < 1) return;
+  ui.ragEnabled = !ui.ragEnabled;
+  setText("#agent-rag-status", ui.ragEnabled ? "사용 중" : "사용 가능");
+  updateWorkspaceControlStates();
+  showToast(ui.ragEnabled ? "이 대화에 로컬 AkasicDB 검색을 사용합니다." : "이 대화의 로컬 RAG를 해제했습니다.");
+}
+
+async function selectWorkspaceModel() {
+  const selector = $("#agent-model-selector");
+  if (!selector || selector.disabled || !selector.value) return;
+  ui.modelSelectionPending = true;
+  updateWorkspaceControlStates();
+  try {
+    const selected = await api("/api/workspace/models/select", {
+      method: "POST",
+      body: { model_id: selector.value },
+    });
+    setText("#agent-model-status", selected?.label ? "검증 모델 선택됨" : "검증 모델 고정");
+  } catch (error) {
+    showToast(describeApiError(error, "검증 모델을 선택하지 못했습니다."), "error");
+    await loadWorkspaceCapabilities();
+  } finally {
+    ui.modelSelectionPending = false;
+    updateWorkspaceControlStates();
+  }
 }
 
 function switchView(view, options = {}) {
@@ -473,6 +910,7 @@ function updateControlStates() {
   $(".chat-workspace")?.setAttribute("aria-busy", String(chatBusy));
   $("#chat-transcript")?.setAttribute("aria-busy", String(chatBusy));
   document.body.classList.toggle("agent-active", agentActive);
+  updateWorkspaceControlStates();
 
   const evolution = $('[data-action="evolution-run"]');
   if (evolution) {
@@ -561,6 +999,14 @@ function createAgentMessageElement() {
   completion.setAttribute("role", "status");
   const time = document.createElement("time");
   const content = document.createElement("p");
+  const sources = document.createElement("details");
+  sources.className = "chat-sources";
+  sources.hidden = true;
+  const sourcesSummary = document.createElement("summary");
+  sourcesSummary.textContent = "로컬 RAG 근거";
+  const sourcesList = document.createElement("ol");
+  sourcesList.setAttribute("aria-label", "답변에 사용된 로컬 RAG 근거");
+  sources.append(sourcesSummary, sourcesList);
   const continueButton = document.createElement("button");
   continueButton.className = "chat-continue-button";
   continueButton.type = "button";
@@ -582,7 +1028,7 @@ function createAgentMessageElement() {
   });
   meta.append(completion, time);
   header.append(author, meta);
-  bubble.append(header, content, continueButton);
+  bubble.append(header, content, sources, continueButton);
   item.append(avatar, bubble);
   return item;
 }
@@ -628,9 +1074,10 @@ function renderAgentConversation(messages = []) {
       generatedTokens: Number.isInteger(message.generated_tokens)
         ? Math.max(0, Math.min(1536, message.generated_tokens))
         : 0,
-      generationMode: ["cogni_core", "conversation_fastpath", "factbook", "quality_fallback"].includes(message.generation_mode)
+      generationMode: ["cogni_core", "cogni_core_rag", "conversation_fastpath", "factbook", "quality_fallback"].includes(message.generation_mode)
         ? message.generation_mode
         : null,
+      sources: normalizedRetrievalSources(message.sources),
     });
   });
 
@@ -681,6 +1128,8 @@ function renderAgentConversation(messages = []) {
           completionCopy = "대화 FAST PATH · 완료";
         } else if (message.generationMode === "factbook") {
           completionCopy = "FACT-BOOK · 검증된 사실";
+        } else if (message.generationMode === "cogni_core_rag") {
+          completionCopy = "로컬 RAG · 근거 연결 완료";
         } else if (message.generationMode === "quality_fallback") {
           completionCopy = "품질 검증 실패 · 복구 필요";
         } else {
@@ -703,6 +1152,22 @@ function renderAgentConversation(messages = []) {
     }
     const content = $(".chat-bubble p", item);
     content.textContent = message.content;
+    const sources = $(".chat-sources", item);
+    const sourcesList = $(".chat-sources ol", item);
+    if (sources && sourcesList) {
+      const fragment = document.createDocumentFragment();
+      message.sources.forEach((source) => {
+        const row = document.createElement("li");
+        const title = document.createElement("span");
+        const score = document.createElement("small");
+        title.textContent = `[근거 ${source.number}] ${source.title}`;
+        score.textContent = source.score === null ? "점수 미제공" : `유사도 ${source.score.toFixed(4)}`;
+        row.append(title, score);
+        fragment.append(row);
+      });
+      sourcesList.replaceChildren(fragment);
+      sources.hidden = role !== "assistant" || message.sources.length === 0;
+    }
     const continueButton = $(".chat-continue-button", item);
     if (continueButton) continueButton.hidden = role !== "assistant" || !message.truncated || message.streaming;
     transcript.append(item);
@@ -863,7 +1328,11 @@ async function sendAgentMessage() {
   try {
     const state = await api("/api/agent/chat", {
       method: "POST",
-      body: { message, mode: ui.agentMode },
+      body: {
+        message,
+        mode: ui.agentMode,
+        rag: ui.agentMode === "chat" && ui.ragEnabled,
+      },
     });
     if (input) input.value = "";
     updateAgentCharacterCount();
@@ -1175,6 +1644,15 @@ function bindActions() {
   $('[data-action="agent-cancel"]')?.addEventListener("click", cancelAgentTurn);
   $('[data-action="agent-reset"]')?.addEventListener("click", resetAgentConversation);
   $('[data-action="evolution-run"]')?.addEventListener("click", runEvolutionCycle);
+  $('[data-action="workspace-attach"]')?.addEventListener("click", () => {
+    const input = $("#agent-attachment-input");
+    if (input && !input.disabled) input.click();
+  });
+  $("#agent-attachment-input")?.addEventListener("change", (event) => {
+    uploadWorkspaceFiles(event.target.files);
+  });
+  $('[data-action="workspace-rag-toggle"]')?.addEventListener("click", toggleWorkspaceRag);
+  $("#agent-model-selector")?.addEventListener("change", selectWorkspaceModel);
   $("#chat-transcript")?.addEventListener("click", (event) => {
     const trigger = event.target.closest('[data-action="agent-focus"]');
     if (!trigger || trigger.disabled) return;
@@ -1186,21 +1664,25 @@ function bindActions() {
   });
   $$('[data-agent-mode]').forEach((button) => button.addEventListener("click", () => {
     ui.agentMode = button.dataset.agentMode;
+    if (ui.agentMode !== "chat") ui.ragEnabled = false;
     $$('[data-agent-mode]').forEach((candidate) => {
       const selected = candidate === button;
       candidate.classList.toggle("is-selected", selected);
       candidate.setAttribute("aria-pressed", String(selected));
     });
+    updateWorkspaceControlStates();
     $("#agent-input")?.focus();
   }));
   $$('[data-agent-prompt]').forEach((button) => button.addEventListener("click", () => {
     const mode = button.dataset.agentModeValue || "chat";
     ui.agentMode = mode;
+    if (ui.agentMode !== "chat") ui.ragEnabled = false;
     $$('[data-agent-mode]').forEach((candidate) => {
       const selected = candidate.dataset.agentMode === mode;
       candidate.classList.toggle("is-selected", selected);
       candidate.setAttribute("aria-pressed", String(selected));
     });
+    updateWorkspaceControlStates();
     const input = $("#agent-input");
     if (input) {
       input.value = button.dataset.agentPrompt || "";
@@ -1250,6 +1732,7 @@ function init() {
   updateFullscreenState();
   updateAgentCharacterCount();
   updateControlStates();
+  loadWorkspaceCapabilities();
   pollAgentState();
   pollState();
 }

@@ -10,8 +10,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Cogni-OS 2.0 Genesis local sovereign AI control")]
 [assembly: AssemblyCompany("Cogni-OS")]
 [assembly: AssemblyProduct("Cogni-OS 2.0 Genesis")]
-[assembly: AssemblyVersion("0.3.2.0")]
-[assembly: AssemblyFileVersion("0.3.2.0")]
+[assembly: AssemblyVersion("0.4.0.0")]
+[assembly: AssemblyFileVersion("0.4.0.0")]
 
 internal static class CogniBoardLauncher
 {

@@ -33,11 +33,19 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import subprocess
+import sys
 from threading import RLock
 from types import ModuleType
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from cogni_demo.lens_api import (
+    LensAkasicBridge,
+    LensApiClient,
+    LensApiError,
+    LensSearchKind,
+)
 from cogni_os.factbook import RuntimeFactBook
 
 
@@ -46,9 +54,17 @@ MAX_ATTACHMENT_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_ATTACHMENT_BASE64_CHARS = 4 * ((MAX_ATTACHMENT_BYTES + 2) // 3)
 MAX_ATTACHMENT_COUNT = 32
 MAX_ATTACHMENT_NAME_CHARS = 128
+MAX_ATTACHMENT_CATALOG_BYTES = 128 * 1024
+MAX_ATTACHMENT_PREVIEW_CHARS = 12_000
 MAX_JSON_ATTACHMENT_BYTES = 1024 * 1024
 MAX_JSON_NESTING = 64
 MAX_INDEXED_TEXT_CHARS = 256_000
+MAX_PDF_PAGES = 128
+MAX_PDF_EXTRACTED_CHARS = MAX_INDEXED_TEXT_CHARS
+MAX_PDF_WORKER_OUTPUT_BYTES = 2 * 1024 * 1024
+PDF_EXTRACT_TIMEOUT_SECONDS = 8.0
+PDF_EXTRACT_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024
+PDF_EXTRACT_CPU_LIMIT_SECONDS = 6
 MAX_RAG_CHUNKS_PER_DOCUMENT = 128
 MAX_RAG_QUERY_CHARS = 1_024
 MAX_RAG_RESULTS = 12
@@ -88,6 +104,14 @@ _ALLOWED_MEDIA_TYPES = {**_TEXT_MEDIA_TYPES, **_BINARY_MEDIA_TYPES}
 _TOKEN_RE = re.compile(r"[0-9a-zA-Z_\u3131-\u318e\uac00-\ud7a3]{2,}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _BLOB_NAME_RE = re.compile(r"(?P<digest>[0-9a-f]{24})(?P<suffix>\.[a-z0-9]+)\Z")
+_ATTACHMENT_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
+_CATALOG_FILENAME = "attachment-catalog.v1.json"
+_CATALOG_SCHEMA_VERSION = 1
+
+try:
+    from pypdf import PdfReader as _PdfReader
+except Exception:  # noqa: BLE001 - optional parser must fail closed at import
+    _PdfReader = None
 
 
 class WorkspaceCapabilityError(ValueError):
@@ -128,6 +152,237 @@ class AttachmentRecord:
             # Storage is local, but no absolute host path is exposed to the UI.
             "storage": "local_content_addressed",
         }
+
+
+def _pdf_extractor_available() -> bool:
+    return _PdfReader is not None
+
+
+def _normalize_extracted_text(value: str) -> str:
+    """Remove control bytes that cannot cross the RAG or browser boundary."""
+
+    normalized: list[str] = []
+    for character in value.replace("\r\n", "\n").replace("\r", "\n"):
+        codepoint = ord(character)
+        if character in "\n\t":
+            normalized.append(character)
+        elif codepoint < 32 or 0x7F <= codepoint <= 0x9F:
+            normalized.append(" ")
+        else:
+            normalized.append(character)
+    return "".join(normalized).strip()
+
+
+def _assign_windows_pdf_job(process: subprocess.Popen[bytes]) -> int:
+    """Assign the waiting parser process to a kill-on-close bounded Job Object."""
+
+    if os.name != "nt":
+        return 0
+    import ctypes
+    from ctypes import wintypes
+
+    class _BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class _ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimitInformation),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    information = _ExtendedLimitInformation()
+    information.BasicLimitInformation.PerProcessUserTimeLimit = (
+        PDF_EXTRACT_CPU_LIMIT_SECONDS * 10_000_000
+    )
+    information.BasicLimitInformation.LimitFlags = 0x00000002 | 0x00000100 | 0x00002000
+    information.ProcessMemoryLimit = PDF_EXTRACT_MEMORY_LIMIT_BYTES
+    if not kernel32.SetInformationJobObject(
+        job,
+        9,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        raise OSError(error, "SetInformationJobObject failed")
+    if not kernel32.AssignProcessToJobObject(
+        job,
+        wintypes.HANDLE(process._handle),  # noqa: SLF001 - native process handle
+    ):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        raise OSError(error, "AssignProcessToJobObject failed")
+    return int(job)
+
+
+def _close_windows_handle(handle: int) -> None:
+    if os.name == "nt" and handle:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def _run_pdf_extractor_subprocess(content: bytes) -> str:
+    candidate = Path(__file__).with_name("pdf_extract_worker.py")
+    if candidate.is_symlink():
+        raise WorkspaceCapabilityError(
+            "PDF_SANDBOX_UNAVAILABLE", "the PDF worker path is unsafe"
+        )
+    worker = candidate.resolve(strict=True)
+    if worker.parent != Path(__file__).parent.resolve(strict=True):
+        raise WorkspaceCapabilityError(
+            "PDF_SANDBOX_UNAVAILABLE", "the PDF worker path is unsafe"
+        )
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-I", str(worker)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(worker.parent),
+            creationflags=creation_flags,
+        )
+    except OSError as exc:
+        raise WorkspaceCapabilityError(
+            "PDF_SANDBOX_UNAVAILABLE", "the PDF worker could not be started"
+        ) from exc
+    job_handle = 0
+    try:
+        try:
+            job_handle = _assign_windows_pdf_job(process)
+        except OSError as exc:
+            process.kill()
+            process.communicate()
+            raise WorkspaceCapabilityError(
+                "PDF_SANDBOX_UNAVAILABLE", "PDF resource limits could not be applied"
+            ) from exc
+        try:
+            stdout, _stderr = process.communicate(
+                input=content,
+                timeout=PDF_EXTRACT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            if job_handle:
+                _close_windows_handle(job_handle)
+                job_handle = 0
+            else:
+                process.kill()
+            process.communicate()
+            raise WorkspaceCapabilityError(
+                "PDF_TEXT_EXTRACTION_TIMEOUT", "PDF extraction exceeded its time limit"
+            ) from exc
+    finally:
+        _close_windows_handle(job_handle)
+    if len(stdout) > MAX_PDF_WORKER_OUTPUT_BYTES:
+        raise WorkspaceCapabilityError(
+            "PDF_TEXT_LIMIT", "PDF worker output exceeds its byte limit"
+        )
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise WorkspaceCapabilityError(
+            "PDF_TEXT_EXTRACTION_FAILED", "the PDF worker returned invalid output"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
+        raise WorkspaceCapabilityError(
+            "PDF_TEXT_EXTRACTION_FAILED", "the PDF worker response is invalid"
+        )
+    if process.returncode != 0 or payload["ok"] is not True:
+        code = payload.get("code")
+        message = payload.get("message")
+        if (
+            not isinstance(code, str)
+            or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) is None
+        ):
+            code = "PDF_TEXT_EXTRACTION_FAILED"
+        if not isinstance(message, str) or not 1 <= len(message) <= 256:
+            message = "the isolated PDF extractor rejected this document"
+        raise WorkspaceCapabilityError(code, message)
+    text = payload.get("text")
+    page_count = payload.get("page_count")
+    if (
+        not isinstance(text, str)
+        or not 1 <= len(text) <= MAX_PDF_EXTRACTED_CHARS
+        or not isinstance(page_count, int)
+        or isinstance(page_count, bool)
+        or not 1 <= page_count <= MAX_PDF_PAGES
+    ):
+        raise WorkspaceCapabilityError(
+            "PDF_TEXT_EXTRACTION_FAILED", "the PDF worker result exceeded its contract"
+        )
+    return text
+
+
+def _extract_pdf_text(content: bytes) -> str:
+    """Extract PDF text in a wall/CPU/RAM-bounded local subprocess."""
+
+    if _PdfReader is None:
+        raise WorkspaceCapabilityError(
+            "PDF_TEXT_EXTRACTION_UNAVAILABLE",
+            "the optional local pypdf extractor is unavailable",
+        )
+    if not isinstance(content, bytes) or not 1 <= len(content) <= MAX_ATTACHMENT_BYTES:
+        raise WorkspaceCapabilityError(
+            "ATTACHMENT_TOO_LARGE", "PDF attachment exceeds its byte limit"
+        )
+    text = _normalize_extracted_text(_run_pdf_extractor_subprocess(content))
+    if not text or len(text) > MAX_PDF_EXTRACTED_CHARS:
+        raise WorkspaceCapabilityError(
+            "PDF_TEXT_LIMIT", "extracted PDF text exceeds its character limit"
+        )
+    return text
+
+
+def _bounded_preview_text(text: str) -> tuple[str, bool]:
+    normalized = _normalize_extracted_text(text)
+    if len(normalized) <= MAX_ATTACHMENT_PREVIEW_CHARS:
+        return normalized, False
+    return normalized[:MAX_ATTACHMENT_PREVIEW_CHARS].rstrip(), True
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +475,217 @@ def _prepare_storage_root(project_root: Path) -> Path:
             )
         current = resolved
     return current
+
+
+def _attachment_name_is_safe(name: object) -> bool:
+    return bool(
+        isinstance(name, str)
+        and 1 <= len(name) <= MAX_ATTACHMENT_NAME_CHARS
+        and Path(name).name == name
+        and name not in {".", ".."}
+        and not any(
+            ord(character) < 32 or 0x7F <= ord(character) <= 0x9F for character in name
+        )
+    )
+
+
+def _atomic_json_write(path: Path, payload: Mapping[str, object]) -> None:
+    """Write one bounded catalog without following a link or exposing a partial file."""
+
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise WorkspaceCapabilityError(
+            "ATTACHMENT_CATALOG_INVALID", "attachment catalog could not be encoded"
+        ) from exc
+    if not 1 <= len(encoded) <= MAX_ATTACHMENT_CATALOG_BYTES:
+        raise WorkspaceCapabilityError(
+            "ATTACHMENT_CATALOG_TOO_LARGE", "attachment catalog exceeds its byte limit"
+        )
+    parent = path.parent.resolve(strict=True)
+    if path.parent.is_symlink() or not path.resolve(strict=False).is_relative_to(
+        parent
+    ):
+        raise WorkspaceCapabilityError(
+            "ATTACHMENT_CATALOG_UNSAFE", "attachment catalog path is unsafe"
+        )
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file():
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_CATALOG_UNSAFE", "attachment catalog is not a regular file"
+            )
+    temporary = parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if (
+            path.is_symlink()
+            or not path.resolve(strict=True).is_relative_to(parent)
+            or path.stat().st_size != len(encoded)
+        ):
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_CATALOG_UNSAFE", "attachment catalog publication failed"
+            )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _load_attachment_catalog(
+    catalog_path: Path, storage_root: Path
+) -> tuple[dict[str, AttachmentRecord], set[str]]:
+    """Load only integrity-verified records; malformed state fails closed."""
+
+    if not catalog_path.exists() and not catalog_path.is_symlink():
+        return {}, set()
+    if catalog_path.is_symlink() or not catalog_path.is_file():
+        raise WorkspaceCapabilityError(
+            "ATTACHMENT_CATALOG_UNSAFE", "attachment catalog is not a regular file"
+        )
+    try:
+        resolved = catalog_path.resolve(strict=True)
+        if not resolved.is_relative_to(storage_root.parent.resolve(strict=True)):
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_CATALOG_UNSAFE", "attachment catalog escaped its workspace"
+            )
+        size = resolved.stat().st_size
+        if not 1 <= size <= MAX_ATTACHMENT_CATALOG_BYTES:
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_CATALOG_TOO_LARGE",
+                "attachment catalog exceeds its byte limit",
+            )
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except WorkspaceCapabilityError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise WorkspaceCapabilityError(
+            "ATTACHMENT_CATALOG_INVALID", "attachment catalog is invalid"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema_version", "items", "indexed_attachment_ids"}
+        or payload.get("schema_version") != _CATALOG_SCHEMA_VERSION
+        or not isinstance(payload.get("items"), list)
+        or not isinstance(payload.get("indexed_attachment_ids"), list)
+        or len(payload["items"]) > MAX_ATTACHMENT_COUNT
+        or len(payload["indexed_attachment_ids"]) > MAX_ATTACHMENT_COUNT
+    ):
+        raise WorkspaceCapabilityError(
+            "ATTACHMENT_CATALOG_INVALID", "attachment catalog schema is invalid"
+        )
+    records: dict[str, AttachmentRecord] = {}
+    for item in payload["items"]:
+        if not isinstance(item, dict) or set(item) != {
+            "attachment_id",
+            "name",
+            "media_type",
+            "size_bytes",
+            "sha256",
+            "created_at",
+            "blob_name",
+            "text_indexable",
+        }:
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_CATALOG_INVALID", "attachment catalog item is invalid"
+            )
+        attachment_id = item["attachment_id"]
+        name = item["name"]
+        media_type = item["media_type"]
+        digest = item["sha256"]
+        blob_name = item["blob_name"]
+        size_bytes = item["size_bytes"]
+        created_at = item["created_at"]
+        text_indexable = item["text_indexable"]
+        suffix = Path(name).suffix.casefold() if isinstance(name, str) else ""
+        if (
+            not isinstance(attachment_id, str)
+            or _ATTACHMENT_ID_RE.fullmatch(attachment_id) is None
+            or attachment_id in records
+            or not _attachment_name_is_safe(name)
+            or _ALLOWED_MEDIA_TYPES.get(suffix) != media_type
+            or not isinstance(digest, str)
+            or _SHA256_RE.fullmatch(digest) is None
+            or not digest.startswith(attachment_id)
+            or blob_name != f"{attachment_id}{suffix}"
+            or not isinstance(size_bytes, int)
+            or isinstance(size_bytes, bool)
+            or not 1 <= size_bytes <= MAX_ATTACHMENT_BYTES
+            or not isinstance(created_at, str)
+            or not 1 <= len(created_at) <= 64
+            or not isinstance(text_indexable, bool)
+            or (suffix != ".pdf" and text_indexable != (suffix in _TEXT_MEDIA_TYPES))
+        ):
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_CATALOG_INVALID", "attachment catalog item is invalid"
+            )
+        try:
+            timestamp = datetime.fromisoformat(created_at)
+        except ValueError as exc:
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_CATALOG_INVALID", "attachment timestamp is invalid"
+            ) from exc
+        if timestamp.tzinfo is None:
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_CATALOG_INVALID", "attachment timestamp is invalid"
+            )
+        stored = storage_root / blob_name
+        try:
+            stored_resolved = stored.resolve(strict=True)
+        except OSError as exc:
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_INTEGRITY_FAILED", "catalogued attachment is missing"
+            ) from exc
+        if (
+            stored.is_symlink()
+            or not stored_resolved.is_relative_to(storage_root)
+            or not stored_resolved.is_file()
+            or stored_resolved.stat().st_size != size_bytes
+            or _sha256_file(stored_resolved) != digest
+        ):
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_INTEGRITY_FAILED",
+                "catalogued attachment failed its integrity check",
+            )
+        records[attachment_id] = AttachmentRecord(
+            attachment_id,
+            name,
+            media_type,
+            size_bytes,
+            digest,
+            stored_resolved,
+            created_at,
+            text_indexable or suffix == ".pdf",
+        )
+    indexed_raw = payload["indexed_attachment_ids"]
+    if (
+        any(not isinstance(item, str) for item in indexed_raw)
+        or len(set(indexed_raw)) != len(indexed_raw)
+        or not set(indexed_raw).issubset(records)
+        or any(not records[item].text_indexable for item in indexed_raw)
+    ):
+        raise WorkspaceCapabilityError(
+            "ATTACHMENT_CATALOG_INVALID", "attachment index state is invalid"
+        )
+    return records, set(indexed_raw)
 
 
 def _inventory_storage_root(storage_root: Path) -> tuple[frozenset[Path], int, int]:
@@ -532,6 +998,9 @@ class AkasicDBAdapter:
         )
         self.root = root
         self.revision = revision
+        self._graph_type = graph_type
+        self._relational_type = relational_type
+        self._vector_type = vector_type
         self.graph_store = graph_type()
         self.relational_store = relational_type()
         self.vector_store = vector_type()
@@ -560,6 +1029,7 @@ class AkasicDBAdapter:
             "revision": self.revision,
             "integration": "external_pinned_core_adapter",
             "storage_lifetime": "process_memory",
+            "restart_recovery": "persistent_catalog_rebuild",
             "embedding": "stable_sha256_lexical_sketch_v1",
             "documents": self.document_count,
             "chunks": self.chunk_count,
@@ -567,6 +1037,16 @@ class AkasicDBAdapter:
             "license_file_present": license_file,
             "source_vendored": False,
         }
+
+    def reset(self) -> None:
+        """Replace all upstream stores so deleted documents cannot remain searchable."""
+
+        with self._lock:
+            self.graph_store = self._graph_type()
+            self.relational_store = self._relational_type()
+            self.vector_store = self._vector_type()
+            self._chunk_ids.clear()
+            self._indexed_attachments.clear()
 
     def index_document(
         self,
@@ -785,6 +1265,7 @@ class WorkspaceCapabilityService:
         *,
         akasicdb_path: str | Path | None = None,
         web_policy: WebAccessPolicy | None = None,
+        lens_client: LensApiClient | None = None,
         answer_integration_enabled: bool = False,
     ) -> None:
         root = Path(project_root).resolve(strict=True)
@@ -795,16 +1276,20 @@ class WorkspaceCapabilityService:
         self.project_root = root
         self.model = model
         self.web_policy = web_policy or WebAccessPolicy()
+        self.lens_client = lens_client or LensApiClient.from_environment({})
         if not isinstance(answer_integration_enabled, bool):
             raise TypeError("answer_integration_enabled must be bool")
         self.answer_integration_enabled = answer_integration_enabled
         self.storage_root = _prepare_storage_root(root)
+        self.catalog_path = self.storage_root.parent / _CATALOG_FILENAME
         (
             self._persisted_valid_blobs,
             self._persisted_blob_count,
             self._persisted_blob_bytes,
         ) = _inventory_storage_root(self.storage_root)
-        self._attachments: dict[str, AttachmentRecord] = {}
+        self._attachments, self._indexed_attachment_ids = _load_attachment_catalog(
+            self.catalog_path, self.storage_root
+        )
         self._lock = RLock()
         self.akasicdb: AkasicDBAdapter | None = None
         self.akasicdb_error: tuple[str, str] | None = None
@@ -823,6 +1308,15 @@ class WorkspaceCapabilityService:
                 self.akasicdb_error = (
                     "AKASICDB_UNAVAILABLE",
                     "the configured AkasicDB clone could not be opened",
+                )
+        if self.akasicdb is not None and self._indexed_attachment_ids:
+            try:
+                self._rebuild_rag_index()
+            except (OSError, UnicodeError, WorkspaceCapabilityError):
+                self.akasicdb = None
+                self.akasicdb_error = (
+                    "AKASICDB_REINDEX_FAILED",
+                    "the persistent local index could not be reconstructed",
                 )
 
     @staticmethod
@@ -901,6 +1395,82 @@ class WorkspaceCapabilityService:
         )
         return cls(project_root, model, **kwargs)
 
+    @staticmethod
+    def _record_is_text_indexable(record: AttachmentRecord) -> bool:
+        suffix = Path(record.name).suffix.casefold()
+        if suffix == ".pdf":
+            return _pdf_extractor_available()
+        return record.text_indexable
+
+    @classmethod
+    def _record_payload(
+        cls, record: AttachmentRecord, *, indexed: bool
+    ) -> dict[str, object]:
+        suffix = Path(record.name).suffix.casefold()
+        text_indexable = cls._record_is_text_indexable(record)
+        if suffix in _BINARY_MEDIA_TYPES and suffix != ".pdf":
+            preview_kind = "image"
+            preview_available = True
+        elif suffix == ".pdf":
+            preview_kind = "text"
+            preview_available = _pdf_extractor_available()
+        else:
+            preview_kind = "text"
+            preview_available = True
+        return {
+            **record.as_payload(),
+            "text_indexable": text_indexable,
+            "indexed": indexed,
+            "preview_kind": preview_kind,
+            "preview_available": preview_available,
+        }
+
+    def _verified_attachment_bytes(self, record: AttachmentRecord) -> bytes:
+        try:
+            resolved = record.stored_path.resolve(strict=True)
+            if (
+                record.stored_path.is_symlink()
+                or not resolved.is_relative_to(self.storage_root)
+                or not resolved.is_file()
+                or resolved.stat().st_size != record.size_bytes
+                or _sha256_file(resolved) != record.sha256
+            ):
+                raise WorkspaceCapabilityError(
+                    "ATTACHMENT_INTEGRITY_FAILED",
+                    "attachment changed after admission",
+                )
+            content = resolved.read_bytes()
+        except WorkspaceCapabilityError:
+            raise
+        except OSError as exc:
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_INTEGRITY_FAILED",
+                "attachment could not be read after admission",
+            ) from exc
+        if len(content) != record.size_bytes:
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_INTEGRITY_FAILED",
+                "attachment changed while it was being read",
+            )
+        return content
+
+    def _read_attachment_text(self, record: AttachmentRecord) -> str:
+        suffix = Path(record.name).suffix.casefold()
+        content = self._verified_attachment_bytes(record)
+        if suffix == ".pdf":
+            return _extract_pdf_text(content)
+        if suffix not in _TEXT_MEDIA_TYPES:
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_NOT_INDEXABLE",
+                "this attachment does not have a verified text extraction path",
+            )
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WorkspaceCapabilityError(
+                "INVALID_TEXT_ENCODING", "text attachments must be UTF-8"
+            ) from exc
+
     def capability_payload(self) -> dict[str, object]:
         rag: dict[str, object]
         if self.akasicdb is None:
@@ -922,6 +1492,33 @@ class WorkspaceCapabilityService:
                 "query_api": True,
                 **self.akasicdb.status_payload(),
             }
+        web_search = self.web_policy.as_payload()
+        lens_connector = {
+            **self.lens_client.capability_payload(),
+            "search_api": True,
+            "patent_search": True,
+            "scholarly_search": True,
+            "citation_links": True,
+            "provenance": True,
+            "lens_to_akasicdb": self.akasicdb is not None,
+            "lens_index_lifetime": "process_memory_until_local_index_rebuild",
+        }
+        web_search.update(
+            {
+                "execution": "official_lens_api_only",
+                "executor_implemented": True,
+                "official_lens_connector": lens_connector,
+            }
+        )
+        for resource in ("lens_patent_search", "lens_scholarly_search"):
+            selected = web_search.get(resource)
+            if isinstance(selected, dict):
+                selected.update(
+                    {
+                        "state": lens_connector["state"],
+                        "network_executor_implemented": True,
+                    }
+                )
         return {
             "schema_version": 1,
             "attachments": {
@@ -934,8 +1531,18 @@ class WorkspaceCapabilityService:
                 "persisted_blob_bytes": self._persisted_blob_bytes,
                 "accepted_media_types": sorted(set(_ALLOWED_MEDIA_TYPES.values())),
                 "image_to_model_integration": False,
-                "pdf_text_extraction": False,
-                "catalog_lifetime": "process_memory",
+                "pdf_text_extraction": _pdf_extractor_available(),
+                "pdf_text_extraction_backend": (
+                    "pypdf" if _pdf_extractor_available() else None
+                ),
+                "pdf_max_pages": MAX_PDF_PAGES,
+                "pdf_max_extracted_chars": MAX_PDF_EXTRACTED_CHARS,
+                "pdf_process_isolation": True,
+                "pdf_wall_timeout_seconds": PDF_EXTRACT_TIMEOUT_SECONDS,
+                "pdf_cpu_limit_seconds": PDF_EXTRACT_CPU_LIMIT_SECONDS,
+                "pdf_memory_limit_bytes": PDF_EXTRACT_MEMORY_LIMIT_BYTES,
+                "preview_max_chars": MAX_ATTACHMENT_PREVIEW_CHARS,
+                "catalog_lifetime": "local_filesystem_persistent",
                 "blob_lifetime": "local_filesystem_until_manual_cleanup",
             },
             "rag": rag,
@@ -953,13 +1560,16 @@ class WorkspaceCapabilityService:
                 "runtime_audio_input": False,
                 "required_before_enablement": "verified local STT and audio pipeline",
             },
-            "web_search": self.web_policy.as_payload(),
+            "web_search": web_search,
         }
 
     def list_attachments(self) -> dict[str, object]:
         with self._lock:
             items = [
-                record.as_payload()
+                self._record_payload(
+                    record,
+                    indexed=record.attachment_id in self._indexed_attachment_ids,
+                )
                 for record in sorted(
                     self._attachments.values(), key=lambda item: item.created_at
                 )
@@ -969,16 +1579,7 @@ class WorkspaceCapabilityService:
     def add_attachment(
         self, *, name: str, media_type: str, content_base64: str
     ) -> dict[str, object]:
-        if (
-            not isinstance(name, str)
-            or not 1 <= len(name) <= MAX_ATTACHMENT_NAME_CHARS
-            or Path(name).name != name
-            or name in {".", ".."}
-            or any(
-                ord(character) < 32 or 0x7F <= ord(character) <= 0x9F
-                for character in name
-            )
-        ):
+        if not _attachment_name_is_safe(name):
             raise WorkspaceCapabilityError(
                 "INVALID_ATTACHMENT_NAME", "attachment name is unsafe"
             )
@@ -1018,7 +1619,13 @@ class WorkspaceCapabilityService:
         with self._lock:
             existing = self._attachments.get(attachment_id)
             if existing is not None:
-                return {**existing.as_payload(), "duplicate": True}
+                return {
+                    **self._record_payload(
+                        existing,
+                        indexed=attachment_id in self._indexed_attachment_ids,
+                    ),
+                    "duplicate": True,
+                }
             stored_resolved = stored.resolve(strict=False)
             reuses_persisted_blob = stored_resolved in self._persisted_valid_blobs
             if len(self._attachments) >= MAX_ATTACHMENT_COUNT or (
@@ -1037,7 +1644,15 @@ class WorkspaceCapabilityService:
                     "ATTACHMENT_TOTAL_BYTES_REACHED",
                     "attachment storage total byte limit reached",
                 )
-            _atomic_content_write(stored, content, digest)
+            try:
+                _atomic_content_write(stored, content, digest)
+            except WorkspaceCapabilityError:
+                raise
+            except (OSError, UnicodeError) as exc:
+                raise WorkspaceCapabilityError(
+                    "ATTACHMENT_STORE_FAILED",
+                    "attachment blob could not be committed",
+                ) from exc
             created = datetime.now(timezone.utc).isoformat()
             record = AttachmentRecord(
                 attachment_id,
@@ -1047,16 +1662,253 @@ class WorkspaceCapabilityService:
                 digest,
                 stored,
                 created,
-                suffix in _TEXT_MEDIA_TYPES,
+                suffix in _TEXT_MEDIA_TYPES or suffix == ".pdf",
             )
             self._attachments[attachment_id] = record
-            if not reuses_persisted_blob:
-                self._persisted_valid_blobs = frozenset(
-                    (*self._persisted_valid_blobs, stored.resolve(strict=True))
+            try:
+                self._persist_catalog()
+            except WorkspaceCapabilityError as exc:
+                self._attachments.pop(attachment_id, None)
+                cleanup_error: OSError | None = None
+                if not reuses_persisted_blob:
+                    try:
+                        stored.unlink()
+                    except OSError as unlink_exc:
+                        cleanup_error = unlink_exc
+                try:
+                    # `_atomic_json_write` can publish the replacement and then
+                    # fail its postcondition check.  Re-publish the previous
+                    # in-memory state so restart recovery observes the rollback.
+                    self._persist_catalog()
+                except WorkspaceCapabilityError as rollback_exc:
+                    raise WorkspaceCapabilityError(
+                        "ATTACHMENT_ROLLBACK_FAILED",
+                        "attachment admission rollback requires operator review",
+                    ) from rollback_exc
+                (
+                    self._persisted_valid_blobs,
+                    self._persisted_blob_count,
+                    self._persisted_blob_bytes,
+                ) = _inventory_storage_root(self.storage_root)
+                if cleanup_error is not None:
+                    raise WorkspaceCapabilityError(
+                        "ATTACHMENT_ROLLBACK_FAILED",
+                        "attachment blob cleanup requires operator review",
+                    ) from cleanup_error
+                raise exc
+            (
+                self._persisted_valid_blobs,
+                self._persisted_blob_count,
+                self._persisted_blob_bytes,
+            ) = _inventory_storage_root(self.storage_root)
+        return {
+            **self._record_payload(record, indexed=False),
+            "duplicate": False,
+        }
+
+    def _catalog_payload(self) -> dict[str, object]:
+        items: list[dict[str, object]] = []
+        for record in sorted(
+            self._attachments.values(),
+            key=lambda item: (item.created_at, item.attachment_id),
+        ):
+            items.append(
+                {
+                    "attachment_id": record.attachment_id,
+                    "name": record.name,
+                    "media_type": record.media_type,
+                    "size_bytes": record.size_bytes,
+                    "sha256": record.sha256,
+                    "created_at": record.created_at,
+                    "blob_name": record.stored_path.name,
+                    "text_indexable": record.text_indexable,
+                }
+            )
+        return {
+            "schema_version": _CATALOG_SCHEMA_VERSION,
+            "items": items,
+            "indexed_attachment_ids": sorted(self._indexed_attachment_ids),
+        }
+
+    def _persist_catalog(self) -> None:
+        try:
+            _atomic_json_write(self.catalog_path, self._catalog_payload())
+        except WorkspaceCapabilityError:
+            raise
+        except (OSError, UnicodeError) as exc:
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_CATALOG_WRITE_FAILED",
+                "attachment catalog could not be committed",
+            ) from exc
+
+    def _rebuild_rag_index(self) -> None:
+        if self.akasicdb is None:
+            return
+        self.akasicdb.reset()
+        for attachment_id in sorted(self._indexed_attachment_ids):
+            record = self._attachments[attachment_id]
+            self.akasicdb.index_document(
+                attachment_id=record.attachment_id,
+                name=record.name,
+                media_type=record.media_type,
+                text=self._read_attachment_text(record),
+            )
+
+    def delete_attachment(self, attachment_id: str) -> dict[str, object]:
+        if (
+            not isinstance(attachment_id, str)
+            or _ATTACHMENT_ID_RE.fullmatch(attachment_id) is None
+        ):
+            raise WorkspaceCapabilityError(
+                "INVALID_ATTACHMENT_ID", "attachment_id is invalid"
+            )
+        with self._lock:
+            record = self._attachments.get(attachment_id)
+            if record is None:
+                raise WorkspaceCapabilityError(
+                    "ATTACHMENT_NOT_FOUND", "attachment was not found"
                 )
-                self._persisted_blob_count += 1
-                self._persisted_blob_bytes += len(content)
-        return {**record.as_payload(), "duplicate": False}
+            # A successful response means both the catalog/index transaction and
+            # the physical content-addressed blob deletion completed.  Read the
+            # bounded blob before unlink so a later catalog/index failure can be
+            # rolled back without leaving an inaccessible or misleading record.
+            blob_content = self._verified_attachment_bytes(record)
+            previous_indexed = set(self._indexed_attachment_ids)
+            try:
+                record.stored_path.unlink()
+            except OSError as exc:
+                raise WorkspaceCapabilityError(
+                    "ATTACHMENT_DELETE_FAILED",
+                    "attachment blob could not be deleted",
+                ) from exc
+
+            self._attachments.pop(attachment_id)
+            self._indexed_attachment_ids.discard(attachment_id)
+            try:
+                self._persist_catalog()
+                self._rebuild_rag_index()
+            except (OSError, UnicodeError, WorkspaceCapabilityError) as exc:
+                self._attachments[attachment_id] = record
+                self._indexed_attachment_ids = previous_indexed
+                try:
+                    _atomic_content_write(
+                        record.stored_path, blob_content, record.sha256
+                    )
+                    self._persist_catalog()
+                    self._rebuild_rag_index()
+                except (
+                    OSError,
+                    UnicodeError,
+                    WorkspaceCapabilityError,
+                ) as rollback_exc:
+                    (
+                        self._persisted_valid_blobs,
+                        self._persisted_blob_count,
+                        self._persisted_blob_bytes,
+                    ) = _inventory_storage_root(self.storage_root)
+                    raise WorkspaceCapabilityError(
+                        "ATTACHMENT_DELETE_ROLLBACK_FAILED",
+                        "attachment deletion rollback requires operator review",
+                    ) from rollback_exc
+                raise WorkspaceCapabilityError(
+                    "ATTACHMENT_DELETE_FAILED",
+                    "attachment deletion could not be committed",
+                ) from exc
+            (
+                self._persisted_valid_blobs,
+                self._persisted_blob_count,
+                self._persisted_blob_bytes,
+            ) = _inventory_storage_root(self.storage_root)
+        return {
+            "attachment_id": attachment_id,
+            "deleted": True,
+            "index_removed": attachment_id in previous_indexed,
+            "blob_deleted": True,
+            "remaining": len(self._attachments),
+            "indexed_documents": (
+                self.akasicdb.document_count if self.akasicdb is not None else 0
+            ),
+        }
+
+    def preview_attachment(self, attachment_id: str) -> dict[str, object]:
+        """Return a bounded preview contract without exposing a host path."""
+
+        if (
+            not isinstance(attachment_id, str)
+            or _ATTACHMENT_ID_RE.fullmatch(attachment_id) is None
+        ):
+            raise WorkspaceCapabilityError(
+                "INVALID_ATTACHMENT_ID", "attachment_id is invalid"
+            )
+        with self._lock:
+            record = self._attachments.get(attachment_id)
+            if record is None:
+                raise WorkspaceCapabilityError(
+                    "ATTACHMENT_NOT_FOUND", "attachment was not found"
+                )
+            suffix = Path(record.name).suffix.casefold()
+            base = {
+                "attachment_id": record.attachment_id,
+                "name": record.name,
+                "media_type": record.media_type,
+                "size_bytes": record.size_bytes,
+            }
+            if suffix in _TEXT_MEDIA_TYPES or suffix == ".pdf":
+                preview, truncated = _bounded_preview_text(
+                    self._read_attachment_text(record)
+                )
+                return {
+                    **base,
+                    "kind": "text",
+                    "text": preview,
+                    "truncated": truncated,
+                    "max_chars": MAX_ATTACHMENT_PREVIEW_CHARS,
+                    "extraction": "pypdf" if suffix == ".pdf" else "utf8",
+                }
+            if suffix in _BINARY_MEDIA_TYPES:
+                # Verify the bytes now; the authenticated content route repeats
+                # this check to close the preview/content time-of-check gap.
+                self._verified_attachment_bytes(record)
+                return {
+                    **base,
+                    "kind": "image",
+                    "content_url": (
+                        "/api/workspace/attachments/content?attachment_id="
+                        + record.attachment_id
+                    ),
+                }
+        raise WorkspaceCapabilityError(
+            "ATTACHMENT_PREVIEW_UNAVAILABLE",
+            "this attachment has no verified preview path",
+        )
+
+    def image_attachment_content(self, attachment_id: str) -> tuple[bytes, str]:
+        """Read only admitted raster formats for the authenticated image route."""
+
+        if (
+            not isinstance(attachment_id, str)
+            or _ATTACHMENT_ID_RE.fullmatch(attachment_id) is None
+        ):
+            raise WorkspaceCapabilityError(
+                "INVALID_ATTACHMENT_ID", "attachment_id is invalid"
+            )
+        with self._lock:
+            record = self._attachments.get(attachment_id)
+            if record is None:
+                raise WorkspaceCapabilityError(
+                    "ATTACHMENT_NOT_FOUND", "attachment was not found"
+                )
+            if Path(record.name).suffix.casefold() not in {
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".webp",
+            }:
+                raise WorkspaceCapabilityError(
+                    "ATTACHMENT_CONTENT_UNAVAILABLE",
+                    "only admitted raster images have a content route",
+                )
+            return self._verified_attachment_bytes(record), record.media_type
 
     @staticmethod
     def _validate_content(suffix: str, content: bytes) -> None:
@@ -1120,43 +1972,162 @@ class WorkspaceCapabilityService:
             raise WorkspaceCapabilityError(
                 "INVALID_ATTACHMENT_IDS", "attachment_ids must be a bounded text list"
             )
-        results: list[dict[str, object]] = []
-        for attachment_id in attachment_ids:
-            with self._lock:
-                record = self._attachments.get(attachment_id)
-            if record is None:
-                raise WorkspaceCapabilityError(
-                    "ATTACHMENT_NOT_FOUND", "attachment was not found"
-                )
-            if not record.text_indexable:
-                raise WorkspaceCapabilityError(
-                    "ATTACHMENT_NOT_INDEXABLE",
-                    "only UTF-8 text attachments can be indexed",
-                )
-            if (
-                record.stored_path.is_symlink()
-                or not record.stored_path.is_file()
-                or not record.stored_path.resolve(strict=True).is_relative_to(
-                    self.storage_root
-                )
-                or _sha256_file(record.stored_path) != record.sha256
-            ):
-                raise WorkspaceCapabilityError(
-                    "ATTACHMENT_INTEGRITY_FAILED",
-                    "attachment changed after admission",
-                )
-            text = record.stored_path.read_text(encoding="utf-8")
-            results.append(
-                self.akasicdb.index_document(
-                    attachment_id=record.attachment_id,
-                    name=record.name,
-                    media_type=record.media_type,
-                    text=text,
-                )
+        if len(set(attachment_ids)) != len(attachment_ids):
+            raise WorkspaceCapabilityError(
+                "INVALID_ATTACHMENT_IDS",
+                "attachment_ids must be a unique bounded text list",
             )
+        with self._lock:
+            records: dict[str, AttachmentRecord] = {}
+            texts: dict[str, str] = {}
+            for attachment_id in attachment_ids:
+                record = self._attachments.get(attachment_id)
+                if record is None:
+                    raise WorkspaceCapabilityError(
+                        "ATTACHMENT_NOT_FOUND", "attachment was not found"
+                    )
+                if not self._record_is_text_indexable(record):
+                    raise WorkspaceCapabilityError(
+                        "ATTACHMENT_NOT_INDEXABLE",
+                        "this attachment has no verified text extraction path",
+                    )
+                records[attachment_id] = record
+                texts[attachment_id] = self._read_attachment_text(record)
+
+            previous = set(self._indexed_attachment_ids)
+            target = previous | set(attachment_ids)
+            target_records = {item: self._attachments[item] for item in sorted(target)}
+            target_texts = {
+                item: (
+                    texts[item]
+                    if item in texts
+                    else self._read_attachment_text(target_records[item])
+                )
+                for item in target_records
+            }
+            try:
+                self.akasicdb.reset()
+                indexed_results: dict[str, dict[str, object]] = {}
+                for item, record in target_records.items():
+                    result = self.akasicdb.index_document(
+                        attachment_id=record.attachment_id,
+                        name=record.name,
+                        media_type=record.media_type,
+                        text=target_texts[item],
+                    )
+                    if item in records:
+                        indexed_results[item] = result
+                self._indexed_attachment_ids = target
+                self._persist_catalog()
+            except Exception as exc:  # noqa: BLE001 - transactional adapter boundary
+                self._indexed_attachment_ids = previous
+                try:
+                    self._persist_catalog()
+                    self._rebuild_rag_index()
+                except Exception as rollback_exc:  # noqa: BLE001
+                    raise WorkspaceCapabilityError(
+                        "RAG_INDEX_ROLLBACK_FAILED",
+                        "the local RAG rollback requires operator review",
+                    ) from rollback_exc
+                if isinstance(exc, WorkspaceCapabilityError):
+                    raise
+                raise WorkspaceCapabilityError(
+                    "RAG_INDEX_FAILED", "the local RAG index could not be committed"
+                ) from exc
+            results = [indexed_results[item] for item in attachment_ids]
         return {
             "engine": "AkasicDB",
             "results": results,
+            "documents": self.akasicdb.document_count,
+            "chunks": self.akasicdb.chunk_count,
+            "answer_integration": self.answer_integration_enabled,
+        }
+
+    def reindex_attachments(self, attachment_ids: list[str]) -> dict[str, object]:
+        """Force a bounded rebuild while retaining every previously indexed file."""
+
+        if self.akasicdb is None:
+            code, message = self.akasicdb_error or (
+                "AKASICDB_UNAVAILABLE",
+                "AkasicDB is unavailable",
+            )
+            raise WorkspaceCapabilityError(code, message)
+        if (
+            not isinstance(attachment_ids, list)
+            or not 1 <= len(attachment_ids) <= MAX_ATTACHMENT_COUNT
+            or any(not isinstance(item, str) for item in attachment_ids)
+            or len(set(attachment_ids)) != len(attachment_ids)
+        ):
+            raise WorkspaceCapabilityError(
+                "INVALID_ATTACHMENT_IDS",
+                "attachment_ids must be a unique bounded text list",
+            )
+        with self._lock:
+            requested: list[AttachmentRecord] = []
+            for attachment_id in attachment_ids:
+                record = self._attachments.get(attachment_id)
+                if record is None:
+                    raise WorkspaceCapabilityError(
+                        "ATTACHMENT_NOT_FOUND", "attachment was not found"
+                    )
+                if not record.text_indexable:
+                    raise WorkspaceCapabilityError(
+                        "ATTACHMENT_NOT_INDEXABLE",
+                        "this attachment has no verified text extraction path",
+                    )
+                requested.append(record)
+
+            previous = set(self._indexed_attachment_ids)
+            target = previous | set(attachment_ids)
+            records = {item: self._attachments[item] for item in sorted(target)}
+            # Read, integrity-check, extract, and chunk every source before the
+            # active in-memory index is reset.
+            texts = {
+                item: self._read_attachment_text(record)
+                for item, record in records.items()
+            }
+            chunk_counts = {
+                item: len(_chunk_text(text)) for item, text in texts.items()
+            }
+            try:
+                self.akasicdb.reset()
+                for item, record in records.items():
+                    self.akasicdb.index_document(
+                        attachment_id=record.attachment_id,
+                        name=record.name,
+                        media_type=record.media_type,
+                        text=texts[item],
+                    )
+                self._indexed_attachment_ids = target
+                self._persist_catalog()
+            except (OSError, UnicodeError, WorkspaceCapabilityError) as exc:
+                self._indexed_attachment_ids = previous
+                try:
+                    self._persist_catalog()
+                    self._rebuild_rag_index()
+                except (
+                    OSError,
+                    UnicodeError,
+                    WorkspaceCapabilityError,
+                ) as rollback_exc:
+                    raise WorkspaceCapabilityError(
+                        "RAG_REINDEX_ROLLBACK_FAILED",
+                        "the local RAG rollback requires operator review",
+                    ) from rollback_exc
+                raise WorkspaceCapabilityError(
+                    "RAG_REINDEX_FAILED", "the local RAG rebuild could not be committed"
+                ) from exc
+        return {
+            "engine": "AkasicDB",
+            "reindexed_attachment_ids": list(attachment_ids),
+            "results": [
+                {
+                    "attachment_id": record.attachment_id,
+                    "chunks": chunk_counts[record.attachment_id],
+                    "reindexed": record.attachment_id in previous,
+                }
+                for record in requested
+            ],
             "documents": self.akasicdb.document_count,
             "chunks": self.akasicdb.chunk_count,
             "answer_integration": self.answer_integration_enabled,
@@ -1176,6 +2147,41 @@ class WorkspaceCapabilityService:
             "answer_integration": self.answer_integration_enabled,
             **result,
         }
+
+    def search_lens(
+        self,
+        kind: LensSearchKind | str,
+        query: str,
+        *,
+        limit: int = 5,
+        index_in_akasicdb: bool = False,
+    ) -> dict[str, object]:
+        """Search official Lens resources and optionally index normalized evidence."""
+
+        if not isinstance(index_in_akasicdb, bool):
+            raise WorkspaceCapabilityError(
+                "INVALID_LENS_INDEX_MODE", "Lens index mode must be boolean"
+            )
+        try:
+            if not index_in_akasicdb:
+                return self.lens_client.search(kind, query, limit=limit).as_payload()
+            if self.akasicdb is None:
+                code, message = self.akasicdb_error or (
+                    "AKASICDB_UNAVAILABLE",
+                    "AkasicDB is unavailable",
+                )
+                raise WorkspaceCapabilityError(code, message)
+            result = LensAkasicBridge(self.lens_client, self.akasicdb).search_and_index(
+                kind, query, limit=limit
+            )
+            return {
+                **result,
+                "index_engine": "AkasicDB",
+                "index_lifetime": "process_memory_until_local_index_rebuild",
+                "provenance_embedded": True,
+            }
+        except LensApiError as exc:
+            raise WorkspaceCapabilityError(exc.code, str(exc)) from exc
 
     def select_model(self, model_id: str) -> dict[str, object]:
         if not isinstance(model_id, str) or model_id != self.model.model_id:
@@ -1207,9 +2213,12 @@ __all__ = [
     "AkasicDBAdapter",
     "AttachmentRecord",
     "MAX_ATTACHMENT_BYTES",
+    "MAX_ATTACHMENT_PREVIEW_CHARS",
     "MAX_ATTACHMENT_TOTAL_BYTES",
     "MAX_JSON_ATTACHMENT_BYTES",
     "MAX_JSON_NESTING",
+    "MAX_PDF_EXTRACTED_CHARS",
+    "MAX_PDF_PAGES",
     "MAX_RAG_RESULTS",
     "VerifiedModelMetadata",
     "WebAccessPolicy",

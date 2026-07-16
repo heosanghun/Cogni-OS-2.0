@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-16T02:47:26.555473+00:00",
+  "scope": "actual_local_gemma4_image_forward_smoke_test",
+  "model_root": "local-artifact:gemma4-e4b-it",
+  "manifest": "config/gemma4-e4b-it.manifest.toml",
+  "artifact_manifest_required": true,
+  "actual_model_forward_executed": true,
+  "external_calls": 0,
+  "input": {
+    "source": "deterministic_locally_generated_png",
+    "format": "PNG",
+    "width": 256,
+    "height": 256,
+    "byte_count": 595,
+    "sha256": "0e513cbdb6792a57d4b16db147085d043ee344622e19b3527c4d79093a390848",
+    "question": "이 이미지를 보고 중앙의 큰 도형 하나의 색상과 모양만 한 문장으로 답하세요. 설명이나 추측을 덧붙이지 마세요. Answer only the central shape's color and shape in one sentence."
+  },
+  "inference": {
+    "decode_mode": "strict",
+    "sampling_seed": 0,
+    "max_new_tokens": 64,
+    "finish_reason": "stop",
+    "generation_mode": "cogni_core"
+  },
+  "response": "중앙의 큰 도형은 파란색 정사각형입니다.",
+  "evaluation": {
+    "required_concepts": [
+      "blue",
+      "square"
+    ],
+    "matched_color_terms": [
+      "파란"
+    ],
+    "matched_shape_terms": [
+      "정사각",
+      "사각형"
+    ],
+    "color_pass": true,
+    "shape_pass": true,
+    "pass": true
+  },
+  "image_understanding_pass": true,
+  "claim_boundary": "This result covers one fixed blue-square smoke test only; it does not establish general visual reasoning quality or VRAM conformance."
+}

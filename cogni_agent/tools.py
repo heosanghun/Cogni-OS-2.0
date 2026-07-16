@@ -21,6 +21,7 @@ import sys
 from time import monotonic
 
 from cogni_flow.task_plan import (
+    ArtifactBundle,
     CapabilityToken,
     ExpectedArtifact,
     RiskTier,
@@ -34,10 +35,15 @@ from cogni_flow.task_plan import (
     TaskVerifier,
     TypedTaskPlan,
     VerifierKind,
+    artifact_bundle_manifest_bytes,
+    artifact_bundle_manifest_path,
+    artifact_bundle_root,
+    parse_artifact_bundle_payload,
 )
 
 
 MAX_REQUEST_CHARS = 4_096
+MAX_PROJECT_COMMAND_BYTES = 1 * 1024 * 1024
 MAX_RESULT_CHARS = 40_000
 MAX_READ_BYTES = 128 * 1024
 MAX_SAVE_BYTES = 64 * 1024
@@ -66,6 +72,7 @@ class ToolRequest:
     argument: str = ""
     scope: str = "."
     content: str = ""
+    artifact_bundle: ArtifactBundle | None = None
 
 
 @dataclass(frozen=True)
@@ -84,12 +91,18 @@ HELP_TEXT = """안전한 로컬 작업 명령
 /status                          Git 변경 상태 읽기
 /test [tests/파일.py]            신뢰 개발자 opt-in에서만 고정 pytest 실행
 /save <파일명> 다음 줄부터 내용   outputs/agent-workspace에 결과 저장
+/project 다음 줄에 JSON           최대 12파일/256KiB PoC·MVP 묶음 저장
+
+/project JSON 스키마:
+{"schema_version":1,"project":"demo","files":[{"path":"main.py","content":"print('hello')\\n"}]}
 
 동일한 작업을 “프로젝트 상태를 보여주세요”, “docs 폴더의 파일 목록을
 보여주세요”, “README.md 파일을 읽어주세요”, “전체 테스트를 실행해주세요”처럼
 명확한 자연어로 요청할 수도 있습니다. 모호한 자연어는 실행하지 않고 도움말을
 표시합니다. 임의 셸 명령과 소스 직접 쓰기는 허용되지 않습니다. 코드 변경은
-Self-Harness의 제안 전용 T2 staging을 거쳐야 합니다."""
+Self-Harness의 제안 전용 T2 staging을 거쳐야 합니다. /project 결과는
+outputs/agent-workspace/<project> 아래의 실행되지 않는 산출물이며, 기존 프로젝트를
+덮어쓰지 않습니다."""
 
 
 _SAFE_NATURAL_PATH = r"[A-Za-z0-9_.\-/]+"
@@ -192,7 +205,12 @@ def parse_tool_request(message: str) -> ToolRequest | None:
     text = message.strip()
     if not text:
         raise ToolPolicyError("empty task request")
-    if len(text) > MAX_REQUEST_CHARS:
+    first_line = text.partition("\n")[0]
+    is_project_command = first_line.split(maxsplit=1)[0].lower() == "/project"
+    if is_project_command:
+        if len(text.encode("utf-8")) > MAX_PROJECT_COMMAND_BYTES:
+            raise ToolPolicyError("/project request exceeds its bounded input limit")
+    elif len(text) > MAX_REQUEST_CHARS:
         raise ToolPolicyError("task request exceeds the bounded input limit")
 
     aliases = {
@@ -241,6 +259,16 @@ def parse_tool_request(message: str) -> ToolRequest | None:
         if name.name != argument or name.suffix.lower() not in ALLOWED_SAVE_SUFFIXES:
             raise ToolPolicyError("/save filename must use .txt, .md, .json, or .csv")
         return ToolRequest(operation, argument, content=remainder)
+    if operation == "project":
+        if argument or not separator or not remainder.strip():
+            raise ToolPolicyError(
+                "/project requires one JSON payload on following lines"
+            )
+        try:
+            bundle = parse_artifact_bundle_payload(remainder)
+        except TaskPlanError as exc:
+            raise ToolPolicyError(str(exc)) from exc
+        return ToolRequest(operation, artifact_bundle=bundle)
     raise ToolPolicyError(f"unsupported task command: /{operation}")
 
 
@@ -332,6 +360,8 @@ class WorkspaceToolExecutor:
         if not isinstance(request, ToolRequest):
             raise TypeError("request must be ToolRequest")
         operation = request.operation
+        if operation != "project" and request.artifact_bundle is not None:
+            raise ToolPolicyError("only /project may carry an artifact bundle")
         action_id = f"{operation}-1"
         expected_artifacts: tuple[ExpectedArtifact, ...] = ()
         risk = RiskTier.T0
@@ -394,11 +424,46 @@ class WorkspaceToolExecutor:
             timeout = 10.0
             cpu_seconds = 5.0
             verifier = TaskVerifier(VerifierKind.ARTIFACT_SHA256)
+        elif operation == "project":
+            bundle = request.artifact_bundle
+            if (
+                bundle is None
+                or any((request.argument, request.content))
+                or request.scope != "."
+            ):
+                raise ToolPolicyError("/project requires only a typed artifact bundle")
+            path = artifact_bundle_root(bundle)
+            manifest_path = artifact_bundle_manifest_path(bundle)
+            manifest = artifact_bundle_manifest_bytes(bundle)
+            action = TaskAction(
+                action_id,
+                TaskActionKind.WRITE_ARTIFACT_BUNDLE,
+                path=path,
+                artifact_bundle=bundle,
+            )
+            allowed_paths = (path,)
+            expected_artifacts = (
+                ExpectedArtifact(
+                    manifest_path,
+                    sha256(manifest).hexdigest(),
+                    max_bytes=MAX_SAVE_BYTES,
+                ),
+            )
+            risk = RiskTier.T1
+            timeout = 15.0
+            cpu_seconds = 10.0
+            ram_bytes = 512 * 1024**2
+            verifier = TaskVerifier(VerifierKind.ARTIFACT_SHA256)
         else:
             raise ToolPolicyError("operation is not on the fixed allowlist")
 
+        bundle_seed = (
+            sha256(artifact_bundle_manifest_bytes(request.artifact_bundle)).hexdigest()
+            if request.artifact_bundle is not None
+            else ""
+        )
         seed = "\x1f".join(
-            (operation, request.argument, request.scope, request.content)
+            (operation, request.argument, request.scope, request.content, bundle_seed)
         ).encode("utf-8")
         plan_id = "tool-" + sha256(seed).hexdigest()[:20]
         return TypedTaskPlan(

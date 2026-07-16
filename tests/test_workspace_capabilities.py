@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from base64 import b64encode
 from hashlib import sha256
+from io import BytesIO
 import json
 from pathlib import Path
 import tempfile
@@ -86,6 +87,32 @@ def _write_clone(root: Path) -> dict[str, str]:
     return digests
 
 
+def _pdf_bytes(text: str) -> bytes:
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    font_reference = writer._add_object(font)
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_reference})}
+    )
+    stream = DecodedStreamObject()
+    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    stream.set_data(f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("ascii"))
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
 class TestWorkspaceCapabilities(unittest.TestCase):
     def test_lexical_sketch_does_not_cancel_colliding_terms(self) -> None:
         # These two terms land in the same signed-hash bucket with opposite
@@ -131,12 +158,144 @@ class TestWorkspaceCapabilities(unittest.TestCase):
             self.assertEqual(listed["count"], 1)
             self.assertEqual(
                 service.capability_payload()["attachments"]["catalog_lifetime"],
-                "process_memory",
+                "local_filesystem_persistent",
             )
             blobs = list(service.storage_root.iterdir())
             self.assertEqual(len(blobs), 1)
             self.assertEqual(blobs[0].read_bytes(), content)
             self.assertFalse(any(path.name.endswith(".tmp") for path in blobs))
+
+    def test_bounded_text_and_image_previews_do_not_expose_host_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            service = WorkspaceCapabilityService(temporary, _model())
+            text = service.add_attachment(
+                name="long.txt",
+                media_type="text/plain",
+                content_base64=b64encode(b"x" * 20_000).decode(),
+            )
+            preview = service.preview_attachment(text["attachment_id"])
+            self.assertEqual(preview["kind"], "text")
+            self.assertTrue(preview["truncated"])
+            self.assertEqual(
+                len(preview["text"]), capabilities.MAX_ATTACHMENT_PREVIEW_CHARS
+            )
+            self.assertNotIn(str(Path(temporary)), json.dumps(preview))
+
+            image_bytes = b"\x89PNG\r\n\x1a\n" + b"bounded-image"
+            image = service.add_attachment(
+                name="local.png",
+                media_type="image/png",
+                content_base64=b64encode(image_bytes).decode(),
+            )
+            image_preview = service.preview_attachment(image["attachment_id"])
+            self.assertEqual(image_preview["kind"], "image")
+            self.assertEqual(
+                image_preview["content_url"],
+                "/api/workspace/attachments/content?attachment_id="
+                + image["attachment_id"],
+            )
+            content, media_type = service.image_attachment_content(
+                image["attachment_id"]
+            )
+            self.assertEqual(content, image_bytes)
+            self.assertEqual(media_type, "image/png")
+            self.assertNotIn(str(Path(temporary)), json.dumps(image_preview))
+
+    def test_pdf_extraction_preview_index_and_explicit_reindex(self) -> None:
+        if capabilities._PdfReader is None:
+            self.skipTest("optional pypdf runtime is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                admitted = service.add_attachment(
+                    name="paper.pdf",
+                    media_type="application/pdf",
+                    content_base64=b64encode(
+                        _pdf_bytes("equilibrium evidence")
+                    ).decode(),
+                )
+                self.assertTrue(admitted["text_indexable"])
+                preview = service.preview_attachment(admitted["attachment_id"])
+                self.assertEqual(preview["extraction"], "pypdf")
+                self.assertIn("equilibrium evidence", preview["text"])
+                indexed = service.index_attachments([admitted["attachment_id"]])
+                self.assertEqual(indexed["documents"], 1)
+                result = service.query_rag("equilibrium")
+                self.assertEqual(result["count"], 1)
+                self.assertEqual(
+                    result["results"][0]["attachment_id"], admitted["attachment_id"]
+                )
+                self.assertEqual(result["results"][0]["chunk_index"], 0)
+                self.assertGreater(result["results"][0]["score"], 0)
+                rebuilt = service.reindex_attachments([admitted["attachment_id"]])
+                self.assertEqual(
+                    rebuilt["reindexed_attachment_ids"], [admitted["attachment_id"]]
+                )
+                self.assertTrue(rebuilt["results"][0]["reindexed"])
+
+    def test_pdf_extraction_is_fail_closed_when_optional_backend_is_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(capabilities, "_PdfReader", None):
+                service = WorkspaceCapabilityService(temporary, _model())
+                admitted = service.add_attachment(
+                    name="paper.pdf",
+                    media_type="application/pdf",
+                    content_base64=b64encode(b"%PDF-1.4\nlocal-only").decode(),
+                )
+                self.assertFalse(admitted["text_indexable"])
+                self.assertFalse(
+                    service.capability_payload()["attachments"]["pdf_text_extraction"]
+                )
+                with self.assertRaisesRegex(
+                    WorkspaceCapabilityError, "pypdf extractor is unavailable"
+                ):
+                    service.preview_attachment(admitted["attachment_id"])
+
+    def test_pdf_extracted_text_limit_is_enforced_before_indexing(self) -> None:
+        with patch.object(
+            capabilities,
+            "_run_pdf_extractor_subprocess",
+            return_value="x" * (capabilities.MAX_PDF_EXTRACTED_CHARS + 1),
+        ):
+            with self.assertRaisesRegex(WorkspaceCapabilityError, "character limit"):
+                capabilities._extract_pdf_text(b"%PDF-1.4\nlocal")
+
+    def test_pdf_subprocess_timeout_is_fail_closed_and_kills_worker(self) -> None:
+        class _TimedOutProcess:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.killed = False
+
+            def communicate(self, input=None, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise capabilities.subprocess.TimeoutExpired("pdf", timeout)
+                return b"", b""
+
+            def kill(self) -> None:
+                self.killed = True
+
+        process = _TimedOutProcess()
+        with (
+            patch.object(capabilities.subprocess, "Popen", return_value=process),
+            patch.object(capabilities, "_assign_windows_pdf_job", return_value=0),
+        ):
+            with self.assertRaisesRegex(
+                WorkspaceCapabilityError, "time limit"
+            ) as raised:
+                capabilities._run_pdf_extractor_subprocess(b"%PDF-1.4\nlocal")
+        self.assertEqual(raised.exception.code, "PDF_TEXT_EXTRACTION_TIMEOUT")
+        self.assertTrue(process.killed)
 
     def test_encoded_length_is_rejected_before_base64_decode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -167,7 +326,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
             ):
                 WorkspaceCapabilityService(root, _model())
 
-    def test_process_restart_does_not_claim_a_persistent_catalog(self) -> None:
+    def test_process_restart_restores_the_integrity_checked_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             first = WorkspaceCapabilityService(temporary, _model())
             encoded = b64encode(b"local evidence").decode("ascii")
@@ -175,15 +334,120 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 name="one.txt", media_type="text/plain", content_base64=encoded
             )
             second = WorkspaceCapabilityService(temporary, _model())
-            self.assertEqual(second.list_attachments()["count"], 0)
+            self.assertEqual(second.list_attachments()["count"], 1)
             admitted = second.add_attachment(
                 name="one.txt", media_type="text/plain", content_base64=encoded
             )
-            self.assertFalse(admitted["duplicate"])
+            self.assertTrue(admitted["duplicate"])
             self.assertEqual(
                 second.capability_payload()["attachments"]["persisted_blob_count"],
                 1,
             )
+
+    def test_add_rolls_back_blob_and_memory_when_catalog_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            service = WorkspaceCapabilityService(temporary, _model())
+            with patch.object(
+                capabilities,
+                "_atomic_json_write",
+                side_effect=[OSError("catalog full"), None],
+            ):
+                with self.assertRaisesRegex(
+                    WorkspaceCapabilityError, "catalog could not be committed"
+                ):
+                    service.add_attachment(
+                        name="rollback.txt",
+                        media_type="text/plain",
+                        content_base64=b64encode(b"transactional evidence").decode(),
+                    )
+            self.assertEqual(service.list_attachments()["count"], 0)
+            self.assertEqual(list(service.storage_root.iterdir()), [])
+            self.assertEqual(
+                service.capability_payload()["attachments"]["persisted_blob_count"],
+                0,
+            )
+
+    def test_index_batch_rolls_back_catalog_and_rag_on_commit_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                admitted = service.add_attachment(
+                    name="rollback.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode("원자적 인덱스".encode()).decode(),
+                )
+                with patch.object(
+                    capabilities,
+                    "_atomic_json_write",
+                    side_effect=[OSError("catalog full"), None],
+                ):
+                    with self.assertRaisesRegex(
+                        WorkspaceCapabilityError, "catalog could not be committed"
+                    ):
+                        service.index_attachments([admitted["attachment_id"]])
+                self.assertFalse(service.list_attachments()["items"][0]["indexed"])
+                self.assertEqual(service.query_rag("원자적 인덱스")["count"], 0)
+
+    def test_delete_unlink_failure_preserves_catalog_blob_and_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                admitted = service.add_attachment(
+                    name="retained.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode("삭제 실패 보존".encode()).decode(),
+                )
+                attachment_id = admitted["attachment_id"]
+                service.index_attachments([attachment_id])
+                record = service._attachments[attachment_id]
+                with patch.object(
+                    Path, "unlink", side_effect=PermissionError("locked")
+                ):
+                    with self.assertRaisesRegex(
+                        WorkspaceCapabilityError, "blob could not be deleted"
+                    ):
+                        service.delete_attachment(attachment_id)
+                self.assertTrue(record.stored_path.is_file())
+                self.assertTrue(service.list_attachments()["items"][0]["indexed"])
+                self.assertEqual(service.query_rag("삭제 실패 보존")["count"], 1)
+
+    def test_delete_catalog_failure_restores_the_unlinked_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            service = WorkspaceCapabilityService(temporary, _model())
+            admitted = service.add_attachment(
+                name="restore.txt",
+                media_type="text/plain",
+                content_base64=b64encode(b"restore after catalog failure").decode(),
+            )
+            attachment_id = admitted["attachment_id"]
+            stored_path = service._attachments[attachment_id].stored_path
+            with patch.object(
+                capabilities,
+                "_atomic_json_write",
+                side_effect=[OSError("catalog full"), None],
+            ):
+                with self.assertRaisesRegex(
+                    WorkspaceCapabilityError, "deletion could not be committed"
+                ):
+                    service.delete_attachment(attachment_id)
+            self.assertTrue(stored_path.is_file())
+            self.assertEqual(service.list_attachments()["count"], 1)
 
     def test_restart_inventory_blocks_cumulative_blob_count_bypass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -197,7 +461,9 @@ class TestWorkspaceCapabilities(unittest.TestCase):
 
             restarted = WorkspaceCapabilityService(temporary, _model())
             attachments = restarted.capability_payload()["attachments"]
-            self.assertEqual(attachments["catalog_lifetime"], "process_memory")
+            self.assertEqual(
+                attachments["catalog_lifetime"], "local_filesystem_persistent"
+            )
             self.assertEqual(attachments["persisted_blob_count"], MAX_ATTACHMENT_COUNT)
             self.assertLess(
                 attachments["persisted_blob_bytes"], MAX_ATTACHMENT_TOTAL_BYTES
@@ -247,12 +513,66 @@ class TestWorkspaceCapabilities(unittest.TestCase):
             admitted = restarted.add_attachment(
                 name="renamed.txt", media_type="text/plain", content_base64=encoded
             )
-            self.assertFalse(admitted["duplicate"])
+            self.assertTrue(admitted["duplicate"])
             self.assertEqual(len(list(restarted.storage_root.iterdir())), 1)
             self.assertEqual(
                 restarted.capability_payload()["attachments"]["persisted_blob_count"],
                 1,
             )
+
+    def test_index_state_is_rebuilt_after_restart_and_delete_removes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                first = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                admitted = first.add_attachment(
+                    name="persistent.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode("평형 탐색 영구 근거".encode()).decode(),
+                )
+                attachment_id = admitted["attachment_id"]
+                first.index_attachments([attachment_id])
+
+                restarted = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                listed = restarted.list_attachments()
+                self.assertEqual(listed["count"], 1)
+                self.assertTrue(listed["items"][0]["indexed"])
+                self.assertEqual(restarted.query_rag("평형 탐색")["count"], 1)
+
+                deleted = restarted.delete_attachment(attachment_id)
+                self.assertTrue(deleted["deleted"])
+                self.assertTrue(deleted["index_removed"])
+                self.assertTrue(deleted["blob_deleted"])
+                self.assertEqual(restarted.query_rag("평형 탐색")["count"], 0)
+
+                final = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                self.assertEqual(final.list_attachments()["count"], 0)
+                self.assertEqual(final.query_rag("평형 탐색")["count"], 0)
+
+    def test_catalog_symlink_and_tampered_blob_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = WorkspaceCapabilityService(root, _model())
+            admitted = service.add_attachment(
+                name="evidence.txt",
+                media_type="text/plain",
+                content_base64=b64encode(b"verified evidence").decode(),
+            )
+            record = service._attachments[admitted["attachment_id"]]
+            record.stored_path.write_bytes(b"tampered")
+            with self.assertRaisesRegex(WorkspaceCapabilityError, "integrity check"):
+                WorkspaceCapabilityService(root, _model())
 
     def test_attachment_name_rejects_c0_and_c1_control_characters(self) -> None:
         encoded = b64encode(b"safe content").decode()

@@ -30,6 +30,7 @@ class _Agent:
     def __init__(self) -> None:
         self.availability_check = None
         self.evidence: tuple[object, ...] = ()
+        self.image_content: bytes | None = None
         self.messages: list[str] = []
         self.shutdown_called = False
 
@@ -37,9 +38,10 @@ class _Agent:
     def is_active(self) -> bool:
         return False
 
-    def start_turn(self, _message, _mode="chat", *, evidence=()):
+    def start_turn(self, _message, _mode="chat", *, evidence=(), image_content=None):
         self.messages.append(_message)
         self.evidence = tuple(evidence)
+        self.image_content = image_content
         return "turn-rag"
 
     def snapshot(self):
@@ -73,9 +75,23 @@ class _Workspace:
             },
         ]
         self.queries: list[str] = []
+        self.lens_queries: list[dict[str, object]] = []
 
     def capability_payload(self):
-        return {"schema_version": 1, "rag": {"state": "local_index_ready"}}
+        return {
+            "schema_version": 1,
+            "attachments": {"state": "enabled"},
+            "rag": {"state": "local_index_ready"},
+            "models": {
+                "items": [
+                    {
+                        "checkpoint_modalities": ["text", "image"],
+                        "runtime_input_modalities": ["text"],
+                        "unwired_checkpoint_modalities": ["image"],
+                    }
+                ]
+            },
+        }
 
     def list_attachments(self):
         return {"items": [], "count": 0}
@@ -86,8 +102,45 @@ class _Workspace:
         self.added = body
         return {"attachment_id": "abc", "storage": "local_content_addressed"}
 
+    def delete_attachment(self, attachment_id):
+        return {
+            "attachment_id": attachment_id,
+            "deleted": True,
+            "index_removed": True,
+            "blob_deleted": True,
+            "remaining": 0,
+            "indexed_documents": 0,
+        }
+
+    def preview_attachment(self, attachment_id):
+        return {
+            "attachment_id": attachment_id,
+            "name": "paper.txt",
+            "media_type": "text/plain",
+            "size_bytes": 8,
+            "kind": "text",
+            "text": "evidence",
+            "truncated": False,
+            "max_chars": 12000,
+            "extraction": "utf8",
+        }
+
+    def image_attachment_content(self, attachment_id):
+        if attachment_id != "a" * 24:
+            raise WorkspaceCapabilityError(
+                "ATTACHMENT_NOT_FOUND", "private path must not leak"
+            )
+        return b"\x89PNG\r\n\x1a\n", "image/png"
+
     def index_attachments(self, attachment_ids):
         return {"results": list(attachment_ids), "answer_integration": False}
+
+    def reindex_attachments(self, attachment_ids):
+        return {
+            "reindexed_attachment_ids": list(attachment_ids),
+            "documents": len(attachment_ids),
+            "chunks": len(attachment_ids),
+        }
 
     def query_rag(self, query, *, limit=5):
         self.queries.append(query)
@@ -104,6 +157,24 @@ class _Workspace:
                 "MODEL_NOT_VERIFIED", "C:\\private\\model must not leak"
             )
         return {"model_id": model_id, "selected": True}
+
+    def search_lens(self, kind, query, *, limit=5, index_in_akasicdb=False):
+        request = {
+            "kind": kind,
+            "query": query,
+            "limit": limit,
+            "index_in_akasicdb": index_in_akasicdb,
+        }
+        self.lens_queries.append(request)
+        search = {
+            "provider": "Lens.org official API",
+            "kind": kind,
+            "total": 0,
+            "count": 0,
+            "results": [],
+            "external_calls": 1,
+        }
+        return {"search": search, "indexed": []} if index_in_akasicdb else search
 
 
 class TestWorkspaceHTTPAPI(unittest.TestCase):
@@ -159,6 +230,17 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         connection.close()
         return status, payload
 
+    def _get_raw(self, path: str, *, authenticated: bool = True):
+        connection = self._connection()
+        headers = {"Cookie": self.cookie} if authenticated else {}
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        payload = response.read()
+        status = response.status
+        content_type = response.getheader("Content-Type")
+        connection.close()
+        return status, payload, content_type
+
     def _post(self, path: str, body: dict[str, object]):
         connection = self._connection()
         connection.request(
@@ -184,6 +266,18 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         status, payload = self._get("/api/workspace/attachments")
         self.assertEqual(status, 200)
         self.assertEqual(payload["count"], 0)
+        attachment_id = "a" * 24
+        status, payload = self._get(
+            f"/api/workspace/attachments/preview?attachment_id={attachment_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["attachment_id"], attachment_id)
+        status, content, content_type = self._get_raw(
+            f"/api/workspace/attachments/content?attachment_id={attachment_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(content, b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(content_type, "image/png")
         self.assertEqual(
             self._get("/api/workspace/capabilities", authenticated=False)[0], 403
         )
@@ -204,6 +298,16 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
             self._post("/api/workspace/rag/index", {"attachment_ids": ["abc"]})[0],
             200,
         )
+        status, payload = self._post(
+            "/api/workspace/rag/reindex", {"attachment_ids": ["abc"]}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["reindexed_attachment_ids"], ["abc"])
+        status, payload = self._post(
+            "/api/workspace/attachments/delete", {"attachment_id": "abc"}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["deleted"])
         self.assertEqual(
             self._post("/api/workspace/rag/query", {"query": "평형", "limit": 2})[1][
                 "count"
@@ -215,6 +319,35 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
                 0
             ],
             200,
+        )
+        status, payload = self._post(
+            "/api/workspace/lens/search",
+            {"kind": "patent", "query": "equilibrium", "limit": 5},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["provider"], "Lens.org official API")
+        status, payload = self._post(
+            "/api/workspace/lens/search-and-index",
+            {"kind": "scholarly", "query": "fixed point"},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("indexed", payload)
+        self.assertEqual(
+            self.workspace.lens_queries,
+            [
+                {
+                    "kind": "patent",
+                    "query": "equilibrium",
+                    "limit": 5,
+                    "index_in_akasicdb": False,
+                },
+                {
+                    "kind": "scholarly",
+                    "query": "fixed point",
+                    "limit": 5,
+                    "index_in_akasicdb": True,
+                },
+            ],
         )
         status, payload = self._post(
             "/api/workspace/models/select", {"model_id": "unknown"}
@@ -257,6 +390,133 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"]["code"], "INVALID_BODY")
+
+    def test_image_chat_is_explicit_single_turn_bounded_and_path_free(self) -> None:
+        attachment_id = "a" * 24
+        with patch.object(
+            self.server, "image_to_model_integration_ready", return_value=True
+        ):
+            status, capability = self._get("/api/workspace/capabilities")
+            self.assertEqual(status, 200)
+            self.assertTrue(capability["attachments"]["image_to_model_integration"])
+            self.assertEqual(
+                capability["attachments"]["image_selection"],
+                "explicit_single_next_turn",
+            )
+            self.assertEqual(
+                capability["models"]["items"][0]["runtime_input_modalities"],
+                ["text", "image"],
+            )
+            self.assertEqual(
+                capability["models"]["items"][0]["unwired_checkpoint_modalities"],
+                [],
+            )
+            status, payload = self._post(
+                "/api/agent/chat",
+                {
+                    "message": "이 이미지를 설명해 주세요.",
+                    "mode": "chat",
+                    "rag": False,
+                    "image_attachment_id": attachment_id,
+                },
+            )
+        self.assertEqual(status, 202)
+        self.assertTrue(payload["image_requested"])
+        self.assertTrue(payload["image_input_admitted"])
+        self.assertEqual(payload["image_media_type"], "image/png")
+        self.assertEqual(self.agent.image_content, b"\x89PNG\r\n\x1a\n")
+        encoded = json.dumps(payload)
+        self.assertNotIn("89504e47", encoded.casefold())
+        self.assertNotIn("C:\\", encoded)
+
+    def test_image_chat_rejects_invalid_id_media_rag_task_and_unverified_runtime(
+        self,
+    ) -> None:
+        status, capability = self._get("/api/workspace/capabilities")
+        self.assertEqual(status, 200)
+        self.assertFalse(capability["attachments"]["image_to_model_integration"])
+
+        text_only_capability = {
+            "schema_version": 1,
+            "attachments": {"state": "enabled"},
+            "rag": {"state": "local_index_ready"},
+            "models": {
+                "items": [
+                    {
+                        "checkpoint_modalities": ["text"],
+                        "runtime_input_modalities": ["text"],
+                    }
+                ]
+            },
+        }
+        with (
+            patch.object(
+                self.server, "image_to_model_integration_ready", return_value=True
+            ),
+            patch.object(
+                self.workspace,
+                "capability_payload",
+                return_value=text_only_capability,
+            ),
+        ):
+            status, capability = self._get("/api/workspace/capabilities")
+        self.assertEqual(status, 200)
+        self.assertFalse(capability["attachments"]["image_to_model_integration"])
+
+        invalid_bodies = (
+            {"message": "x", "image_attachment_id": None},
+            {"message": "x", "image_attachment_id": "A" * 24},
+            {
+                "message": "x",
+                "mode": "chat",
+                "rag": True,
+                "image_attachment_id": "a" * 24,
+            },
+            {
+                "message": "/status",
+                "mode": "task",
+                "image_attachment_id": "a" * 24,
+            },
+        )
+        for body in invalid_bodies:
+            with self.subTest(body=body):
+                status, payload = self._post("/api/agent/chat", body)
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["code"], "INVALID_BODY")
+
+        status, payload = self._post(
+            "/api/agent/chat",
+            {"message": "x", "image_attachment_id": "a" * 24},
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"]["code"], "IMAGE_MODEL_UNAVAILABLE")
+
+        with patch.object(
+            self.server, "image_to_model_integration_ready", return_value=True
+        ):
+            status, payload = self._post(
+                "/api/agent/chat",
+                {"message": "x", "image_attachment_id": "b" * 24},
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "ATTACHMENT_NOT_FOUND")
+
+        with (
+            patch.object(
+                self.server, "image_to_model_integration_ready", return_value=True
+            ),
+            patch.object(
+                self.workspace,
+                "image_attachment_content",
+                return_value=(b"plain", "text/plain"),
+            ),
+        ):
+            status, payload = self._post(
+                "/api/agent/chat",
+                {"message": "x", "image_attachment_id": "a" * 24},
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "WORKSPACE_RESPONSE_INVALID")
 
     def test_rag_chat_truncates_only_the_search_query(self) -> None:
         import cogni_agent.manager as manager_module

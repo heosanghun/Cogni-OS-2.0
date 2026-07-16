@@ -1,8 +1,8 @@
-# Cogni-OS 2.0 v0.3.2 Security and Safety Model
+# Cogni-OS 2.0 v0.4.0 Security and Safety Model
 
 ## Release boundary
 
-Version 0.3.2 is a local research runtime with a **proposal-only** evolution
+Version 0.4.0 is a local research runtime with a **proposal-only** evolution
 boundary. It may observe failures, build evidence-linked candidates, and store
 an inert proposal archive. It may not execute candidate source, replace active
 source, or promote a proposal. Safe promotion belongs to a later phase and
@@ -20,8 +20,9 @@ requires independently attested kernel isolation.
 - SHA-256 and closed-world verification run before and after tokenizer/model
   loading; OS read-only controls are still required to defend an adversarial
   swap-and-restore race that user-space pre/post checks cannot prove absent;
-- Hub IDs, URLs, remote code, force-download, telemetry and external APIs are
-  rejected or disabled;
+- Hub IDs, model URLs, remote code, force-download, and telemetry are rejected
+  or disabled. Network mode is off by default; the only implemented exception
+  is the official Lens connector described below;
 - the HTTP server binds to loopback, validates Host/Origin, uses an HttpOnly
   per-process session token, restrictive CSP, exact routes, bounded bodies and
   a static-asset allowlist;
@@ -38,6 +39,54 @@ requires independently attested kernel isolation.
   generation fallback; Cogni-Core terminal success and base-integrity checks
   are required before the response is atomically published, and Core failure
   fails closed.
+
+### Local attachments, RAG, and multimodal input
+
+- attachment names, media types, magic bytes, per-file/total sizes, counts,
+  JSON nesting, PDF pages, extracted characters, previews, and index chunks
+  are bounded before use;
+- attachment blobs are content-addressed and stored under a dedicated local
+  root; catalog and blob digests are revalidated on restart and before reads;
+- arbitrary paths, symlink/reparse escapes, active content, HTML, executables,
+  archives, and unknown media types are not admitted;
+- PDF extraction is local and runs outside the HTTP process. Windows assigns
+  the waiting worker to a kill-on-close Job Object with a 256 MiB process-memory
+  cap and six-second CPU cap; POSIX applies matching rlimits, and the parent
+  enforces an eight-second wall timeout plus output/page/character bounds.
+  Parser success is not treated as proof that a document is benign or factual;
+- AkasicDB is loaded only from one audited revision after exact source-module
+  digest checks. Its demo server, remote-model paths, synthetic dataset, and
+  hard-coded answer paths are not imported or started;
+- retrieved text is normalized into bounded `RetrievalEvidence` with explicit
+  provenance before prompt construction. Index presence alone never grants
+  answer authority;
+- the current deterministic 256-dimensional lexical vectorizer is not exposed
+  as a trained semantic embedding or source-truth verifier;
+- image/audio preprocessing is manifest-bound and emits only an allowlisted,
+  fixed-schema CPU tensor bundle. Tensor dtype, shape, byte count, modality,
+  job, lease, deadline, artifact, and session identity are rechecked across
+  the worker boundary;
+- a selected image has one-turn scope. Audio accepts only mono 16-bit PCM WAV
+  at 16 kHz for at most 30 seconds. Video has no admitted runtime route.
+
+### Voice and opt-in Lens boundary
+
+- browser microphone permission is requested only after a user gesture;
+  capture, cancel, object-URL cleanup, and authenticated loopback transport are
+  bounded by the UI/session lifecycle;
+- transcription uses the already resident manifest-verified Gemma service and
+  cannot silently call a remote STT provider;
+- speech playback invokes an installed Windows System.Speech voice through a
+  fixed encoded PowerShell program with JSON on standard input, no shell
+  interpolation, bounded text/output, timeout, and WAV validation;
+- Lens remains disabled unless online opt-in mode, the exact
+  `api.lens.org` allowlist host, a bounded user-supplied token, and explicit
+  terms acceptance are all present;
+- the Lens client uses only bounded HTTPS POST to fixed patent/scholarly API
+  routes, rejects redirects/host changes and oversized or malformed responses,
+  redacts authorization secrets, and records provenance and attribution;
+- no generic web browser/search executor is granted model authority. Lens
+  results reach local RAG only through an explicit search-and-index action.
 
 ### Numerical and memory safety
 
@@ -153,19 +202,26 @@ device descriptors and artifact hashes must come from the trusted host. A
 Python class cannot prove that a malicious injected object is offline or that
 an external evaluator is honest.
 
-## Deliberately unavailable in v0.3.2
+## Deliberately unavailable in v0.4.0
 
 - automatic source promotion or live-code replacement;
 - a trusted kernel-isolated Windows Sandbox/VM/container attestation;
 - network/host-filesystem escape evidence for a candidate runner;
-- signed executable, SBOM, installer/update trust chain, or hardware-backed
-  signing identity;
+- signed executable, signed installer/update trust chain, or hardware-backed
+  signing identity; the release builder does emit an unsigned-status manifest,
+  CycloneDX dependency inventory and third-party metadata notice;
 - RTX 4090 hardware certification and packet-level egress audit;
 - an independent external human-labelled 20-turn conversation study;
 - trained DEQ/Wproj, Fast Weight Programmer and System 3 expert artifacts;
 - at least three-seed FP-EWC BWT/FWT results;
 - production PCAS calibration and System 4 quality evidence;
 - independent held-out quality/verifier results for advisory modules;
+- a trained semantic embedder and independent RAG relevance/poisoning study;
+- video understanding and combined multimodal depth-100 VRAM evidence;
+- live Lens validation without a user token, terms acceptance, and attribution
+  review;
+- multi-speaker/noise/multilingual STT WER and TTS accessibility/quality
+  acceptance evidence;
 - production code signing and a signed installer/update trust chain.
 
 `SubprocessSandbox` and any previous atomic-replacement primitives are
@@ -175,7 +231,7 @@ boundary or marker is never accepted as proof of kernel isolation.
 ## Deployment responsibility
 
 Mirror the model, tokenizer, licenses, configuration and provenance into the
-offline environment before launch. Do not allow runtime downloads. The v0.3.2
+offline environment before launch. Do not allow runtime downloads. The v0.4.0
 launcher is a bootstrapper that requires the source tree and dependencies; it
 is not a signed standalone appliance. Repeat all VRAM, air-gap, conversation
 and failure-injection gates on the exact deployment hardware and software

@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.4.0 — 2026-07-16
+
+### Persistent local knowledge workspace
+
+- added a bounded, content-addressed attachment catalog that survives restart,
+  revalidates blob identity, and supports list, preview, delete, and full
+  reindex operations;
+- added bounded local PDF extraction with `pypdf`, page/character limits, and
+  source metadata rather than treating raw PDF bytes as model text;
+- integrated the pinned, digest-verified AkasicDB GraphStore,
+  RelationalStore, and VectorStore through a local-only adapter;
+- allowed validated retrieval chunks to enter the answer path as bounded
+  `RetrievalEvidence` with attachment, chunk, score, and provenance fields;
+- retained the current deterministic vectorizer as a bounded lexical index,
+  not a trained semantic-embedding claim.
+
+### Multimodal and local voice paths
+
+- added manifest-bound `Gemma4Processor` image and audio preprocessing using
+  the instruction-tuned multimodal chat template;
+- extended model IPC with fixed-schema, bounded CPU tensors for one explicit
+  image or audio request while preserving lease, job, deadline, artifact, and
+  session binding;
+- added explicit one-turn image selection and authenticated local preview,
+  without implementing video input;
+- added user-initiated browser microphone capture, bounded 16 kHz mono PCM WAV
+  admission, resident-Gemma transcription, and local Windows System.Speech
+  playback;
+- measured one fixed blue-square PNG through the actual Cogni-Core image path,
+  which returned the required colour and shape with a terminal stop and zero
+  external calls;
+- measured one Korean Windows-TTS-to-Gemma-STT smoke with normalized
+  similarity 1.0 and zero application external calls; this is not a WER,
+  noisy-speech, multilingual, latency, or general quality benchmark.
+
+### Gated research search and review UX
+
+- added bounded official Lens patent and scholarly API clients with exact-host
+  allowlisting, explicit online mode, user token, terms-acceptance, attribution,
+  timeout, response-size, and provenance gates;
+- added explicit Lens-to-AkasicDB indexing; no live Lens result is included or
+  claimed without user credentials and accepted terms;
+- added a read-only Self-Harness proposal diff viewer that exposes evidence
+  and stale-base checks while retaining zero source-apply, approval,
+  promotion, or rollback authority;
+- aligned product, UI, launcher, validation, and release metadata at v0.4.0.
+
 ## 0.3.2 — 2026-07-12
 
 ### Natural conversation and completion integrity

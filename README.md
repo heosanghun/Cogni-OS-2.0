@@ -1,10 +1,11 @@
-# Cogni-OS 2.0 Genesis — v0.3.2
+# Cogni-OS 2.0 Genesis — v0.4.0
 
-Cogni-OS 2.0 is an offline, bounded research runtime for a verified local
-dense Gemma 4 E4B-it artifact. Version 0.3.2 connects conversation integrity,
-causal DEQ/CTS conditioning, typed local tasks, bounded research workflows,
-and a **proposal-only** Self-Harness behind explicit capability and evidence
-states.
+Cogni-OS 2.0 is an offline-by-default, bounded research runtime for a verified local
+dense Gemma 4 E4B-it artifact. Version 0.4.0 adds a persistent local document
+workspace, provenance-bearing AkasicDB RAG, bounded Gemma image/audio routes,
+local speech input/output, and an explicitly opt-in Lens patent/scholarly API
+connector to the existing conversation, Cogni-Core, typed-task, and
+**proposal-only** Self-Harness boundaries.
 
 This release is not an AGI claim, an RTX 4090 certification, or evidence that
 every research module improves model quality. A Python implementation or a
@@ -12,7 +13,7 @@ passing component test never upgrades a capability by itself.
 
 ## Product authority at a glance
 
-| Capability | v0.3.2 state | May affect the answer? | What is still required |
+| Capability | v0.4.0 state | May affect the answer? | What is still required |
 |---|---|---:|---|
 | verified local Gemma 4 E4B-it | `authoritative` | yes | exact pinned instruction-tuned artifact and seven-file manifest |
 | bounded conversation fast path | `product_ux` | yes, narrow social turns only | must never intercept general knowledge/code/format requests |
@@ -24,6 +25,11 @@ passing component test never upgrades a capability by itself.
 | System 4 swarm/PCAS | `advisory` | no | production PCAS calibration and answer-quality evidence |
 | AFlow/ADAS | `research` | no | attested real evaluator and held-out evidence |
 | Self-Harness | `proposal_only` | no runtime mutation | Phase 12 attested sandbox and safe-promotion evidence |
+| persistent attachments + PDF extraction | `local_verified_path` | only after explicit RAG/image selection | deployment-specific parser and corpus review |
+| AkasicDB RAG | `local_index_ready` when pinned clone verifies | yes, with bounded source provenance | semantic embedder and independent retrieval-quality benchmark |
+| Gemma image/audio tensor IPC | `bounded_runtime_path` | yes when the verified processor admits the modality | broad multimodal quality and combined-VRAM evidence |
+| local STT/TTS | `measured_smoke` on the development host | yes, after explicit user action | multi-speaker WER, noise, language, latency and accessibility study |
+| Lens patent/scholarly search | `opt_in_gated` | only after explicit search/index action | token, terms acceptance, allowlist, live validation and distribution attribution review |
 
 The runtime Fact-book is the authority for the live process. Evidence records
 are content-addressed and bound to the exact model, code, configuration, and
@@ -55,7 +61,10 @@ Detailed gates and commands are in
 
 Requirements are Python 3.11+, a compatible local PyTorch/CUDA environment,
 and a complete local model artifact. Runtime downloads, Hub IDs, remote code,
-telemetry, and external APIs are not permitted.
+and telemetry are not permitted. Network access remains disabled by default;
+the sole implemented exception is the official Lens API connector, which
+requires explicit online mode, the exact `api.lens.org` allowlist entry, a
+user-supplied API token, and recorded terms acceptance.
 
 ```powershell
 python -m pytest -q
@@ -98,24 +107,64 @@ python scripts\benchmark_system4.py `
   --device cuda --iterations 10000 --stress-switch --switch-block 32
 ```
 
+## Local workspace, RAG, and multimodal input
+
+CogniBoard stores admitted `.txt`, `.md`, `.csv`, `.json`, `.pdf`, `.png`,
+`.jpg`, `.jpeg`, and `.webp` attachments in a bounded local catalog. Catalog
+and blob integrity are revalidated on restart; users can preview, delete, and
+reindex files. PDF text extraction uses the local `pypdf` backend with page,
+character, and preview limits.
+
+Local RAG loads only the audited AkasicDB revision
+`a6c8e8ebd487e7cb86079f9804a66aaf0914d1dc` and verifies the three storage
+module digests before use. Retrieved chunks enter the answer prompt only
+through bounded `RetrievalEvidence`, and the UI shows attachment id, chunk
+index, score, and source metadata. The bundled vectorizer is deterministic and
+bounded; it is **not** represented as a trained semantic embedder.
+
+Image and audio preprocessing use the manifest-bound `Gemma4Processor`, then
+cross the worker boundary as fixed-schema CPU tensors with request/artifact/
+session binding. One explicitly selected image can be used for one turn.
+Browser audio is accepted only as bounded mono 16-bit PCM WAV at 16 kHz and
+at most 30 seconds. A local development smoke transcribed a Korean phrase with
+normalized similarity 1.0 and synthesized it with the installed Microsoft
+Heami `ko-KR` Windows voice, with zero application external calls. This single
+synthetic phrase is not a WER or general speech-quality benchmark. Video input
+is not implemented.
+
+A separate actual-model smoke sent a locally generated 256×256 PNG containing
+one blue square through the Cogni-Core image route. The response was
+`중앙의 큰 도형은 파란색 정사각형입니다.`, with `finish_reason=stop` and zero
+external calls. This one fixed case is not general visual-reasoning or
+multimodal VRAM evidence.
+
+Lens search does not scrape web pages. It uses bounded HTTPS POST requests to
+the official patent or scholarly API only after all four authorization gates
+pass. Results retain Lens provenance and can be explicitly indexed into the
+local AkasicDB adapter. No live Lens query is claimed for this release because
+the release process has no distributable user token or terms acceptance.
+
 ## Windows launcher
 
-Build the v0.3.2 launcher from the exact source tree:
+Build the v0.4.0 launcher from the exact source tree:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_windows_launcher.ps1 `
-  -OutputPath release\CogniBoard-v0.3.2.exe
+  -OutputPath release\CogniBoard-v0.4.0.exe
 ```
 
 The launcher is a console-free bootstrapper, not a standalone model bundle. It
 requires this source tree, local Python/CUDA dependencies, and the verified
 model plus manifest. The binary is not code-signed in this research release.
-Do not use older release assets as v0.3.2 evidence.
+The frozen release builder records that unsigned state and emits
+`SBOM.cdx.json`, `THIRD_PARTY_NOTICES.md`, `BUILD_MANIFEST.txt`, and
+`SHA256SUMS.txt`; these inventories do not replace independent license review.
+Do not use older release assets as v0.4.0 evidence.
 
 Korean operator documentation: [`docs/COGNIBOARD_USER_MANUAL_PLAYBOOK_KO.md`](docs/COGNIBOARD_USER_MANUAL_PLAYBOOK_KO.md).
 
-The v0.3.2 validation addendum is
-[`release/COGNI_OS_0.3.2_VALIDATION_ADDENDUM_KO.md`](release/COGNI_OS_0.3.2_VALIDATION_ADDENDUM_KO.md).
+The v0.4.0 validation addendum is
+[`release/COGNI_OS_0.4.0_VALIDATION_ADDENDUM_KO.md`](release/COGNI_OS_0.4.0_VALIDATION_ADDENDUM_KO.md).
 
 ## Runtime boundaries
 
@@ -127,7 +176,8 @@ The v0.3.2 validation addendum is
 - Local tasks execute only typed, allowlisted operations. Natural language is
   never passed to a shell.
 - AFlow can only create a bounded research archive.
-- Self-Harness stores inert proposals and cannot install them in v0.3.2.
+- Self-Harness stores inert proposals and exposes a read-only diff review; it
+  cannot approve, execute, install, promote, or roll back source in v0.4.0.
 - The graphical server is loopback-only, uses per-session authentication and
   local allowlisted assets, and has no CDN or analytics dependency.
 

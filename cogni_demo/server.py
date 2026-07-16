@@ -13,7 +13,7 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.client import HTTPConnection
-from inspect import signature
+from inspect import Parameter, signature
 import argparse
 import hmac
 import json
@@ -34,6 +34,7 @@ from typing import Any, BinaryIO
 from urllib.parse import parse_qs, urlsplit
 import webbrowser
 
+from cogni_demo.lens_api import LensApiClient
 from cogni_demo.protocol import (
     EVENT_SENTINEL,
     MAX_EVENT_LINE_BYTES,
@@ -44,13 +45,31 @@ from cogni_demo.protocol import (
     validate_terminal_metrics,
 )
 from cogni_demo.workspace_capabilities import (
+    MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_BASE64_CHARS,
     WorkspaceCapabilityError,
     WorkspaceCapabilityService,
     web_policy_from_environment,
 )
 from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError
+from cogni_agent.tools import (
+    MAX_PROJECT_COMMAND_BYTES,
+    ToolPolicyError,
+    parse_tool_request,
+)
+from cogni_agent.local_voice import (
+    Gemma4ModelSpeechTranscriber,
+    LocalVoiceError,
+    LocalVoiceService,
+    MAX_TTS_TEXT_CHARS,
+    MAX_VOICE_BASE64_CHARS,
+    WindowsSpeechSynthesizer,
+)
 from cogni_flow.rhythm import RhythmController, SystemMode
+from cogni_flow.proposal_review import (
+    ProposalReviewError,
+    build_proposal_review,
+)
 from cogni_os.artifacts import verify_artifact_manifest
 from cogni_os.gpu_lease import (
     GPULease,
@@ -61,7 +80,14 @@ from cogni_os.gpu_lease import (
 
 MAX_REQUEST_BODY_BYTES = 8 * 1024
 MAX_AGENT_CHAT_REQUEST_BODY_BYTES = 64 * 1024
+# ``/api/agent/chat`` carries both ordinary dialogue and the explicitly typed
+# ``/project`` command.  The latter has a 1 MiB decoded-command ceiling, while
+# JSON string escaping may make its wire envelope larger.  Keep the HTTP read
+# bounded, then apply the stricter mode-aware decoded limits below.
+MAX_AGENT_PROJECT_REQUEST_BODY_BYTES = 2 * MAX_PROJECT_COMMAND_BYTES + 4 * 1024
 MAX_ATTACHMENT_REQUEST_BODY_BYTES = MAX_ATTACHMENT_BASE64_CHARS + 4 * 1024
+MAX_VOICE_REQUEST_BODY_BYTES = MAX_VOICE_BASE64_CHARS + 4 * 1024
+MAX_TTS_REQUEST_BODY_BYTES = MAX_TTS_TEXT_CHARS * 4 + 1024
 MAX_AGENT_CHAT_MESSAGE_CHARS = 4_096
 MAX_RAG_QUERY_CHARS = 1_024
 MAX_RAG_EVIDENCE_CHARS = 6_000
@@ -89,7 +115,8 @@ _STATIC_ASSETS = {
 }
 _CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self'; "
-    "connect-src 'self'; img-src 'self' data:; object-src 'none'; "
+    "connect-src 'self'; img-src 'self' blob:; media-src 'self' blob:; "
+    "object-src 'none'; "
     "base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
 )
 
@@ -1240,6 +1267,27 @@ class EvolutionController:
                 "daemon_running": bool(getattr(status, "running", False)),
             }
 
+    def proposal_review(self) -> dict[str, object]:
+        """Return inert proposal diffs without exposing any mutation operation."""
+
+        ledger = getattr(self.harness, "proposal_ledger", None)
+        if ledger is None:
+            raise ProposalReviewError("proposal ledger is unavailable")
+        project_root = getattr(ledger, "project_root", None)
+        proposals = getattr(self.harness, "evidence_proposals", None)
+        reviewable = getattr(ledger, "reviewable_patches", None)
+        if project_root is None or proposals is None or reviewable is None:
+            raise ProposalReviewError("proposal review evidence is unavailable")
+        try:
+            reviewable_patches = dict(reviewable)
+        except (TypeError, ValueError) as exc:
+            raise ProposalReviewError("proposal review evidence is invalid") from exc
+        return build_proposal_review(
+            project_root,
+            tuple(proposals),
+            reviewable_patches,
+        )
+
     def start(self) -> str:
         with self._condition:
             if self._stopped:
@@ -1460,6 +1508,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
         agent_manager: Any | None = None,
         evolution_manager: EvolutionController | Any | None = None,
         workspace_service: WorkspaceCapabilityService | Any | None = None,
+        voice_service: LocalVoiceService | Any | None = None,
         port: int = DEFAULT_PORT,
         token: str | None = None,
         watchdog_timeout: float | None = DEFAULT_WATCHDOG_SECONDS,
@@ -1470,6 +1519,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
         self.agent_manager = agent_manager
         self.evolution_manager = evolution_manager
         self.workspace_service = workspace_service
+        self.voice_service = voice_service or LocalVoiceService()
         self.asset_directory = Path(asset_directory).resolve(strict=True)
         if not self.asset_directory.is_dir():
             raise ValueError("asset_directory must be a directory")
@@ -1509,6 +1559,58 @@ class DemoHTTPServer(ThreadingHTTPServer):
     @property
     def bootstrap_url(self) -> str:
         return f"{self.origin}/?token={self.token}"
+
+    @staticmethod
+    def _has_explicit_image_parameter(target: object) -> bool:
+        if not callable(target):
+            return False
+        try:
+            parameter = signature(target).parameters.get("image_content")
+        except (TypeError, ValueError):
+            return False
+        return parameter is not None and parameter.kind in {
+            Parameter.POSITIONAL_OR_KEYWORD,
+            Parameter.KEYWORD_ONLY,
+        }
+
+    def image_to_model_integration_ready(self) -> bool:
+        """Expose image chat only for the manifest-verified Gemma runtime.
+
+        A similarly shaped test double or arbitrary generation backend is not a
+        product capability.  The exact production manager, ModelService, local
+        Gemma factory, artifact digest and processor binding must all agree.
+        """
+
+        try:
+            from cogni_agent.manager import AgentManager
+            from cogni_agent.model_service import LocalGemmaModelFactory, ModelService
+
+            agent = self.agent_manager
+            if not isinstance(
+                agent, AgentManager
+            ) or not self._has_explicit_image_parameter(agent.start_turn):
+                return False
+            service = getattr(agent, "model_service", None)
+            if not isinstance(
+                service, ModelService
+            ) or not self._has_explicit_image_parameter(service.iter_generate_tokens):
+                return False
+            factory = getattr(service, "model_factory", None)
+            if (
+                not isinstance(factory, LocalGemmaModelFactory)
+                or factory.manifest_path is None
+                or service.artifact_digest != factory.artifact_digest
+            ):
+                return False
+            processor = getattr(service, "_multimodal_processor_config", None)
+            if not isinstance(processor, tuple) or len(processor) != 2:
+                return False
+            processor_root, processor_manifest = map(Path, processor)
+            return processor_root == Path(
+                factory.model_path
+            ) and processor_manifest == Path(factory.manifest_path)
+        except (AttributeError, ImportError, OSError, TypeError, ValueError):
+            return False
 
     def touch_authenticated_state_poll(self) -> None:
         with self._lifecycle_lock:
@@ -1560,6 +1662,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
         mode: str,
         *,
         evidence: tuple[Any, ...] = (),
+        image_content: bytes | None = None,
     ) -> str:
         with self._compute_lock:
             self._require_admission_open()
@@ -1567,9 +1670,49 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 raise RuntimeError("agent manager is unavailable")
             if self.manager.is_active or self._evolution_active():
                 raise ComputeBusyError("validation or evolution owns local compute")
+            if image_content is not None:
+                return self.agent_manager.start_turn(
+                    message,
+                    mode,
+                    evidence=evidence,
+                    image_content=image_content,
+                )
             if evidence:
                 return self.agent_manager.start_turn(message, mode, evidence=evidence)
             return self.agent_manager.start_turn(message, mode)
+
+    def transcribe_voice(
+        self, audio_wav_base64: object, *, language: object = "auto"
+    ) -> dict[str, object]:
+        """Run resident-model STT only while it exclusively owns compute."""
+
+        with self._compute_lock:
+            self._require_admission_open()
+            if (
+                self.manager.is_active
+                or self._agent_active()
+                or self._evolution_active()
+            ):
+                raise ComputeBusyError("local compute is already in use")
+            return self.voice_service.transcribe_base64(
+                audio_wav_base64,
+                language=language,
+            )
+
+    def synthesize_voice(
+        self, text: object, *, language: object = "auto"
+    ) -> dict[str, object]:
+        """Create bounded local speech without overlapping product work."""
+
+        with self._compute_lock:
+            self._require_admission_open()
+            if (
+                self.manager.is_active
+                or self._agent_active()
+                or self._evolution_active()
+            ):
+                raise ComputeBusyError("local compute is already in use")
+            return self.voice_service.synthesize(text, language=language)
 
     def start_evolution(self) -> str:
         with self._compute_lock:
@@ -1688,6 +1831,42 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/agent/state":
             self._agent_state(parsed.query)
             return
+        if parsed.path == "/api/evolution/proposals" and not parsed.query:
+            manager = self.server.evolution_manager
+            review = getattr(manager, "proposal_review", None)
+            if manager is None or not callable(review):
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "EVOLUTION_UNAVAILABLE"
+                )
+                return
+            self.server.touch_authenticated_state_poll()
+            try:
+                payload = review()
+            except ProposalReviewError:
+                self._json_error(
+                    HTTPStatus.CONFLICT, "PROPOSAL_REVIEW_INTEGRITY_FAILED"
+                )
+                return
+            except (OSError, RuntimeError, TypeError, ValueError):
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "PROPOSAL_REVIEW_UNAVAILABLE"
+                )
+                return
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if (
+                not isinstance(payload, dict)
+                or payload.get("mode") != "proposal_only_read_only"
+                or payload.get("mutation_endpoint") is not False
+                or payload.get("execution_endpoint") is not False
+                or not isinstance(items, list)
+                or len(items) > 8
+            ):
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "PROPOSAL_REVIEW_UNAVAILABLE"
+                )
+                return
+            self._json(HTTPStatus.OK, payload)
+            return
         if parsed.path == "/api/workspace/capabilities" and not parsed.query:
             if self.server.workspace_service is None:
                 self._json_error(
@@ -1695,9 +1874,62 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             self.server.touch_authenticated_state_poll()
-            self._json(
-                HTTPStatus.OK, self.server.workspace_service.capability_payload()
+            payload = self.server.workspace_service.capability_payload()
+            if not isinstance(payload, dict):
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE"
+                )
+                return
+            # Browser capture, loopback transport and optional local STT are a
+            # separate boundary from attachment/RAG capabilities.  Publish the
+            # live voice service state so an audio-advertising checkpoint is
+            # never mistaken for a working transcription artifact.
+            payload = deepcopy(payload)
+            models = payload.get("models")
+            model_items = models.get("items") if isinstance(models, dict) else None
+            checkpoint_image = bool(
+                isinstance(model_items, list)
+                and any(
+                    isinstance(item, dict)
+                    and isinstance(item.get("checkpoint_modalities"), list)
+                    and "image" in item["checkpoint_modalities"]
+                    for item in model_items
+                )
             )
+            image_integration = (
+                checkpoint_image and self.server.image_to_model_integration_ready()
+            )
+            attachment_capability = payload.get("attachments")
+            if isinstance(attachment_capability, dict):
+                attachment_capability["image_to_model_integration"] = image_integration
+                attachment_capability["image_selection"] = (
+                    "explicit_single_next_turn" if image_integration else "disabled"
+                )
+            if isinstance(models, dict):
+                models["image_to_model_integration"] = image_integration
+            if image_integration and isinstance(model_items, list):
+                for item in model_items:
+                    if not isinstance(item, dict):
+                        continue
+                    runtime_modalities = item.get("runtime_input_modalities")
+                    if (
+                        isinstance(runtime_modalities, list)
+                        and "image" not in runtime_modalities
+                    ):
+                        runtime_modalities.append("image")
+                    unwired = item.get("unwired_checkpoint_modalities")
+                    if isinstance(unwired, list):
+                        item["unwired_checkpoint_modalities"] = [
+                            modality for modality in unwired if modality != "image"
+                        ]
+            checkpoint_microphone = payload.get("microphone")
+            voice = self.server.voice_service.capability_payload()
+            if isinstance(checkpoint_microphone, dict):
+                voice["checkpoint_advertises_audio"] = bool(
+                    checkpoint_microphone.get("checkpoint_advertises_audio", False)
+                )
+            payload["microphone"] = voice
+            self._json(HTTPStatus.OK, payload)
             return
         if parsed.path == "/api/workspace/attachments" and not parsed.query:
             if self.server.workspace_service is None:
@@ -1707,6 +1939,33 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 return
             self.server.touch_authenticated_state_poll()
             self._json(HTTPStatus.OK, self.server.workspace_service.list_attachments())
+            return
+        if parsed.path in {
+            "/api/workspace/attachments/preview",
+            "/api/workspace/attachments/content",
+        }:
+            workspace = self.server.workspace_service
+            if workspace is None:
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE"
+                )
+                return
+            values = parse_qs(parsed.query, keep_blank_values=True)
+            if set(values) != {"attachment_id"} or len(values["attachment_id"]) != 1:
+                self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_QUERY")
+                return
+            attachment_id = values["attachment_id"][0]
+            try:
+                if parsed.path.endswith("/preview"):
+                    payload = workspace.preview_attachment(attachment_id)
+                    self._json(HTTPStatus.OK, payload)
+                else:
+                    content, media_type = workspace.image_attachment_content(
+                        attachment_id
+                    )
+                    self._send(HTTPStatus.OK, content, media_type)
+            except WorkspaceCapabilityError as exc:
+                self._workspace_error(exc)
             return
         asset = _STATIC_ASSETS.get(parsed.path)
         if asset is None or parsed.query:
@@ -1746,15 +2005,23 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             "/api/agent/reset",
             "/api/evolution/run",
             "/api/workspace/attachments/add",
+            "/api/workspace/attachments/delete",
             "/api/workspace/rag/index",
+            "/api/workspace/rag/reindex",
             "/api/workspace/rag/query",
+            "/api/workspace/lens/search",
+            "/api/workspace/lens/search-and-index",
             "/api/workspace/models/select",
+            "/api/workspace/voice/transcribe",
+            "/api/workspace/voice/synthesize",
         }:
             self._json_error(HTTPStatus.NOT_FOUND, "NOT_FOUND")
             return
         body_limit = {
-            "/api/agent/chat": MAX_AGENT_CHAT_REQUEST_BODY_BYTES,
+            "/api/agent/chat": MAX_AGENT_PROJECT_REQUEST_BODY_BYTES,
             "/api/workspace/attachments/add": MAX_ATTACHMENT_REQUEST_BODY_BYTES,
+            "/api/workspace/voice/transcribe": MAX_VOICE_REQUEST_BODY_BYTES,
+            "/api/workspace/voice/synthesize": MAX_TTS_REQUEST_BODY_BYTES,
         }.get(parsed.path, MAX_REQUEST_BODY_BYTES)
         body = self._read_json_body(maximum_bytes=body_limit)
         if body is None:
@@ -1783,18 +2050,49 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             if self.server.agent_manager is None:
                 self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AGENT_UNAVAILABLE")
                 return
-            if not set(body) <= {"message", "mode", "rag"} or "message" not in body:
+            envelope_message = body.get("message")
+            envelope_mode = body.get("mode", "chat")
+            envelope_project = False
+            if isinstance(envelope_message, str) and envelope_message.strip():
+                envelope_first_token = (
+                    envelope_message.strip().partition("\n")[0].split(maxsplit=1)[0]
+                )
+                envelope_project = (
+                    envelope_mode == "task"
+                    and envelope_first_token.casefold() == "/project"
+                )
+            request_body_bytes = int(self.headers["Content-Length"])
+            if (
+                request_body_bytes > MAX_AGENT_CHAT_REQUEST_BODY_BYTES
+                and not envelope_project
+            ):
+                self._json_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "BODY_TOO_LARGE")
+                return
+            if (
+                not set(body) <= {"message", "mode", "rag", "image_attachment_id"}
+                or "message" not in body
+            ):
                 self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
                 return
             rag_requested = body.get("rag", False)
             if not isinstance(rag_requested, bool):
                 self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
                 return
+            mode = body.get("mode", "chat")
+            image_attachment_id = body.get("image_attachment_id")
+            image_requested = "image_attachment_id" in body
+            if image_requested and (
+                not isinstance(image_attachment_id, str)
+                or re.fullmatch(r"[0-9a-f]{24}", image_attachment_id) is None
+                or rag_requested
+                or mode != "chat"
+            ):
+                self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
+                return
             message = body.get("message")
             if (
                 not isinstance(message, str)
                 or not message.strip()
-                or len(message.strip()) > MAX_AGENT_CHAT_MESSAGE_CHARS
                 or any(
                     ord(character) < 32 and character not in "\t\r\n"
                     for character in message
@@ -1802,7 +2100,32 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             ):
                 self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
                 return
+            stripped_message = message.strip()
+            first_token = stripped_message.partition("\n")[0].split(maxsplit=1)[0]
+            project_candidate = first_token.casefold() == "/project"
+            if project_candidate:
+                if mode != "task" or rag_requested or image_requested:
+                    self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
+                    return
+                if len(stripped_message.encode("utf-8")) > MAX_PROJECT_COMMAND_BYTES:
+                    self._json_error(
+                        HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "BODY_TOO_LARGE"
+                    )
+                    return
+                try:
+                    project_request = parse_tool_request(stripped_message)
+                except (ToolPolicyError, TypeError, UnicodeError):
+                    self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
+                    return
+                if project_request is None or project_request.operation != "project":
+                    self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
+                    return
+            elif len(stripped_message) > MAX_AGENT_CHAT_MESSAGE_CHARS:
+                self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
+                return
             evidence: tuple[Any, ...] = ()
+            image_content: bytes | None = None
+            image_media_type: str | None = None
             if rag_requested:
                 if self.server.workspace_service is None:
                     self._json_error(
@@ -1817,9 +2140,45 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 except WorkspaceCapabilityError as exc:
                     self._workspace_error(exc)
                     return
+            if image_requested:
+                workspace = self.server.workspace_service
+                if workspace is None:
+                    self._json_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE"
+                    )
+                    return
+                if not self.server.image_to_model_integration_ready():
+                    self._json_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE, "IMAGE_MODEL_UNAVAILABLE"
+                    )
+                    return
+                try:
+                    image_content, image_media_type = (
+                        workspace.image_attachment_content(image_attachment_id)
+                    )
+                except WorkspaceCapabilityError as exc:
+                    self._workspace_error(exc)
+                    return
+                except (OSError, TypeError, ValueError):
+                    self._json_error(
+                        HTTPStatus.BAD_REQUEST, "WORKSPACE_RESPONSE_INVALID"
+                    )
+                    return
+                if (
+                    type(image_content) is not bytes
+                    or not 1 <= len(image_content) <= MAX_ATTACHMENT_BYTES
+                    or image_media_type not in {"image/png", "image/jpeg", "image/webp"}
+                ):
+                    self._json_error(
+                        HTTPStatus.BAD_REQUEST, "WORKSPACE_RESPONSE_INVALID"
+                    )
+                    return
             try:
                 turn_id = self.server.start_agent_turn(
-                    message, body.get("mode", "chat"), evidence=evidence
+                    message,
+                    mode,
+                    evidence=evidence,
+                    image_content=image_content,
                 )
             except (AgentBusyError, ComputeBusyError):
                 self._json_error(HTTPStatus.CONFLICT, "COMPUTE_BUSY")
@@ -1833,6 +2192,9 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                     "turn_id": turn_id,
                     "rag_requested": rag_requested,
                     "rag_evidence_count": len(evidence),
+                    "image_requested": image_requested,
+                    "image_input_admitted": image_content is not None,
+                    "image_media_type": image_media_type,
                     **self.server.agent_manager.snapshot(),
                 },
             )
@@ -1972,11 +2334,42 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, state)
 
     def _workspace_post(self, path: str, body: dict[str, Any]) -> None:
-        workspace = self.server.workspace_service
-        if workspace is None:
-            self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE")
-            return
         try:
+            if path == "/api/workspace/voice/transcribe":
+                if set(body) not in (
+                    {"audio_wav_base64"},
+                    {"audio_wav_base64", "language"},
+                ):
+                    raise WorkspaceCapabilityError(
+                        "INVALID_BODY", "voice transcription body fields are invalid"
+                    )
+                self._json(
+                    HTTPStatus.OK,
+                    self.server.transcribe_voice(
+                        body["audio_wav_base64"],
+                        language=body.get("language", "auto"),
+                    ),
+                )
+                return
+            if path == "/api/workspace/voice/synthesize":
+                if set(body) not in ({"text"}, {"text", "language"}):
+                    raise WorkspaceCapabilityError(
+                        "INVALID_BODY", "voice synthesis body fields are invalid"
+                    )
+                self._json(
+                    HTTPStatus.OK,
+                    self.server.synthesize_voice(
+                        body["text"],
+                        language=body.get("language", "auto"),
+                    ),
+                )
+                return
+            workspace = self.server.workspace_service
+            if workspace is None:
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE"
+                )
+                return
             if path == "/api/workspace/attachments/add":
                 if set(body) != {"name", "media_type", "content_base64"}:
                     raise WorkspaceCapabilityError(
@@ -1989,6 +2382,14 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 )
                 self._json(HTTPStatus.CREATED, payload)
                 return
+            if path == "/api/workspace/attachments/delete":
+                if set(body) != {"attachment_id"}:
+                    raise WorkspaceCapabilityError(
+                        "INVALID_BODY", "attachment deletion body fields are invalid"
+                    )
+                payload = workspace.delete_attachment(body["attachment_id"])
+                self._json(HTTPStatus.OK, payload)
+                return
             if path == "/api/workspace/rag/index":
                 if set(body) != {"attachment_ids"}:
                     raise WorkspaceCapabilityError(
@@ -1997,12 +2398,39 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 payload = workspace.index_attachments(body["attachment_ids"])
                 self._json(HTTPStatus.OK, payload)
                 return
+            if path == "/api/workspace/rag/reindex":
+                if set(body) != {"attachment_ids"}:
+                    raise WorkspaceCapabilityError(
+                        "INVALID_BODY", "RAG reindex body fields are invalid"
+                    )
+                payload = workspace.reindex_attachments(body["attachment_ids"])
+                self._json(HTTPStatus.OK, payload)
+                return
             if path == "/api/workspace/rag/query":
                 if set(body) not in ({"query"}, {"query", "limit"}):
                     raise WorkspaceCapabilityError(
                         "INVALID_BODY", "RAG query body fields are invalid"
                     )
                 payload = workspace.query_rag(body["query"], limit=body.get("limit", 5))
+                self._json(HTTPStatus.OK, payload)
+                return
+            if path in {
+                "/api/workspace/lens/search",
+                "/api/workspace/lens/search-and-index",
+            }:
+                if set(body) not in (
+                    {"kind", "query"},
+                    {"kind", "query", "limit"},
+                ):
+                    raise WorkspaceCapabilityError(
+                        "INVALID_BODY", "Lens search body fields are invalid"
+                    )
+                payload = workspace.search_lens(
+                    body["kind"],
+                    body["query"],
+                    limit=body.get("limit", 5),
+                    index_in_akasicdb=(path == "/api/workspace/lens/search-and-index"),
+                )
                 self._json(HTTPStatus.OK, payload)
                 return
             if path == "/api/workspace/models/select":
@@ -2015,6 +2443,12 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
         except (KeyError, TypeError):
             self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
             return
+        except ComputeBusyError:
+            self._json_error(HTTPStatus.CONFLICT, "COMPUTE_BUSY")
+            return
+        except LocalVoiceError as exc:
+            self._voice_error(exc)
+            return
         except WorkspaceCapabilityError as exc:
             self._workspace_error(exc)
             return
@@ -2026,6 +2460,13 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
         code = error.code
         if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) is None:
             code = "WORKSPACE_REQUEST_REJECTED"
+        self._json_error(HTTPStatus.BAD_REQUEST, code)
+
+    def _voice_error(self, error: LocalVoiceError) -> None:
+        # Never echo decoder, artifact or local filesystem diagnostics.
+        code = error.code
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) is None:
+            code = "VOICE_REQUEST_REJECTED"
         self._json_error(HTTPStatus.BAD_REQUEST, code)
 
     @staticmethod
@@ -2219,6 +2660,7 @@ def _build_product_controls(
             factbook,
             akasicdb_path=os.environ.get("COGNI_OS_AKASICDB_DIR") or None,
             web_policy=web_policy_from_environment(os.environ),
+            lens_client=LensApiClient.from_environment(os.environ),
             answer_integration_enabled=(
                 "evidence" in signature(AgentManager.start_turn).parameters
             ),
@@ -2313,6 +2755,49 @@ def _build_product_controls(
         raise
 
 
+def _build_local_voice_service(
+    model_path: str | Path,
+    manifest_path: str | Path,
+    agent_manager: object,
+) -> LocalVoiceService:
+    """Bind voice features to verified, already-running local authorities.
+
+    STT receives the exact ``ModelService`` owned by ``AgentManager`` so it
+    cannot create a second Gemma model.  Windows TTS is advertised only after
+    a real installed voice has produced and validated a bounded WAV probe.
+    Optional construction failures intentionally leave capture transport
+    available while the corresponding STT/TTS capability stays disabled.
+    """
+
+    transcriber = None
+    try:
+        transcriber = Gemma4ModelSpeechTranscriber(agent_manager.model_service)
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+
+    synthesizer = None
+    try:
+        candidate = WindowsSpeechSynthesizer()
+        probe = candidate.synthesize(text="Cogni", language="auto")
+        if (
+            not isinstance(probe, dict)
+            or probe.get("source") != "verified_windows_system_speech"
+            or probe.get("external_calls") != 0
+            or not isinstance(probe.get("audio_wav_base64"), str)
+        ):
+            raise ValueError("Windows TTS probe returned invalid evidence")
+        synthesizer = candidate
+    except (LocalVoiceError, OSError, TypeError, ValueError):
+        pass
+
+    return LocalVoiceService.for_verified_gemma4(
+        model_path,
+        manifest_path,
+        transcriber=transcriber,
+        synthesizer=synthesizer,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m cogni_demo.server")
     project_root = Path(__file__).resolve().parents[1]
@@ -2361,6 +2846,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         rhythm=rhythm,
     )
     workspace_service = getattr(agent_manager, "workspace_capability_service", None)
+    voice_service = _build_local_voice_service(
+        args.model,
+        args.manifest,
+        agent_manager,
+    )
     try:
         server = DemoHTTPServer(
             manager,
@@ -2368,6 +2858,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             agent_manager=agent_manager,
             evolution_manager=evolution_manager,
             workspace_service=workspace_service,
+            voice_service=voice_service,
             port=args.port,
         )
     except OSError:

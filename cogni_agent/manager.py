@@ -28,6 +28,7 @@ from .model_service import (
     ModelServiceError,
     truncate_repeated_tokens,
 )
+from .multimodal import MAX_IMAGE_BYTES
 from .prompting import decode_response, render_chat_prompt, stop_token_ids
 from .response_quality import (
     QualityAction,
@@ -553,6 +554,7 @@ class GenerationBackend(Protocol):
         self,
         prompt: str,
         *,
+        image_content: bytes | None = None,
         max_new_tokens: int,
         decode_mode: str = "conversation",
         sampling_seed: int | None = None,
@@ -735,13 +737,26 @@ class AgentManager:
         mode: str = "chat",
         *,
         evidence: tuple[RetrievalEvidence, ...] = (),
+        image_content: bytes | None = None,
     ) -> str:
         text = self._validate_message(message)
         if mode not in {"chat", "task"}:
             raise ValueError("mode must be chat or task")
         bounded_evidence = self._validate_retrieval_evidence(evidence)
+        bounded_image = self._validate_image_content(image_content)
         if mode == "task" and bounded_evidence:
             raise ValueError("retrieval evidence is available only in chat mode")
+        if mode == "task" and bounded_image is not None:
+            raise ValueError("image content is available only in chat mode")
+        if bounded_evidence and bounded_image is not None:
+            raise ValueError("image content cannot be combined with retrieval evidence")
+        if (
+            bounded_image is not None
+            and not self._backend_explicitly_supports_image_content()
+        ):
+            raise ModelServiceError(
+                "model backend does not explicitly support image content"
+            )
         with self._condition:
             if self._status in ACTIVE_AGENT_STATUSES:
                 raise AgentBusyError("another agent turn is active")
@@ -770,6 +785,7 @@ class AgentManager:
                     mode,
                     resume_truncated,
                     bounded_evidence,
+                    bounded_image,
                 ),
                 name=f"cogni-agent-{turn_id[:8]}",
                 daemon=True,
@@ -822,6 +838,7 @@ class AgentManager:
         mode: str,
         resume_truncated: bool,
         evidence: tuple[RetrievalEvidence, ...],
+        image_content: bytes | None,
     ) -> None:
         try:
             with self.rhythm.inference_slot():
@@ -834,6 +851,7 @@ class AgentManager:
                         message,
                         resume_truncated=resume_truncated,
                         evidence=evidence,
+                        image_content=image_content,
                     )
             if finish is not None:
                 with self._condition:
@@ -883,8 +901,13 @@ class AgentManager:
         *,
         resume_truncated: bool,
         evidence: tuple[RetrievalEvidence, ...],
+        image_content: bytes | None,
     ) -> TurnFinish | None:
-        if self.conversation_fast_path is not None and not resume_truncated:
+        if (
+            image_content is None
+            and self.conversation_fast_path is not None
+            and not resume_truncated
+        ):
             previous_user, previous_assistant = self._previous_fast_path_exchange()
             fast_answer = self.conversation_fast_path.answer(
                 message,
@@ -897,7 +920,11 @@ class AgentManager:
                     user_sequence,
                     fast_answer,
                 )
-        if self.fact_grounder is not None and not resume_truncated:
+        if (
+            image_content is None
+            and self.fact_grounder is not None
+            and not resume_truncated
+        ):
             grounded = self.fact_grounder.answer(message)
             if grounded is None:
                 previous = self._previous_assistant_content()
@@ -1030,6 +1057,13 @@ class AgentManager:
             system_prompt=turn_system_prompt,
             user_context_override=user_context_override,
         )
+        requested_generation_mode = (
+            "cogni_core_image"
+            if image_content is not None
+            else "cogni_core_rag"
+            if evidence
+            else "cogni_core"
+        )
         message_id = self._append_message(
             "assistant",
             "",
@@ -1038,7 +1072,7 @@ class AgentManager:
             continuations=0,
             truncated=False,
             generated_tokens=0,
-            generation_mode="cogni_core_rag" if evidence else None,
+            generation_mode=requested_generation_mode,
         )
         public_prefill = structural_prefill or ""
         response = public_prefill
@@ -1049,7 +1083,7 @@ class AgentManager:
         char_truncated = False
         repetition_boundary = False
         quality_boundary = False
-        generation_mode = "cogni_core_rag" if evidence else "cogni_core"
+        generation_mode = requested_generation_mode
         quality_repair_attempts = 0
         retrieval_citation_repairs = 0
         generation_attempts = 0
@@ -1109,6 +1143,7 @@ class AgentManager:
             for chunk in self._generation_stream(
                 prompt,
                 request_budget,
+                image_content=image_content,
                 decode_mode=decode_mode,
                 timeout_seconds=max(0.01, decode_deadline - monotonic()),
                 sampling_seed=self._sampling_seed(
@@ -2352,6 +2387,7 @@ class AgentManager:
         prompt: str,
         max_new_tokens: int,
         *,
+        image_content: bytes | None = None,
         decode_mode: str,
         timeout_seconds: float,
         sampling_seed: int,
@@ -2371,6 +2407,16 @@ class AgentManager:
             return variadic or name in parameters
 
         kwargs: dict[str, Any] = {"max_new_tokens": max_new_tokens}
+        if image_content is not None:
+            image_parameter = parameters.get("image_content")
+            if image_parameter is None or image_parameter.kind not in {
+                Parameter.POSITIONAL_OR_KEYWORD,
+                Parameter.KEYWORD_ONLY,
+            }:
+                raise ModelServiceError(
+                    "model backend does not explicitly support image content"
+                )
+            kwargs["image_content"] = image_content
         if supported("stop_token_ids"):
             kwargs["stop_token_ids"] = self._response_stop_ids
         if supported("conversation_id"):
@@ -3007,6 +3053,7 @@ class AgentManager:
                 if generation_mode not in {
                     None,
                     "cogni_core",
+                    "cogni_core_image",
                     "conversation_fastpath",
                     "factbook",
                     "quality_fallback",
@@ -3054,6 +3101,7 @@ class AgentManager:
                     if generation_mode is not None:
                         if generation_mode not in {
                             "cogni_core",
+                            "cogni_core_image",
                             "conversation_fastpath",
                             "factbook",
                             "quality_fallback",
@@ -3094,6 +3142,7 @@ class AgentManager:
         if generation_mode not in {
             None,
             "cogni_core",
+            "cogni_core_image",
             "conversation_fastpath",
             "factbook",
             "quality_fallback",
@@ -3314,6 +3363,27 @@ class AgentManager:
         if any(ord(character) < 32 and character not in "\t\r\n" for character in text):
             raise ValueError("message contains unsupported control characters")
         return text
+
+    @staticmethod
+    def _validate_image_content(image_content: bytes | None) -> bytes | None:
+        if image_content is None:
+            return None
+        if type(image_content) is not bytes:
+            raise TypeError("image_content must be immutable bytes or None")
+        if not 1 <= len(image_content) <= MAX_IMAGE_BYTES:
+            raise ValueError("image_content is empty or exceeds the 8 MiB limit")
+        return image_content
+
+    def _backend_explicitly_supports_image_content(self) -> bool:
+        try:
+            parameters = signature(self.model_service.iter_generate_tokens).parameters
+        except (TypeError, ValueError):
+            return False
+        parameter = parameters.get("image_content")
+        return parameter is not None and parameter.kind in {
+            Parameter.POSITIONAL_OR_KEYWORD,
+            Parameter.KEYWORD_ONLY,
+        }
 
 
 __all__ = [

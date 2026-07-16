@@ -13,6 +13,7 @@ from unittest.mock import patch
 import torch
 
 from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError, SYSTEM_PROMPT
+from cogni_agent.tools import MAX_PROJECT_COMMAND_BYTES
 from cogni_agent.model_service import (
     TRUSTED_GEMMA4_E4B_IT_DIGESTS,
     TRUSTED_GEMMA4_E4B_IT_REVISION,
@@ -28,6 +29,7 @@ from cogni_demo.server import (
 from cogni_flow.cycle import EvolutionReport
 from cogni_flow.harness import FailureTrace
 from cogni_flow.production import BoundedLogDB, PromotionMode
+from cogni_flow.proposal_review import ProposalReviewError
 from cogni_flow.rhythm import RhythmController
 from cogni_flow.scheduler import ScheduleDecision, ScheduleTick
 from cogni_os.gpu_lease import GPULeaseManager
@@ -109,6 +111,7 @@ class _FakeEvolutionManager:
         self.sequence = 0
         self.shutdown_called = False
         self.availability_check = None
+        self.review_requests = 0
 
     @property
     def is_active(self) -> bool:
@@ -130,6 +133,17 @@ class _FakeEvolutionManager:
         self.active = True
         self.sequence += 1
         return "evolution-1"
+
+    def proposal_review(self) -> dict[str, object]:
+        self.review_requests += 1
+        return {
+            "schema_version": 1,
+            "mode": "proposal_only_read_only",
+            "items": [],
+            "count": 0,
+            "mutation_endpoint": False,
+            "execution_endpoint": False,
+        }
 
     def shutdown(self) -> None:
         self.active = False
@@ -341,6 +355,114 @@ class TestAgentHTTPControlPlane(unittest.TestCase):
         status, state = self._post("/api/agent/reset", {})
         self.assertEqual(status, 200)
         self.assertEqual(state["conversation"], [])
+
+    def test_project_command_uses_bounded_task_envelope_not_chat_limit(self) -> None:
+        project_message = "/project\n" + json.dumps(
+            {
+                "schema_version": 1,
+                "project": "http-poc",
+                "files": [
+                    {"path": "main.txt", "content": "x" * (70 * 1024)},
+                    {"path": "README.md", "content": "bounded multi-file PoC\n"},
+                ],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.assertGreater(len(project_message), 64 * 1024)
+
+        status, state = self._post(
+            "/api/agent/chat",
+            {"message": project_message, "mode": "task", "rag": False},
+        )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(state["turn_id"], "turn-1")
+        self.assertEqual(self.agent.messages[-1]["content"], project_message)
+
+    def test_project_command_http_admission_enforces_mode_and_bundle_bounds(
+        self,
+    ) -> None:
+        valid_payload = {
+            "schema_version": 1,
+            "project": "bounded-poc",
+            "files": [{"path": "main.txt", "content": "safe"}],
+        }
+        project_message = "/project\n" + json.dumps(
+            valid_payload, separators=(",", ":")
+        )
+        for body in (
+            {"message": project_message, "mode": "chat"},
+            {"message": project_message, "mode": "task", "rag": True},
+            {"message": "x" * 4097, "mode": "task"},
+        ):
+            with self.subTest(body=body):
+                status, payload = self._post("/api/agent/chat", body)
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["code"], "INVALID_BODY")
+
+        status, payload = self._post(
+            "/api/agent/chat",
+            {"message": "x" * (70 * 1024), "mode": "chat"},
+        )
+        self.assertEqual(status, 413)
+        self.assertEqual(payload["error"]["code"], "BODY_TOO_LARGE")
+
+        oversized_bundle = dict(valid_payload)
+        oversized_bundle["files"] = [
+            {"path": "main.txt", "content": "x" * (256 * 1024 + 1)}
+        ]
+        status, payload = self._post(
+            "/api/agent/chat",
+            {
+                "message": "/project\n"
+                + json.dumps(oversized_bundle, separators=(",", ":")),
+                "mode": "task",
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "INVALID_BODY")
+
+        command_over_limit = (
+            "/project\n{"
+            + (" " * MAX_PROJECT_COMMAND_BYTES)
+            + '"schema_version":1,"project":"p","files":'
+            '[{"path":"a.txt","content":"x"}]}'
+        )
+        status, payload = self._post(
+            "/api/agent/chat",
+            {"message": command_over_limit, "mode": "task"},
+        )
+        self.assertEqual(status, 413)
+        self.assertEqual(payload["error"]["code"], "BODY_TOO_LARGE")
+
+    def test_proposal_review_is_authenticated_exact_read_only_get(self) -> None:
+        status, payload = self._get("/api/evolution/proposals")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["mode"], "proposal_only_read_only")
+        self.assertFalse(payload["mutation_endpoint"])
+        self.assertFalse(payload["execution_endpoint"])
+        self.assertEqual(self.evolution.review_requests, 1)
+
+        status, payload = self._get("/api/evolution/proposals?apply=true")
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"]["code"], "NOT_FOUND")
+        status, payload = self._post("/api/evolution/proposals", {})
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"]["code"], "NOT_FOUND")
+        self.assertEqual(self.evolution.review_requests, 1)
+
+        with patch.object(
+            self.evolution,
+            "proposal_review",
+            side_effect=ProposalReviewError("C:/private/source.py changed"),
+        ):
+            status, payload = self._get("/api/evolution/proposals")
+        self.assertEqual(status, 409)
+        self.assertEqual(
+            payload,
+            {"error": {"code": "PROPOSAL_REVIEW_INTEGRITY_FAILED"}},
+        )
 
     def test_validator_agent_and_evolution_have_one_compute_owner(self) -> None:
         status, _payload = self._post("/api/run", {})

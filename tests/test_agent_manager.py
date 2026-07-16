@@ -20,7 +20,8 @@ from cogni_agent.manager import (
     safe_quality_fallback,
 )
 from cogni_agent.fact_grounding import RuntimeFactGrounder
-from cogni_agent.model_service import GenerationChunk
+from cogni_agent.model_service import GenerationChunk, ModelServiceError
+from cogni_agent.multimodal import MAX_IMAGE_BYTES
 from cogni_agent.response_quality import compile_response_intent
 from cogni_agent.tools import ToolResult, WorkspaceToolExecutor
 from cogni_flow.rhythm import RhythmController
@@ -123,6 +124,40 @@ class _ScriptedService(_Service):
         self.active_request_id = None
 
 
+class _ImageScriptedService(_ScriptedService):
+    def __init__(self, plans):
+        super().__init__(plans)
+        self.images = []
+
+    def iter_generate_tokens(
+        self,
+        prompt,
+        *,
+        image_content=None,
+        max_new_tokens,
+        stop_token_ids=None,
+        decode_mode="conversation",
+        timeout=None,
+        total_timeout=None,
+        sampling_seed=None,
+    ):
+        self.images.append(image_content)
+        yield from super().iter_generate_tokens(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+            decode_mode=decode_mode,
+            timeout=timeout,
+            total_timeout=total_timeout,
+            sampling_seed=sampling_seed,
+        )
+
+
+class _VariadicImageClaimService(_ScriptedService):
+    def iter_generate_tokens(self, prompt, **kwargs):
+        yield from super().iter_generate_tokens(prompt, **kwargs)
+
+
 class _TokenStreamService(_Service):
     def __init__(self, text):
         super().__init__()
@@ -198,6 +233,17 @@ class _BlockingFactGrounder(RuntimeFactGrounder):
         return "검증된 Runtime Fact-book 응답입니다."
 
 
+class _ExplodingFactGrounder(RuntimeFactGrounder):
+    def __init__(self) -> None:
+        pass
+
+    def answer(self, _question: str) -> str:
+        raise AssertionError("image turns must bypass text fact grounding")
+
+    def answer_followup(self, _question: str, _previous: str | None) -> str:
+        raise AssertionError("image turns must bypass text fact grounding")
+
+
 def _wait(manager: AgentManager, timeout: float = 5.0):
     deadline = monotonic() + timeout
     while monotonic() < deadline:
@@ -222,6 +268,112 @@ class TestAgentManager(unittest.TestCase):
             service or _Service(),
             WorkspaceToolExecutor(self.root, timeout_seconds=5),
             **kwargs,
+        )
+
+    def test_image_content_requires_bounded_immutable_bytes(self) -> None:
+        manager = self.manager(_ImageScriptedService([]))
+
+        for invalid in (bytearray(b"image"), memoryview(b"image"), "image"):
+            with self.subTest(value=type(invalid).__name__):
+                with self.assertRaisesRegex(TypeError, "immutable bytes"):
+                    manager.start_turn("이미지를 설명해 주세요.", image_content=invalid)
+        for invalid in (b"", b"x" * (MAX_IMAGE_BYTES + 1)):
+            with self.subTest(size=len(invalid)):
+                with self.assertRaisesRegex(ValueError, "8 MiB"):
+                    manager.start_turn("이미지를 설명해 주세요.", image_content=invalid)
+
+        self.assertEqual(manager.snapshot()["conversation"], [])
+
+    def test_image_content_rejects_task_and_rag_combinations(self) -> None:
+        manager = self.manager(_ImageScriptedService([]))
+        image = b"immutable-image"
+
+        with self.assertRaisesRegex(ValueError, "only in chat mode"):
+            manager.start_turn("/status", mode="task", image_content=image)
+        with self.assertRaisesRegex(ValueError, "retrieval evidence"):
+            manager.start_turn(
+                "이미지를 설명해 주세요.",
+                evidence=(RetrievalEvidence("doc", "문서", "근거 문장"),),
+                image_content=image,
+            )
+
+        self.assertEqual(manager.snapshot()["conversation"], [])
+
+    def test_image_content_requires_an_explicit_backend_parameter(self) -> None:
+        for service in (
+            _ScriptedService([]),
+            _VariadicImageClaimService([]),
+        ):
+            with self.subTest(service=type(service).__name__):
+                manager = self.manager(service)
+                with self.assertRaisesRegex(
+                    ModelServiceError,
+                    "explicitly support image content",
+                ):
+                    manager.start_turn(
+                        "이미지를 설명해 주세요.",
+                        image_content=b"immutable-image",
+                    )
+                self.assertEqual(manager.snapshot()["conversation"], [])
+
+    def test_image_turn_bypasses_text_shortcuts_and_publishes_image_mode(
+        self,
+    ) -> None:
+        image = b"immutable-image"
+        service = _ImageScriptedService(
+            [("사진 속 파란 원은 중앙에 선명하게 배치되어 있습니다.", "stop")]
+        )
+        fast_path = ConversationFastPath()
+        manager = self.manager(
+            service,
+            conversation_fast_path=fast_path,
+            fact_grounder=_ExplodingFactGrounder(),
+        )
+
+        with patch.object(
+            ConversationFastPath,
+            "answer",
+            side_effect=AssertionError("image turns must bypass text fast path"),
+        ):
+            manager.start_turn(
+                "사진 속 파란 원을 자연스럽게 설명해 주세요.",
+                image_content=image,
+            )
+            state = _wait(manager)
+
+        answer = state["conversation"][-1]
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(answer["generation_mode"], "cogni_core_image")
+        self.assertEqual(state["completion"]["generation_mode"], "cogni_core_image")
+        self.assertEqual(len(service.images), 1)
+        self.assertIs(service.images[0], image)
+        self.assertNotIn("image_content", state["conversation"][0])
+
+    def test_same_image_content_is_used_for_every_bounded_generation_attempt(
+        self,
+    ) -> None:
+        question = "이미지의 파란 원을 자연스럽게 설명해 주세요."
+        image = b"immutable-image"
+        service = _ImageScriptedService(
+            [
+                (question + "\n[턴 종료]", "stop"),
+                (
+                    "이미지의 파란 원은 흰 배경 중앙에 선명하게 배치되어 있습니다.",
+                    "stop",
+                ),
+            ]
+        )
+        manager = self.manager(service, max_generation_attempts=2)
+
+        manager.start_turn(question, image_content=image)
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(len(service.images), 2)
+        self.assertTrue(all(item is image for item in service.images))
+        self.assertEqual(
+            state["conversation"][-1]["generation_mode"],
+            "cogni_core_image",
         )
 
     def test_retrieval_evidence_preserves_original_user_turn_and_is_non_authority(

@@ -46,20 +46,44 @@ function Get-ArchiveEntrySha256([string]$ArchivePath, [string]$EntryName, [strin
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
     try {
-        $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         $matches = @()
+        $entryCount = 0
+        [long]$expandedBytes = 0
         foreach ($entry in $zip.Entries) {
             $name = $entry.FullName
+            $entryCount += 1
+            $expandedBytes += $entry.Length
             if (
                 -not $name.StartsWith($Prefix, [StringComparison]::Ordinal) -or
                 $name.Contains('../') -or
-                $name.Contains('..\') -or
+                $name.Contains('\') -or
                 $name.StartsWith('/') -or
-                $name.Contains(':')
+                $name.Contains(':') -or
+                $name.Contains([char]0) -or
+                $entryCount -gt 20000 -or
+                $entry.Length -gt 536870912 -or
+                $expandedBytes -gt 2147483648
             ) {
                 throw "Unsafe source archive entry: $name"
             }
-            if (-not $seen.Add($name)) {
+            $relative = $name.Substring($Prefix.Length).TrimEnd('/')
+            if ($relative.Length -gt 0) {
+                foreach ($segment in $relative.Split('/')) {
+                    if (
+                        [String]::IsNullOrEmpty($segment) -or
+                        $segment -eq '.' -or
+                        $segment -eq '..' -or
+                        $segment.EndsWith('.') -or
+                        $segment.EndsWith(' ') -or
+                        $segment -match '^(?i:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])(?:\..*)?$'
+                    ) {
+                        throw "Unsafe source archive entry: $name"
+                    }
+                }
+            }
+            $normalizedName = $name.TrimEnd('/')
+            if (-not $seen.Add($normalizedName)) {
                 throw "Duplicate source archive entry: $name"
             }
             if ($name -ceq $EntryName) {
@@ -121,6 +145,14 @@ try {
         throw 'git archive failed.'
     }
 
+    # Validate every archive entry (prefix, traversal, absolute/drive paths,
+    # duplicates) before Expand-Archive can materialize any untrusted name.
+    # The same bounded pass captures the checkpoint digest for the later trust
+    # root comparison.
+    $checkpointEntry = $prefix + 'cogni_core/cts_policy_checkpoint.json'
+    $archiveCheckpoint = Get-ArchiveEntrySha256 `
+        $rawArchive $checkpointEntry $prefix
+
     $extractRoot = Join-Path $scratch 'extract'
     Expand-Archive -LiteralPath $rawArchive -DestinationPath $extractRoot
     $source = (Resolve-Path (
@@ -148,9 +180,6 @@ try {
         Pop-Location
     }
 
-    $checkpointEntry = $prefix + 'cogni_core/cts_policy_checkpoint.json'
-    $archiveCheckpoint = Get-ArchiveEntrySha256 `
-        $rawArchive $checkpointEntry $prefix
     if ($archiveCheckpoint -ne $expectedCheckpoint) {
         throw (
             'Source archive changed the CTS policy checkpoint bytes: ' +
@@ -231,6 +260,18 @@ try {
             throw 'Windows launcher build failed.'
         }
 
+        & $python scripts\generate_release_sbom.py `
+            --pyproject (Join-Path $source 'pyproject.toml') `
+            --project-version $releaseVersion `
+            --output (Join-Path $publishStage 'SBOM.cdx.json') `
+            --notices (Join-Path $publishStage 'THIRD_PARTY_NOTICES.md') `
+            --artifact (Join-Path $publishStage $sourceArchiveName) `
+            --artifact (Join-Path $publishStage $wheelName) `
+            --artifact (Join-Path $publishStage $exeName)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Release SBOM generation failed.'
+        }
+
         if ($RunModelSmoke) {
             if (-not (Test-Path -LiteralPath $ModelPath -PathType Container)) {
                 throw "Model path does not exist: $ModelPath"
@@ -291,6 +332,9 @@ try {
         "python_version=$pythonVersion",
         "pip_version=$pipVersion",
         "source_date_epoch=$commitEpoch"
+        "signature_status=unsigned-no-code-signing-certificate-provided"
+        "sbom=SBOM.cdx.json"
+        "third_party_notices=THIRD_PARTY_NOTICES.md"
     )
     $utf8 = New-Object Text.UTF8Encoding($false)
     [IO.File]::WriteAllLines(

@@ -13,6 +13,9 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import Enum
 from hashlib import sha256
+import ast
+import ctypes
+import errno
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -39,6 +42,9 @@ MAX_ACTION_TEXT_BYTES = 256 * 1024
 MAX_ACTION_OUTPUT_BYTES = 1 * 1024 * 1024
 MAX_READ_BYTES = 128 * 1024
 MAX_SAVE_BYTES = 64 * 1024
+MAX_ARTIFACT_BUNDLE_FILES = 12
+MAX_ARTIFACT_BUNDLE_BYTES = 256 * 1024
+MAX_ARTIFACT_BUNDLE_PATH_CHARS = 192
 MAX_SEARCH_FILES = 2_000
 MAX_SEARCH_MATCHES = 100
 MAX_LIST_ENTRIES = 200
@@ -46,6 +52,9 @@ MAX_CAPABILITIES = 128
 CAPABILITY_TTL_SECONDS = 30.0
 REPARSE_POINT_ATTRIBUTE = 0x400
 ALLOWED_ARTIFACT_SUFFIXES = frozenset({".txt", ".md", ".json", ".csv"})
+ALLOWED_ARTIFACT_BUNDLE_SUFFIXES = frozenset(
+    {".py", ".js", ".html", ".css", ".json", ".md", ".txt", ".toml", ".yaml", ".yml"}
+)
 IGNORED_DIRECTORIES = frozenset(
     {
         ".git",
@@ -99,6 +108,7 @@ class TaskActionKind(str, Enum):
     STATUS = "status"
     RUN_TEST = "run_test"
     WRITE_ARTIFACT = "write_artifact"
+    WRITE_ARTIFACT_BUNDLE = "write_artifact_bundle"
     STAGE_SOURCE_CHANGE = "stage_source_change"
     NETWORK = "network"
     ARBITRARY_SHELL = "arbitrary_shell"
@@ -123,6 +133,7 @@ ACTION_RISK: Mapping[TaskActionKind, RiskTier] = {
     TaskActionKind.STATUS: RiskTier.T0,
     TaskActionKind.RUN_TEST: RiskTier.T1,
     TaskActionKind.WRITE_ARTIFACT: RiskTier.T1,
+    TaskActionKind.WRITE_ARTIFACT_BUNDLE: RiskTier.T1,
     TaskActionKind.STAGE_SOURCE_CHANGE: RiskTier.T2,
     TaskActionKind.NETWORK: RiskTier.T3,
     TaskActionKind.ARBITRARY_SHELL: RiskTier.T3,
@@ -132,6 +143,7 @@ ACTION_RISK: Mapping[TaskActionKind, RiskTier] = {
     TaskActionKind.ROLLBACK_MUTATION: RiskTier.T3,
 }
 _RISK_ORDER = {tier: index for index, tier in enumerate(RiskTier)}
+_ARTIFACT_BUNDLE_COMMIT_LOCK = Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +176,186 @@ class TaskVerifier:
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactBundleFile:
+    """One inert UTF-8 file in a bounded PoC/MVP artifact bundle."""
+
+    path: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactBundle:
+    """Explicit immutable schema for an output-only multi-file project."""
+
+    project: str
+    files: tuple[ArtifactBundleFile, ...]
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.files, tuple):
+            raise TypeError("artifact bundle files must be an immutable tuple")
+
+
+def _strict_json_loads(raw: str, *, label: str) -> object:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise TaskPolicyError(f"{label} contains a duplicate key: {key}")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> object:
+        raise TaskPolicyError(f"{label} contains a non-finite number: {value}")
+
+    try:
+        return json.loads(
+            raw,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise TaskPolicyError(f"{label} is not valid JSON") from exc
+
+
+def validate_artifact_bundle(bundle: ArtifactBundle) -> None:
+    """Validate an inert project bundle without granting execution authority."""
+
+    if not isinstance(bundle, ArtifactBundle):
+        raise TaskPolicyError("artifact bundle must use the typed schema")
+    if type(bundle.schema_version) is not int or bundle.schema_version != 1:
+        raise TaskPolicyError("unsupported artifact-bundle schema")
+    if (
+        not isinstance(bundle.project, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", bundle.project)
+        or _WINDOWS_DEVICE.fullmatch(bundle.project)
+    ):
+        raise TaskPolicyError("artifact project name is invalid or reserved")
+    if not 1 <= len(bundle.files) <= MAX_ARTIFACT_BUNDLE_FILES:
+        raise TaskPolicyError("artifact bundle file count is outside [1, 12]")
+
+    seen: set[str] = set()
+    aggregate_bytes = 0
+    for item in bundle.files:
+        if not isinstance(item, ArtifactBundleFile):
+            raise TaskPolicyError("artifact bundle files must use the typed schema")
+        if not isinstance(item.path, str) or not isinstance(item.content, str):
+            raise TaskPolicyError("artifact bundle file fields must be text")
+        if "\\" in item.path or len(item.path) > MAX_ARTIFACT_BUNDLE_PATH_CHARS:
+            raise TaskPolicyError("artifact bundle path must be bounded POSIX text")
+        path = _normalize_relative(item.path)
+        if path != item.path or len(PurePosixPath(path).parts) > 8:
+            raise TaskPolicyError("artifact bundle path is non-canonical or too deep")
+        if any(
+            part.casefold() in IGNORED_DIRECTORIES for part in PurePosixPath(path).parts
+        ):
+            raise TaskPolicyError("artifact bundle path uses a blocked directory")
+        if path.casefold() == "manifest.json":
+            raise TaskPolicyError("manifest.json is reserved for verified metadata")
+        if PurePosixPath(path).suffix.lower() not in ALLOWED_ARTIFACT_BUNDLE_SUFFIXES:
+            raise TaskPolicyError("artifact bundle file suffix is not allowlisted")
+        folded = path.casefold()
+        if folded in seen:
+            raise TaskPolicyError("artifact bundle paths collide case-insensitively")
+        seen.add(folded)
+
+        encoded = item.content.encode("utf-8")
+        if b"\x00" in encoded:
+            raise TaskPolicyError("artifact bundle content must be UTF-8 text")
+        if any(ord(char) < 32 and char not in "\t\n\r" for char in item.content):
+            raise TaskPolicyError("artifact bundle content contains control characters")
+        aggregate_bytes += len(encoded)
+        if aggregate_bytes > MAX_ARTIFACT_BUNDLE_BYTES:
+            raise TaskPolicyError("artifact bundle exceeds the 256 KiB aggregate limit")
+        suffix = PurePosixPath(path).suffix.lower()
+        if suffix == ".py":
+            try:
+                ast.parse(item.content, filename=path)
+            except (SyntaxError, ValueError) as exc:
+                raise TaskPolicyError(
+                    f"Python syntax validation failed: {path}"
+                ) from exc
+        elif suffix == ".json":
+            _strict_json_loads(item.content, label=path)
+
+
+def parse_artifact_bundle_payload(raw: str) -> ArtifactBundle:
+    """Parse the exact JSON command schema and reject extensions/ambiguity."""
+
+    if not isinstance(raw, str):
+        raise TypeError("artifact bundle payload must be text")
+    parsed = _strict_json_loads(raw, label="artifact bundle")
+    if not isinstance(parsed, dict) or set(parsed) != {
+        "schema_version",
+        "project",
+        "files",
+    }:
+        raise TaskPolicyError(
+            "artifact bundle must contain exactly schema_version/project/files"
+        )
+    files = parsed["files"]
+    if not isinstance(files, list):
+        raise TaskPolicyError("artifact bundle files must be a JSON array")
+    typed_files: list[ArtifactBundleFile] = []
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {"path", "content"}:
+            raise TaskPolicyError(
+                "each artifact file must contain exactly path/content"
+            )
+        typed_files.append(ArtifactBundleFile(item["path"], item["content"]))
+    bundle = ArtifactBundle(
+        project=parsed["project"],
+        files=tuple(typed_files),
+        schema_version=parsed["schema_version"],
+    )
+    validate_artifact_bundle(bundle)
+    return bundle
+
+
+def artifact_bundle_root(bundle: ArtifactBundle) -> str:
+    validate_artifact_bundle(bundle)
+    return f"outputs/agent-workspace/{bundle.project}"
+
+
+def artifact_bundle_manifest_bytes(bundle: ArtifactBundle) -> bytes:
+    validate_artifact_bundle(bundle)
+    files = []
+    aggregate_bytes = 0
+    for item in sorted(bundle.files, key=lambda value: value.path.casefold()):
+        encoded = item.content.encode("utf-8")
+        aggregate_bytes += len(encoded)
+        files.append(
+            {
+                "path": item.path,
+                "sha256": sha256(encoded).hexdigest(),
+                "size_bytes": len(encoded),
+            }
+        )
+    manifest = {
+        "aggregate_size_bytes": aggregate_bytes,
+        "execution_allowed": False,
+        "files": files,
+        "kind": "cogni_agent_artifact_bundle",
+        "project": bundle.project,
+        "schema_version": 1,
+        "source_mutation_allowed": False,
+    }
+    return (
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def artifact_bundle_manifest_path(bundle: ArtifactBundle) -> str:
+    return f"{artifact_bundle_root(bundle)}/manifest.json"
+
+
+@dataclass(frozen=True, slots=True)
 class TaskAction:
     action_id: str
     kind: TaskActionKind
@@ -173,6 +365,7 @@ class TaskAction:
     argv: tuple[str, ...] = ()
     expected_sha256: str = ""
     rationale: str = ""
+    artifact_bundle: ArtifactBundle | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.argv, tuple):
@@ -411,6 +604,12 @@ class TaskPlanPolicy:
             if not 1 <= required.max_bytes <= MAX_ACTION_TEXT_BYTES:
                 raise TaskPolicyError("required-input bound is invalid")
 
+        bundle_manifest_paths = {
+            artifact_bundle_manifest_path(action.artifact_bundle)
+            for action in plan.actions
+            if action.kind is TaskActionKind.WRITE_ARTIFACT_BUNDLE
+            and action.artifact_bundle is not None
+        }
         artifact_paths: set[str] = set()
         for artifact in plan.expected_artifacts:
             if not isinstance(artifact, ExpectedArtifact):
@@ -423,7 +622,10 @@ class TaskPlanPolicy:
             ):
                 raise TaskPolicyError("artifact fields have invalid types")
             path = _normalize_relative(artifact.path)
-            self._validate_artifact_path(path)
+            self._validate_artifact_path(
+                path,
+                allow_bundle_manifest=path in bundle_manifest_paths,
+            )
             if path in artifact_paths:
                 raise TaskPolicyError("artifact paths must be unique")
             artifact_paths.add(path)
@@ -439,6 +641,7 @@ class TaskPlanPolicy:
             for action in plan.actions
             if action.kind is TaskActionKind.WRITE_ARTIFACT
         }
+        write_paths.update(bundle_manifest_paths)
         if write_paths != artifact_paths:
             raise TaskPolicyError(
                 "write actions and expected artifacts must have an exact mapping"
@@ -448,7 +651,12 @@ class TaskPlanPolicy:
             for action in plan.actions
             if action.kind is TaskActionKind.WRITE_ARTIFACT
         ]
-        if len(write_actions) != len(write_paths):
+        bundle_actions = [
+            action
+            for action in plan.actions
+            if action.kind is TaskActionKind.WRITE_ARTIFACT_BUNDLE
+        ]
+        if len(write_actions) + len(bundle_actions) != len(write_paths):
             raise TaskPolicyError("artifact paths cannot be written more than once")
         artifact_specs = {
             _normalize_relative(item.path): item for item in plan.expected_artifacts
@@ -463,6 +671,18 @@ class TaskPlanPolicy:
             ):
                 raise TaskPolicyError(
                     "artifact content does not match its declared size/SHA-256"
+                )
+        for action in bundle_actions:
+            assert action.artifact_bundle is not None
+            manifest_path = artifact_bundle_manifest_path(action.artifact_bundle)
+            manifest = artifact_bundle_manifest_bytes(action.artifact_bundle)
+            spec = artifact_specs[manifest_path]
+            if (
+                len(manifest) > spec.max_bytes
+                or sha256(manifest).hexdigest() != spec.sha256
+            ):
+                raise TaskPolicyError(
+                    "artifact bundle manifest does not match its declared SHA-256"
                 )
         self._validate_verifier(plan)
 
@@ -497,6 +717,13 @@ class TaskPlanPolicy:
         self, action: TaskAction, allowed_paths: tuple[str, ...]
     ) -> None:
         encoded = (action.query + action.content + action.rationale).encode("utf-8")
+        if action.artifact_bundle is not None:
+            if not isinstance(action.artifact_bundle, ArtifactBundle):
+                raise TaskPolicyError("artifact bundle must use the typed schema")
+            validate_artifact_bundle(action.artifact_bundle)
+            encoded += b"".join(
+                item.content.encode("utf-8") for item in action.artifact_bundle.files
+            )
         if len(encoded) > MAX_ACTION_TEXT_BYTES or b"\x00" in encoded:
             raise TaskPolicyError("action text is binary or exceeds its bound")
         if action.argv:
@@ -508,7 +735,10 @@ class TaskPlanPolicy:
             ):
                 raise TaskPolicyError("invalid test argv")
         if action.kind in {TaskActionKind.HELP, TaskActionKind.STATUS}:
-            if any((action.path, action.query, action.content, action.argv)):
+            if (
+                any((action.path, action.query, action.content, action.argv))
+                or action.artifact_bundle is not None
+            ):
                 raise TaskPolicyError("parameterless action carries extra fields")
             return
 
@@ -519,17 +749,20 @@ class TaskPlanPolicy:
         if not _within_allowed(path, allowed_paths):
             raise TaskPolicyError("action path is outside the declared capability")
         if action.kind in {TaskActionKind.LIST, TaskActionKind.READ}:
-            if any((action.query, action.content, action.argv)):
+            if (
+                any((action.query, action.content, action.argv))
+                or action.artifact_bundle is not None
+            ):
                 raise TaskPolicyError("read action carries unrelated fields")
         elif action.kind is TaskActionKind.SEARCH:
             if not action.query or len(action.query) > 256:
                 raise TaskPolicyError("search query is empty or too long")
             if any(ord(char) < 32 for char in action.query):
                 raise TaskPolicyError("search query contains control characters")
-            if action.content or action.argv:
+            if action.content or action.argv or action.artifact_bundle is not None:
                 raise TaskPolicyError("search action carries unrelated fields")
         elif action.kind is TaskActionKind.RUN_TEST:
-            if action.content or action.query:
+            if action.content or action.query or action.artifact_bundle is not None:
                 raise TaskPolicyError("test action carries unrelated text")
             if path != "tests" and not (
                 path.startswith("tests/") and path.endswith(".py")
@@ -548,9 +781,29 @@ class TaskPlanPolicy:
                 or action.query
                 or action.expected_sha256
                 or action.rationale
+                or action.artifact_bundle is not None
             ):
                 raise TaskPolicyError("artifact action carries unrelated fields")
+        elif action.kind is TaskActionKind.WRITE_ARTIFACT_BUNDLE:
+            bundle = action.artifact_bundle
+            if bundle is None:
+                raise TaskPolicyError("artifact bundle action requires a typed bundle")
+            validate_artifact_bundle(bundle)
+            if path != artifact_bundle_root(bundle):
+                raise TaskPolicyError("artifact bundle path does not match its project")
+            if any(
+                (
+                    action.query,
+                    action.content,
+                    action.argv,
+                    action.expected_sha256,
+                    action.rationale,
+                )
+            ):
+                raise TaskPolicyError("artifact bundle action carries unrelated fields")
         elif action.kind is TaskActionKind.STAGE_SOURCE_CHANGE:
+            if action.artifact_bundle is not None:
+                raise TaskPolicyError("source proposal cannot carry an artifact bundle")
             if action.argv or action.query:
                 raise TaskPolicyError("source proposal cannot carry argv or query")
             if not action.content or not action.rationale.strip():
@@ -570,11 +823,22 @@ class TaskPlanPolicy:
             raise TaskPolicyError("T3 action is permanently forbidden")
 
     @staticmethod
-    def _validate_artifact_path(path: str) -> None:
+    def _validate_artifact_path(
+        path: str, *, allow_bundle_manifest: bool = False
+    ) -> None:
         prefix = "outputs/agent-workspace/"
         if not path.startswith(prefix):
             raise TaskPolicyError("artifacts are confined to outputs/agent-workspace")
         name = path.removeprefix(prefix)
+        if allow_bundle_manifest:
+            parts = PurePosixPath(name).parts
+            if (
+                len(parts) == 2
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", parts[0])
+                and parts[1] == "manifest.json"
+                and not _WINDOWS_DEVICE.fullmatch(parts[0])
+            ):
+                return
         if (
             "/" in name
             or not name
@@ -840,6 +1104,16 @@ class TaskPlanExecutor:
                 artifact,
                 None,
             )
+        if action.kind is TaskActionKind.WRITE_ARTIFACT_BUNDLE:
+            assert action.artifact_bundle is not None
+            artifact = self._write_artifact_bundle(action.artifact_bundle)
+            return (
+                "saved inert project bundle: "
+                f"{artifact.path} (manifest sha256={artifact.sha256}); "
+                "execution=false, source-mutation=false",
+                artifact,
+                None,
+            )
         if action.kind is TaskActionKind.STAGE_SOURCE_CHANGE:
             if self.proposal_stager is None:
                 raise TaskExecutionError("Self-Harness proposal stager is unavailable")
@@ -1063,6 +1337,214 @@ class TaskPlanExecutor:
                 raise TaskExecutionError("search directory changed during traversal")
         files.sort(key=lambda item: item.as_posix().casefold())
         return files
+
+    def _write_artifact_bundle(self, bundle: ArtifactBundle) -> VerifiedArtifact:
+        """Commit a complete inert project directory with no-overwrite semantics."""
+
+        acquired = _ARTIFACT_BUNDLE_COMMIT_LOCK.acquire(timeout=10.0)
+        if not acquired:
+            raise TaskExecutionError("artifact bundle commit lock timed out")
+        try:
+            return self._write_artifact_bundle_locked(bundle)
+        finally:
+            _ARTIFACT_BUNDLE_COMMIT_LOCK.release()
+
+    def _write_artifact_bundle_locked(self, bundle: ArtifactBundle) -> VerifiedArtifact:
+        """Perform one serialized in-process bundle transaction."""
+
+        validate_artifact_bundle(bundle)
+        output_root = self._ensure_output_root()
+        output_identity = self._identity(output_root)
+        target = output_root / bundle.project
+        try:
+            self._identity(target)
+        except FileNotFoundError:
+            pass
+        else:
+            raise TaskExecutionError(
+                "artifact project already exists; overwrite refused"
+            )
+
+        stage = output_root / f".bundle-{secrets.token_hex(16)}.tmp"
+        os.mkdir(stage, 0o700)
+        stage_identity = self._identity(stage)
+        if self._is_linklike(stage, stage_identity) or not stat.S_ISDIR(
+            stage_identity.mode
+        ):
+            raise TaskExecutionError("artifact staging directory is not trusted")
+        committed = False
+        try:
+            for item in sorted(bundle.files, key=lambda value: value.path.casefold()):
+                parent = stage
+                for part in PurePosixPath(item.path).parts[:-1]:
+                    child = parent / part
+                    try:
+                        os.mkdir(child, 0o700)
+                    except FileExistsError:
+                        pass
+                    identity = self._identity(child)
+                    if self._is_linklike(child, identity) or not stat.S_ISDIR(
+                        identity.mode
+                    ):
+                        raise TaskExecutionError(
+                            "artifact staging path became a link or non-directory"
+                        )
+                    resolved = child.resolve(strict=True)
+                    if not _same_path(
+                        resolved, child.absolute()
+                    ) or not _lexically_within(resolved, stage):
+                        raise TaskExecutionError(
+                            "artifact staging path escaped its root"
+                        )
+                    parent = child
+                self._write_new_bundle_file(
+                    parent / PurePosixPath(item.path).name,
+                    item.content.encode("utf-8"),
+                )
+
+            manifest = artifact_bundle_manifest_bytes(bundle)
+            self._write_new_bundle_file(stage / "manifest.json", manifest)
+            if not self._same_object(output_identity, self._identity(output_root)):
+                raise TaskExecutionError("artifact output root changed before commit")
+            if not self._same_object(stage_identity, self._identity(stage)):
+                raise TaskExecutionError("artifact staging root changed before commit")
+            try:
+                self._identity(target)
+            except FileNotFoundError:
+                pass
+            else:
+                raise TaskExecutionError(
+                    "artifact project appeared before commit; overwrite refused"
+                )
+            self._rename_directory_no_replace(stage, target)
+            committed = True
+        finally:
+            if not committed:
+                self._remove_private_stage(stage, output_root, output_identity)
+
+        target_identity = self._identity(target)
+        if self._is_linklike(target, target_identity) or not stat.S_ISDIR(
+            target_identity.mode
+        ):
+            raise TaskExecutionError("committed artifact project is not a directory")
+        if not _same_path(target.resolve(strict=True), target.absolute()):
+            raise TaskExecutionError("committed artifact project resolved unexpectedly")
+
+        root_relative = artifact_bundle_root(bundle)
+        for item in bundle.files:
+            data, digest = self._secure_read(
+                f"{root_relative}/{item.path}", MAX_ARTIFACT_BUNDLE_BYTES
+            )
+            expected = item.content.encode("utf-8")
+            if data != expected or digest != sha256(expected).hexdigest():
+                raise TaskExecutionError(
+                    "artifact bundle read-back verification failed"
+                )
+        manifest_path = artifact_bundle_manifest_path(bundle)
+        manifest_data, manifest_digest = self._secure_read(
+            manifest_path, MAX_SAVE_BYTES
+        )
+        expected_manifest = artifact_bundle_manifest_bytes(bundle)
+        if manifest_data != expected_manifest:
+            raise TaskExecutionError("artifact bundle manifest read-back failed")
+        return VerifiedArtifact(
+            manifest_path,
+            manifest_digest,
+            len(manifest_data),
+        )
+
+    def _write_new_bundle_file(self, target: Path, payload: bytes) -> None:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(target, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        identity = self._identity(target)
+        if self._is_linklike(target, identity) or not stat.S_ISREG(identity.mode):
+            raise TaskExecutionError("artifact staging file is not a regular file")
+        if identity.size != len(payload):
+            raise TaskExecutionError("artifact staging file size mismatch")
+
+    def _remove_private_stage(
+        self,
+        stage: Path,
+        output_root: Path,
+        output_identity: _FileIdentity,
+    ) -> None:
+        try:
+            identity = self._identity(stage)
+        except FileNotFoundError:
+            return
+        if (
+            stage.parent != output_root
+            or not stage.name.startswith(".bundle-")
+            or self._is_linklike(stage, identity)
+            or not stat.S_ISDIR(identity.mode)
+            or not self._same_object(output_identity, self._identity(output_root))
+        ):
+            raise TaskExecutionError("refusing unsafe artifact staging cleanup")
+        shutil.rmtree(stage)
+
+    @staticmethod
+    def _rename_directory_no_replace(source: Path, target: Path) -> None:
+        """Atomically publish a directory, never replacing an existing target."""
+
+        if os.name == "nt":
+            try:
+                os.rename(source, target)
+            except FileExistsError as exc:
+                raise TaskExecutionError(
+                    "artifact project already exists; overwrite refused"
+                ) from exc
+            return
+        if sys.platform.startswith("linux"):
+            libc = ctypes.CDLL(None, use_errno=True)
+            renameat2 = getattr(libc, "renameat2", None)
+            if renameat2 is None:
+                raise TaskExecutionError(
+                    "atomic no-replace directory commit is unavailable"
+                )
+            renameat2.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            renameat2.restype = ctypes.c_int
+            result = renameat2(
+                -100,
+                os.fsencode(source),
+                -100,
+                os.fsencode(target),
+                1,
+            )
+            if result == 0:
+                return
+            error = ctypes.get_errno()
+            if error in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise TaskExecutionError(
+                    "artifact project already exists; overwrite refused"
+                )
+            if error in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
+                raise TaskExecutionError(
+                    "atomic no-replace directory commit is unavailable"
+                )
+            raise TaskExecutionError(
+                f"artifact directory commit failed with errno {error}"
+            )
+        raise TaskExecutionError("atomic no-replace directory commit is unavailable")
 
     def _write_artifact(self, raw: str, content: str) -> VerifiedArtifact:
         relative = _normalize_relative(raw)
@@ -1482,6 +1964,8 @@ def _is_sha256(value: str) -> bool:
 
 
 __all__ = [
+    "ArtifactBundle",
+    "ArtifactBundleFile",
     "CapabilityError",
     "CapabilityToken",
     "ExpectedArtifact",
@@ -1505,4 +1989,9 @@ __all__ = [
     "UnverifiedPlannerGate",
     "VerifiedArtifact",
     "VerifierKind",
+    "artifact_bundle_manifest_bytes",
+    "artifact_bundle_manifest_path",
+    "artifact_bundle_root",
+    "parse_artifact_bundle_payload",
+    "validate_artifact_bundle",
 ]

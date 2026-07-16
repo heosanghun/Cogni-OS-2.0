@@ -96,9 +96,25 @@ class TestReleaseBundleIntegrity(unittest.TestCase):
             "Move-Item -LiteralPath $publishStage -Destination $publishedOutput",
             "SOURCE_DATE_EPOCH",
             "commit_oid=$commitOid",
+            "SBOM.cdx.json",
+            "THIRD_PARTY_NOTICES.md",
+            "unsigned-no-code-signing-certificate-provided",
         ):
             with self.subTest(contract=contract):
                 self.assertIn(contract, script)
+
+    def test_archive_entries_are_validated_before_expansion(self) -> None:
+        script = (ROOT / "scripts" / "build_release_bundle.ps1").read_text(
+            encoding="utf-8"
+        )
+        validation = "$archiveCheckpoint = Get-ArchiveEntrySha256"
+        expansion = "Expand-Archive -LiteralPath $rawArchive"
+
+        self.assertEqual(script.count(validation), 1)
+        self.assertLess(script.index(validation), script.index(expansion))
+        self.assertIn("[StringComparer]::OrdinalIgnoreCase", script)
+        self.assertIn("$name.Contains('\\')", script)
+        self.assertIn("$expandedBytes -gt 2147483648", script)
 
 
 if __name__ == "__main__":

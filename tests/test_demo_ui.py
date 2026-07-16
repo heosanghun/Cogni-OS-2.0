@@ -75,7 +75,13 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn('data-action="fullscreen"', html)
         self.assertIn("<strong>Moat</strong>", html)
         self.assertNotIn("<strong>Defense</strong>", html)
-        for action in ("agent-send", "agent-cancel", "agent-reset", "evolution-run"):
+        for action in (
+            "agent-send",
+            "agent-cancel",
+            "agent-reset",
+            "evolution-run",
+            "evolution-review",
+        ):
             self.assertIn(f'data-action="{action}"', html)
 
     def test_ai_workspace_accessibility_contract_is_complete(self) -> None:
@@ -146,6 +152,10 @@ class TestCogniBoardUI(unittest.TestCase):
             r'id="agent-attachment-input"[^>]*type="file"[^>]*multiple[^>]*disabled',
         )
         self.assertIn('id="agent-attachment-tray"', html)
+        self.assertIn('data-action="workspace-rag-reindex"', html)
+        self.assertIn('id="attachment-preview-layer"', html)
+        self.assertIn('id="attachment-preview-text"', html)
+        self.assertIn('id="attachment-preview-image"', html)
         self.assertRegex(
             html,
             r'id="agent-attachment-live-status"[^>]*role="status"'
@@ -176,6 +186,7 @@ class TestCogniBoardUI(unittest.TestCase):
         )
         self.assertIn(".composer-commandbar", stylesheet)
         self.assertIn(".attachment-chip", stylesheet)
+        self.assertIn(".attachment-preview-dialog", stylesheet)
         self.assertIn('.composer-tool-button[aria-pressed="true"]', stylesheet)
 
     def test_workspace_ui_consumes_bounded_capability_contract(self) -> None:
@@ -185,29 +196,74 @@ class TestCogniBoardUI(unittest.TestCase):
             "/api/workspace/capabilities",
             "/api/workspace/attachments",
             "/api/workspace/attachments/add",
+            "/api/workspace/attachments/delete",
+            "/api/workspace/attachments/preview",
+            "/api/workspace/attachments/content",
             "/api/workspace/rag/index",
+            "/api/workspace/rag/reindex",
+            "/api/workspace/lens/search",
+            "/api/workspace/lens/search-and-index",
             "/api/workspace/models/select",
         ):
             with self.subTest(endpoint=endpoint):
                 self.assertIn(endpoint, script)
         self.assertIn("MAX_ATTACHMENT_UPLOAD_BYTES = 8 * 1024 * 1024", script)
-        self.assertIn("WEB_SEARCH_UI_IMPLEMENTED = false", script)
-        self.assertIn("MICROPHONE_CAPTURE_UI_IMPLEMENTED = false", script)
+        self.assertIn("WEB_SEARCH_UI_IMPLEMENTED = true", script)
+        self.assertIn("MICROPHONE_CAPTURE_UI_IMPLEMENTED = true", script)
         self.assertIn("reader.readAsDataURL(file)", script)
         self.assertIn("content_base64: contentBase64", script)
         self.assertIn('attachments.state === "enabled"', script)
         self.assertIn('rag.state === "local_index_ready"', script)
         self.assertIn('rag: ui.agentMode === "chat" && ui.ragEnabled', script)
-        self.assertIn('if (ui.agentMode !== "chat") ui.ragEnabled = false', script)
-        self.assertIn("web.executor_implemented !== true", script)
-        self.assertIn("microphone.runtime_audio_input !== true", script)
+        self.assertIn('if (ui.agentMode !== "chat") {', script)
+        self.assertIn("ui.ragEnabled = false", script)
+        self.assertIn("MAX_AGENT_CHAT_INPUT_CHARS = 4096", script)
+        self.assertIn("MAX_AGENT_PROJECT_INPUT_CHARS = 1 * 1024 * 1024", script)
+        self.assertIn('ui.agentMode === "task"', script)
+        self.assertIn("input.maxLength =", script)
+        self.assertIn('lens.state !== "ready"', script)
+        self.assertIn("official_lens_connector", script)
+        self.assertIn("renderLensSearchResults", script)
+        self.assertIn("verifiedLensUrl", script)
+        self.assertIn("LENS_TERMS_REQUIRED", script)
+        markup = (STATIC / "index.html").read_text(encoding="utf-8")
+        self.assertIn("Data Sourced from The Lens", markup)
+        self.assertIn("www.lens.org", markup)
+        self.assertIn("about.lens.org/lens-api-terms-of-use/", markup)
+        self.assertIn("microphone.runtime_audio_input === true", script)
         self.assertIn(
             'networkMode === "online_opt_in" ? "ONLINE OPT-IN" : "LOCAL ONLY"', script
         )
         self.assertIn('setText("#external-call-count", "0")', script)
-        self.assertIn("chip.append(name, state)", script)
+        self.assertIn("chip.append(name, state, imageSelect, remove)", script)
+        self.assertIn('data-action="workspace-attachment-delete"', script)
+        self.assertIn('data-action="workspace-attachment-preview"', script)
+        self.assertIn('data-action="workspace-image-select"', script)
+        self.assertIn("openWorkspaceAttachmentPreview", script)
+        self.assertIn("reindexWorkspaceAttachments", script)
+        self.assertIn("attachment_id ${source.attachmentId}", script)
+        self.assertIn("chunk_index ${source.chunkIndex}", script)
+        self.assertIn("score ${source.score.toFixed(4)}", script)
         self.assertIn('"로컬 저장·모델 미전달"', script)
         self.assertIn("selector.replaceChildren(fragment)", script)
+
+    def test_image_chat_selection_is_explicit_single_turn_and_accessible(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn('selectedImageAttachmentId: ""', script)
+        self.assertIn("attachments.image_to_model_integration === true", script)
+        self.assertIn("function selectWorkspaceImageAttachment", script)
+        self.assertIn('imageSelect.setAttribute("aria-pressed"', script)
+        self.assertIn(
+            "requestBody.image_attachment_id = ui.selectedImageAttachmentId", script
+        )
+        self.assertIn("state?.image_input_admitted === true", script)
+        self.assertIn('ui.selectedImageAttachmentId = ""', script)
+        self.assertIn("if (selecting) ui.ragEnabled = false", script)
+        self.assertIn("if (ui.ragEnabled) ui.selectedImageAttachmentId", script)
+        self.assertIn(".attachment-image-select", stylesheet)
+        self.assertIn('[data-image-selected="true"]', stylesheet)
 
     def test_ai_workspace_uses_xss_safe_bounded_dom_rendering(self) -> None:
         script = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -235,6 +291,38 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("message.sources.length === 0", script)
         self.assertIn("VIEW_IDS.has(initial)", script)
         self.assertNotIn('$(`[data-view-panel="${initial}"]`)', script)
+
+    def test_self_harness_proposal_review_is_accessible_and_read_only(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+
+        self.assertRegex(
+            html,
+            r'data-action="evolution-review"[^>]*aria-controls="proposal-review-layer"'
+            r'[^>]*aria-haspopup="dialog"[^>]*disabled',
+        )
+        self.assertRegex(
+            html,
+            r'class="proposal-review-dialog"[^>]*role="dialog"'
+            r'[^>]*aria-modal="true"[^>]*aria-labelledby="proposal-review-title"',
+        )
+        self.assertIn('id="proposal-review-list"', html)
+        self.assertIn("이 화면에는 실행·승인·적용 기능이 없습니다.", html)
+        self.assertIn("/api/evolution/proposals", script)
+        self.assertIn("renderProposalReview", script)
+        self.assertIn('document.createElement("pre")', script)
+        self.assertIn("list.replaceChildren(fragment)", script)
+        self.assertIn(
+            "event.target === event.currentTarget) closeProposalReview()", script
+        )
+        self.assertIn('event.key === "Escape"', script)
+        self.assertIn(".proposal-review-dialog", stylesheet)
+        self.assertNotRegex(
+            script,
+            r"/api/evolution/proposals/(?:apply|approve|execute|promote)",
+        )
+        self.assertNotRegex(script, r"\.innerHTML\b|insertAdjacentHTML")
 
     def test_rag_provenance_uses_text_only_dom_for_malicious_titles(self) -> None:
         script = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -369,6 +457,9 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("validationConnectionLost", script)
         self.assertIn("로컬 AI 연결이 복구되었습니다.", script)
         self.assertIn("검증 제어 연결이 복구되었습니다.", script)
+        self.assertIn(
+            "result?.deleted !== true || result?.blob_deleted !== true", script
+        )
 
     def test_responsive_workspace_has_no_global_horizontal_scroll_contract(
         self,
@@ -538,7 +629,7 @@ class TestCogniBoardUI(unittest.TestCase):
             env=environment,
             timeout=30,
         ).stdout.strip()
-        self.assertEqual(version, "0.3.2.0")
+        self.assertEqual(version, "0.4.0.0")
 
 
 if __name__ == "__main__":

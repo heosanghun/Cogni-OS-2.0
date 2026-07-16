@@ -1,4 +1,4 @@
-# Cogni-OS 2.0 v0.3.2 Validation Gates
+# Cogni-OS 2.0 v0.4.0 Validation Gates
 
 ## Evidence rule
 
@@ -33,20 +33,24 @@ The retained current-scope evidence has the following status:
 
 | Gate | Status |
 |---|---|
-| full source regression (`ruff`, format, `pytest`) | `PASS` |
-| automated 20-turn local completion run | `PASS` |
-| integrated Gemma/DEQ/CTS GPU runtime measurement | `PASS (RTX 5090 Laptop measured)` |
-| final System 4 stress measurement | `PASS (measurement-only/advisory)` |
-| natural Korean 10-turn release gate | `PASS (local Gemma + bounded product routes)` |
-| final release bytes and `SHA256SUMS.txt` | `PASS` only after regeneration from the frozen v0.3.2 commit |
+| full source regression (`ruff`, format, `pytest`, Node syntax) | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
+| automated 20-turn local completion run | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
+| integrated Gemma/DEQ/CTS GPU runtime measurement | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
+| final System 4 stress measurement | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
+| natural Korean 10-turn release gate | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
+| local Korean TTS → Gemma STT smoke | `PASS (one synthetic phrase; development host)` |
+| deterministic image-understanding smoke | `PASS (one fixed PNG; development host)` |
+| live Lens patent/scholarly query | `NOT RUN (user token and terms acceptance not bundled)` |
+| final release bytes and `SHA256SUMS.txt` | `PASS` only after regeneration from the frozen v0.4.0 commit |
 
 These passes are scoped to the retained source/model/config/device evidence.
 They do not certify the target RTX 4090, code signing, or a standalone installer.
 
-The retained current-scope JSON records are under `release/evidence/`: the
-20-turn conversation transcript, integrated Gemma/CTS runtime result, System 4
-stress result, and source-regression summary. Release byte identity is recorded
-separately in `release/SHA256SUMS.txt`, which is excluded from source archives.
+The older JSON records under `release/evidence/` remain historical comparison
+material. They cannot authorize the changed v0.4.0 source scope. Final v0.4.0
+records and release bytes must be regenerated from one frozen commit; release
+byte identity is recorded separately in `release/SHA256SUMS.txt`, which is
+excluded from source archives.
 
 ## Source validation
 
@@ -61,12 +65,12 @@ python -m pytest -q
 The exact number of collected tests is intentionally not a release contract:
 new security cases change it. A release candidate must retain the complete raw
 command output, source commit/tree digest, Python/PyTorch versions and skipped
-test reasons. No historical fixed count is accepted as v0.3.2 evidence.
+test reasons. No historical fixed count is accepted as v0.4.0 evidence.
 
-The current retained run passed Ruff and format checks plus Node syntax check.
-Pytest completed with 709 passed, 3 skipped, 3 deprecation warnings and
-565 subtests passed in 112.44 seconds. These counts
-describe this validation snapshot; they are not a permanent product contract.
+The previous retained v0.3.2 run passed Ruff and format checks plus Node syntax
+check, with 709 passed, 3 skipped, 3 deprecation warnings and 565 subtests in
+112.44 seconds. Those counts describe only that historical snapshot and do not
+pass the v0.4.0 release gate.
 
 The suite covers the following Phase 1–11 invariants:
 
@@ -95,7 +99,75 @@ The suite covers the following Phase 1–11 invariants:
   held-in/out metrics, lineage/replay and `research_archive_only` output;
 - persistent Self-Harness success/failure evidence, strict bounded restart
   hydration, causal signatures, K≥3 distinct candidates, immutable surfaces,
-  negative archive and zero mutation in proposal-only mode.
+  negative archive and zero mutation in proposal-only mode;
+- persistent attachment catalog/blob recovery, content and path integrity,
+  PDF bounds plus isolated worker timeout/resource contract,
+  preview/delete/reindex transactions and authenticated content;
+- pinned AkasicDB module digests, bounded indexing/query, answer-bearing
+  `RetrievalEvidence`, provenance and restart reconstruction;
+- fixed-schema Gemma image/audio tensor preprocessing and IPC, malformed shape/
+  dtype/size rejection, explicit one-turn image admission and request binding;
+- bounded browser WAV admission, local STT/TTS fail-closed contracts, and UI
+  capture/playback lifecycle cleanup;
+- four-gate Lens authorization, fixed official endpoints, bounded responses,
+  secret redaction, attribution, provenance and explicit Lens-to-RAG indexing;
+- read-only Self-Harness diff review with no approve/apply endpoint.
+
+## Workspace, multimodal, and voice gates
+
+Run the deterministic component contracts before loading the GPU model:
+
+```powershell
+python -m pytest -q `
+  tests/test_workspace_capabilities.py `
+  tests/test_workspace_capabilities_api.py `
+  tests/test_multimodal_processor.py `
+  tests/test_multimodal_worker_ipc.py `
+  tests/test_audio_worker_ipc.py `
+  tests/test_local_voice.py `
+  tests/test_local_tts.py `
+  tests/test_voice_api.py `
+  tests/test_voice_ui_contract.py `
+  tests/test_lens_api.py `
+  tests/test_proposal_review.py
+```
+
+Run actual local voice and image forwards serially so two validators do not
+compete for the single GPU lease:
+
+```powershell
+python -m scripts.validate_gemma4_local_voice `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
+  --output C:\Project\cognios-evidence\local-voice-v0.4.0.json
+
+python -m scripts.validate_gemma4_local_image `
+  --model C:\Project\cognios\gemma4-e4b-it `
+  --manifest config\gemma4-e4b-it.manifest.toml `
+  --output C:\Project\cognios-evidence\local-image-v0.4.0.json
+```
+
+The 2026-07-16 development-host voice smoke synthesized
+`안녕하세요. 코그니보드 로컬 음성 검증입니다.` with Microsoft Heami Desktop
+`ko-KR`, converted it to 16 kHz mono PCM, and transcribed the same phrase with
+the manifest-bound resident Gemma service. Normalized similarity was 1.0,
+duration was 5.0187 seconds, and both STT and TTS reported zero application
+external calls. This one synthetic phrase proves only that exact pipeline
+smoke; it is not WER, noisy-speech, speaker-diversity, latency, multilingual,
+or accessibility acceptance evidence.
+
+The 2026-07-16 deterministic image smoke sent a 595-byte locally generated
+256×256 PNG with one blue square through the manifest-bound Cogni-Core image
+path. The model returned `중앙의 큰 도형은 파란색 정사각형입니다.` with
+`finish_reason=stop`, `generation_mode=cogni_core`, both concept gates true,
+and zero external calls. This one fixed case does not establish general visual
+reasoning or combined image-plus-depth-100 VRAM conformance. Video has no
+validation route in v0.4.0.
+
+Lens tests use an injected fake transport and prove only local policy/schema
+invariants. A live request is permitted only when online opt-in, exact
+`api.lens.org` allowlisting, a user token, and explicit terms acceptance all
+exist. No release token is stored, and no live Lens result is claimed.
 
 ## Local Gemma artifact and runtime
 
@@ -233,8 +305,10 @@ These are not completed by the repository test suite and remain gated:
   precision ≥95%;
 - Phase 12 kernel-isolated sandbox, promotion fault injection and byte-identical
   rollback evidence;
-- code signing, a signed installer/update trust chain, SBOM, licenses and
-  provenance bundle.
+- code signing, a signed installer/update trust chain, independent license
+  review and distribution approval. The local builder emits a CycloneDX SBOM,
+  declared-license inventory and artifact/checksum provenance but cannot turn
+  metadata into legal approval or a cryptographic signature.
 
 Until those artifacts exist and validate in the current scope, the corresponding
 capability must remain `gated`, `advisory`, `research`, `night_only`, or

@@ -67,7 +67,15 @@ from cogni_os.gpu_lease import (
 from cogni_os.runtime import SearchCollaboratorsV2
 
 from .conditioning import build_latent_logits_processor
+from .multimodal import (
+    MultimodalPreprocessError,
+    MultimodalTensorBundle,
+    VerifiedGemma4MultimodalProcessor,
+)
 from .protocol import (
+    AUDIO_FIELD_INPUT_FEATURES,
+    AUDIO_FIELD_INPUT_FEATURES_MASK,
+    AUDIO_FIELD_MM_TOKEN_TYPE_IDS,
     DECODE_CONVERSATION,
     DECODE_STRICT,
     DIGEST_BYTES,
@@ -77,6 +85,9 @@ from .protocol import (
     FINISH_STOP,
     HARD_MAX_INPUT_TOKENS,
     HARD_MAX_NEW_TOKENS,
+    IMAGE_FIELD_MM_TOKEN_TYPE_IDS,
+    IMAGE_FIELD_PIXEL_VALUES,
+    IMAGE_FIELD_POSITION_IDS,
     NO_DEADLINE_NS,
     STATUS_BASE_MUTATED,
     STATUS_AUTHORITY_REJECTED,
@@ -331,6 +342,146 @@ def _session_digest(session_id: str) -> Tensor:
     return torch.tensor(
         list(sha256(normalized.encode("utf-8")).digest()), dtype=torch.int64
     )
+
+
+def _bind_media_session_digest(session_digest: Tensor, content_sha256: str) -> Tensor:
+    """Bind every worker response to the exact locally decoded media bytes."""
+
+    digest_hex = _validated_digest_hex(content_sha256, "media content digest")
+    if session_digest.shape != (DIGEST_BYTES,) or session_digest.dtype != torch.int64:
+        raise TensorProtocolError("conversation digest is invalid")
+    bound = sha256(
+        bytes(map(int, session_digest.tolist())) + bytes.fromhex(digest_hex)
+    ).digest()
+    return torch.tensor(list(bound), dtype=torch.int64)
+
+
+def _image_bundle_inputs(
+    bundle: MultimodalTensorBundle,
+    *,
+    max_input_tokens: int,
+) -> tuple[Tensor, Tensor, tuple[tuple[int, Tensor], ...], str]:
+    if (
+        not isinstance(bundle, MultimodalTensorBundle)
+        or bundle.modality != "image"
+        or bundle.processor_verified is not True
+    ):
+        raise RequestLimitError("image was not produced by the verified processor")
+    digest = _validated_digest_hex(bundle.content_sha256, "image content digest")
+    mapping = bundle.as_mapping()
+    if set(mapping) != {
+        "input_ids",
+        "attention_mask",
+        "mm_token_type_ids",
+        "pixel_values",
+        "image_position_ids",
+    }:
+        raise RequestLimitError("verified image bundle has an unsupported schema")
+    input_ids = mapping["input_ids"]
+    attention_mask = mapping["attention_mask"]
+    if (
+        input_ids.device.type != "cpu"
+        or input_ids.dtype != torch.int64
+        or not input_ids.is_contiguous()
+        or input_ids.ndim != 2
+        or input_ids.shape[0] != 1
+        or not 1 <= input_ids.shape[1] <= max_input_tokens
+    ):
+        raise RequestLimitError("image prompt exceeds the service token bound")
+    if (
+        attention_mask.device.type != "cpu"
+        or attention_mask.dtype != torch.int64
+        or not attention_mask.is_contiguous()
+        or attention_mask.shape != input_ids.shape
+    ):
+        raise RequestLimitError("image attention mask is invalid")
+    image_tensors = (
+        (IMAGE_FIELD_MM_TOKEN_TYPE_IDS, mapping["mm_token_type_ids"]),
+        (IMAGE_FIELD_PIXEL_VALUES, mapping["pixel_values"]),
+        (IMAGE_FIELD_POSITION_IDS, mapping["image_position_ids"]),
+    )
+    return input_ids, attention_mask, image_tensors, digest
+
+
+def _image_generation_kwargs(
+    image_tensors: tuple[tuple[int, Tensor], ...],
+    device: torch.device,
+) -> dict[str, Tensor]:
+    names = {
+        IMAGE_FIELD_MM_TOKEN_TYPE_IDS: "mm_token_type_ids",
+        IMAGE_FIELD_PIXEL_VALUES: "pixel_values",
+        IMAGE_FIELD_POSITION_IDS: "image_position_ids",
+    }
+    if {code for code, _tensor in image_tensors} != set(names):
+        raise TensorProtocolError("worker image tensor schema is incomplete")
+    return {
+        names[code]: tensor.to(device, non_blocking=False)
+        for code, tensor in image_tensors
+    }
+
+
+def _audio_bundle_inputs(
+    bundle: MultimodalTensorBundle,
+    *,
+    max_input_tokens: int,
+) -> tuple[Tensor, Tensor, tuple[tuple[int, Tensor], ...], str]:
+    if (
+        not isinstance(bundle, MultimodalTensorBundle)
+        or bundle.modality != "audio"
+        or bundle.processor_verified is not True
+    ):
+        raise RequestLimitError("audio was not produced by the verified processor")
+    digest = _validated_digest_hex(bundle.content_sha256, "audio content digest")
+    mapping = bundle.as_mapping()
+    if set(mapping) != {
+        "input_ids",
+        "attention_mask",
+        "mm_token_type_ids",
+        "input_features",
+        "input_features_mask",
+    }:
+        raise RequestLimitError("verified audio bundle has an unsupported schema")
+    input_ids = mapping["input_ids"]
+    attention_mask = mapping["attention_mask"]
+    if (
+        input_ids.device.type != "cpu"
+        or input_ids.dtype != torch.int64
+        or not input_ids.is_contiguous()
+        or input_ids.ndim != 2
+        or input_ids.shape[0] != 1
+        or not 1 <= input_ids.shape[1] <= max_input_tokens
+    ):
+        raise RequestLimitError("audio prompt exceeds the service token bound")
+    if (
+        attention_mask.device.type != "cpu"
+        or attention_mask.dtype != torch.int64
+        or not attention_mask.is_contiguous()
+        or attention_mask.shape != input_ids.shape
+    ):
+        raise RequestLimitError("audio attention mask is invalid")
+    audio_tensors = (
+        (AUDIO_FIELD_MM_TOKEN_TYPE_IDS, mapping["mm_token_type_ids"]),
+        (AUDIO_FIELD_INPUT_FEATURES, mapping["input_features"]),
+        (AUDIO_FIELD_INPUT_FEATURES_MASK, mapping["input_features_mask"]),
+    )
+    return input_ids, attention_mask, audio_tensors, digest
+
+
+def _audio_generation_kwargs(
+    audio_tensors: tuple[tuple[int, Tensor], ...],
+    device: torch.device,
+) -> dict[str, Tensor]:
+    names = {
+        AUDIO_FIELD_MM_TOKEN_TYPE_IDS: "mm_token_type_ids",
+        AUDIO_FIELD_INPUT_FEATURES: "input_features",
+        AUDIO_FIELD_INPUT_FEATURES_MASK: "input_features_mask",
+    }
+    if {code for code, _tensor in audio_tensors} != set(names):
+        raise TensorProtocolError("worker audio tensor schema is incomplete")
+    return {
+        names[code]: tensor.to(device, non_blocking=False)
+        for code, tensor in audio_tensors
+    }
 
 
 def _decode_mode_code(value: object) -> int:
@@ -1580,6 +1731,17 @@ def _worker_main(
         try:
             input_ids = request.input_ids.to(device)
             attention_mask = request.attention_mask.to(device)
+            multimodal_generation_kwargs: dict[str, Tensor] = {}
+            if request.image_tensors:
+                multimodal_generation_kwargs = _image_generation_kwargs(
+                    request.image_tensors,
+                    device,
+                )
+            elif request.audio_tensors:
+                multimodal_generation_kwargs = _audio_generation_kwargs(
+                    request.audio_tensors,
+                    device,
+                )
             logits_processor = None
             if pipeline is not None:
                 stage = "core_pipeline"
@@ -1630,6 +1792,10 @@ def _worker_main(
                         streamer=streamer,
                         stopping_criteria=_stopping_criteria(stop_criteria),
                     )
+                    # Only the fixed tensor schema reconstructed by protocol.py
+                    # reaches generate(); raw image bytes, paths, strings and
+                    # JSON never enter the resident model process.
+                    generation_options.update(multimodal_generation_kwargs)
                     if request.decode_mode == DECODE_CONVERSATION:
                         generation_options.update(
                             do_sample=True,
@@ -1748,6 +1914,7 @@ class ModelService:
         gpu_lease_vram_bytes: int = DEFAULT_MAX_VRAM_BYTES,
         worker_lifetime_seconds: float = 3_600.0,
         artifact_digest: str | None = None,
+        multimodal_processor_config: tuple[str | Path, str | Path] | None = None,
     ) -> None:
         if not callable(tokenizer) or not callable(getattr(tokenizer, "decode", None)):
             raise TypeError("tokenizer must be callable and provide decode()")
@@ -1867,6 +2034,24 @@ class ModelService:
         # CUDA resident until ``stop()`` positively confirms worker death.
         self._retire_required = False
         self._reserved_stop_sequences = reserved_stop_sequences(tokenizer)
+        if multimodal_processor_config is None:
+            self._multimodal_processor_config: tuple[Path, Path] | None = None
+        else:
+            if (
+                not isinstance(multimodal_processor_config, tuple)
+                or len(multimodal_processor_config) != 2
+            ):
+                raise TypeError("multimodal processor config must contain two paths")
+            processor_root = Path(multimodal_processor_config[0]).resolve(strict=True)
+            processor_manifest = Path(multimodal_processor_config[1]).resolve(
+                strict=True
+            )
+            self._multimodal_processor_config = (
+                processor_root,
+                processor_manifest,
+            )
+        self._multimodal_processor: VerifiedGemma4MultimodalProcessor | None = None
+        self._multimodal_processor_lock = Lock()
 
     @classmethod
     def for_local_gemma(
@@ -1903,6 +2088,7 @@ class ModelService:
             tokenizer,
             factory,
             artifact_digest=factory.artifact_digest,
+            multimodal_processor_config=(root, manifest_path),
             **service_kwargs,
         )
 
@@ -1978,6 +2164,46 @@ class ModelService:
             purpose=purpose,
             required_vram_bytes=self.gpu_lease_vram_bytes,
         )
+
+    def _process_image(
+        self,
+        content: bytes,
+        prompt: str,
+    ) -> MultimodalTensorBundle:
+        config = self._multimodal_processor_config
+        if config is None:
+            raise RequestLimitError(
+                "image inference requires a verified local Gemma 4 processor"
+            )
+        try:
+            with self._multimodal_processor_lock:
+                processor = self._multimodal_processor
+                if processor is None:
+                    processor = VerifiedGemma4MultimodalProcessor(*config)
+                    self._multimodal_processor = processor
+                return processor.process_image(content, prompt)
+        except MultimodalPreprocessError as exc:
+            raise RequestLimitError("local image preprocessing was rejected") from exc
+
+    def _process_audio_wav(
+        self,
+        content: bytes,
+        prompt: str,
+    ) -> MultimodalTensorBundle:
+        config = self._multimodal_processor_config
+        if config is None:
+            raise RequestLimitError(
+                "audio inference requires a verified local Gemma 4 processor"
+            )
+        try:
+            with self._multimodal_processor_lock:
+                processor = self._multimodal_processor
+                if processor is None:
+                    processor = VerifiedGemma4MultimodalProcessor(*config)
+                    self._multimodal_processor = processor
+                return processor.process_audio_wav(content, prompt)
+        except MultimodalPreprocessError as exc:
+            raise RequestLimitError("local audio preprocessing was rejected") from exc
 
     def start(self) -> ModelService:
         def process_alive(candidate: Any) -> bool:
@@ -2171,6 +2397,8 @@ class ModelService:
         self,
         prompt: str,
         *,
+        image_content: bytes | None = None,
+        audio_wav_content: bytes | None = None,
         max_new_tokens: int | None = None,
         stop_token_ids: Tensor | None = None,
         timeout: float | None = None,
@@ -2195,6 +2423,31 @@ class ModelService:
         # intermediate frame all consume the same wall-clock budget.
         total_deadline = monotonic() + total_wait_seconds
         total_deadline_ns = monotonic_ns() + int(total_wait_seconds * 1_000_000_000)
+        image_tensors: tuple[tuple[int, Tensor], ...] = ()
+        audio_tensors: tuple[tuple[int, Tensor], ...] = ()
+        media_digest: str | None = None
+        if image_content is not None and audio_wav_content is not None:
+            raise RequestLimitError("one turn cannot contain image and audio media")
+        if image_content is None and audio_wav_content is None:
+            input_ids, attention_mask = self._tokenize(prompt)
+        elif image_content is not None:
+            bundle = self._process_image(image_content, prompt)
+            input_ids, attention_mask, image_tensors, media_digest = (
+                _image_bundle_inputs(
+                    bundle,
+                    max_input_tokens=self.max_input_tokens,
+                )
+            )
+        else:
+            bundle = self._process_audio_wav(audio_wav_content, prompt)
+            input_ids, attention_mask, audio_tensors, media_digest = (
+                _audio_bundle_inputs(
+                    bundle,
+                    max_input_tokens=self.max_input_tokens,
+                )
+            )
+        if monotonic() >= total_deadline:
+            raise TimeoutError("local generation exceeded its total deadline")
         self.start()
         if monotonic() >= total_deadline:
             try:
@@ -2213,7 +2466,6 @@ class ModelService:
         buffered_tokens: list[Tensor] = []
         authority: _RequestAuthority | None = None
         try:
-            input_ids, attention_mask = self._tokenize(prompt)
             if monotonic() >= total_deadline:
                 deadline_exceeded = True
                 raise TimeoutError("local generation exceeded its total deadline")
@@ -2231,6 +2483,11 @@ class ModelService:
             # interactive manager. Healthy token frames may refresh the former,
             # but can never extend the latter.
             session_digest = _session_digest(conversation_id)
+            if media_digest is not None:
+                session_digest = _bind_media_session_digest(
+                    session_digest,
+                    media_digest,
+                )
             effective_seed = (
                 requested_seed
                 if requested_seed is not None
@@ -2285,6 +2542,8 @@ class ModelService:
                 stop_token_ids=stop_token_ids,
                 decode_mode=decode_mode_code,
                 sampling_seed=effective_seed,
+                image_tensors=image_tensors,
+                audio_tensors=audio_tensors,
                 **authority.response_kwargs(),
             )
             admission_remaining = total_deadline - monotonic()
@@ -2451,6 +2710,8 @@ class ModelService:
         self,
         prompt: str,
         *,
+        image_content: bytes | None = None,
+        audio_wav_content: bytes | None = None,
         max_new_tokens: int | None = None,
         stop_token_ids: Tensor | None = None,
         timeout: float | None = None,
@@ -2466,6 +2727,8 @@ class ModelService:
         generation_mode = "cogni_core"
         for chunk in self.iter_generate_tokens(
             prompt,
+            image_content=image_content,
+            audio_wav_content=audio_wav_content,
             max_new_tokens=max_new_tokens,
             stop_token_ids=stop_token_ids,
             timeout=timeout,

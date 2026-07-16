@@ -87,6 +87,26 @@ multimodal depth-100 VRAM evidence가 아니다.
 - proposal diff integrity, stale-base rejection, and absence of approve/apply
   authority.
 
+## 동결 소스 GPU·System 4 실측
+
+동결 commit `7039152760920461eddec9b049ebbb2a5ac06f0b`에서 현재 개발 장치
+`NVIDIA GeForce RTX 5090 Laptop GPU`로 재실행했다.
+
+| 항목 | 관측값 |
+|---|---:|
+| E4B-it manifest files | 7 verified |
+| CTS depth / arena | 100/100 · 301/301 |
+| DEQ residual | 0.0015335083 |
+| solver/silent fallback | 0 / 0 |
+| peak allocated VRAM | 14.8468876 GiB (gate 16.7 GiB) |
+| System 4 stress | 10,000 iterations · convergence 1.0 |
+| System 4 p50 / p95 | 2.6971 ms / 3.24152 ms |
+| System 4 settled FP/FN | 0.0 / 0.0 |
+
+Raw evidence는 `validation/evidence/gemma4_cts_runtime_v040.json`과
+`validation/evidence/system4_stress_v040.json`이다. 이는 목표 RTX 4090 인증,
+whole-system O(1), combined multimodal VRAM 또는 제품 전체 latency 증거가 아니다.
+
 Component command:
 
 ```powershell
@@ -104,7 +124,7 @@ python -m pytest -q `
   tests/test_proposal_review.py
 ```
 
-## frozen release에서 다시 수행할 gate
+## 최종 package에서 다시 수행할 gate
 
 최종 source 변경이 끝난 동일 commit에서 아래 항목을 다시 실행하고 raw output,
 environment, skipped reason, commit/tree digest를 보존해야 한다.
@@ -112,8 +132,8 @@ environment, skipped reason, commit/tree digest를 보존해야 한다.
 - 전체 `pytest`, Ruff check/format, Node syntax
 - 10-turn natural Korean conversation
 - 20-turn completion stress
-- integrated Gemma/DEQ/CTS depth-100와 16.7 GiB postcondition
-- System 4 stress measurement
+- integrated Gemma/DEQ/CTS depth-100와 System 4는 동결 소스에서 완료됐으며
+  package smoke가 동일 commit을 가리키는지 확인
 - deterministic local image forward
 - loopback UI/API와 Windows launcher smoke
 - EXE, wheel, source ZIP, manual/checklist의 final SHA-256

@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "validation_id": "gemma4-cts-runtime-v0.4.0",
-  "recorded_at": "2026-07-16T12:33:18+09:00",
+  "recorded_at": "2026-07-16T13:59:17+09:00",
   "command": "python -u scripts\\validate_gemma4_runtime.py --model C:\\Project\\cognios\\gemma4-e4b-it --manifest config\\gemma4-e4b-it.manifest.toml --vram-limit-gib 16.7 --event-stream",
   "status": "passed",
   "source": {
-    "baseline_commit": "e090b3a701bad3dc13812529123b6c4a424387a5",
-    "working_tree_state": "v0.4.0 candidate with intentional uncommitted changes",
+    "commit": "7039152760920461eddec9b049ebbb2a5ac06f0b",
+    "tracked_working_tree_state": "clean",
     "validator_sha256": "1223A98A6C6FC875B9D7654DC2965D5892879BE4FAF4190A60E9CF736F8EAC47",
     "manifest_sha256": "D2BAC4A348A4657C281B57605ACE8F76393A189113649092998716B8770E8515",
     "torch_version": "2.11.0+cu128"
@@ -15,8 +15,8 @@
     "verified_files": 7,
     "model_class": "Gemma4ForConditionalGeneration",
     "hidden_size": 2560,
-    "load_seconds": 26.211214100010693,
-    "inference_seconds": 12.388499499997124,
+    "load_seconds": 23.31527040002402,
+    "inference_seconds": 11.280247600050643,
     "requested_depth": 100,
     "reached_depth": 100,
     "nodes_used": 301,

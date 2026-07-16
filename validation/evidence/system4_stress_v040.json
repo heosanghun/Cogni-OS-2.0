@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "validation_id": "system4-stress-v0.4.0",
+  "recorded_at": "2026-07-16T13:59:17+09:00",
+  "command": "python -u scripts\\benchmark_system4.py --device cuda --iterations 10000 --stress-switch --switch-block 32",
+  "status": "passed",
+  "source": {
+    "commit": "7039152760920461eddec9b049ebbb2a5ac06f0b",
+    "tracked_working_tree_state": "clean",
+    "benchmark_sha256": "C41DA6CB4DD5DEC4F7D548488A1F2B7BBC2C417AC10CE796F5B2A12566A315E7"
+  },
+  "metrics": {
+    "batch": 1,
+    "device": "cuda",
+    "dtype": "float32",
+    "input_dim": 64,
+    "state_dim": 64,
+    "iterations": 10000,
+    "warmup": 20,
+    "stress_switch": true,
+    "switch_block": 32,
+    "latency_ms": {
+      "minimum": 2.3914,
+      "p50": 2.6971,
+      "p95": 3.2415199999999995,
+      "p99": 4.335605,
+      "maximum": 7.1257
+    },
+    "maximum_residual": 0.00004648032700060867,
+    "safe_convergence_rate": 1.0,
+    "operator_norm": {
+      "normal_upper_bound": 0.32436394691467285,
+      "crisis_upper_bound": 0.40665507316589355,
+      "required_margin": 0.95
+    },
+    "spectral_radius": {
+      "normal": 0.15065038204193115,
+      "crisis": 0.15065038204193115
+    },
+    "pcas": {
+      "expected_switches": 312,
+      "observed_switches": 312,
+      "excess_switches": 0,
+      "settled_false_negative_rate": 0.0,
+      "settled_false_positive_rate": 0.0,
+      "transition_settling_steps_maximum": 5,
+      "transition_settling_steps_mean": 4.0
+    },
+    "topology": {
+      "normal_edges": 192,
+      "crisis_edges": 28,
+      "maximum_reachability_steps": 3
+    }
+  },
+  "scope_note": "Measurement-only CUDA stress evidence on the current RTX 5090 Laptop environment. This is not an RTX 4090 certification and does not prove whole-system latency or quality."
+}

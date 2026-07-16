@@ -5,9 +5,9 @@
 
 ## 현재 집계
 
-- 전체 미완료: **64개**
+- 전체 미완료: **62개**
 - 코드/제품 경로 미구현: **13개**
-- 부분 구현 또는 검증 잔여: **46개**
+- 부분 구현 또는 검증 잔여: **44개**
 - 외부 장치·토큰·아티팩트 차단: **5개**
 
 ## 제품 실행 경로 미구현
@@ -71,9 +71,7 @@
 | 133 | [ ] | 근거 provenance drawer | 메시지별 RAG source 표시만 구현 | 독립 drawer, 문장↔원문 위치 navigation |
 | 137 | [ ] | 반응형 layout | breakpoint CSS와 1080p QA | 1366×768, 1920×1080, 4K, 125–200% zoom 시각/키보드 QA |
 | 139 | [ ] | 접근성 | ARIA/label/live region/disabled reason 일부 구현 | 키보드-only, focus order, screen-reader, contrast 감사 |
-| 151 | [ ] | 현재 scope 실제 GPU 증거 | 기존 RTX 5090 Laptop Phase 11 JSON; 최신 작업 source와 byte 불일치 | 동결 최신 commit/모델/config/device digest로 재실행 |
 | 152 | [ ] | 현재 scope peak VRAM | 과거 14.8469 GiB scoped canary | E4B-it 최신 source 및 target 4090에서 allocated/reserved 기록 |
-| 153 | [ ] | CTS depth/residual 현재 증거 | 과거 Phase 11 runtime JSON은 존재 | 최신 동결 source의 E4B-it 100/100 evidence |
 | 159 | [ ] | 로그·시각·버전·commit 결합 | evidence/log schema와 release records | 최신 bundle bytes까지 동일 commit/SHA로 묶기 |
 | 166 | [ ] | 현재 전체 소스 GitHub 업로드 | 원격 브랜치는 `e090b3a`까지 push; 현재 변경/이 문서는 미push | clean commit push와 remote SHA 확인 |
 | 168 | [ ] | 최신 version/checksum/release notes | v0.4.0 version·release notes와 SBOM/third-party notice 생성 경로는 구현; 최종 동결 package 산출 전 | 동결 commit의 실제 bundle에서 `SHA256SUMS.txt`, SBOM/license/provenance를 생성·검증 |

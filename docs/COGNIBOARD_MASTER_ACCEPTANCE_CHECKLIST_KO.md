@@ -20,9 +20,9 @@
 `[x]`는 위 정의의 `COMPLETED`만 뜻한다. `PARTIAL`이나 외부 자료가 없는 상태를 화면 표시,
 설계 문서, 단위 테스트만으로 완료라고 부르지 않는다.
 
-현재 스냅샷 집계는 `COMPLETED 106 / PARTIAL 46 / NOT_IMPLEMENTED 13 /
-EXTERNAL_BLOCKER 5`이다. 즉 170개 중 64개는 아직 승격 조건이 남아 있다. 실제 20-turn
-대화 stress와 전체 source 회귀는 통과했으며, 동결 커밋 기준 CTS 재실측과 최신 패키지·EXE·
+현재 스냅샷 집계는 `COMPLETED 108 / PARTIAL 44 / NOT_IMPLEMENTED 13 /
+EXTERNAL_BLOCKER 5`이다. 즉 170개 중 62개는 아직 승격 조건이 남아 있다. 실제 20-turn
+대화 stress, 전체 source 회귀, 동결 커밋 기준 CTS 재실측은 통과했으며 최신 패키지·EXE·
 GitHub 업로드는 아직 이 집계에서 완료로 보지 않는다.
 
 ## 1. 전체 기능 체크리스트
@@ -251,11 +251,11 @@ GitHub 업로드는 아직 이 집계에서 완료로 보지 않는다.
 |---:|:---:|---|---|---|---|
 | 149 | [x] | manifest 파일 무결성 | `COMPLETED` | `cogni_os/artifacts.py`, validation scripts/tests | load 전에 SHA 검증 유지 |
 | 150 | [x] | 모델 SHA/parameter inventory | `COMPLETED` | artifact manifest/factbook/tests | 모델 변경 시 전부 무효화·재측정 |
-| 151 | [ ] | 현재 scope 실제 GPU 증거 | `PARTIAL` | 기존 RTX 5090 Laptop Phase 11 JSON; 최신 작업 source와 byte 불일치 | 동결 최신 commit/모델/config/device digest로 재실행 |
+| 151 | [x] | 현재 scope 실제 GPU 증거 | `COMPLETED` | 동결 commit `7039152`, E4B-it manifest/validator digest와 RTX 5090 Laptop actual run을 `validation/evidence/gemma4_cts_runtime_v040.json`에 결합 | 이 증거를 RTX 4090 또는 다른 commit/model 범위로 확대하지 않기 |
 | 152 | [ ] | 현재 scope peak VRAM | `PARTIAL` | 과거 14.8469 GiB scoped canary | E4B-it 최신 source 및 target 4090에서 allocated/reserved 기록 |
-| 153 | [ ] | CTS depth/residual 현재 증거 | `PARTIAL` | 과거 Phase 11 runtime JSON은 존재 | 최신 동결 source의 E4B-it 100/100 evidence |
+| 153 | [x] | CTS depth/residual 현재 증거 | `COMPLETED` | 동결 commit `7039152` actual E4B-it: depth 100/100, 301 nodes, residual 0.0015335083, fallback/solver failure 0, finite PASS | source/model/manifest 변경 시 재실행 |
 | 154 | [x] | fallback/solver failure telemetry | `COMPLETED` | runtime validator/evidence schema | silent fallback 금지 유지 |
-| 155 | [x] | 전체 source 회귀 | `COMPLETED` | 현재 v0.4.0 candidate에서 `pytest` 883 passed, 6 skipped, 720 subtests; Ruff check/format, Node syntax, `git diff --check` PASS | 동결 커밋 직전·직후와 패키지 source에서 동일 gate 재실행 |
+| 155 | [x] | 전체 source 회귀 | `COMPLETED` | 동결 직전 `pytest` 891 passed, 6 skipped, 723 subtests; Ruff check/format, Node syntax, `git diff --check` PASS | 패키지 source에서도 핵심 gate 유지 |
 | 156 | [x] | 과거 metric을 현재값으로 표시 금지 | `COMPLETED` | `cogni_os/factbook.py`, UI tests | scope 불일치 시 값 제거 |
 | 157 | [x] | live 검증 전 `NOT VERIFIED` | `COMPLETED` | demo server/UI tests | startup 기본값 유지 |
 | 158 | [x] | measured/verified/target/plan 분리 | `COMPLETED` | `cogni_os/evidence.py`, `config/evidence.schema.json` | 모든 신규 기능 동일 taxonomy 적용 |
@@ -283,14 +283,10 @@ GitHub 업로드는 아직 이 집계에서 완료로 보지 않는다.
 
 ### P0 — 현재 소스 무결성·RAG 영속성·배포
 
-- [ ] **ID 99 (`PARTIAL`)**: 정상 삭제·index 제거·재시작 후 stale retrieval 0은 구현됐다.
-  blob unlink 실패 고아 파일의 격리·재시도·수거와 fault-injection rollback을 추가한다.
-- [ ] **ID 52/155 (`PARTIAL`)**: 최신 동결 커밋에서 전체 ruff/format/Node/pytest와 실제
-  Gemma 완료 20-turn stress를 실행한다. 현재 v0.4.0 한국어 10-turn은 이미 PASS했다.
 - [ ] **ID 8/9/166–170**: 동일 clean commit에서 source package, launcher/EXE, manual,
   release notes와 checksum을 만들고 패키지 E2E 후 GitHub remote SHA를 확인한다.
-- [ ] **ID 151–153/159 (`PARTIAL`)**: 최신 commit/model/config/device digest로 CTS·residual·VRAM
-  증거를 다시 묶는다.
+- [ ] **ID 152/159 (`PARTIAL`)**: 현재 장치 allocated VRAM 실측은 보존됐다. 목표 RTX 4090의
+  allocated/reserved와 최종 bundle SHA를 동일 범위로 묶는다.
 
 ### P1 — 대화·작업·근거 UX의 남은 범위
 

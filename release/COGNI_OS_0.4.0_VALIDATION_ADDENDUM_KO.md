@@ -159,3 +159,19 @@ environment, skipped reason, commit/tree digest를 보존해야 한다.
 
 이 증거가 current scope에서 존재하기 전까지 해당 기능은 `gated`, `advisory`,
 `research`, `night_only`, `opt_in_gated`, 또는 `proposal_only` 상태를 유지한다.
+
+## v0.4.0 패키지 검증 기록
+
+commit `5bcfbb457f998beb47b3788204c25de3af546b32`에서 release builder를 실행해
+EXE·wheel·source ZIP·manual PDF·CycloneDX SBOM·third-party notices와 SHA-256 manifest를
+생성했다. 10개 checksum을 다시 계산해 모두 일치함을 확인했다.
+
+- packaged launcher cold start: 49.924초, launcher exit 0
+- 인증된 `/api/state`, workspace capabilities, HTML: HTTP 200
+- attachment UI, voice UI, local RAG, image-to-model route: enabled/확인
+- 인증된 shutdown 후 backend process 종료
+- release 집중 회귀: 99 passed, 1 skipped, 169 subtests passed
+- actual local model smoke: 7 files verified, finish reason `stop`, CUDA worker cleanup PASS
+
+원시 구조화 기록은 `validation/evidence/release_bundle_v040.json`이다. 이 기록은 현재 개발
+장치의 패키지 실행 증거이며, 독립 clean Windows 재현·코드 서명·RTX 4090 인증으로 확대하지 않는다.

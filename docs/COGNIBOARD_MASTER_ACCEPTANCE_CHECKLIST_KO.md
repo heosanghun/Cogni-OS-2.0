@@ -3,10 +3,11 @@
 ## 0. 문서 목적과 판정 기준
 
 이 문서는 사용자가 요청한 기능을 빠짐없이 고정 ID로 추적하는 단일 완료 원장이다. 판정 기준은
-`agent/workspace-rag-multimodal-v0.4.0` 브랜치의 기준 커밋 `e090b3a` 이후 현재 v0.4.0
-개발 소스이다. 항목별 상태는 현재 코드 경로와 해당 범위의 자동 검증 또는 실측 증거만 반영한다.
-현재 패키지·커밋·푸시는 아직 끝나지 않았으므로 그 범위의 항목은 승격하지 않는다.
-과거 v0.3.2 EXE와 과거 검증 JSON은 최신 개발 소스의 완료 증거가 아니다.
+`agent/workspace-rag-multimodal-v0.4.0` 브랜치의 v0.4.0 동결 소스이다. 항목별 상태는 현재 코드
+경로와 해당 범위의 자동 검증 또는 실측 증거만 반영한다. commit `5bcfbb4` 기준 EXE·wheel·
+source ZIP·manual·SBOM·checksum 생성과 패키지 실행 smoke는 완료됐으며, GitHub 원격 반영과
+독립 clean Windows 재현은 별도 항목으로 남긴다. 과거 v0.3.2 binary와 범위가 다른 검증 JSON은
+최신 개발 소스의 완료 증거가 아니다.
 
 상태의 의미는 다음과 같다.
 
@@ -20,10 +21,10 @@
 `[x]`는 위 정의의 `COMPLETED`만 뜻한다. `PARTIAL`이나 외부 자료가 없는 상태를 화면 표시,
 설계 문서, 단위 테스트만으로 완료라고 부르지 않는다.
 
-현재 스냅샷 집계는 `COMPLETED 108 / PARTIAL 44 / NOT_IMPLEMENTED 13 /
-EXTERNAL_BLOCKER 5`이다. 즉 170개 중 62개는 아직 승격 조건이 남아 있다. 실제 20-turn
-대화 stress, 전체 source 회귀, 동결 커밋 기준 CTS 재실측은 통과했으며 최신 패키지·EXE·
-GitHub 업로드는 아직 이 집계에서 완료로 보지 않는다.
+현재 스냅샷 집계는 `COMPLETED 114 / PARTIAL 42 / NOT_IMPLEMENTED 9 /
+EXTERNAL_BLOCKER 5`이다. 즉 170개 중 56개는 아직 승격 조건이 남아 있다. 실제 20-turn
+대화 stress, 전체 source 회귀, 동결 커밋 기준 CTS 재실측, 최신 패키지·EXE 실행 smoke는
+통과했으며 GitHub 업로드와 외부·연구·안전 gate는 이 집계에서 완료로 보지 않는다.
 
 ## 1. 전체 기능 체크리스트
 
@@ -38,8 +39,8 @@ GitHub 업로드는 아직 이 집계에서 완료로 보지 않는다.
 | 5 | [x] | 실제 장치와 목표 장치 구분 표시 | `COMPLETED` | `cogni_os/factbook.py`, `cogni_demo/static/app.js`, `tests/test_factbook.py` | 라이브 검증 전에는 `NOT VERIFIED` 유지 |
 | 6 | [ ] | 기본 air-gap 및 외부 호출 0 | `PARTIAL` | `cogni_os/runtime.py`, `cogni_demo/server.py`, `tests/test_airgap.py` | 현재 배포 바이트에 대한 패킷/egress 감사와 오프라인 의존성 검토 |
 | 7 | [x] | 외부 API는 명시적 온라인 모드에서만 허용 | `COMPLETED` | `cogni_demo/workspace_capabilities.py::WebAccessPolicy`, `tests/test_workspace_capabilities.py` | 모든 향후 connector가 동일 권한 계약 사용 |
-| 8 | [ ] | 최신 기능 통합 더블클릭 EXE | `NOT_IMPLEMENTED` | 기존 `CogniBoard.exe`/v0.3.2 bundle은 `e090b3a` 이후 기능을 포함하지 않음 | 동결한 최신 커밋에서 launcher·bundle 재생성 및 smoke |
-| 9 | [ ] | 패키지된 EXE 기능 회귀 | `NOT_IMPLEMENTED` | `tests/test_release_bundle.py`는 기존 bundle 계약만 검증 | 새 EXE로 첨부·RAG·UI·대화·검증 E2E 실행 |
+| 8 | [x] | 최신 기능 통합 더블클릭 EXE | `COMPLETED` | commit `5bcfbb4`에서 `CogniBoard-v0.4.0.exe` 생성, file version 0.4.0.0, SHA-256과 unsigned 상태 기록, 49.924초 cold-start smoke PASS | 제품 소스 변경 시 동일 빌더로 재생성 |
+| 9 | [x] | 패키지된 EXE 기능 회귀 | `COMPLETED` | `validation/evidence/release_bundle_v040.json`: 인증 UI/state/capability/shutdown, 첨부·RAG·voice/image route, actual model smoke; release 집중 회귀 99 passed·1 skipped·169 subtests | 실제 장치 품질·패킷·독립 clean-host 범위는 해당 별도 ID 유지 |
 
 ### B. Cogni-Core: DEQ·CTS (10–18)
 
@@ -259,7 +260,7 @@ GitHub 업로드는 아직 이 집계에서 완료로 보지 않는다.
 | 156 | [x] | 과거 metric을 현재값으로 표시 금지 | `COMPLETED` | `cogni_os/factbook.py`, UI tests | scope 불일치 시 값 제거 |
 | 157 | [x] | live 검증 전 `NOT VERIFIED` | `COMPLETED` | demo server/UI tests | startup 기본값 유지 |
 | 158 | [x] | measured/verified/target/plan 분리 | `COMPLETED` | `cogni_os/evidence.py`, `config/evidence.schema.json` | 모든 신규 기능 동일 taxonomy 적용 |
-| 159 | [ ] | 로그·시각·버전·commit 결합 | `PARTIAL` | evidence/log schema와 release records | 최신 bundle bytes까지 동일 commit/SHA로 묶기 |
+| 159 | [x] | 로그·시각·버전·commit 결합 | `COMPLETED` | `BUILD_MANIFEST.txt`, `SHA256SUMS.txt`, `validation/evidence/release_bundle_v040.json`이 source commit·version·checkpoint·10개 artifact SHA와 smoke를 결합 | 재빌드 시 새 commit·artifact digest로 원자 갱신 |
 
 ### P. 문서·배포·사업 데모 (160–170)
 
@@ -272,9 +273,9 @@ GitHub 업로드는 아직 이 집계에서 완료로 보지 않는다.
 | 164 | [x] | 사업계획 연계 데모 계획 | `COMPLETED` | `docs/COGNIBOARD_BUSINESS_DEMO_PLAN_KO.md` | 사업 수치 출처와 plan 배지 유지 |
 | 165 | [x] | 방산·신약·금융 데모 시나리오 | `COMPLETED` | business/demo UI·문서 | 실데이터/규제 검증 전 PoC로 표기 |
 | 166 | [ ] | 현재 전체 소스 GitHub 업로드 | `PARTIAL` | 원격 브랜치는 `e090b3a`까지 push; 현재 변경/이 문서는 미push | clean commit push와 remote SHA 확인 |
-| 167 | [ ] | 최신 current-source package | `NOT_IMPLEMENTED` | 기존 source ZIP은 최신 workspace 변경 전 | 동결 commit에서 wheel/source ZIP 재생성 |
-| 168 | [ ] | 최신 version/checksum/release notes | `PARTIAL` | v0.4.0 version·release notes와 SBOM/third-party notice 생성 경로는 구현; 최종 동결 package 산출 전 | 동결 commit의 실제 bundle에서 `SHA256SUMS.txt`, SBOM/license/provenance를 생성·검증 |
-| 169 | [ ] | 최신 더블클릭 데모 실행파일 | `NOT_IMPLEMENTED` | 기존 EXE는 최신 첨부/RAG/delete를 포함하지 않음 | 동일 동결 commit에서 EXE 생성·서명 상태 표기·smoke |
+| 167 | [x] | 최신 current-source package | `COMPLETED` | commit `5bcfbb4`에서 wheel과 source ZIP 생성, immutable commit/source archive/checkpoint digest 기록 | 제품 소스 변경 시 package 재생성 |
+| 168 | [x] | 최신 version/checksum/release notes | `COMPLETED` | v0.4.0 release notes·manual PDF·CycloneDX SBOM·third-party notices·BUILD_MANIFEST·SHA256SUMS 생성, 10개 파일 digest 재계산 PASS | 독립 라이선스 검토·서명은 별도 외부 gate로 유지 |
+| 169 | [x] | 최신 더블클릭 데모 실행파일 | `COMPLETED` | 동일 commit의 v0.4.0.0 EXE가 packaged source를 기동하고 인증된 loopback UI/API와 정상 shutdown smoke PASS | 코드 서명 인증서 확보 전 unsigned 상태를 명시 |
 | 170 | [ ] | 재현 가능한 설치·실행 | `PARTIAL` | source 명령과 launcher 문서는 존재 | clean Windows 환경에서 offline 설치→manifest 검증→실행 재현 |
 
 ## 2. 미구현·부분·외부 차단 전용 체크리스트
@@ -283,10 +284,12 @@ GitHub 업로드는 아직 이 집계에서 완료로 보지 않는다.
 
 ### P0 — 현재 소스 무결성·RAG 영속성·배포
 
-- [ ] **ID 8/9/166–170**: 동일 clean commit에서 source package, launcher/EXE, manual,
-  release notes와 checksum을 만들고 패키지 E2E 후 GitHub remote SHA를 확인한다.
-- [ ] **ID 152/159 (`PARTIAL`)**: 현재 장치 allocated VRAM 실측은 보존됐다. 목표 RTX 4090의
-  allocated/reserved와 최종 bundle SHA를 동일 범위로 묶는다.
+- [x] **ID 8/9/167–169**: 동일 commit에서 source package, launcher/EXE, manual, release notes,
+  SBOM과 checksum을 만들고 인증된 패키지 실행 smoke를 통과했다.
+- [ ] **ID 166/170**: GitHub remote SHA를 확인하고 독립 clean Windows에서 offline 설치→manifest
+  검증→실행을 재현한다.
+- [ ] **ID 152 (`PARTIAL`)**: 현재 RTX 5090 Laptop의 allocated VRAM 실측은 보존됐다. 목표
+  RTX 4090의 allocated/reserved를 동일 범위로 추가한다. 최종 bundle SHA 결합은 ID 159로 완료했다.
 
 ### P1 — 대화·작업·근거 UX의 남은 범위
 
@@ -351,10 +354,11 @@ P4 attested sandbox
             └─> byte-identical rollback
 ```
 
-현재 가장 먼저 닫아야 할 경로는 P0이다. P0가 끝나지 않은 상태에서 새 EXE를 만들면 오래된
-기능을 다시 포장하게 된다. 멀티모달·음성은 입력 버튼보다 모델 tensor 계약과 VRAM gate가
-선행되어야 한다. Lens는 connector 코드보다 승인 토큰·약관·감사 경계가 함께 준비되어야 한다.
-Self-Harness 자동 승격은 OS 수준 격리와 rollback 증거보다 먼저 열 수 없다.
+현재 코드로 닫을 수 있는 P0 배포 경로는 GitHub push와 remote SHA 확인이다. 독립 clean Windows
+재현과 목표 RTX 4090 검증은 현재 장치 밖의 별도 gate다. 멀티모달·음성은 입력 버튼보다 모델
+tensor 계약과 VRAM gate가 선행되어야 한다. Lens는 connector 코드뿐 아니라 승인 토큰·약관·
+감사 경계가 함께 준비되어야 한다. Self-Harness 자동 승격은 OS 수준 격리와 rollback 증거보다
+먼저 열 수 없다.
 
 ## 4. 과장 금지 및 완료 보고 규칙
 

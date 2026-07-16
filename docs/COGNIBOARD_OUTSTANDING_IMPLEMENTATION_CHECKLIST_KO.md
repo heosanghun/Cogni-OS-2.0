@@ -5,17 +5,15 @@
 
 ## 현재 집계
 
-- 전체 미완료: **62개**
-- 코드/제품 경로 미구현: **13개**
-- 부분 구현 또는 검증 잔여: **44개**
+- 전체 미완료: **56개**
+- 코드/제품 경로 미구현: **9개**
+- 부분 구현 또는 검증 잔여: **42개**
 - 외부 장치·토큰·아티팩트 차단: **5개**
 
 ## 제품 실행 경로 미구현
 
 | ID | 체크 | 요구사항 | 현재 근거 | 완료 승격 조건 |
 |---:|:---:|---|---|---|
-| 8 | [ ] | 최신 기능 통합 더블클릭 EXE | 기존 `CogniBoard.exe`/v0.3.2 bundle은 `e090b3a` 이후 기능을 포함하지 않음 | 동결한 최신 커밋에서 launcher·bundle 재생성 및 smoke |
-| 9 | [ ] | 패키지된 EXE 기능 회귀 | `tests/test_release_bundle.py`는 기존 bundle 계약만 검증 | 새 EXE로 첨부·RAG·UI·대화·검증 E2E 실행 |
 | 69 | [ ] | 격리된 실제 patch 실행 | v0.3.2는 `proposal_only`; `README.md` | Phase 12 kernel/process/network 격리 sandbox |
 | 72 | [ ] | 검증 후 승격/승인 | 자동 승격은 명시적으로 차단 | 사람 승인 + attested promotion transaction |
 | 73 | [ ] | 기존 코드 rollback | 후보 lifecycle rollback은 source rollback이 아님 | 실제 설치 bytes의 원자적·byte-identical rollback |
@@ -25,8 +23,6 @@
 | 113 | [ ] | 로컬 모델 자동 발견 | 고정 manifest 외 directory scan 없음 | 안전한 root, symlink/remote ID 차단, manifest 검증 |
 | 116 | [ ] | 안전한 unload/load 전환 | 단일 worker lifecycle만 존재 | lease drain→unload→memory check→load→rollback E2E |
 | 120 | [ ] | 일반 웹 검색 connector | 정책과 UI 상태만 존재 | 승인 provider, bounded schema, URL/time provenance |
-| 167 | [ ] | 최신 current-source package | 기존 source ZIP은 최신 workspace 변경 전 | 동결 commit에서 wheel/source ZIP 재생성 |
-| 169 | [ ] | 최신 더블클릭 데모 실행파일 | 기존 EXE는 최신 첨부/RAG/delete를 포함하지 않음 | 동일 동결 commit에서 EXE 생성·서명 상태 표기·smoke |
 
 ## 부분 구현·검증 잔여
 
@@ -72,9 +68,7 @@
 | 137 | [ ] | 반응형 layout | breakpoint CSS와 1080p QA | 1366×768, 1920×1080, 4K, 125–200% zoom 시각/키보드 QA |
 | 139 | [ ] | 접근성 | ARIA/label/live region/disabled reason 일부 구현 | 키보드-only, focus order, screen-reader, contrast 감사 |
 | 152 | [ ] | 현재 scope peak VRAM | 과거 14.8469 GiB scoped canary | E4B-it 최신 source 및 target 4090에서 allocated/reserved 기록 |
-| 159 | [ ] | 로그·시각·버전·commit 결합 | evidence/log schema와 release records | 최신 bundle bytes까지 동일 commit/SHA로 묶기 |
 | 166 | [ ] | 현재 전체 소스 GitHub 업로드 | 원격 브랜치는 `e090b3a`까지 push; 현재 변경/이 문서는 미push | clean commit push와 remote SHA 확인 |
-| 168 | [ ] | 최신 version/checksum/release notes | v0.4.0 version·release notes와 SBOM/third-party notice 생성 경로는 구현; 최종 동결 package 산출 전 | 동결 commit의 실제 bundle에서 `SHA256SUMS.txt`, SBOM/license/provenance를 생성·검증 |
 | 170 | [ ] | 재현 가능한 설치·실행 | source 명령과 launcher 문서는 존재 | clean Windows 환경에서 offline 설치→manifest 검증→실행 재현 |
 
 ## 외부 입력 없이는 완료 불가능

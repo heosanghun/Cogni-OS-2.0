@@ -5,9 +5,9 @@
 
 ## 현재 집계
 
-- 전체 미완료: **56개**
+- 전체 미완료: **55개**
 - 코드/제품 경로 미구현: **9개**
-- 부분 구현 또는 검증 잔여: **42개**
+- 부분 구현 또는 검증 잔여: **41개**
 - 외부 장치·토큰·아티팩트 차단: **5개**
 
 ## 제품 실행 경로 미구현
@@ -68,7 +68,6 @@
 | 137 | [ ] | 반응형 layout | breakpoint CSS와 1080p QA | 1366×768, 1920×1080, 4K, 125–200% zoom 시각/키보드 QA |
 | 139 | [ ] | 접근성 | ARIA/label/live region/disabled reason 일부 구현 | 키보드-only, focus order, screen-reader, contrast 감사 |
 | 152 | [ ] | 현재 scope peak VRAM | 과거 14.8469 GiB scoped canary | E4B-it 최신 source 및 target 4090에서 allocated/reserved 기록 |
-| 166 | [ ] | 현재 전체 소스 GitHub 업로드 | 원격 브랜치는 `e090b3a`까지 push; 현재 변경/이 문서는 미push | clean commit push와 remote SHA 확인 |
 | 170 | [ ] | 재현 가능한 설치·실행 | source 명령과 launcher 문서는 존재 | clean Windows 환경에서 offline 설치→manifest 검증→실행 재현 |
 
 ## 외부 입력 없이는 완료 불가능

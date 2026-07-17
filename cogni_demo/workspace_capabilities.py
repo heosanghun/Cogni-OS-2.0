@@ -112,7 +112,15 @@ _RAG_QUARANTINE_FILENAME = "rag-quarantine.v1.json"
 _RAG_QUARANTINE_SCHEMA_VERSION = 1
 _RAG_QUARANTINE_CODE = "RAG_OPERATOR_REVIEW_REQUIRED"
 _RAG_QUARANTINE_MESSAGE = "local RAG state is quarantined pending operator review"
-_RAG_QUARANTINE_KEYS = {"schema_version", "reason", "catalog_sha256"}
+_RAG_TRANSACTION_PENDING = "pending"
+_RAG_TRANSACTION_COMMITTED = "committed"
+_RAG_TRANSACTION_COMMITTED_REASON = "RAG_TRANSACTION_DURABLY_COMMITTED"
+_RAG_QUARANTINE_KEYS = {
+    "schema_version",
+    "state",
+    "reason",
+    "catalog_sha256",
+}
 
 try:
     from pypdf import PdfReader as _PdfReader
@@ -768,23 +776,50 @@ def _catalog_digest_for_rag_marker(catalog_path: Path) -> str:
     return sha256(content).hexdigest()
 
 
-def _rag_quarantine_marker_payload(catalog_sha256: str) -> dict[str, object]:
+@dataclass(frozen=True)
+class _RagTransactionMarker:
+    state: str
+    reason: str
+    catalog_sha256: str
+
+
+def _rag_transaction_marker_payload(
+    *, state: str, catalog_sha256: str
+) -> dict[str, object]:
     if _SHA256_RE.fullmatch(catalog_sha256) is None:
         raise WorkspaceCapabilityError(
             "RAG_QUARANTINE_MARKER_INVALID",
             "RAG quarantine marker digest is invalid",
         )
+    if state == _RAG_TRANSACTION_PENDING:
+        reason = _RAG_QUARANTINE_CODE
+    elif state == _RAG_TRANSACTION_COMMITTED:
+        reason = _RAG_TRANSACTION_COMMITTED_REASON
+    else:
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_INVALID",
+            "RAG quarantine marker state is invalid",
+        )
     return {
         "schema_version": _RAG_QUARANTINE_SCHEMA_VERSION,
-        "reason": _RAG_QUARANTINE_CODE,
+        "state": state,
+        "reason": reason,
         "catalog_sha256": catalog_sha256,
     }
 
 
-def _atomic_rag_quarantine_write(path: Path, catalog_sha256: str) -> None:
-    """Publish a durable pre-mutation marker without exposing partial JSON."""
+def _atomic_rag_transaction_marker_write(
+    path: Path,
+    *,
+    state: str,
+    catalog_sha256: str,
+    replace_existing: bool,
+) -> None:
+    """Atomically publish one fsync'd transaction state marker."""
 
-    payload = _rag_quarantine_marker_payload(catalog_sha256)
+    payload = _rag_transaction_marker_payload(
+        state=state, catalog_sha256=catalog_sha256
+    )
     encoded = json.dumps(
         payload,
         ensure_ascii=True,
@@ -804,7 +839,7 @@ def _atomic_rag_quarantine_write(path: Path, catalog_sha256: str) -> None:
             "RAG_QUARANTINE_MARKER_WRITE_FAILED",
             "RAG quarantine marker path is unsafe",
         )
-    if path.exists() or path.is_symlink():
+    if not replace_existing and (path.exists() or path.is_symlink()):
         raise WorkspaceCapabilityError(
             "RAG_QUARANTINE_MARKER_WRITE_FAILED",
             "RAG quarantine marker already requires operator review",
@@ -854,8 +889,8 @@ def _atomic_rag_quarantine_write(path: Path, catalog_sha256: str) -> None:
             pass
 
 
-def _load_rag_quarantine_marker(path: Path) -> str | None:
-    """Return the bound catalog digest; any present malformed marker fails closed."""
+def _load_rag_quarantine_marker(path: Path) -> _RagTransactionMarker | None:
+    """Load one strict marker; any present malformed marker fails closed."""
 
     if not path.exists() and not path.is_symlink():
         return None
@@ -914,7 +949,10 @@ def _load_rag_quarantine_marker(path: Path) -> str | None:
         or set(payload) != _RAG_QUARANTINE_KEYS
         or payload.get("schema_version") != _RAG_QUARANTINE_SCHEMA_VERSION
         or isinstance(payload.get("schema_version"), bool)
-        or payload.get("reason") != _RAG_QUARANTINE_CODE
+        or not isinstance(payload.get("state"), str)
+        or payload.get("state")
+        not in (_RAG_TRANSACTION_PENDING, _RAG_TRANSACTION_COMMITTED)
+        or not isinstance(payload.get("reason"), str)
         or not isinstance(payload.get("catalog_sha256"), str)
         or _SHA256_RE.fullmatch(payload["catalog_sha256"]) is None
     ):
@@ -922,37 +960,93 @@ def _load_rag_quarantine_marker(path: Path) -> str | None:
             "RAG_QUARANTINE_MARKER_INVALID",
             "RAG quarantine marker schema is invalid",
         )
-    return payload["catalog_sha256"]
+    expected_reason = (
+        _RAG_QUARANTINE_CODE
+        if payload["state"] == _RAG_TRANSACTION_PENDING
+        else _RAG_TRANSACTION_COMMITTED_REASON
+    )
+    if payload["reason"] != expected_reason:
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_INVALID",
+            "RAG quarantine marker reason is invalid",
+        )
+    return _RagTransactionMarker(
+        state=payload["state"],
+        reason=payload["reason"],
+        catalog_sha256=payload["catalog_sha256"],
+    )
 
 
-def _remove_rag_quarantine_marker(path: Path, expected_catalog_sha256: str) -> None:
+def _atomic_rag_quarantine_write(path: Path, catalog_sha256: str) -> None:
+    """Publish pending, replacing only a matching leftover committed marker."""
+
     observed = _load_rag_quarantine_marker(path)
-    if observed is None or observed != expected_catalog_sha256:
+    replace_existing = False
+    if observed is not None:
+        if (
+            observed.state != _RAG_TRANSACTION_COMMITTED
+            or observed.catalog_sha256 != catalog_sha256
+        ):
+            raise WorkspaceCapabilityError(
+                "RAG_QUARANTINE_MARKER_WRITE_FAILED",
+                "RAG quarantine marker already requires operator review",
+            )
+        replace_existing = True
+    _atomic_rag_transaction_marker_write(
+        path,
+        state=_RAG_TRANSACTION_PENDING,
+        catalog_sha256=catalog_sha256,
+        replace_existing=replace_existing,
+    )
+
+
+def _commit_rag_transaction_marker(
+    path: Path,
+    *,
+    expected_pending_sha256: str,
+    committed_catalog_sha256: str,
+) -> None:
+    """Durably replace pending with a digest-bound committed state."""
+
+    observed = _load_rag_quarantine_marker(path)
+    if (
+        observed is None
+        or observed.state != _RAG_TRANSACTION_PENDING
+        or observed.catalog_sha256 != expected_pending_sha256
+    ):
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_COMMIT_FAILED",
+            "RAG quarantine marker no longer matches this transaction",
+        )
+    _atomic_rag_transaction_marker_write(
+        path,
+        state=_RAG_TRANSACTION_COMMITTED,
+        catalog_sha256=committed_catalog_sha256,
+        replace_existing=True,
+    )
+
+
+def _cleanup_committed_rag_marker(path: Path, expected_catalog_sha256: str) -> None:
+    """Best-effort cleanup after committed is already restart-safe."""
+
+    observed = _load_rag_quarantine_marker(path)
+    if (
+        observed is None
+        or observed.state != _RAG_TRANSACTION_COMMITTED
+        or observed.catalog_sha256 != expected_catalog_sha256
+    ):
         raise WorkspaceCapabilityError(
             "RAG_QUARANTINE_MARKER_CLEAR_FAILED",
-            "RAG quarantine marker no longer matches this transaction",
+            "committed RAG marker no longer matches the catalog",
         )
     parent = path.parent.resolve(strict=True)
     try:
         path.unlink()
-        try:
-            _fsync_directory(
-                parent,
-                error_code="RAG_QUARANTINE_MARKER_CLEAR_FAILED",
-                message="RAG quarantine marker removal was not durable",
-            )
-        except WorkspaceCapabilityError as clear_exc:
-            # `unlink` already changed the live namespace. Re-publish the same
-            # pending marker before returning an error so an ordinary restart
-            # cannot auto-promote an outcome whose removal was not durable.
-            try:
-                _atomic_rag_quarantine_write(path, expected_catalog_sha256)
-            except Exception:  # noqa: BLE001 - best-effort durable re-publication
-                # The writer replaces before its directory fsync/post-check; a
-                # raised durability error can therefore still leave the valid
-                # marker in place for restart. The caller remains quarantined.
-                pass
-            raise clear_exc
+        _fsync_directory(
+            parent,
+            error_code="RAG_QUARANTINE_MARKER_CLEAR_FAILED",
+            message="committed RAG marker removal was not durable",
+        )
     except WorkspaceCapabilityError:
         raise
     except OSError as exc:
@@ -965,6 +1059,30 @@ def _remove_rag_quarantine_marker(path: Path, expected_catalog_sha256: str) -> N
             "RAG_QUARANTINE_MARKER_CLEAR_FAILED",
             "RAG quarantine marker removal failed verification",
         )
+
+
+def _rag_quarantine_required_on_startup(marker_path: Path, catalog_path: Path) -> bool:
+    """Resolve crash states without promoting a pending or mismatched outcome."""
+
+    marker = _load_rag_quarantine_marker(marker_path)
+    if marker is None:
+        return False
+    if marker.state == _RAG_TRANSACTION_PENDING:
+        return True
+    catalog_sha256 = _catalog_digest_for_rag_marker(catalog_path)
+    if marker.catalog_sha256 != catalog_sha256:
+        return True
+    try:
+        _cleanup_committed_rag_marker(marker_path, catalog_sha256)
+    except Exception:  # noqa: BLE001 - committed may safely remain or be absent
+        remaining = _load_rag_quarantine_marker(marker_path)
+        if remaining is None:
+            return False
+        return not (
+            remaining.state == _RAG_TRANSACTION_COMMITTED
+            and remaining.catalog_sha256 == catalog_sha256
+        )
+    return False
 
 
 def _load_attachment_catalog(
@@ -1893,8 +2011,8 @@ class WorkspaceCapabilityService:
         self.akasicdb: AkasicDBAdapter | None = None
         self.akasicdb_error: tuple[str, str] | None = None
         try:
-            rag_quarantine_present = (
-                _load_rag_quarantine_marker(self.rag_quarantine_path) is not None
+            rag_quarantine_present = _rag_quarantine_required_on_startup(
+                self.rag_quarantine_path, self.catalog_path
             )
         except WorkspaceCapabilityError:
             # A malformed, truncated, oversized, or unsafe marker remains an
@@ -2447,11 +2565,39 @@ class WorkspaceCapabilityService:
         return catalog_sha256
 
     def _complete_rag_transaction_locked(self, catalog_sha256: str) -> None:
-        """Remove only this transaction's verified marker after a stable outcome."""
+        """Commit the post-outcome catalog before best-effort marker cleanup."""
 
         try:
-            _remove_rag_quarantine_marker(self.rag_quarantine_path, catalog_sha256)
+            committed_catalog_sha256 = _catalog_digest_for_rag_marker(self.catalog_path)
+            _commit_rag_transaction_marker(
+                self.rag_quarantine_path,
+                expected_pending_sha256=catalog_sha256,
+                committed_catalog_sha256=committed_catalog_sha256,
+            )
         except Exception as exc:  # noqa: BLE001 - durable fail-closed boundary
+            self._activate_rag_quarantine_locked()
+            raise WorkspaceCapabilityError(
+                _RAG_QUARANTINE_CODE,
+                _RAG_QUARANTINE_MESSAGE,
+            ) from exc
+        try:
+            _cleanup_committed_rag_marker(
+                self.rag_quarantine_path, committed_catalog_sha256
+            )
+        except Exception as exc:  # noqa: BLE001 - committed may remain or be absent
+            try:
+                remaining = _load_rag_quarantine_marker(self.rag_quarantine_path)
+            except Exception as inspection_exc:  # noqa: BLE001
+                self._activate_rag_quarantine_locked()
+                raise WorkspaceCapabilityError(
+                    _RAG_QUARANTINE_CODE,
+                    _RAG_QUARANTINE_MESSAGE,
+                ) from inspection_exc
+            if remaining is None or (
+                remaining.state == _RAG_TRANSACTION_COMMITTED
+                and remaining.catalog_sha256 == committed_catalog_sha256
+            ):
+                return
             self._activate_rag_quarantine_locked()
             raise WorkspaceCapabilityError(
                 _RAG_QUARANTINE_CODE,

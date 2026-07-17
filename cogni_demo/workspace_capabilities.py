@@ -232,6 +232,34 @@ class IndexedChunk:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class IndexedSourceSnapshot:
+    """Immutable, blob-bound authority for one indexed browser excerpt."""
+
+    attachment_id: str
+    attachment_sha256: str
+    name: str
+    media_type: str
+    chunk: IndexedChunk
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "attachment_id": self.attachment_id,
+            "name": self.name,
+            "media_type": self.media_type,
+            **self.chunk.as_payload(),
+        }
+
+    def matches(self, record: AttachmentRecord, indexed: Mapping[str, object]) -> bool:
+        return (
+            record.attachment_id == self.attachment_id
+            and record.sha256 == self.attachment_sha256
+            and record.name == self.name
+            and record.media_type == self.media_type
+            and indexed == self.as_payload()
+        )
+
+
 def _pdf_extractor_available() -> bool:
     return _PdfReader is not None
 
@@ -1601,6 +1629,8 @@ class WorkspaceCapabilityService:
             self.catalog_path, self.storage_root
         )
         self._lock = RLock()
+        self._source_snapshots: dict[tuple[str, int], IndexedSourceSnapshot] = {}
+        self._source_generation = 0
         self.akasicdb: AkasicDBAdapter | None = None
         self.akasicdb_error: tuple[str, str] | None = None
         selected_path = self._discover_akasicdb(akasicdb_path)
@@ -1743,7 +1773,6 @@ class WorkspaceCapabilityService:
                 or not resolved.is_relative_to(self.storage_root)
                 or not resolved.is_file()
                 or resolved.stat().st_size != record.size_bytes
-                or _sha256_file(resolved) != record.sha256
             ):
                 raise WorkspaceCapabilityError(
                     "ATTACHMENT_INTEGRITY_FAILED",
@@ -1757,10 +1786,13 @@ class WorkspaceCapabilityService:
                 "ATTACHMENT_INTEGRITY_FAILED",
                 "attachment could not be read after admission",
             ) from exc
-        if len(content) != record.size_bytes:
+        if (
+            len(content) != record.size_bytes
+            or sha256(content).hexdigest() != record.sha256
+        ):
             raise WorkspaceCapabilityError(
                 "ATTACHMENT_INTEGRITY_FAILED",
-                "attachment changed while it was being read",
+                "attachment bytes no longer match the admitted digest",
             )
         return content
 
@@ -2057,18 +2089,59 @@ class WorkspaceCapabilityService:
                 "attachment catalog could not be committed",
             ) from exc
 
+    @staticmethod
+    def _build_source_snapshots(
+        records: Mapping[str, AttachmentRecord],
+        documents: Mapping[str, ExtractedDocument],
+    ) -> dict[tuple[str, int], IndexedSourceSnapshot]:
+        """Bind every excerpt to the exact admitted blob used for indexing."""
+
+        snapshots: dict[tuple[str, int], IndexedSourceSnapshot] = {}
+        for attachment_id, record in records.items():
+            document = documents.get(attachment_id)
+            if document is None:
+                raise WorkspaceCapabilityError(
+                    "RAG_SOURCE_INTEGRITY_FAILED",
+                    "the indexed source snapshot is incomplete",
+                )
+            for chunk in _chunk_document(document):
+                key = (attachment_id, chunk.chunk_index)
+                if key in snapshots:
+                    raise WorkspaceCapabilityError(
+                        "RAG_SOURCE_INTEGRITY_FAILED",
+                        "the indexed source snapshot is ambiguous",
+                    )
+                snapshots[key] = IndexedSourceSnapshot(
+                    attachment_id=attachment_id,
+                    attachment_sha256=record.sha256,
+                    name=record.name,
+                    media_type=record.media_type,
+                    chunk=chunk,
+                )
+        return snapshots
+
     def _rebuild_rag_index(self) -> None:
         if self.akasicdb is None:
             return
+        records = {
+            attachment_id: self._attachments[attachment_id]
+            for attachment_id in sorted(self._indexed_attachment_ids)
+        }
+        documents = {
+            attachment_id: self._read_attachment_document(record)
+            for attachment_id, record in records.items()
+        }
+        snapshots = self._build_source_snapshots(records, documents)
         self.akasicdb.reset()
-        for attachment_id in sorted(self._indexed_attachment_ids):
-            record = self._attachments[attachment_id]
+        for attachment_id, record in records.items():
             self.akasicdb.index_document(
                 attachment_id=record.attachment_id,
                 name=record.name,
                 media_type=record.media_type,
-                document=self._read_attachment_document(record),
+                document=documents[attachment_id],
             )
+        self._source_snapshots = snapshots
+        self._source_generation += 1
 
     def delete_attachment(self, attachment_id: str) -> dict[str, object]:
         if (
@@ -2340,6 +2413,9 @@ class WorkspaceCapabilityService:
                 )
                 for item in target_records
             }
+            target_snapshots = self._build_source_snapshots(
+                target_records, target_documents
+            )
             try:
                 self.akasicdb.reset()
                 indexed_results: dict[str, dict[str, object]] = {}
@@ -2354,6 +2430,8 @@ class WorkspaceCapabilityService:
                         indexed_results[item] = result
                 self._indexed_attachment_ids = target
                 self._persist_catalog()
+                self._source_snapshots = target_snapshots
+                self._source_generation += 1
             except Exception as exc:  # noqa: BLE001 - transactional adapter boundary
                 self._indexed_attachment_ids = previous
                 try:
@@ -2425,6 +2503,7 @@ class WorkspaceCapabilityService:
                 item: len(_chunk_document(document))
                 for item, document in documents.items()
             }
+            target_snapshots = self._build_source_snapshots(records, documents)
             try:
                 self.akasicdb.reset()
                 for item, record in records.items():
@@ -2436,6 +2515,8 @@ class WorkspaceCapabilityService:
                     )
                 self._indexed_attachment_ids = target
                 self._persist_catalog()
+                self._source_snapshots = target_snapshots
+                self._source_generation += 1
             except (OSError, UnicodeError, WorkspaceCapabilityError) as exc:
                 self._indexed_attachment_ids = previous
                 try:
@@ -2487,7 +2568,7 @@ class WorkspaceCapabilityService:
     def preview_rag_source(
         self, attachment_id: str, chunk_index: int
     ) -> dict[str, object]:
-        """Rebuild provenance and return only the exact indexed source record."""
+        """Return one O(1), immutable source snapshot under a short read lock."""
 
         if self.akasicdb is None:
             code, message = self.akasicdb_error or (
@@ -2516,36 +2597,23 @@ class WorkspaceCapabilityService:
                 raise WorkspaceCapabilityError(
                     "RAG_SOURCE_NOT_FOUND", "the indexed source was not found"
                 )
+            snapshot = self._source_snapshots.get((attachment_id, chunk_index))
+            if snapshot is None:
+                raise WorkspaceCapabilityError(
+                    "RAG_SOURCE_NOT_FOUND", "the indexed source was not found"
+                )
             indexed = self.akasicdb.source_preview(
                 attachment_id=attachment_id, chunk_index=chunk_index
             )
-            # Re-read and integrity-check the admitted blob, then reproduce the
-            # normalized chunk.  This prevents a mutable in-memory adapter
-            # record from becoming browser-visible source authority.
-            expected_chunks = _chunk_document(self._read_attachment_document(record))
-            expected = next(
-                (item for item in expected_chunks if item.chunk_index == chunk_index),
-                None,
-            )
-            if expected is None:
+            # The snapshot was created from the same digest-verified bytes as
+            # the committed index.  The adapter remains checked here so an
+            # in-memory record mutation cannot become browser-visible authority.
+            if not snapshot.matches(record, indexed):
                 raise WorkspaceCapabilityError(
                     "RAG_SOURCE_INTEGRITY_FAILED",
                     "the indexed source no longer matches the admitted attachment",
                 )
-            expected_payload = expected.as_payload()
-            if (
-                indexed.get("attachment_id") != record.attachment_id
-                or indexed.get("name") != record.name
-                or indexed.get("media_type") != record.media_type
-                or any(
-                    indexed.get(key) != value for key, value in expected_payload.items()
-                )
-            ):
-                raise WorkspaceCapabilityError(
-                    "RAG_SOURCE_INTEGRITY_FAILED",
-                    "the indexed source no longer matches the admitted attachment",
-                )
-        return {"schema_version": 1, **indexed}
+            return {"schema_version": 1, **snapshot.as_payload()}
 
     def search_lens(
         self,

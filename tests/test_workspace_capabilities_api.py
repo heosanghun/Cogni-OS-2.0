@@ -13,6 +13,7 @@ from unittest.mock import patch
 from cogni_demo.server import (
     DemoHTTPServer,
     MAX_AGENT_CHAT_REQUEST_BODY_BYTES,
+    MAX_INDEXED_TEXT_CHARS,
     MAX_REQUEST_BODY_BYTES,
 )
 from cogni_demo.workspace_capabilities import WorkspaceCapabilityError
@@ -373,6 +374,13 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
             "/api/workspace/rag/source?attachment_id="
             + attachment_id
             + "&chunk_index=%2B1",
+            "/api/workspace/rag/source?chunk_index=0&attachment_id=" + attachment_id,
+            route + "&",
+            route.replace("&", "&&"),
+            route.replace("attachment_id", "attachment%5fid"),
+            route.replace(attachment_id, "%61" + attachment_id[1:]),
+            route.replace("chunk_index", "chunk%5findex"),
+            route.replace("chunk_index=0", "chunk_index=%30"),
         )
         for invalid in invalid_routes:
             status, error = self._get(invalid)
@@ -402,6 +410,32 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(payload["error"]["code"], "WORKSPACE_RESPONSE_INVALID")
         self.assertNotIn("/home/private", json.dumps(payload))
+
+        malformed_payloads = (
+            {**valid, "schema_version": True},
+            {**valid, "chunk_index": False},
+            {**valid, "char_start": False},
+            {**valid, "char_end": True},
+            {**valid, "name": "bad\x7fname.md"},
+            {**valid, "name": "bad\x80name.md"},
+            {**valid, "media_type": "text/html"},
+            {
+                **valid,
+                "char_start": MAX_INDEXED_TEXT_CHARS,
+                "char_end": MAX_INDEXED_TEXT_CHARS + len(valid["text"]),
+            },
+            {
+                **valid,
+                "char_start": MAX_INDEXED_TEXT_CHARS - len(valid["text"]) + 1,
+                "char_end": MAX_INDEXED_TEXT_CHARS + 1,
+            },
+        )
+        for malformed in malformed_payloads:
+            with self.subTest(malformed=malformed):
+                self.workspace.source_payload = malformed
+                status, payload = self._get(route)
+                self.assertEqual(status, 503)
+                self.assertEqual(payload["error"]["code"], "WORKSPACE_RESPONSE_INVALID")
 
     def test_workspace_post_routes_and_bounded_errors(self) -> None:
         status, payload = self._post(

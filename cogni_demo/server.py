@@ -47,6 +47,7 @@ from cogni_demo.protocol import (
 from cogni_demo.workspace_capabilities import (
     MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_BASE64_CHARS,
+    MAX_INDEXED_TEXT_CHARS,
     WorkspaceCapabilityError,
     WorkspaceCapabilityService,
     web_policy_from_environment,
@@ -122,6 +123,15 @@ _RAG_SOURCE_RESPONSE_KEYS = frozenset(
 )
 _RAG_SOURCE_OFFSET_BASES = frozenset(
     {"normalized_document_text_v1", "normalized_pdf_page_text_v1"}
+)
+_RAG_SOURCE_MEDIA_TYPES = frozenset(
+    {
+        "application/json",
+        "application/pdf",
+        "text/csv",
+        "text/markdown",
+        "text/plain",
+    }
 )
 
 _ACTIVE_STATUSES = {"starting", "running", "cancelling"}
@@ -234,6 +244,7 @@ def _rag_source_payload_is_valid(
     if not isinstance(payload, dict) or set(payload) != _RAG_SOURCE_RESPONSE_KEYS:
         return False
     schema_version = payload.get("schema_version")
+    payload_chunk_index = payload.get("chunk_index")
     name = payload.get("name")
     media_type = payload.get("media_type")
     text = payload.get("text")
@@ -247,15 +258,19 @@ def _rag_source_payload_is_valid(
         or isinstance(schema_version, bool)
         or schema_version != 1
         or payload.get("attachment_id") != attachment_id
-        or payload.get("chunk_index") != chunk_index
+        or not isinstance(payload_chunk_index, int)
+        or isinstance(payload_chunk_index, bool)
+        or payload_chunk_index != chunk_index
         or not isinstance(name, str)
         or not 1 <= len(name) <= 128
         or name in {".", ".."}
         or "/" in name
         or "\\" in name
-        or any(ord(character) < 32 for character in name)
+        or any(
+            ord(character) < 32 or 127 <= ord(character) <= 159 for character in name
+        )
         or not isinstance(media_type, str)
-        or re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", media_type) is None
+        or media_type not in _RAG_SOURCE_MEDIA_TYPES
         or not isinstance(text, str)
         or not 1 <= len(text) <= MAX_RAG_EVIDENCE_CHUNK_CHARS
         or not text.strip()
@@ -267,9 +282,11 @@ def _rag_source_payload_is_valid(
         or not isinstance(char_start, int)
         or isinstance(char_start, bool)
         or char_start < 0
+        or char_start >= MAX_INDEXED_TEXT_CHARS
         or not isinstance(char_end, int)
         or isinstance(char_end, bool)
         or char_end <= char_start
+        or char_end > MAX_INDEXED_TEXT_CHARS
         or char_end - char_start != len(text)
         or offset_basis not in _RAG_SOURCE_OFFSET_BASES
         or not isinstance(excerpt_sha256, str)
@@ -2065,22 +2082,18 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE"
                 )
                 return
-            values = parse_qs(parsed.query, keep_blank_values=True)
-            if (
-                set(values) != {"attachment_id", "chunk_index"}
-                or len(values["attachment_id"]) != 1
-                or len(values["chunk_index"]) != 1
-            ):
+            # This evidence URL has one canonical representation: attachment_id
+            # first, then chunk_index.  Matching the raw query (rather than a
+            # percent-decoded mapping) rejects encoded unreserved characters,
+            # reordered/duplicate keys, empty separators and trailing data.
+            source_query = re.fullmatch(
+                r"attachment_id=([0-9a-f]{24})&chunk_index=(0|[1-9][0-9]{0,2})",
+                parsed.query,
+            )
+            if source_query is None:
                 self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_QUERY")
                 return
-            attachment_id = values["attachment_id"][0]
-            raw_chunk_index = values["chunk_index"][0]
-            if (
-                re.fullmatch(r"[0-9a-f]{24}", attachment_id) is None
-                or re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", raw_chunk_index) is None
-            ):
-                self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_QUERY")
-                return
+            attachment_id, raw_chunk_index = source_query.groups()
             chunk_index = int(raw_chunk_index)
             if chunk_index >= 128:
                 self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_QUERY")

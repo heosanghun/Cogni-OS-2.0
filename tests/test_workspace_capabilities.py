@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 from pathlib import Path
 import tempfile
+from threading import Event, Thread
 import unittest
 from unittest.mock import patch
 
@@ -909,6 +910,146 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 with self.assertRaises(WorkspaceCapabilityError) as captured:
                     service.preview_rag_source(admitted["attachment_id"], 0)
                 self.assertEqual(captured.exception.code, "RAG_SOURCE_INTEGRITY_FAILED")
+
+    def test_attachment_reader_hashes_the_exact_returned_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            service = WorkspaceCapabilityService(temporary, _model())
+            admitted = service.add_attachment(
+                name="same-size.txt",
+                media_type="text/plain",
+                content_base64=b64encode(b"trusted-bytes").decode(),
+            )
+            record = service._attachments[admitted["attachment_id"]]
+            forged = b"x" * record.size_bytes
+            self.assertNotEqual(sha256(forged).hexdigest(), record.sha256)
+            with patch.object(Path, "read_bytes", return_value=forged):
+                with self.assertRaises(WorkspaceCapabilityError) as captured:
+                    service._verified_attachment_bytes(record)
+            self.assertEqual(captured.exception.code, "ATTACHMENT_INTEGRITY_FAILED")
+
+    def test_pdf_source_snapshot_is_o1_for_repeated_concurrent_clicks(self) -> None:
+        if capabilities._PdfReader is None:
+            self.skipTest("optional pypdf runtime is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                admitted = service.add_attachment(
+                    name="snapshot.pdf",
+                    media_type="application/pdf",
+                    content_base64=b64encode(_pdf_bytes("immutable evidence")).decode(),
+                )
+                attachment_id = admitted["attachment_id"]
+                service.index_attachments([attachment_id])
+                expected = service.preview_rag_source(attachment_id, 0)
+                results: list[dict[str, object] | None] = [None] * 8
+                errors: list[BaseException] = []
+
+                def preview(index: int) -> None:
+                    try:
+                        results[index] = service.preview_rag_source(attachment_id, 0)
+                    except BaseException as exc:  # pragma: no cover - surfaced below
+                        errors.append(exc)
+
+                with patch.object(
+                    capabilities,
+                    "_extract_pdf_document",
+                    side_effect=AssertionError("source GET must not re-extract PDF"),
+                ):
+                    threads = [
+                        Thread(target=preview, args=(index,)) for index in range(8)
+                    ]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=2)
+                    self.assertTrue(all(not thread.is_alive() for thread in threads))
+                self.assertEqual(errors, [])
+                self.assertEqual(results, [expected] * 8)
+
+    def test_source_get_serializes_with_reindex_and_delete_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                admitted = service.add_attachment(
+                    name="lifecycle.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"lifecycle evidence").decode(),
+                )
+                attachment_id = admitted["attachment_id"]
+                service.index_attachments([attachment_id])
+                initial_generation = service._source_generation
+
+                source_results: list[dict[str, object]] = []
+                mutation_results: list[dict[str, object]] = []
+                errors: list[BaseException] = []
+                entered = Event()
+                release = Event()
+                assert service.akasicdb is not None
+                original_preview = service.akasicdb.source_preview
+
+                def blocked_preview(**kwargs):
+                    entered.set()
+                    if not release.wait(timeout=2):
+                        raise TimeoutError("test source release timed out")
+                    return original_preview(**kwargs)
+
+                def read_source() -> None:
+                    try:
+                        source_results.append(
+                            service.preview_rag_source(attachment_id, 0)
+                        )
+                    except BaseException as exc:  # pragma: no cover - surfaced below
+                        errors.append(exc)
+
+                def reindex() -> None:
+                    try:
+                        mutation_results.append(
+                            service.reindex_attachments([attachment_id])
+                        )
+                    except BaseException as exc:  # pragma: no cover - surfaced below
+                        errors.append(exc)
+
+                with patch.object(
+                    service.akasicdb, "source_preview", side_effect=blocked_preview
+                ):
+                    reader = Thread(target=read_source)
+                    mutation = Thread(target=reindex)
+                    reader.start()
+                    self.assertTrue(entered.wait(timeout=2))
+                    mutation.start()
+                    self.assertTrue(mutation.is_alive())
+                    release.set()
+                    reader.join(timeout=2)
+                    mutation.join(timeout=2)
+                self.assertEqual(errors, [])
+                self.assertEqual(len(source_results), 1)
+                self.assertEqual(len(mutation_results), 1)
+                self.assertGreater(service._source_generation, initial_generation)
+                self.assertEqual(
+                    service.preview_rag_source(attachment_id, 0), source_results[0]
+                )
+
+                deleted = service.delete_attachment(attachment_id)
+                self.assertTrue(deleted["deleted"])
+                with self.assertRaises(WorkspaceCapabilityError) as captured:
+                    service.preview_rag_source(attachment_id, 0)
+                self.assertEqual(captured.exception.code, "RAG_SOURCE_NOT_FOUND")
 
     def test_invalid_url_port_is_a_bounded_policy_error(self) -> None:
         policy = WebAccessPolicy(online_mode=True, allowlist=("api.lens.org",))

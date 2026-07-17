@@ -854,6 +854,95 @@ class TestCogniBoardUI(unittest.TestCase):
             script,
         )
 
+    def test_validation_ready_and_evidence_transitions_fail_closed(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is not installed in this Python test environment")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        start = script.index("function updateState(state)")
+        end = script.index("\n}\n\nfunction formatAgentTime", start) + 2
+        update_state = script[start:end]
+        probe = (
+            r"""
+const assert = require("node:assert/strict");
+const VALIDATION_STATUSES = new Set([
+  "ready", "starting", "running", "cancelling", "cancelled", "succeeded", "failed", "offline",
+]);
+const ACTIVE_STATUSES = new Set(["starting", "running", "cancelling"]);
+const ui = { lastStatus: "ready", lastEvidenceVerified: false, lastSeq: -1 };
+const labels = Object.create(null);
+const runtimeCalls = [];
+const metricScopes = [];
+const phaseCalls = [];
+const toasts = [];
+const railSeal = { dataset: Object.create(null) };
+const document = { body: { classList: { toggle() {} } } };
+function normalizedLiveRuntimeMetrics(raw) {
+  return raw?.valid === true ? Object.freeze({ ...raw }) : null;
+}
+function setRuntimeStatus(status, stage, evidenceVerified) {
+  runtimeCalls.push({ status, stage, evidenceVerified });
+  labels["#runtime-pill"] = evidenceVerified ? "VERIFIED" : status.toUpperCase();
+}
+function updateMetrics(metrics, scope) { metricScopes.push({ metrics, scope }); }
+function updatePhases(state, evidenceVerified) { phaseCalls.push({ state, evidenceVerified }); }
+function renderEvents() {}
+function updateControlStates() {}
+function setText(selector, value) { labels[selector] = value; }
+function showToast(_message, tone) { toasts.push(tone); }
+function $(selector) { return selector === ".rail-seal" ? railSeal : null; }
+"""
+            + update_state
+            + r"""
+
+updateState({ status: "ready", stage: "ready", metrics: { valid: true } });
+assert.equal(labels["#rail-verdict"], "PRIOR EVIDENCE");
+assert.equal(labels["#rail-time"], "직전 검증 실측 · 현재 실행 미검증");
+assert.equal(runtimeCalls.at(-1).evidenceVerified, false);
+assert.equal(phaseCalls.at(-1).evidenceVerified, false);
+assert.equal(metricScopes.at(-1).scope, "prior");
+assert.equal(ui.lastEvidenceVerified, false);
+assert.equal(railSeal.dataset.state, "ready");
+assert.equal(Object.values(labels).includes("VERIFIED"), false);
+
+updateState({ status: "hostile", stage: "postcheck", metrics: { valid: true } });
+assert.equal(ui.lastStatus, "failed");
+assert.equal(ui.lastEvidenceVerified, false);
+assert.equal(labels["#rail-verdict"], "NEW RUN FAILED");
+assert.equal(runtimeCalls.at(-1).evidenceVerified, false);
+assert.equal(phaseCalls.at(-1).evidenceVerified, false);
+assert.equal(metricScopes.at(-1).scope, "prior");
+assert.notEqual(railSeal.dataset.state, "succeeded");
+
+toasts.length = 0;
+updateState({ status: "succeeded", stage: "postcheck", metrics: null });
+assert.deepEqual(toasts, ["error"]);
+assert.equal(labels["#rail-verdict"], "INVALID EVIDENCE");
+assert.equal(ui.lastEvidenceVerified, false);
+
+updateState({ status: "succeeded", stage: "postcheck", metrics: { valid: true } });
+assert.deepEqual(toasts, ["error", "success"]);
+assert.equal(labels["#rail-verdict"], "VERIFIED");
+assert.equal(ui.lastEvidenceVerified, true);
+assert.equal(metricScopes.at(-1).scope, "current");
+
+updateState({ status: "succeeded", stage: "postcheck", metrics: null });
+assert.deepEqual(toasts, ["error", "success", "error"]);
+assert.equal(labels["#rail-verdict"], "INVALID EVIDENCE");
+assert.equal(ui.lastEvidenceVerified, false);
+updateState({ status: "succeeded", stage: "postcheck", metrics: null });
+assert.deepEqual(toasts, ["error", "success", "error"]);
+"""
+        )
+        completed = subprocess.run(
+            [node, "-e", probe],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_live_runtime_metric_validator_rejects_partial_and_out_of_range_data(
         self,
     ) -> None:

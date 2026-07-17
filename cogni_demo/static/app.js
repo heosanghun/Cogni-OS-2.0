@@ -245,6 +245,7 @@ const ui = {
   selectedScenario: "defense",
   lastSeq: -1,
   lastStatus: "ready",
+  lastEvidenceVerified: false,
   pollStopped: false,
   tourIndex: 0,
   toastTimer: null,
@@ -2688,11 +2689,13 @@ function updateControlStates() {
 function updateState(state) {
   if (!state || typeof state !== "object") return;
   const prior = ui.lastStatus;
+  const priorEvidenceVerified = ui.lastEvidenceVerified === true;
   const status = VALIDATION_STATUSES.has(state.status) ? state.status : "failed";
   const liveMetrics = normalizedLiveRuntimeMetrics(state.metrics);
   const hasLiveEvidence = liveMetrics !== null;
   const evidenceVerified = status === "succeeded" && hasLiveEvidence;
   ui.lastStatus = status;
+  ui.lastEvidenceVerified = evidenceVerified;
   if (Number.isInteger(state.seq)) ui.lastSeq = Math.max(ui.lastSeq, state.seq);
   setRuntimeStatus(status, state.stage, evidenceVerified);
   updateMetrics(liveMetrics, evidenceVerified ? "current" : "prior");
@@ -2713,11 +2716,11 @@ function updateState(state) {
     setText("#rail-time", hasLiveEvidence ? "직전 현재 프로세스 실측 유지 · 완료 후 교체" : "현재 실측 생성 중");
   } else if (status === "succeeded" && evidenceVerified) {
     setText("#rail-verdict", "VERIFIED");
-    if (prior !== "succeeded") showToast("완전한 현재 프로세스 실측이 CTS 안전 계약을 통과했습니다.", "success");
+    if (prior !== "succeeded" || !priorEvidenceVerified) showToast("완전한 현재 프로세스 실측이 CTS 안전 계약을 통과했습니다.", "success");
   } else if (status === "succeeded") {
     setText("#rail-verdict", "INVALID EVIDENCE");
     setText("#rail-time", "완전한 현재 프로세스 실측 없음");
-    if (prior !== "succeeded") {
+    if (prior !== "succeeded" || priorEvidenceVerified) {
       showToast("검증 종료 payload가 완전한 CTS 안전 계약을 충족하지 못했습니다.", "error");
     }
   } else if (status === "failed") {
@@ -2730,8 +2733,11 @@ function updateState(state) {
     setText("#rail-time", hasLiveEvidence ? "직전 현재 프로세스 실측 유지" : "유효한 현재 프로세스 실측 없음");
     if (prior !== "cancelled") showToast("검증을 취소하고 GPU worker를 정리했습니다.", "warning");
   } else if (status === "ready") {
-    setText("#rail-verdict", hasLiveEvidence ? "VERIFIED" : "NOT VERIFIED");
-    if (!hasLiveEvidence) setText("#rail-time", "현재 프로세스 검증 전");
+    setText("#rail-verdict", hasLiveEvidence ? "PRIOR EVIDENCE" : "NOT VERIFIED");
+    setText(
+      "#rail-time",
+      hasLiveEvidence ? "직전 검증 실측 · 현재 실행 미검증" : "현재 프로세스 검증 전",
+    );
   }
 }
 

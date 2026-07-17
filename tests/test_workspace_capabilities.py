@@ -87,12 +87,11 @@ def _write_clone(root: Path) -> dict[str, str]:
     return digests
 
 
-def _pdf_bytes(text: str) -> bytes:
+def _pdf_pages_bytes(page_texts: tuple[str | None, ...]) -> bytes:
     from pypdf import PdfWriter
     from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
     writer = PdfWriter()
-    page = writer.add_blank_page(width=612, height=792)
     font = DictionaryObject(
         {
             NameObject("/Type"): NameObject("/Font"),
@@ -101,16 +100,24 @@ def _pdf_bytes(text: str) -> bytes:
         }
     )
     font_reference = writer._add_object(font)
-    page[NameObject("/Resources")] = DictionaryObject(
-        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_reference})}
-    )
-    stream = DecodedStreamObject()
-    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-    stream.set_data(f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("ascii"))
-    page[NameObject("/Contents")] = writer._add_object(stream)
+    for text in page_texts:
+        page = writer.add_blank_page(width=612, height=792)
+        if text is None:
+            continue
+        page[NameObject("/Resources")] = DictionaryObject(
+            {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_reference})}
+        )
+        stream = DecodedStreamObject()
+        escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream.set_data(f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("ascii"))
+        page[NameObject("/Contents")] = writer._add_object(stream)
     output = BytesIO()
     writer.write(output)
     return output.getvalue()
+
+
+def _pdf_bytes(text: str) -> bytes:
+    return _pdf_pages_bytes((text,))
 
 
 class TestWorkspaceCapabilities(unittest.TestCase):
@@ -215,12 +222,11 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 service = WorkspaceCapabilityService(
                     project, _model(), akasicdb_path=clone
                 )
+                pdf_content = _pdf_bytes("equilibrium evidence")
                 admitted = service.add_attachment(
                     name="paper.pdf",
                     media_type="application/pdf",
-                    content_base64=b64encode(
-                        _pdf_bytes("equilibrium evidence")
-                    ).decode(),
+                    content_base64=b64encode(pdf_content).decode(),
                 )
                 self.assertTrue(admitted["text_indexable"])
                 preview = service.preview_attachment(admitted["attachment_id"])
@@ -233,13 +239,103 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 self.assertEqual(
                     result["results"][0]["attachment_id"], admitted["attachment_id"]
                 )
-                self.assertEqual(result["results"][0]["chunk_index"], 0)
-                self.assertGreater(result["results"][0]["score"], 0)
+                source = result["results"][0]
+                self.assertEqual(source["chunk_index"], 0)
+                self.assertEqual(source["page_number"], 1)
+                self.assertEqual(source["offset_basis"], "normalized_pdf_page_text_v1")
+                extracted = capabilities._extract_pdf_document(pdf_content)
+                normalized_page = capabilities._normalize_index_source(
+                    extracted.pages[0].text
+                )
+                self.assertEqual(
+                    normalized_page[source["char_start"] : source["char_end"]],
+                    source["text"],
+                )
+                self.assertEqual(
+                    source["excerpt_sha256"],
+                    sha256(source["text"].encode()).hexdigest(),
+                )
+                self.assertGreater(source["score"], 0)
                 rebuilt = service.reindex_attachments([admitted["attachment_id"]])
                 self.assertEqual(
                     rebuilt["reindexed_attachment_ids"], [admitted["attachment_id"]]
                 )
                 self.assertTrue(rebuilt["results"][0]["reindexed"])
+
+    def test_pdf_blank_page_and_provenance_survive_restart_and_reindex(self) -> None:
+        if capabilities._PdfReader is None:
+            self.skipTest("optional pypdf runtime is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            pdf_content = _pdf_pages_bytes(
+                ("alpha evidence", None, "omega evidence on physical page three")
+            )
+            extracted = capabilities._extract_pdf_document(pdf_content)
+            self.assertEqual(extracted.page_count, 3)
+            self.assertEqual(
+                tuple(page.page_number for page in extracted.pages), (1, 2, 3)
+            )
+            self.assertEqual(extracted.pages[1].text, "")
+
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                admitted = service.add_attachment(
+                    name="three-pages.pdf",
+                    media_type="application/pdf",
+                    content_base64=b64encode(pdf_content).decode(),
+                )
+                preview = service.preview_attachment(admitted["attachment_id"])
+                self.assertEqual(preview["page_count"], 3)
+                self.assertEqual(
+                    preview["pages"],
+                    [
+                        {
+                            "page_number": 1,
+                            "extracted_chars": len(extracted.pages[0].text),
+                        },
+                        {"page_number": 2, "extracted_chars": 0},
+                        {
+                            "page_number": 3,
+                            "extracted_chars": len(extracted.pages[2].text),
+                        },
+                    ],
+                )
+                service.index_attachments([admitted["attachment_id"]])
+
+                def assert_page_three_source(
+                    selected: WorkspaceCapabilityService,
+                ) -> None:
+                    result = selected.query_rag("omega physical")
+                    self.assertEqual(result["count"], 1)
+                    source = result["results"][0]
+                    self.assertEqual(source["page_number"], 3)
+                    self.assertEqual(source["chunk_index"], 1)
+                    normalized_page = capabilities._normalize_index_source(
+                        extracted.pages[2].text
+                    )
+                    self.assertEqual(
+                        normalized_page[source["char_start"] : source["char_end"]],
+                        source["text"],
+                    )
+                    self.assertEqual(
+                        source["excerpt_sha256"],
+                        sha256(source["text"].encode()).hexdigest(),
+                    )
+
+                assert_page_three_source(service)
+                restarted = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                assert_page_three_source(restarted)
+                restarted.reindex_attachments([admitted["attachment_id"]])
+                assert_page_three_source(restarted)
 
     def test_pdf_extraction_is_fail_closed_when_optional_backend_is_missing(
         self,
@@ -296,6 +392,35 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 capabilities._run_pdf_extractor_subprocess(b"%PDF-1.4\nlocal")
         self.assertEqual(raised.exception.code, "PDF_TEXT_EXTRACTION_TIMEOUT")
         self.assertTrue(process.killed)
+
+    def test_pdf_parent_rejects_nonsequential_worker_pages(self) -> None:
+        class _InvalidSequenceProcess:
+            returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                del input, timeout
+                payload = {
+                    "ok": True,
+                    "pages": [
+                        {"page_number": 1, "text": "first"},
+                        {"page_number": 3, "text": "third"},
+                    ],
+                }
+                return json.dumps(payload).encode(), b""
+
+        with (
+            patch.object(
+                capabilities.subprocess,
+                "Popen",
+                return_value=_InvalidSequenceProcess(),
+            ),
+            patch.object(capabilities, "_assign_windows_pdf_job", return_value=0),
+        ):
+            with self.assertRaisesRegex(
+                WorkspaceCapabilityError, "page sequence"
+            ) as raised:
+                capabilities._run_pdf_extractor_document(b"%PDF-1.4\nlocal")
+        self.assertEqual(raised.exception.code, "PDF_TEXT_EXTRACTION_FAILED")
 
     def test_encoded_length_is_rejected_before_base64_decode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -643,7 +768,17 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 self.assertEqual(indexed["chunks"], 1)
                 result = adapter.query("평형 탐색", limit=5)
                 self.assertEqual(result["count"], 1)
-                self.assertGreater(result["results"][0]["score"], 0)
+                source = result["results"][0]
+                self.assertGreater(source["score"], 0)
+                self.assertIsNone(source["page_number"])
+                self.assertEqual(source["offset_basis"], "normalized_document_text_v1")
+                normalized = capabilities._normalize_index_source(
+                    "평형 탐색과 텐서 검색을 결합합니다."
+                )
+                self.assertEqual(
+                    normalized[source["char_start"] : source["char_end"]],
+                    source["text"],
+                )
                 entity = next(iter(adapter._chunk_ids))
                 adapter.vector_store.similarity_search = lambda *_args, **_kwargs: [
                     (entity, 0.9)

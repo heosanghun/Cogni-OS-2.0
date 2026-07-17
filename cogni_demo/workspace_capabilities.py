@@ -154,6 +154,84 @@ class AttachmentRecord:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ExtractedPage:
+    """One physical PDF page after bounded, deterministic normalization."""
+
+    page_number: int
+    text: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.page_number, int)
+            or isinstance(self.page_number, bool)
+            or self.page_number < 1
+        ):
+            raise ValueError("page_number must be a positive integer")
+        if not isinstance(self.text, str):
+            raise TypeError("page text must be str")
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedDocument:
+    """A bounded document plus optional physical-page provenance.
+
+    Non-paginated UTF-8 attachments use ``page_count=0`` and ``pages=()``.
+    PDFs always carry every physical page, including pages with empty text.
+    """
+
+    text: str
+    page_count: int
+    pages: tuple[ExtractedPage, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError("document text must be str")
+        if (
+            not isinstance(self.page_count, int)
+            or isinstance(self.page_count, bool)
+            or self.page_count < 0
+        ):
+            raise ValueError("page_count must be a non-negative integer")
+        if not isinstance(self.pages, tuple) or any(
+            not isinstance(page, ExtractedPage) for page in self.pages
+        ):
+            raise TypeError("pages must be an ExtractedPage tuple")
+        if self.pages:
+            if self.page_count != len(self.pages) or tuple(
+                page.page_number for page in self.pages
+            ) != tuple(range(1, self.page_count + 1)):
+                raise ValueError("physical PDF pages must be exact and sequential")
+            if self.text != "\n\n".join(page.text for page in self.pages):
+                raise ValueError("document text must match its physical pages")
+        elif self.page_count != 0:
+            raise ValueError("a paginated document must include every physical page")
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedChunk:
+    """One searchable excerpt with an exact normalized-source coordinate."""
+
+    chunk_index: int
+    text: str
+    page_number: int | None
+    char_start: int
+    char_end: int
+    offset_basis: str
+    excerpt_sha256: str
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "chunk_index": self.chunk_index,
+            "text": self.text,
+            "page_number": self.page_number,
+            "char_start": self.char_start,
+            "char_end": self.char_end,
+            "offset_basis": self.offset_basis,
+            "excerpt_sha256": self.excerpt_sha256,
+        }
+
+
 def _pdf_extractor_available() -> bool:
     return _PdfReader is not None
 
@@ -266,7 +344,7 @@ def _close_windows_handle(handle: int) -> None:
         kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
-def _run_pdf_extractor_subprocess(content: bytes) -> str:
+def _run_pdf_extractor_document(content: bytes) -> ExtractedDocument:
     candidate = Path(__file__).with_name("pdf_extract_worker.py")
     if candidate.is_symlink():
         raise WorkspaceCapabilityError(
@@ -343,19 +421,72 @@ def _run_pdf_extractor_subprocess(content: bytes) -> str:
         if not isinstance(message, str) or not 1 <= len(message) <= 256:
             message = "the isolated PDF extractor rejected this document"
         raise WorkspaceCapabilityError(code, message)
-    text = payload.get("text")
-    page_count = payload.get("page_count")
+    raw_pages = payload.get("pages")
     if (
-        not isinstance(text, str)
-        or not 1 <= len(text) <= MAX_PDF_EXTRACTED_CHARS
-        or not isinstance(page_count, int)
-        or isinstance(page_count, bool)
-        or not 1 <= page_count <= MAX_PDF_PAGES
+        set(payload) != {"ok", "pages"}
+        or not isinstance(raw_pages, list)
+        or not 1 <= len(raw_pages) <= MAX_PDF_PAGES
     ):
         raise WorkspaceCapabilityError(
             "PDF_TEXT_EXTRACTION_FAILED", "the PDF worker result exceeded its contract"
         )
-    return text
+    pages: list[ExtractedPage] = []
+    for expected_page_number, raw_page in enumerate(raw_pages, start=1):
+        if not isinstance(raw_page, dict) or set(raw_page) != {
+            "page_number",
+            "text",
+        }:
+            raise WorkspaceCapabilityError(
+                "PDF_TEXT_EXTRACTION_FAILED",
+                "the PDF worker page result is invalid",
+            )
+        page_number = raw_page.get("page_number")
+        text = raw_page.get("text")
+        if (
+            page_number != expected_page_number
+            or isinstance(page_number, bool)
+            or not isinstance(text, str)
+            or _normalize_extracted_text(text) != text
+        ):
+            raise WorkspaceCapabilityError(
+                "PDF_TEXT_EXTRACTION_FAILED",
+                "the PDF worker page sequence is invalid",
+            )
+        pages.append(ExtractedPage(page_number=page_number, text=text))
+    document_text = "\n\n".join(page.text for page in pages)
+    if (
+        not any(page.text for page in pages)
+        or len(document_text) > MAX_PDF_EXTRACTED_CHARS
+    ):
+        raise WorkspaceCapabilityError(
+            "PDF_TEXT_LIMIT", "extracted PDF text exceeds its character limit"
+        )
+    return ExtractedDocument(
+        text=document_text,
+        page_count=len(pages),
+        pages=tuple(pages),
+    )
+
+
+def _run_pdf_extractor_subprocess(content: bytes) -> str:
+    """Compatibility wrapper for callers that consume only normalized text."""
+
+    return _run_pdf_extractor_document(content).text
+
+
+def _extract_pdf_document(content: bytes) -> ExtractedDocument:
+    """Extract a PDF with every physical page preserved for provenance."""
+
+    if _PdfReader is None:
+        raise WorkspaceCapabilityError(
+            "PDF_TEXT_EXTRACTION_UNAVAILABLE",
+            "the optional local pypdf extractor is unavailable",
+        )
+    if not isinstance(content, bytes) or not 1 <= len(content) <= MAX_ATTACHMENT_BYTES:
+        raise WorkspaceCapabilityError(
+            "ATTACHMENT_TOO_LARGE", "PDF attachment exceeds its byte limit"
+        )
+    return _run_pdf_extractor_document(content)
 
 
 def _extract_pdf_text(content: bytes) -> str:
@@ -908,15 +1039,23 @@ def _stable_sha256_embedding(text: str) -> list[float]:
     return vector
 
 
-def _chunk_text(text: str) -> tuple[str, ...]:
-    normalized = "\n".join(line.rstrip() for line in text.splitlines()).strip()
+def _normalize_index_source(text: str) -> str:
+    if not isinstance(text, str):
+        raise TypeError("indexed source must be text")
+    return "\n".join(line.rstrip() for line in text.splitlines()).strip()
+
+
+def _chunk_normalized_source(
+    text: str,
+    *,
+    page_number: int | None,
+    offset_basis: str,
+    first_chunk_index: int,
+) -> tuple[IndexedChunk, ...]:
+    normalized = _normalize_index_source(text)
     if not normalized:
-        raise WorkspaceCapabilityError("EMPTY_DOCUMENT", "document has no text")
-    if len(normalized) > MAX_INDEXED_TEXT_CHARS:
-        raise WorkspaceCapabilityError(
-            "DOCUMENT_TOO_LARGE", "document exceeds the local index character limit"
-        )
-    chunks: list[str] = []
+        return ()
+    chunks: list[IndexedChunk] = []
     cursor = 0
     while cursor < len(normalized):
         end = min(len(normalized), cursor + RAG_CHUNK_CHARS)
@@ -926,17 +1065,75 @@ def _chunk_text(text: str) -> tuple[str, ...]:
                 boundary = normalized.rfind(" ", cursor + 1, end)
             if boundary > cursor + RAG_CHUNK_CHARS // 2:
                 end = boundary
-        chunk = normalized[cursor:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if len(chunks) > MAX_RAG_CHUNKS_PER_DOCUMENT:
-            raise WorkspaceCapabilityError(
-                "TOO_MANY_CHUNKS", "document exceeds the local index chunk limit"
+        segment = normalized[cursor:end]
+        leading = len(segment) - len(segment.lstrip())
+        trailing = len(segment.rstrip())
+        char_start = cursor + leading
+        char_end = cursor + trailing
+        if char_start < char_end:
+            chunk_text = normalized[char_start:char_end]
+            chunks.append(
+                IndexedChunk(
+                    chunk_index=first_chunk_index + len(chunks),
+                    text=chunk_text,
+                    page_number=page_number,
+                    char_start=char_start,
+                    char_end=char_end,
+                    offset_basis=offset_basis,
+                    excerpt_sha256=sha256(chunk_text.encode("utf-8")).hexdigest(),
+                )
             )
         if end >= len(normalized):
             break
         cursor = max(cursor + 1, end - RAG_CHUNK_OVERLAP_CHARS)
     return tuple(chunks)
+
+
+def _chunk_document(document: ExtractedDocument) -> tuple[IndexedChunk, ...]:
+    if not isinstance(document, ExtractedDocument):
+        raise TypeError("document must be ExtractedDocument")
+    if not document.text or len(document.text) > MAX_INDEXED_TEXT_CHARS:
+        code = "EMPTY_DOCUMENT" if not document.text else "DOCUMENT_TOO_LARGE"
+        message = (
+            "document has no text"
+            if not document.text
+            else "document exceeds the local index character limit"
+        )
+        raise WorkspaceCapabilityError(code, message)
+    chunks: list[IndexedChunk] = []
+    if document.pages:
+        for page in document.pages:
+            chunks.extend(
+                _chunk_normalized_source(
+                    page.text,
+                    page_number=page.page_number,
+                    offset_basis="normalized_pdf_page_text_v1",
+                    first_chunk_index=len(chunks),
+                )
+            )
+    else:
+        chunks.extend(
+            _chunk_normalized_source(
+                document.text,
+                page_number=None,
+                offset_basis="normalized_document_text_v1",
+                first_chunk_index=0,
+            )
+        )
+    if not chunks:
+        raise WorkspaceCapabilityError("EMPTY_DOCUMENT", "document has no text")
+    if len(chunks) > MAX_RAG_CHUNKS_PER_DOCUMENT:
+        raise WorkspaceCapabilityError(
+            "TOO_MANY_CHUNKS", "document exceeds the local index chunk limit"
+        )
+    return tuple(chunks)
+
+
+def _chunk_text(text: str) -> tuple[str, ...]:
+    """Compatibility wrapper for non-paginated callers."""
+
+    document = ExtractedDocument(text=text, page_count=0, pages=())
+    return tuple(chunk.text for chunk in _chunk_document(document))
 
 
 class AkasicDBAdapter:
@@ -1054,9 +1251,18 @@ class AkasicDBAdapter:
         attachment_id: str,
         name: str,
         media_type: str,
-        text: str,
+        text: str | None = None,
+        document: ExtractedDocument | None = None,
     ) -> dict[str, object]:
-        chunks = _chunk_text(text)
+        if (text is None) == (document is None):
+            raise TypeError("provide exactly one of text or document")
+        if document is None:
+            if not isinstance(text, str):
+                raise TypeError("text must be str")
+            document = ExtractedDocument(text=text, page_count=0, pages=())
+        elif not isinstance(document, ExtractedDocument):
+            raise TypeError("document must be ExtractedDocument")
+        chunks = _chunk_document(document)
         document_entity = f"document:{attachment_id}"
         with self._lock:
             if attachment_id in self._indexed_attachments:
@@ -1066,8 +1272,8 @@ class AkasicDBAdapter:
                     "already_indexed": True,
                     "chunks": 0,
                 }
-            for index, chunk in enumerate(chunks):
-                entity = f"chunk:{attachment_id}:{index}"
+            for chunk in chunks:
+                entity = f"chunk:{attachment_id}:{chunk.chunk_index}"
                 self.graph_store.add_edge(document_entity, entity, "contains")
                 self.relational_store.insert(
                     entity,
@@ -1076,11 +1282,16 @@ class AkasicDBAdapter:
                         "attachment_id": attachment_id,
                         "name": name,
                         "media_type": media_type,
-                        "chunk_index": index,
-                        "chunk": chunk,
+                        "chunk_index": chunk.chunk_index,
+                        "chunk": chunk.text,
+                        "page_number": chunk.page_number,
+                        "char_start": chunk.char_start,
+                        "char_end": chunk.char_end,
+                        "offset_basis": chunk.offset_basis,
+                        "excerpt_sha256": chunk.excerpt_sha256,
                     },
                 )
-                self.vector_store.insert(entity, _stable_sha256_embedding(chunk))
+                self.vector_store.insert(entity, _stable_sha256_embedding(chunk.text))
                 self._chunk_ids.add(entity)
             self._indexed_attachments.add(attachment_id)
         return {
@@ -1088,6 +1299,7 @@ class AkasicDBAdapter:
             "indexed": True,
             "already_indexed": False,
             "chunks": len(chunks),
+            "page_count": document.page_count,
         }
 
     def query(self, query: str, *, limit: int = 5) -> dict[str, object]:
@@ -1139,6 +1351,11 @@ class AkasicDBAdapter:
                         "media_type": record.get("media_type"),
                         "chunk_index": record.get("chunk_index"),
                         "text": chunk_text,
+                        "page_number": record.get("page_number"),
+                        "char_start": record.get("char_start"),
+                        "char_end": record.get("char_end"),
+                        "offset_basis": record.get("offset_basis"),
+                        "excerpt_sha256": record.get("excerpt_sha256"),
                         "score": round(numeric_score, 8),
                     }
                 )
@@ -1454,22 +1671,28 @@ class WorkspaceCapabilityService:
             )
         return content
 
-    def _read_attachment_text(self, record: AttachmentRecord) -> str:
+    def _read_attachment_document(self, record: AttachmentRecord) -> ExtractedDocument:
         suffix = Path(record.name).suffix.casefold()
         content = self._verified_attachment_bytes(record)
         if suffix == ".pdf":
-            return _extract_pdf_text(content)
+            return _extract_pdf_document(content)
         if suffix not in _TEXT_MEDIA_TYPES:
             raise WorkspaceCapabilityError(
                 "ATTACHMENT_NOT_INDEXABLE",
                 "this attachment does not have a verified text extraction path",
             )
         try:
-            return content.decode("utf-8")
+            text = content.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise WorkspaceCapabilityError(
                 "INVALID_TEXT_ENCODING", "text attachments must be UTF-8"
             ) from exc
+        return ExtractedDocument(text=text, page_count=0, pages=())
+
+    def _read_attachment_text(self, record: AttachmentRecord) -> str:
+        """Compatibility wrapper for previews and legacy internal callers."""
+
+        return self._read_attachment_document(record).text
 
     def capability_payload(self) -> dict[str, object]:
         rag: dict[str, object]
@@ -1751,7 +1974,7 @@ class WorkspaceCapabilityService:
                 attachment_id=record.attachment_id,
                 name=record.name,
                 media_type=record.media_type,
-                text=self._read_attachment_text(record),
+                document=self._read_attachment_document(record),
             )
 
     def delete_attachment(self, attachment_id: str) -> dict[str, object]:
@@ -1853,7 +2076,26 @@ class WorkspaceCapabilityService:
                 "media_type": record.media_type,
                 "size_bytes": record.size_bytes,
             }
-            if suffix in _TEXT_MEDIA_TYPES or suffix == ".pdf":
+            if suffix == ".pdf":
+                document = self._read_attachment_document(record)
+                preview, truncated = _bounded_preview_text(document.text)
+                return {
+                    **base,
+                    "kind": "text",
+                    "text": preview,
+                    "truncated": truncated,
+                    "max_chars": MAX_ATTACHMENT_PREVIEW_CHARS,
+                    "extraction": "pypdf",
+                    "page_count": document.page_count,
+                    "pages": [
+                        {
+                            "page_number": page.page_number,
+                            "extracted_chars": len(page.text),
+                        }
+                        for page in document.pages
+                    ],
+                }
+            if suffix in _TEXT_MEDIA_TYPES:
                 preview, truncated = _bounded_preview_text(
                     self._read_attachment_text(record)
                 )
@@ -1863,7 +2105,7 @@ class WorkspaceCapabilityService:
                     "text": preview,
                     "truncated": truncated,
                     "max_chars": MAX_ATTACHMENT_PREVIEW_CHARS,
-                    "extraction": "pypdf" if suffix == ".pdf" else "utf8",
+                    "extraction": "utf8",
                 }
             if suffix in _BINARY_MEDIA_TYPES:
                 # Verify the bytes now; the authenticated content route repeats
@@ -1979,7 +2221,7 @@ class WorkspaceCapabilityService:
             )
         with self._lock:
             records: dict[str, AttachmentRecord] = {}
-            texts: dict[str, str] = {}
+            documents: dict[str, ExtractedDocument] = {}
             for attachment_id in attachment_ids:
                 record = self._attachments.get(attachment_id)
                 if record is None:
@@ -1992,16 +2234,16 @@ class WorkspaceCapabilityService:
                         "this attachment has no verified text extraction path",
                     )
                 records[attachment_id] = record
-                texts[attachment_id] = self._read_attachment_text(record)
+                documents[attachment_id] = self._read_attachment_document(record)
 
             previous = set(self._indexed_attachment_ids)
             target = previous | set(attachment_ids)
             target_records = {item: self._attachments[item] for item in sorted(target)}
-            target_texts = {
+            target_documents = {
                 item: (
-                    texts[item]
-                    if item in texts
-                    else self._read_attachment_text(target_records[item])
+                    documents[item]
+                    if item in documents
+                    else self._read_attachment_document(target_records[item])
                 )
                 for item in target_records
             }
@@ -2013,7 +2255,7 @@ class WorkspaceCapabilityService:
                         attachment_id=record.attachment_id,
                         name=record.name,
                         media_type=record.media_type,
-                        text=target_texts[item],
+                        document=target_documents[item],
                     )
                     if item in records:
                         indexed_results[item] = result
@@ -2070,7 +2312,7 @@ class WorkspaceCapabilityService:
                     raise WorkspaceCapabilityError(
                         "ATTACHMENT_NOT_FOUND", "attachment was not found"
                     )
-                if not record.text_indexable:
+                if not self._record_is_text_indexable(record):
                     raise WorkspaceCapabilityError(
                         "ATTACHMENT_NOT_INDEXABLE",
                         "this attachment has no verified text extraction path",
@@ -2082,12 +2324,13 @@ class WorkspaceCapabilityService:
             records = {item: self._attachments[item] for item in sorted(target)}
             # Read, integrity-check, extract, and chunk every source before the
             # active in-memory index is reset.
-            texts = {
-                item: self._read_attachment_text(record)
+            documents = {
+                item: self._read_attachment_document(record)
                 for item, record in records.items()
             }
             chunk_counts = {
-                item: len(_chunk_text(text)) for item, text in texts.items()
+                item: len(_chunk_document(document))
+                for item, document in documents.items()
             }
             try:
                 self.akasicdb.reset()
@@ -2096,7 +2339,7 @@ class WorkspaceCapabilityService:
                         attachment_id=record.attachment_id,
                         name=record.name,
                         media_type=record.media_type,
-                        text=texts[item],
+                        document=documents[item],
                     )
                 self._indexed_attachment_ids = target
                 self._persist_catalog()
@@ -2212,6 +2455,9 @@ __all__ = [
     "AKASICDB_REPOSITORY",
     "AkasicDBAdapter",
     "AttachmentRecord",
+    "ExtractedDocument",
+    "ExtractedPage",
+    "IndexedChunk",
     "MAX_ATTACHMENT_BYTES",
     "MAX_ATTACHMENT_PREVIEW_CHARS",
     "MAX_ATTACHMENT_TOTAL_BYTES",

@@ -4,6 +4,7 @@ import os
 from types import SimpleNamespace
 import unittest
 
+from scripts.gpu5_boundary_guard import PROJECT_GPU_UUID
 from scripts.validate_agent_completion import (
     DEFAULT_PROMPTS,
     PromptCase,
@@ -11,6 +12,7 @@ from scripts.validate_agent_completion import (
     _expected_factbook_identity,
     _korean_completion_metrics,
     _prompt_cases,
+    _query_nvidia_smi_gpu_memory_bytes,
     _read_process_rss_bytes,
     _sample_worker_memory,
     _sentence_repetition_metrics,
@@ -19,6 +21,7 @@ from scripts.validate_agent_completion import (
     _turn_record,
     _worker_snapshot,
     build_parser,
+    execute,
 )
 
 
@@ -73,6 +76,7 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         default = parser.parse_args(["--model", "m", "--manifest", "x"])
         stress = parser.parse_args(["--model", "m", "--manifest", "x", "--turns", "20"])
         self.assertEqual(default.turns, 20)
+        self.assertIsNone(default.physical_gpu_index)
         self.assertEqual(default.timeout, 120.0)
         self.assertEqual(stress.turns, 20)
         for value in ("0", "101", "not-a-number"):
@@ -82,6 +86,22 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
             parser.parse_args(
                 ["--model", "m", "--manifest", "x", "--timeout", "120.001"]
             )
+        selected = parser.parse_args(
+            ["--model", "m", "--manifest", "x", "--physical-gpu-index", "5"]
+        )
+        self.assertEqual(selected.physical_gpu_index, 5)
+        for value in ("0", "4", "6", "7", "not-a-number"):
+            with self.subTest(gpu=value), self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "--model",
+                        "m",
+                        "--manifest",
+                        "x",
+                        "--physical-gpu-index",
+                        value,
+                    ]
+                )
 
         diagnostic = [
             {
@@ -365,6 +385,129 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         self.assertFalse(checks["not_explicitly_truncated"])
         self.assertFalse(checks["korean_complete"])
 
+    def test_gpu_memory_query_fails_closed_without_project_selector(self):
+        calls = []
+
+        def forbidden_runner(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("nvidia-smi must not run without the selector")
+
+        self.assertEqual(
+            _query_nvidia_smi_gpu_memory_bytes(77, runner=forbidden_runner),
+            (None, "gpu_selector_required"),
+        )
+        self.assertEqual(
+            _query_nvidia_smi_gpu_memory_bytes(
+                77,
+                physical_gpu_index=6,
+                runner=forbidden_runner,
+            ),
+            (None, "gpu_selector_rejected"),
+        )
+        self.assertEqual(calls, [])
+
+    def test_gpu_memory_query_names_only_index5_and_checks_uuid(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((tuple(argv), kwargs))
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{PROJECT_GPU_UUID}, 77, 900\n",
+                stderr="",
+            )
+
+        measured = _query_nvidia_smi_gpu_memory_bytes(
+            77,
+            physical_gpu_index=5,
+            gpu_query_context="native-host",
+            runner=runner,
+        )
+        self.assertEqual(measured, (900 * 1024**2, "measured"))
+        self.assertEqual(calls[0][0][:3], ("nvidia-smi", "-i", "5"))
+        self.assertNotIn("6", calls[0][0][:3])
+        self.assertNotIn("7", calls[0][0][:3])
+        self.assertEqual(calls[0][1]["timeout"], 5)
+
+        def wrong_uuid(argv, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout="GPU-wrong, 77, 900\n",
+                stderr="",
+            )
+
+        self.assertEqual(
+            _query_nvidia_smi_gpu_memory_bytes(
+                77,
+                physical_gpu_index=5,
+                gpu_query_context="native-host",
+                runner=wrong_uuid,
+            ),
+            (None, "gpu_uuid_mismatch"),
+        )
+
+    def test_container_gpu_memory_query_uses_uuid_aggregate_not_worker_pid(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((tuple(argv), kwargs))
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{PROJECT_GPU_UUID}, 900\n",
+                stderr="",
+            )
+
+        measured = _query_nvidia_smi_gpu_memory_bytes(
+            999999,
+            physical_gpu_index=5,
+            gpu_query_context="gpu5-container",
+            runner=runner,
+        )
+        self.assertEqual(measured, (900 * 1024**2, "measured_aggregate"))
+        self.assertEqual(calls[0][0][:3], ("nvidia-smi", "-i", PROJECT_GPU_UUID))
+        self.assertIn("--query-gpu=uuid,memory.used", calls[0][0])
+        self.assertFalse(any("query-compute-apps" in token for token in calls[0][0]))
+
+        def forbidden_runner(*args, **kwargs):
+            raise AssertionError("invalid context must not run nvidia-smi")
+
+        self.assertEqual(
+            _query_nvidia_smi_gpu_memory_bytes(
+                77, physical_gpu_index=5, runner=forbidden_runner
+            ),
+            (None, "gpu_query_context_required"),
+        )
+
+    def test_execute_without_physical_selector_fails_before_model_or_cuda(self):
+        report, code = execute(
+            SimpleNamespace(
+                model="does-not-exist",
+                manifest="does-not-exist",
+                timeout=120.0,
+                turns=1,
+                output=None,
+            )
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("GPU5BoundaryError", report["error"])
+        self.assertNotIn("verified_files", report)
+
+    def test_execute_without_gpu_query_context_fails_before_model_or_cuda(self):
+        report, code = execute(
+            SimpleNamespace(
+                model="does-not-exist",
+                manifest="does-not-exist",
+                timeout=120.0,
+                turns=1,
+                output=None,
+                physical_gpu_index=5,
+                gpu_query_context=None,
+            )
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("GPU5BoundaryError", report["error"])
+        self.assertNotIn("verified_files", report)
+
     def test_memory_sampler_keeps_gpu_unverified_separate_from_rss(self):
         observed = _sample_worker_memory(
             77,
@@ -457,7 +600,39 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         summary = _summarize_turns([first, second], 2)
         self.assertEqual(summary["turn_success_rate"], 0.5)
         self.assertFalse(summary["strict_turn_gate_passed"])
-        self.assertEqual(summary["gpu_memory_verdict"], "passed")
+        self.assertFalse(summary["gpu_memory_gate_passed"])
+        self.assertEqual(summary["gpu_memory_verdict"], "failed")
+
+    def test_release_gate_requires_full_gpu_memory_coverage(self):
+        base = {
+            "passed": True,
+            "checks": {},
+            "repetition": {},
+            "worker": _healthy_worker(),
+            "generation_mode": "cogni_core",
+        }
+        complete = _summarize_turns([dict(base) for _ in range(20)], 20)
+        self.assertTrue(complete["gpu_memory_gate_passed"])
+        self.assertEqual(complete["gpu_memory_coverage_rate"], 1.0)
+        self.assertEqual(complete["gpu_memory_verdict"], "passed")
+        self.assertTrue(complete["strict_turn_gate_passed"])
+
+        missing = [dict(base) for _ in range(20)]
+        missing[-1] = {**base, "worker": _healthy_worker(gpu_bytes=None)}
+        incomplete = _summarize_turns(missing, 20)
+        self.assertFalse(incomplete["gpu_memory_gate_passed"])
+        self.assertEqual(incomplete["gpu_memory_verdict"], "failed")
+        self.assertFalse(incomplete["strict_turn_gate_passed"])
+
+        missing_resident = {**base, "worker": _healthy_worker(gpu_bytes=None)}
+        nonresident = {**base, "worker": _healthy_worker()}
+        nonresident["worker"]["expected_running"] = False
+        uncompensated = _summarize_turns([missing_resident, nonresident], 2)
+        self.assertEqual(uncompensated["worker_expected_turns"], 1)
+        self.assertEqual(uncompensated["gpu_memory_observed_turns"], 0)
+        self.assertEqual(uncompensated["gpu_memory_coverage_rate"], 0.0)
+        self.assertFalse(uncompensated["gpu_memory_gate_passed"])
+        self.assertEqual(uncompensated["gpu_memory_verdict"], "unverified")
 
     def test_turn_record_rejects_substantive_cross_turn_sentence_echo(self):
         prior = (

@@ -53,6 +53,11 @@ from cogni_agent.response_quality import (  # noqa: E402
     response_satisfies_intent,
 )
 from cogni_agent.tools import WorkspaceToolExecutor  # noqa: E402
+from scripts.gpu5_boundary_guard import (  # noqa: E402
+    GPU5BoundaryError,
+    PROJECT_GPU_UUID,
+    require_project_gpu_index,
+)
 from cogni_flow.rhythm import RhythmController  # noqa: E402
 from cogni_os.artifacts import verify_artifact_manifest  # noqa: E402
 from cogni_os.factbook import build_runtime_factbook_from_verified  # noqa: E402
@@ -75,6 +80,7 @@ DEFAULT_TURNS = 20
 RECOMMENDED_STRESS_TURNS = 20
 MAX_STRESS_TURNS = 100
 MAX_INTERACTIVE_TURN_SECONDS = 120.0
+GPU_MEMORY_LIMIT_BYTES = int(16.7 * 1024**3)
 STRESS_PROMPTS = (
     "온디바이스 AI의 장점 두 가지와 한계 한 가지를 세 문장으로 설명하세요. 같은 문장을 반복하지 마세요.",
     "사용자가 잘못된 사실을 정정했을 때 대화형 AI가 취해야 할 절차를 세 단계로 간결하게 답하세요.",
@@ -203,6 +209,19 @@ def _bounded_timeout(value: str) -> float:
             f"timeout must be in [1, {MAX_INTERACTIVE_TURN_SECONDS:.0f}] seconds"
         )
     return timeout
+
+
+def _bounded_physical_gpu_index(value: str) -> int:
+    try:
+        index = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "physical GPU index must be an integer"
+        ) from error
+    try:
+        return require_project_gpu_index(index)
+    except GPU5BoundaryError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _prompt_cases(turns: int) -> tuple[PromptCase, ...]:
@@ -542,12 +561,40 @@ def _read_process_rss_bytes(pid: int) -> int:
     return int(completed.stdout.strip().split()[0]) * 1024
 
 
-def _query_nvidia_smi_gpu_memory_bytes(pid: int) -> tuple[int | None, str]:
+def _query_nvidia_smi_gpu_memory_bytes(
+    pid: int,
+    *,
+    physical_gpu_index: int | None = None,
+    gpu_query_context: str | None = None,
+    runner: Any = subprocess.run,
+) -> tuple[int | None, str]:
     try:
-        completed = subprocess.run(
+        selected_index = require_project_gpu_index(physical_gpu_index)
+    except GPU5BoundaryError:
+        return None, (
+            "gpu_selector_required"
+            if physical_gpu_index is None
+            else "gpu_selector_rejected"
+        )
+    if gpu_query_context == "native-host":
+        query_selector = str(selected_index)
+        query_argument = "--query-compute-apps=gpu_uuid,pid,used_gpu_memory"
+    elif gpu_query_context == "gpu5-container":
+        query_selector = PROJECT_GPU_UUID
+        query_argument = "--query-gpu=uuid,memory.used"
+    else:
+        return None, (
+            "gpu_query_context_required"
+            if gpu_query_context is None
+            else "gpu_query_context_rejected"
+        )
+    try:
+        completed = runner(
             [
                 "nvidia-smi",
-                "--query-compute-apps=pid,used_gpu_memory",
+                "-i",
+                query_selector,
+                query_argument,
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -559,15 +606,33 @@ def _query_nvidia_smi_gpu_memory_bytes(pid: int) -> tuple[int | None, str]:
         return None, f"unavailable:{type(error).__name__}"
     if completed.returncode != 0:
         return None, f"command_failed:{completed.returncode}"
+    if not isinstance(completed.stdout, str) or len(completed.stdout) > 65_536:
+        return None, "invalid_output"
+    if gpu_query_context == "gpu5-container":
+        rows = [
+            [field.strip() for field in line.split(",", 1)]
+            for line in completed.stdout.splitlines()
+            if line.strip()
+        ]
+        if len(rows) != 1 or len(rows[0]) != 2:
+            return None, "invalid_output"
+        gpu_uuid, memory_used = rows[0]
+        if gpu_uuid != PROJECT_GPU_UUID:
+            return None, "gpu_uuid_mismatch"
+        if re.fullmatch(r"\d+(?:\.\d+)?", memory_used) is None:
+            return None, "driver_unreported"
+        return int(float(memory_used) * 1024**2), "measured_aggregate"
     total_mib = 0
     matched = False
     unreported = False
     for line in completed.stdout.splitlines():
-        fields = [field.strip() for field in line.split(",", 1)]
-        if len(fields) != 2 or fields[0] != str(pid):
+        fields = [field.strip() for field in line.split(",", 2)]
+        if len(fields) != 3 or fields[1] != str(pid):
             continue
+        if fields[0] != PROJECT_GPU_UUID:
+            return None, "gpu_uuid_mismatch"
         matched = True
-        value = fields[1]
+        value = fields[2]
         if value.casefold() in {"n/a", "[n/a]", "not supported"}:
             unreported = True
             continue
@@ -589,6 +654,8 @@ def _sample_worker_memory(
     vram_limit_bytes: int,
     rss_reader: Any = _read_process_rss_bytes,
     gpu_reader: Any = _query_nvidia_smi_gpu_memory_bytes,
+    physical_gpu_index: int | None = None,
+    gpu_query_context: str | None = None,
 ) -> dict[str, Any]:
     if pid is None:
         return {
@@ -607,7 +674,14 @@ def _sample_worker_memory(
         rss_bytes = None
         rss_status = f"unavailable:{type(error).__name__}"
     try:
-        gpu_bytes, gpu_status = gpu_reader(pid)
+        if physical_gpu_index is None and gpu_query_context is None:
+            gpu_bytes, gpu_status = gpu_reader(pid)
+        else:
+            gpu_bytes, gpu_status = gpu_reader(
+                pid,
+                physical_gpu_index=physical_gpu_index,
+                gpu_query_context=gpu_query_context,
+            )
     except BaseException as error:
         gpu_bytes = None
         gpu_status = f"unavailable:{type(error).__name__}"
@@ -739,12 +813,22 @@ def _worker_snapshot(
     stable_pid: int | None,
     vram_limit_bytes: int,
     memory_sampler: Any = _sample_worker_memory,
+    physical_gpu_index: int | None = None,
+    gpu_query_context: str | None = None,
 ) -> dict[str, Any]:
     running = bool(service.is_running)
     pid = service.worker_pid
     active_request_id = service.active_request_id
     pid_stable = stable_pid is None or pid == stable_pid
-    memory = memory_sampler(pid, vram_limit_bytes=vram_limit_bytes)
+    memory_kwargs = {"vram_limit_bytes": vram_limit_bytes}
+    if physical_gpu_index is not None:
+        memory_kwargs["physical_gpu_index"] = physical_gpu_index
+    if gpu_query_context is not None:
+        memory_kwargs["gpu_query_context"] = gpu_query_context
+    memory = memory_sampler(
+        pid,
+        **memory_kwargs,
+    )
     worker_healthy = (
         active_request_id is None
         and pid_stable
@@ -896,21 +980,27 @@ def _summarize_turns(
             worker_expected_turns += 1
             if memory.get("memory_observed") is True:
                 worker_memory_observed_turns += 1
-        rss = memory.get("worker_rss_bytes")
-        gpu = memory.get("worker_gpu_memory_bytes")
-        if isinstance(rss, int):
-            peak_rss = max(peak_rss, rss)
-        if isinstance(gpu, int):
-            gpu_samples += 1
-            peak_gpu = max(peak_gpu, gpu)
-            if memory.get("gpu_memory_within_limit") is False:
-                gpu_over_limit += 1
+            rss = memory.get("worker_rss_bytes")
+            gpu = memory.get("worker_gpu_memory_bytes")
+            if isinstance(rss, int):
+                peak_rss = max(peak_rss, rss)
+            if isinstance(gpu, int):
+                gpu_samples += 1
+                peak_gpu = max(peak_gpu, gpu)
+                if memory.get("gpu_memory_within_limit") is False:
+                    gpu_over_limit += 1
     success_rate = 0.0 if requested_turns <= 0 else passed_turns / int(requested_turns)
     # A bounded safety answer is valid UI behavior, but it is not a completed
     # model answer. Release evidence therefore permits no quality fallback.
     allowed_quality_fallback_turns = 0
     quality_fallback_gate_passed = (
         quality_fallback_turns <= allowed_quality_fallback_turns
+    )
+    gpu_memory_gate_passed = (
+        worker_expected_turns > 0
+        and gpu_samples == worker_expected_turns
+        and gpu_over_limit == 0
+        and peak_gpu <= GPU_MEMORY_LIMIT_BYTES
     )
     return {
         "requested_turns": int(requested_turns),
@@ -952,14 +1042,16 @@ def _summarize_turns(
         "gpu_memory_verdict": (
             "unverified"
             if gpu_samples == 0
-            else ("failed" if gpu_over_limit else "passed")
+            else ("passed" if gpu_memory_gate_passed else "failed")
         ),
+        "gpu_memory_gate_passed": gpu_memory_gate_passed,
         "release_schedule_gate_passed": requested_turns == RECOMMENDED_STRESS_TURNS
         and len(turns) == RECOMMENDED_STRESS_TURNS,
         "strict_turn_gate_passed": requested_turns == RECOMMENDED_STRESS_TURNS
         and len(turns) == requested_turns
         and passed_turns == requested_turns
-        and quality_fallback_gate_passed,
+        and quality_fallback_gate_passed
+        and gpu_memory_gate_passed,
     }
 
 
@@ -977,6 +1069,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=_bounded_timeout,
         default=MAX_INTERACTIVE_TURN_SECONDS,
+    )
+    parser.add_argument(
+        "--physical-gpu-index",
+        type=_bounded_physical_gpu_index,
+        help=(
+            "required execution selector; this server project accepts physical GPU "
+            "5 only and never enumerates other devices"
+        ),
+    )
+    parser.add_argument(
+        "--gpu-query-context",
+        choices=("native-host", "gpu5-container"),
+        help=(
+            "required nvidia-smi selector mode: physical index 5 on the host or "
+            "the pinned GPU5 UUID inside Docker's logical cuda:0 namespace"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -1026,7 +1134,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             f"timeout must be in [1, {MAX_INTERACTIVE_TURN_SECONDS:.0f}] seconds"
         )
     cases = _prompt_cases(requested_turns)
-    vram_limit_bytes = int(16.7 * 1024**3)
+    vram_limit_bytes = GPU_MEMORY_LIMIT_BYTES
     report: dict[str, Any] = {
         "schema": "cogni.agent.completion.stress.v1",
         "status": "running",
@@ -1049,14 +1157,16 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 f"every turn must finish within {MAX_INTERACTIVE_TURN_SECONDS:.0f} seconds"
             ),
             "memory": (
-                "worker RSS is required when resident; GPU memory is reported separately "
-                "as unverified when the driver does not expose a per-process value"
+                "pinned GPU5 UUID aggregate memory must be observed on every resident "
+                "turn, remain at or below 16.7 GiB, and have zero over-limit samples"
             ),
         },
         "turns": [],
         "all_checks_passed": False,
     }
     service: ModelService | None = None
+    physical_gpu_index: int | None = None
+    gpu_query_context: str | None = None
     managers: dict[str, AgentManager] = {}
     leases = GPULeaseManager()
     rhythm = RhythmController()
@@ -1065,10 +1175,28 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     stable_worker_pid: int | None = None
     expected_factbook: dict[str, Any] | None = None
     try:
+        physical_gpu_index = require_project_gpu_index(
+            getattr(args, "physical_gpu_index", None)
+        )
+        report["physical_gpu_index"] = physical_gpu_index
+        gpu_query_context = getattr(args, "gpu_query_context", None)
+        if gpu_query_context not in {"native-host", "gpu5-container"}:
+            raise GPU5BoundaryError("an explicit valid GPU query context is required")
+        report["gpu_query_context"] = gpu_query_context
         verified = verify_artifact_manifest(args.model, args.manifest)
         report["verified_files"] = len(verified.files)
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for the real-model completion test")
+        logical_device_count = int(torch.cuda.device_count())
+        logical_device_index = int(torch.cuda.current_device())
+        if gpu_query_context == "gpu5-container" and (
+            logical_device_count != 1 or logical_device_index != 0
+        ):
+            raise GPU5BoundaryError(
+                "GPU5 container must expose one logical device mapped to cuda:0"
+            )
+        report["logical_cuda_device_count"] = logical_device_count
+        report["logical_cuda_device_index"] = logical_device_index
         report["cuda_device"] = torch.cuda.get_device_name(0)
         factbook = build_runtime_factbook_from_verified(
             verified,
@@ -1154,6 +1282,8 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 expected_running=expected_worker,
                 stable_pid=stable_worker_pid,
                 vram_limit_bytes=vram_limit_bytes,
+                physical_gpu_index=physical_gpu_index,
+                gpu_query_context=gpu_query_context,
             )
             if stable_worker_pid is None and worker["running"]:
                 stable_worker_pid = int(worker["pid"])
@@ -1225,6 +1355,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         }
         report["all_checks_passed"] = bool(
             report["summary"]["strict_turn_gate_passed"]
+            and report["summary"]["gpu_memory_gate_passed"]
             and report["worker_cleaned"]
             and report["gpu_lease_released"]
             and "cleanup_error" not in report

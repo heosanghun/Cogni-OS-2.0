@@ -288,6 +288,7 @@ const ui = {
   evidenceDrawerRequestId: 0,
   evidenceDrawerAbortController: null,
   evidenceDrawerReturnFocus: null,
+  evidenceDrawerOpenerIdentity: null,
 };
 
 function $(selector, root = document) {
@@ -365,6 +366,21 @@ function normalizedAttachment(item) {
   };
 }
 
+function parseCanonicalRagSourceId(rawSourceId) {
+  if (
+    typeof rawSourceId !== "string"
+    || !/^[0-9a-f]{24}\.(?:0|[1-9][0-9]{0,2})$/.test(rawSourceId)
+  ) return null;
+  const separator = rawSourceId.lastIndexOf(".");
+  const chunkIndex = Number(rawSourceId.slice(separator + 1));
+  if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex > 127) return null;
+  return Object.freeze({
+    sourceId: rawSourceId,
+    attachmentId: rawSourceId.slice(0, separator),
+    chunkIndex,
+  });
+}
+
 function normalizedRetrievalSources(items) {
   if (!Array.isArray(items)) return [];
   const seen = new Set();
@@ -379,18 +395,15 @@ function normalizedRetrievalSources(items) {
     const score = Number.isFinite(item.score)
       ? Math.max(0, Math.min(1, Number(item.score)))
       : null;
-    const sourceId = typeof item.source_id === "string"
-      ? item.source_id.replace(/[^0-9a-zA-Z._-]/g, "").slice(0, 128)
-      : "";
-    const sourceMatch = /^([0-9a-f]{24})\.(\d{1,3})$/.exec(sourceId);
+    const sourceIdentity = parseCanonicalRagSourceId(item.source_id);
     seen.add(number);
     sources.push({
       number,
       title,
       score,
-      sourceId,
-      attachmentId: sourceMatch ? sourceMatch[1] : "",
-      chunkIndex: sourceMatch ? Number(sourceMatch[2]) : null,
+      sourceId: sourceIdentity?.sourceId || "",
+      attachmentId: sourceIdentity?.attachmentId || "",
+      chunkIndex: sourceIdentity?.chunkIndex ?? null,
     });
   });
   return sources;
@@ -582,6 +595,78 @@ function setEvidenceDrawerState(state, copy) {
   status.setAttribute("aria-live", state === "error" ? "assertive" : "polite");
 }
 
+function evidenceTriggerMatchesIdentity(trigger, identity) {
+  if (
+    !identity
+    || !/^[0-9a-f]{24}$/.test(identity.attachmentId)
+    || !Number.isInteger(identity.chunkIndex)
+    || identity.chunkIndex < 0
+    || identity.chunkIndex > 127
+  ) return false;
+  const candidate = evidenceSourceFromTrigger(trigger);
+  return Boolean(
+    candidate
+    && candidate.attachmentId === identity.attachmentId
+    && candidate.chunkIndex === identity.chunkIndex
+  );
+}
+
+function evidenceOpenerIdentity(source, returnFocus) {
+  if (
+    !source
+    || !/^[0-9a-f]{24}$/.test(source.attachmentId)
+    || !Number.isInteger(source.chunkIndex)
+    || source.chunkIndex < 0
+    || source.chunkIndex > 127
+  ) return null;
+  const message = (
+    returnFocus instanceof HTMLElement
+    && evidenceTriggerMatchesIdentity(returnFocus, source)
+  )
+    ? returnFocus.closest(".chat-message")
+    : null;
+  const rawMessageId = message?.dataset.messageId;
+  const messageId = typeof rawMessageId === "string" && rawMessageId.length <= 128
+    ? rawMessageId
+    : "";
+  return Object.freeze({
+    attachmentId: source.attachmentId,
+    chunkIndex: source.chunkIndex,
+    messageId,
+  });
+}
+
+function latestEvidenceOpener(identity) {
+  const transcript = $("#chat-transcript");
+  if (!(transcript instanceof HTMLElement) || !identity) return null;
+  const matching = $$(
+    'button[data-action="rag-evidence-open"]',
+    transcript,
+  ).filter(
+    (candidate) => (
+      !candidate.disabled
+      && candidate.isConnected
+      && evidenceTriggerMatchesIdentity(candidate, identity)
+    ),
+  );
+  if (!matching.length) return null;
+  if (identity.messageId) {
+    const sameMessage = matching.filter((candidate) => {
+      const candidateMessage = candidate.closest(".chat-message");
+      return candidateMessage?.dataset.messageId === identity.messageId;
+    });
+    if (sameMessage.length) return sameMessage[sameMessage.length - 1];
+  }
+  return matching[matching.length - 1];
+}
+
+function evidenceDrawerFallbackFocus() {
+  const transcript = $("#chat-transcript");
+  if (transcript instanceof HTMLElement && transcript.isConnected) return transcript;
+  const input = $("#agent-input");
+  return input instanceof HTMLElement && input.isConnected ? input : null;
+}
+
 function closeRagEvidenceDrawer() {
   ui.evidenceDrawerRequestId += 1;
   if (ui.evidenceDrawerAbortController) {
@@ -596,8 +681,20 @@ function closeRagEvidenceDrawer() {
   }
   if (layer) layer.hidden = true;
   const returnFocus = ui.evidenceDrawerReturnFocus;
+  const openerIdentity = ui.evidenceDrawerOpenerIdentity;
   ui.evidenceDrawerReturnFocus = null;
-  if (returnFocus instanceof HTMLElement && returnFocus.isConnected) returnFocus.focus();
+  ui.evidenceDrawerOpenerIdentity = null;
+  const connectedExactOpener = (
+    returnFocus instanceof HTMLElement
+    && returnFocus.isConnected
+    && evidenceTriggerMatchesIdentity(returnFocus, openerIdentity)
+  )
+    ? returnFocus
+    : null;
+  const focusTarget = connectedExactOpener
+    || latestEvidenceOpener(openerIdentity)
+    || evidenceDrawerFallbackFocus();
+  focusTarget?.focus({ preventScroll: true });
 }
 
 async function openRagEvidenceSource(source, returnFocus) {
@@ -611,12 +708,13 @@ async function openRagEvidenceSource(source, returnFocus) {
   if (ui.evidenceDrawerAbortController) ui.evidenceDrawerAbortController.abort();
   const requestId = ui.evidenceDrawerRequestId + 1;
   ui.evidenceDrawerRequestId = requestId;
-  ui.evidenceDrawerReturnFocus = returnFocus instanceof HTMLElement ? returnFocus : null;
   const layer = $("#evidence-drawer-layer");
   const drawer = $("#evidence-drawer");
   const excerpt = $("#evidence-drawer-excerpt");
   const empty = $("#evidence-drawer-empty");
   if (!layer || !drawer || !excerpt || !empty) return;
+  ui.evidenceDrawerReturnFocus = returnFocus instanceof HTMLElement ? returnFocus : null;
+  ui.evidenceDrawerOpenerIdentity = evidenceOpenerIdentity(source, returnFocus);
   excerpt.textContent = "";
   excerpt.hidden = true;
   empty.hidden = false;

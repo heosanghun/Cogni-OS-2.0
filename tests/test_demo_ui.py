@@ -333,6 +333,25 @@ class TestCogniBoardUI(unittest.TestCase):
         )
         self.assertIn("normalizedRetrievalSources(items)", script)
         self.assertIn("rawTitle.replace", script)
+        self.assertIn("function parseCanonicalRagSourceId", script)
+        self.assertIn(
+            r"/^[0-9a-f]{24}\.(?:0|[1-9][0-9]{0,2})$/.test(rawSourceId)",
+            script,
+        )
+        self.assertIn(
+            "const sourceIdentity = parseCanonicalRagSourceId(item.source_id)",
+            script,
+        )
+        self.assertIn("chunkIndex > 127", script)
+        normalization_start = script.index("function normalizedRetrievalSources")
+        normalization_end = script.index(
+            "function configureRagEvidenceButton", normalization_start
+        )
+        normalization = script[normalization_start:normalization_end]
+        self.assertNotIn(
+            'item.source_id.replace(/[^0-9a-zA-Z._-]/g, "")',
+            normalization,
+        )
         self.assertIn(
             "title.textContent = `[근거 ${source.number}] ${source.title}`", script
         )
@@ -463,7 +482,26 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("ui.evidenceDrawerRequestId += 1", script)
         self.assertIn("ui.evidenceDrawerAbortController.abort()", script)
         self.assertIn("requestId !== ui.evidenceDrawerRequestId", script)
+        self.assertIn("evidenceDrawerOpenerIdentity: null", script)
         self.assertIn("returnFocus instanceof HTMLElement", script)
+        self.assertIn("function evidenceTriggerMatchesIdentity", script)
+        self.assertIn("function evidenceOpenerIdentity", script)
+        self.assertIn("function latestEvidenceOpener", script)
+        self.assertIn("candidate.attachmentId === identity.attachmentId", script)
+        self.assertIn("candidate.chunkIndex === identity.chunkIndex", script)
+        self.assertIn(
+            "candidateMessage?.dataset.messageId === identity.messageId",
+            script,
+        )
+        self.assertIn("return matching[matching.length - 1]", script)
+        self.assertIn("function evidenceDrawerFallbackFocus", script)
+        self.assertIn('const transcript = $("#chat-transcript")', script)
+        self.assertIn('const input = $("#agent-input")', script)
+        self.assertIn(
+            "evidenceTriggerMatchesIdentity(returnFocus, openerIdentity)", script
+        )
+        self.assertIn("latestEvidenceOpener(openerIdentity)", script)
+        self.assertIn("evidenceDrawerFallbackFocus()", script)
         self.assertIn(
             "event.target === event.currentTarget) closeRagEvidenceDrawer()", script
         )

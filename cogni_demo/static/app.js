@@ -20,6 +20,7 @@ const MAX_PROPOSAL_DIFF_CHARS = 40000;
 const MAX_PROPOSAL_REVIEW_TEXT_CHARS = 4096;
 const MAX_ATTACHMENT_UPLOAD_BYTES = 8 * 1024 * 1024;
 const MAX_ATTACHMENT_UPLOAD_COUNT = 32;
+const MAX_LIVE_VRAM_LIMIT_GIB = 16.7;
 const ATTACHMENT_CONTENT_ENDPOINT = "/api/workspace/attachments/content";
 const RAG_SOURCE_ENDPOINT = "/api/workspace/rag/source";
 const MAX_RAG_SOURCE_TEXT_CHARS = 12000;
@@ -320,6 +321,89 @@ function setText(selector, value) {
 
 function finiteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function normalizedLiveRuntimeMetrics(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const measuredAt = typeof raw.measured_at === "string" ? raw.measured_at : "";
+  const source = typeof raw.source === "string" ? raw.source : "";
+  const device = typeof raw.device === "string" ? raw.device.trim() : "";
+  const modelClass = typeof raw.model_class === "string" ? raw.model_class.trim() : "";
+  if (
+    raw.evidence_kind !== "live_runtime_validation"
+    || !measuredAt
+    || measuredAt.length > 128
+    || Number.isNaN(Date.parse(measuredAt))
+    || source !== "scripts/validate_gemma4_runtime.py --event-stream"
+    || raw.target !== "RTX 4090 24GB"
+    || !device
+    || device.length > 256
+    || !modelClass
+    || modelClass.length > 128
+  ) return null;
+  if (
+    !Number.isInteger(raw.verified_files)
+    || raw.verified_files <= 0
+    || !Number.isInteger(raw.hidden_size)
+    || raw.hidden_size <= 0
+    || !finiteNumber(raw.load_seconds)
+    || raw.load_seconds < 0
+    || !finiteNumber(raw.inference_seconds)
+    || raw.inference_seconds < 0
+    || raw.requested_depth !== 100
+    || raw.reached_depth !== raw.requested_depth
+    || !Number.isInteger(raw.nodes_used)
+    || raw.nodes_used <= 0
+    || !Number.isInteger(raw.node_capacity)
+    || raw.node_capacity <= 0
+    || raw.nodes_used > raw.node_capacity
+    || !Number.isInteger(raw.search_allocated_bytes)
+    || raw.search_allocated_bytes <= 0
+  ) return null;
+  if (
+    raw.transition_converged !== true
+    || raw.finite !== true
+    || !finiteNumber(raw.transition_residual)
+    || raw.transition_residual < 0
+    || raw.transition_residual > 0.005
+    || raw.cts_protocol_version !== "SearchRequestV2"
+    || raw.safe_for_decode !== true
+    || raw.unsafe_silent_fallbacks !== 0
+    || raw.linear_solve_fallbacks !== 0
+    || raw.transition_used_fallback !== false
+    || raw.solver_rank !== 16
+    || !Number.isInteger(raw.solver_history_peak)
+    || raw.solver_history_peak < 1
+    || raw.solver_history_peak > 16
+  ) return null;
+  if (
+    !Number.isInteger(raw.solver_failures)
+    || raw.solver_failures < 0
+    || raw.failed_edges !== raw.solver_failures
+    || raw.q_zero_backups !== raw.failed_edges
+    || !Number.isInteger(raw.mac_budget)
+    || !Number.isInteger(raw.mac_reserved)
+    || raw.mac_reserved <= 0
+    || raw.mac_reserved > raw.mac_budget
+    || raw.act_applied !== 301
+    || typeof raw.trace_digest !== "string"
+    || !/^[0-9a-f]{64}$/.test(raw.trace_digest)
+    || raw.causal_bridge_answer_bearing !== true
+    || raw.causal_bridge_bias_nonzero !== true
+    || !finiteNumber(raw.causal_bridge_bias_max)
+    || raw.causal_bridge_bias_max <= 0
+    || raw.causal_bridge_bias_max > 0.1
+    || raw.conditioned_generated_tokens !== 1
+  ) return null;
+  if (
+    !finiteNumber(raw.vram_limit_gib)
+    || raw.vram_limit_gib <= 0
+    || raw.vram_limit_gib > MAX_LIVE_VRAM_LIMIT_GIB
+    || !finiteNumber(raw.peak_vram_gib)
+    || raw.peak_vram_gib < 0
+    || raw.peak_vram_gib > raw.vram_limit_gib
+  ) return null;
+  return Object.freeze({ ...raw, device, model_class: modelClass });
 }
 
 function showToast(message, tone = "info") {
@@ -692,6 +776,7 @@ function closeRagEvidenceDrawer() {
     excerpt.hidden = true;
   }
   if (layer) layer.hidden = true;
+  syncModalBackgroundBlock();
   const returnFocus = ui.evidenceDrawerReturnFocus;
   const openerIdentity = ui.evidenceDrawerOpenerIdentity;
   ui.evidenceDrawerReturnFocus = null;
@@ -744,6 +829,7 @@ async function openRagEvidenceSource(source, returnFocus) {
   setEvidenceDrawerState("loading", "정확한 로컬 원문을 불러오고 있습니다.");
   layer.hidden = false;
   drawer.focus();
+  syncModalBackgroundBlock();
   const controller = new AbortController();
   ui.evidenceDrawerAbortController = controller;
   try {
@@ -812,6 +898,22 @@ function trapFocusWithin(event, root) {
     event.preventDefault();
     first.focus();
   }
+}
+
+function syncModalBackgroundBlock() {
+  const modalOpen = [
+    "#attachment-preview-layer",
+    "#evidence-drawer-layer",
+    "#proposal-review-layer",
+  ].some((selector) => {
+    const layer = $(selector);
+    return layer instanceof HTMLElement && !layer.hidden;
+  });
+  const shell = $(".app-shell");
+  if (!(shell instanceof HTMLElement)) return;
+  shell.inert = modalOpen;
+  if (modalOpen) shell.setAttribute("aria-hidden", "true");
+  else shell.removeAttribute("aria-hidden");
 }
 
 function renderWorkspaceAttachments() {
@@ -951,6 +1053,14 @@ function updateExternalCallDisclosure(mode, externalCalls) {
   setText("#external-call-count", verified ? String(externalCalls) : "—");
   setText("#telemetry-external-calls", disclosure);
   setText("#rail-external-calls", disclosure);
+  setText(
+    "#mission-external-calls",
+    !verified
+      ? "UNVERIFIED · 앱 외부 호출 상태 미검증"
+      : mode === "online_opt_in"
+        ? `ONLINE OPT-IN · 앱 외부 호출 ${externalCalls}회`
+        : `LOCAL ONLY · 앱 외부 호출 ${externalCalls}회`,
+  );
   const pill = $("#network-mode-pill");
   pill?.classList.toggle("status-local", verified && mode === "air_gapped");
   pill?.classList.toggle("is-online-opt-in", verified && mode === "online_opt_in");
@@ -962,8 +1072,11 @@ function updateExternalCallDisclosure(mode, externalCalls) {
 
 function applyWorkspaceCapabilities(capabilities) {
   if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
+    ui.lensConnectorReady = false;
     updateExternalCallDisclosure("", null);
-    return;
+    setText("#agent-web-status", "미검증");
+    updateWorkspaceControlStates();
+    return false;
   }
   ui.workspaceCapabilities = capabilities;
   ui.workspaceCapabilitiesLoaded = true;
@@ -1081,6 +1194,20 @@ function applyWorkspaceCapabilities(capabilities) {
   renderWorkspaceModels(capabilities.models || {});
   renderWorkspaceAttachments();
   updateWorkspaceControlStates();
+  return true;
+}
+
+async function refreshWorkspaceCapabilityDisclosure() {
+  try {
+    const capabilities = await api("/api/workspace/capabilities");
+    return applyWorkspaceCapabilities(capabilities) === true;
+  } catch (_) {
+    ui.lensConnectorReady = false;
+    updateExternalCallDisclosure("", null);
+    setText("#agent-web-status", "미검증");
+    updateWorkspaceControlStates();
+    return false;
+  }
 }
 
 function updateWorkspaceControlStates() {
@@ -1424,6 +1551,7 @@ function closeWorkspaceAttachmentPreview() {
     text.hidden = true;
   }
   if (layer) layer.hidden = true;
+  syncModalBackgroundBlock();
   const returnFocus = ui.previewReturnFocus;
   ui.previewReturnFocus = null;
   if (returnFocus instanceof HTMLElement && returnFocus.isConnected) returnFocus.focus();
@@ -1542,6 +1670,7 @@ function renderProposalReview(payload) {
 function closeProposalReview() {
   const layer = $("#proposal-review-layer");
   if (layer) layer.hidden = true;
+  syncModalBackgroundBlock();
   const returnFocus = ui.proposalReviewReturnFocus;
   ui.proposalReviewReturnFocus = null;
   if (returnFocus instanceof HTMLElement && returnFocus.isConnected) returnFocus.focus();
@@ -1560,6 +1689,7 @@ async function openProposalReview(returnFocus) {
     if (!layer || !dialog) throw new Error("PROPOSAL_REVIEW_UNAVAILABLE");
     layer.hidden = false;
     dialog.focus();
+    syncModalBackgroundBlock();
   } catch (error) {
     closeProposalReview();
     showToast(describeApiError(error, "Self-Harness 제안 diff를 열지 못했습니다."), "error");
@@ -1610,6 +1740,7 @@ async function openWorkspaceAttachmentPreview(attachmentId, returnFocus) {
     }
     layer.hidden = false;
     dialog.focus();
+    syncModalBackgroundBlock();
   } catch (error) {
     closeWorkspaceAttachmentPreview();
     showToast(describeApiError(error, "첨부 미리보기를 열지 못했습니다."), "error");
@@ -1776,6 +1907,7 @@ async function searchLensOfficialApi(event) {
     setText("#agent-lens-search-status", message);
     showToast(message, "error");
   } finally {
+    await refreshWorkspaceCapabilityDisclosure();
     ui.lensSearchPending = false;
     updateWorkspaceControlStates();
   }
@@ -2222,133 +2354,146 @@ function switchView(view, options = {}) {
   return true;
 }
 
-function setRuntimeStatus(status, stage) {
+function setRuntimeStatus(status, stage, evidenceVerified = true) {
   const pill = $("#runtime-pill");
   const label = $("#runtime-label");
   if (!pill || !label) return;
-  const display = {
-    ready: "검증 READY",
-    starting: "검증 STARTING",
-    running: "검증 LIVE",
-    cancelling: "검증 STOPPING",
-    cancelled: "검증 CANCELLED",
-    succeeded: "검증 VERIFIED",
-    failed: "검증 FAILED",
-    offline: "검증 RECONNECTING",
-  }[status] || `검증 ${String(status || "READY").toUpperCase()}`;
+  const invalidEvidence = status === "succeeded" && !evidenceVerified;
+  const display = invalidEvidence
+    ? "검증 INVALID EVIDENCE"
+    : {
+      ready: "검증 READY",
+      starting: "검증 STARTING",
+      running: "검증 LIVE",
+      cancelling: "검증 STOPPING",
+      cancelled: "검증 CANCELLED",
+      succeeded: "검증 VERIFIED",
+      failed: "검증 FAILED",
+      offline: "검증 RECONNECTING",
+    }[status] || `검증 ${String(status || "READY").toUpperCase()}`;
   label.textContent = display;
-  pill.dataset.state = status;
-  pill.title = String(PHASE_LABELS[stage] || display).slice(0, 128);
+  pill.dataset.state = invalidEvidence ? "failed" : status;
+  pill.title = String(invalidEvidence ? "불완전한 실측 payload" : PHASE_LABELS[stage] || display).slice(0, 128);
 }
 
-function updateMetrics(metrics = {}) {
-  const live = metrics.evidence_kind === "live_runtime_validation";
+function resetLiveRuntimePresentation() {
   $$('[data-live-evidence-badge]').forEach((badge) => {
-    badge.textContent = live ? "현재 실측" : "미검증";
-    badge.classList.toggle("measured", live);
-    badge.classList.toggle("planned", !live);
+    badge.textContent = "미검증";
+    badge.dataset.scope = "unverified";
+    badge.classList.remove("measured");
+    badge.classList.add("planned");
   });
   $$('[data-live-evidence-status]').forEach((status) => {
-    status.textContent = live ? "실측" : "검증 전";
-    status.classList.toggle("measured", live);
-    status.classList.toggle("planned", !live);
+    status.textContent = "검증 전";
+    status.classList.remove("measured");
+    status.classList.add("planned");
   });
   $$('[data-live-evidence-result]').forEach((result) => {
-    result.textContent = live ? "PASS" : "PENDING";
+    result.textContent = "PENDING";
   });
-  if (!live) {
-    setText("#metric-vram", "—");
-    setText("#telemetry-vram", "—");
-    setText("#ledger-vram", "Peak VRAM — GiB");
-    setText("#metric-depth", "—");
-    setText("#orbit-depth", "—");
-    setText("#reactor-depth", "—");
-    setText("#metric-nodes", "검증 전");
-    setText("#metric-residual", "—");
-    setText("#reactor-residual", "—");
-    setText("#metric-fallback", "미측정");
-    setText("#telemetry-fallback", "미측정");
-    setText("#telemetry-finite", "미측정");
-    $("#telemetry-finite")?.classList.remove("positive");
-    setText("#rail-files", "—");
-    setText("#device-name", "실행 전 미측정");
-    setText("#rail-device", "실행 전 미측정");
-    setText("[data-live-cts-copy]", "현재 프로세스 라이브 검증 대기");
-    setText("[data-live-vram-copy]", "현재 프로세스 라이브 검증 대기 · 상한 16.7 GiB");
-    for (const selector of ["#vram-meter", "#telemetry-vram-fill"]) {
-      const meter = $(selector);
-      if (meter) {
-        meter.max = 16.7;
-        meter.value = 0;
-        meter.setAttribute("aria-label", "현재 프로세스 VRAM 검증 전");
-      }
+  setText("#metric-vram", "—");
+  setText("#telemetry-vram", "—");
+  setText("#ledger-vram", "Peak VRAM — GiB");
+  setText("#metric-depth", "—");
+  setText("#orbit-depth", "—");
+  setText("#reactor-depth", "—");
+  setText("#metric-nodes", "검증 전");
+  setText("#metric-residual", "—");
+  setText("#reactor-residual", "—");
+  setText("#metric-fallback", "미측정");
+  setText("#telemetry-fallback", "미측정");
+  setText("#telemetry-finite", "미측정");
+  setText("#metric-tests", "—");
+  $("#telemetry-finite")?.classList.remove("positive");
+  setText("#rail-files", "—");
+  setText("#device-name", "실행 전 미측정");
+  setText("#rail-device", "실행 전 미측정");
+  setText("#rail-time", "현재 프로세스 검증 전");
+  setText("[data-live-cts-copy]", "현재 프로세스 라이브 검증 대기");
+  setText("[data-live-vram-copy]", "현재 프로세스 라이브 검증 대기 · 상한 16.7 GiB");
+  for (const selector of ["#vram-meter", "#telemetry-vram-fill"]) {
+    const meter = $(selector);
+    if (meter) {
+      meter.max = MAX_LIVE_VRAM_LIMIT_GIB;
+      meter.value = 0;
+      meter.setAttribute("aria-label", "현재 프로세스 VRAM 검증 전");
     }
-    return;
   }
-  if (finiteNumber(metrics.peak_vram_gib)) {
-    const vram = metrics.peak_vram_gib;
-    const limit = finiteNumber(metrics.vram_limit_gib) ? metrics.vram_limit_gib : 16.7;
-    setText("#metric-vram", vram.toFixed(4));
-    setText("#telemetry-vram", vram.toFixed(4));
-    setText("#ledger-vram", `Peak VRAM ${vram.toFixed(4)} GiB`);
-    const meter = $("#vram-meter");
-    const telemetry = $("#telemetry-vram-fill");
-    const meterLabel = `VRAM 사용량 ${vram.toFixed(4)} GiB, 상한 ${limit.toFixed(1)} GiB`;
+  for (const selector of ["#device-name", "#rail-device"]) {
+    $(selector)?.removeAttribute("title");
+  }
+}
+
+function updateMetrics(metrics = null, evidenceScope = "unverified") {
+  resetLiveRuntimePresentation();
+  if (metrics === null) return;
+  const currentEvidence = evidenceScope === "current";
+  $$('[data-live-evidence-badge]').forEach((badge) => {
+    badge.textContent = currentEvidence ? "현재 실측" : "직전 검증 실측";
+    badge.dataset.scope = currentEvidence ? "current" : "prior";
+    badge.classList.add("measured");
+    badge.classList.remove("planned");
+  });
+  $$('[data-live-evidence-status]').forEach((status) => {
+    status.textContent = currentEvidence ? "실측" : "직전 실측";
+    status.classList.add("measured");
+    status.classList.remove("planned");
+  });
+  $$('[data-live-evidence-result]').forEach((result) => {
+    result.textContent = currentEvidence ? "PASS" : "PRIOR PASS";
+  });
+
+  const vram = metrics.peak_vram_gib;
+  const limit = metrics.vram_limit_gib;
+  setText("#metric-vram", vram.toFixed(4));
+  setText("#telemetry-vram", vram.toFixed(4));
+  setText("#ledger-vram", `Peak VRAM ${vram.toFixed(4)} GiB`);
+  const meterLabel = `VRAM 사용량 ${vram.toFixed(4)} GiB, 상한 ${limit.toFixed(1)} GiB`;
+  for (const selector of ["#vram-meter", "#telemetry-vram-fill"]) {
+    const meter = $(selector);
     if (meter) {
       meter.max = limit;
       meter.value = vram;
       meter.setAttribute("aria-label", meterLabel);
     }
-    if (telemetry) {
-      telemetry.max = limit;
-      telemetry.value = vram;
-      telemetry.setAttribute("aria-label", meterLabel);
-    }
   }
-  if (Number.isInteger(metrics.reached_depth)) {
-    setText("#metric-depth", metrics.reached_depth);
-    setText("#orbit-depth", metrics.reached_depth);
-    setText("#reactor-depth", metrics.reached_depth);
-  }
-  if (Number.isInteger(metrics.nodes_used)) {
-    const capacity = Number.isInteger(metrics.node_capacity) ? metrics.node_capacity : metrics.nodes_used;
-    setText("#metric-nodes", `${metrics.nodes_used} / ${capacity} nodes`);
-    setText("[data-live-cts-copy]", `현재 프로세스 실측 · ${metrics.nodes_used}/${capacity} node · finite`);
-  }
-  if (finiteNumber(metrics.transition_residual)) {
-    setText("#metric-residual", metrics.transition_residual.toFixed(6));
-    setText("#reactor-residual", metrics.transition_residual.toExponential(3));
-  }
-  if (typeof metrics.transition_used_fallback === "boolean") {
-    const fallback = metrics.transition_used_fallback ? "사용" : "미사용";
-    setText("#metric-fallback", fallback);
-    setText("#telemetry-fallback", metrics.transition_used_fallback ? "USED" : "NOT USED");
-  }
-  if (typeof metrics.finite === "boolean") {
-    setText("#telemetry-finite", metrics.finite ? "PASS" : "FAIL");
-    $("#telemetry-finite")?.classList.toggle("positive", metrics.finite);
-  }
-  if (Number.isInteger(metrics.tests)) setText("#metric-tests", metrics.tests);
-  if (Number.isInteger(metrics.verified_files)) setText("#rail-files", `${metrics.verified_files} files`);
-  if (typeof metrics.device === "string" && metrics.device) {
-    setText("#device-name", metrics.device);
-    setText("#rail-device", metrics.device);
-    const compactDevice = $("#device-name");
-    const railDevice = $("#rail-device");
-    if (compactDevice) compactDevice.title = metrics.device.slice(0, 256);
-    if (railDevice) railDevice.title = metrics.device.slice(0, 256);
-    setText("[data-live-vram-copy]", `${metrics.device.slice(0, 96)} · 상한 16.7 GiB`);
-  }
-  if (typeof metrics.measured_at === "string") {
-    const date = new Date(metrics.measured_at);
-    setText("#rail-time", Number.isNaN(date.valueOf()) ? "최근 검증 기록" : `${date.toLocaleDateString("ko-KR")} 내부 실측`);
-  }
+  setText("#metric-depth", metrics.reached_depth);
+  setText("#orbit-depth", metrics.reached_depth);
+  setText("#reactor-depth", metrics.reached_depth);
+  setText("#metric-nodes", `${metrics.nodes_used} / ${metrics.node_capacity} nodes`);
+  setText(
+    "[data-live-cts-copy]",
+    `${currentEvidence ? "현재 프로세스" : "직전 검증"} 실측 · ${metrics.nodes_used}/${metrics.node_capacity} node · finite`,
+  );
+  setText("#metric-residual", metrics.transition_residual.toFixed(6));
+  setText("#reactor-residual", metrics.transition_residual.toExponential(3));
+  setText("#metric-fallback", "미사용");
+  setText("#telemetry-fallback", "NOT USED");
+  setText("#telemetry-finite", "PASS");
+  $("#telemetry-finite")?.classList.add("positive");
+  setText("#rail-files", `${metrics.verified_files} files`);
+  setText("#device-name", metrics.device);
+  setText("#rail-device", metrics.device);
+  const compactDevice = $("#device-name");
+  const railDevice = $("#rail-device");
+  if (compactDevice) compactDevice.title = metrics.device.slice(0, 256);
+  if (railDevice) railDevice.title = metrics.device.slice(0, 256);
+  setText(
+    "[data-live-vram-copy]",
+    `${currentEvidence ? "현재" : "직전 검증"} 실측 · ${metrics.device.slice(0, 96)} · 상한 ${limit.toFixed(1)} GiB`,
+  );
+  const date = new Date(metrics.measured_at);
+  setText(
+    "#rail-time",
+    `${date.toLocaleDateString("ko-KR")} ${currentEvidence ? "현재" : "직전 검증"} 실측`,
+  );
 }
 
-function updatePhases(state) {
+function updatePhases(state, evidenceVerified = false) {
   const stageIndex = PHASE_ORDER.indexOf(state.stage);
-  const succeeded = state.status === "succeeded";
-  const failed = state.status === "failed";
+  const invalidEvidence = state.status === "succeeded" && !evidenceVerified;
+  const succeeded = state.status === "succeeded" && evidenceVerified;
+  const failed = state.status === "failed" || invalidEvidence;
   $$("#phase-list li").forEach((item) => {
     const indices = Object.keys(PHASE_TO_DOM)
       .filter((key) => PHASE_TO_DOM[key] === item.dataset.phase)
@@ -2357,19 +2502,32 @@ function updatePhases(state) {
     const first = indices.length ? Math.min(...indices) : -1;
     const last = indices.length ? Math.max(...indices) : -1;
     const isCurrent = stageIndex >= first && stageIndex <= last && first >= 0;
-    item.classList.toggle("is-complete", succeeded || (stageIndex >= 0 && last < stageIndex));
+    const isInvalidTerminal = invalidEvidence && item.dataset.phase === "postcheck";
+    item.classList.toggle(
+      "is-complete",
+      succeeded || (!invalidEvidence && stageIndex >= 0 && last < stageIndex),
+    );
     item.classList.toggle("is-active", ACTIVE_STATUSES.has(state.status) && isCurrent);
-    item.classList.toggle("is-failed", failed && isCurrent);
+    item.classList.toggle("is-failed", failed && (isCurrent || isInvalidTerminal));
   });
-  setText("#phase-status", PHASE_LABELS[state.stage] || PHASE_LABELS[state.status] || "대기");
+  setText(
+    "#phase-status",
+    invalidEvidence ? "INVALID EVIDENCE" : PHASE_LABELS[state.stage] || PHASE_LABELS[state.status] || "대기",
+  );
   const reactor = $("#reactor");
   reactor?.classList.toggle("is-running", ACTIVE_STATUSES.has(state.status));
-  reactor?.classList.toggle("is-success", state.status === "succeeded");
+  reactor?.classList.toggle("is-success", succeeded);
   const indicator = $("#live-indicator");
   if (indicator) {
     indicator.classList.toggle("is-live", ACTIVE_STATUSES.has(state.status));
-    indicator.classList.toggle("is-success", state.status === "succeeded");
-    indicator.lastChild.textContent = ACTIVE_STATUSES.has(state.status) ? "LIVE" : state.status === "succeeded" ? "VERIFIED" : "STANDBY";
+    indicator.classList.toggle("is-success", succeeded);
+    indicator.lastChild.textContent = ACTIVE_STATUSES.has(state.status)
+      ? "LIVE"
+      : succeeded
+        ? "VERIFIED"
+        : invalidEvidence
+          ? "INVALID"
+          : "STANDBY";
   }
 }
 
@@ -2531,12 +2689,14 @@ function updateState(state) {
   if (!state || typeof state !== "object") return;
   const prior = ui.lastStatus;
   const status = VALIDATION_STATUSES.has(state.status) ? state.status : "failed";
-  const hasLiveEvidence = state.metrics?.evidence_kind === "live_runtime_validation";
+  const liveMetrics = normalizedLiveRuntimeMetrics(state.metrics);
+  const hasLiveEvidence = liveMetrics !== null;
+  const evidenceVerified = status === "succeeded" && hasLiveEvidence;
   ui.lastStatus = status;
   if (Number.isInteger(state.seq)) ui.lastSeq = Math.max(ui.lastSeq, state.seq);
-  setRuntimeStatus(status, state.stage);
-  updateMetrics(state.metrics || {});
-  updatePhases({ ...state, status });
+  setRuntimeStatus(status, state.stage, evidenceVerified);
+  updateMetrics(liveMetrics, evidenceVerified ? "current" : "prior");
+  updatePhases({ ...state, status }, evidenceVerified);
   renderEvents(state.events || []);
 
   const active = ACTIVE_STATUSES.has(status);
@@ -2544,23 +2704,31 @@ function updateState(state) {
   updateControlStates();
 
   const railSeal = $(".rail-seal");
-  if (railSeal) railSeal.dataset.state = status;
+  if (railSeal) {
+    railSeal.dataset.state = status === "succeeded" && !evidenceVerified ? "failed" : status;
+  }
 
   if (active) {
     setText("#rail-verdict", "LIVE RUNNING");
     setText("#rail-time", hasLiveEvidence ? "직전 현재 프로세스 실측 유지 · 완료 후 교체" : "현재 실측 생성 중");
-  } else if (status === "succeeded") {
+  } else if (status === "succeeded" && evidenceVerified) {
     setText("#rail-verdict", "VERIFIED");
-    if (prior !== "succeeded") showToast("실제 GPU 통합 검증을 통과했습니다.", "success");
+    if (prior !== "succeeded") showToast("완전한 현재 프로세스 실측이 CTS 안전 계약을 통과했습니다.", "success");
+  } else if (status === "succeeded") {
+    setText("#rail-verdict", "INVALID EVIDENCE");
+    setText("#rail-time", "완전한 현재 프로세스 실측 없음");
+    if (prior !== "succeeded") {
+      showToast("검증 종료 payload가 완전한 CTS 안전 계약을 충족하지 못했습니다.", "error");
+    }
   } else if (status === "failed") {
     setText("#rail-verdict", "NEW RUN FAILED");
     setText("#rail-time", hasLiveEvidence ? "직전 현재 프로세스 실측 유지 · 실패 로그 확인" : "유효한 현재 프로세스 실측 없음");
     const error = state.error?.message || state.error?.code || "검증 프로세스가 실패했습니다.";
     if (prior !== "failed") showToast(error, "error");
-  } else if (status === "cancelled" && prior !== "cancelled") {
+  } else if (status === "cancelled") {
     setText("#rail-verdict", "RUN CANCELLED");
     setText("#rail-time", hasLiveEvidence ? "직전 현재 프로세스 실측 유지" : "유효한 현재 프로세스 실측 없음");
-    showToast("검증을 취소하고 GPU worker를 정리했습니다.", "warning");
+    if (prior !== "cancelled") showToast("검증을 취소하고 GPU worker를 정리했습니다.", "warning");
   } else if (status === "ready") {
     setText("#rail-verdict", hasLiveEvidence ? "VERIFIED" : "NOT VERIFIED");
     if (!hasLiveEvidence) setText("#rail-time", "현재 프로세스 검증 전");
@@ -3580,14 +3748,27 @@ function bindKeyboard() {
         return;
       }
       trapFocusWithin(event, $("#evidence-drawer"));
+      return;
+    }
+    const attachmentLayer = $("#attachment-preview-layer");
+    if (attachmentLayer && !attachmentLayer.hidden) {
+      if (event.key === "Escape") {
+        closeWorkspaceAttachmentPreview();
+        return;
+      }
+      trapFocusWithin(event, $(".attachment-preview-dialog", attachmentLayer));
+      return;
+    }
+    const proposalLayer = $("#proposal-review-layer");
+    if (proposalLayer && !proposalLayer.hidden) {
+      if (event.key === "Escape") {
+        closeProposalReview();
+        return;
+      }
+      trapFocusWithin(event, $(".proposal-review-dialog", proposalLayer));
+      return;
     }
     if (event.key === "Escape" && !$("#tour-panel").hidden) closeTour();
-    if (event.key === "Escape" && !$("#attachment-preview-layer")?.hidden) {
-      closeWorkspaceAttachmentPreview();
-    }
-    if (event.key === "Escape" && !$("#proposal-review-layer")?.hidden) {
-      closeProposalReview();
-    }
     if (event.key === "Escape" && ui.voiceSession) cancelVoiceCapture();
     if (event.altKey && /^[1-6]$/.test(event.key)) {
       const views = ["assistant", "mission", "inference", "architecture", "business", "evidence"];

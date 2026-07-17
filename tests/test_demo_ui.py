@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from html.parser import HTMLParser
+import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import unittest
 
@@ -784,14 +786,150 @@ class TestCogniBoardUI(unittest.TestCase):
             with self.subTest(stale_claim=stale_claim):
                 self.assertNotIn(stale_claim, html)
                 self.assertNotIn(stale_claim, script)
-        self.assertIn('metrics.evidence_kind === "live_runtime_validation"', script)
-        self.assertIn("if (!live) {", script)
+        self.assertIn('raw.evidence_kind !== "live_runtime_validation"', script)
+        self.assertIn("if (metrics === null) return;", script)
         self.assertIn("data-live-evidence-badge", html)
         self.assertIn('class="rail-seal" data-state="ready"', html)
         self.assertIn('id="telemetry-external-calls">UNVERIFIED', html)
         self.assertIn('id="rail-external-calls">UNVERIFIED', html)
         self.assertNotIn('<dt>Network</dt><dd class="positive">BLOCKED', html)
         self.assertNotIn("100% 폐쇄망", html)
+
+    def test_runtime_evidence_and_modal_disclosures_fail_closed(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+        for contract in (
+            "function normalizedLiveRuntimeMetrics(raw)",
+            'raw.evidence_kind !== "live_runtime_validation"',
+            'source !== "scripts/validate_gemma4_runtime.py --event-stream"',
+            'raw.target !== "RTX 4090 24GB"',
+            "raw.transition_residual > 0.005",
+            "raw.vram_limit_gib > MAX_LIVE_VRAM_LIMIT_GIB",
+            "raw.peak_vram_gib > raw.vram_limit_gib",
+            "resetLiveRuntimePresentation();",
+            "setRuntimeStatus(status, state.stage, evidenceVerified)",
+            'updateMetrics(liveMetrics, evidenceVerified ? "current" : "prior")',
+            'railSeal.dataset.state = status === "succeeded" && !evidenceVerified ? "failed" : status',
+            'setText("#rail-verdict", "INVALID EVIDENCE")',
+            'badge.textContent = currentEvidence ? "현재 실측" : "직전 검증 실측"',
+            'result.textContent = currentEvidence ? "PASS" : "PRIOR PASS"',
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, script)
+
+        self.assertRegex(
+            html,
+            r'<span><svg[^>]+aria-hidden="true"><path[^>]+/></svg>'
+            r'<span id="mission-external-calls">UNVERIFIED · 앱 외부 호출 상태 미검증</span></span>',
+        )
+        self.assertIn('setText(\n    "#mission-external-calls",', script)
+        lens_start = script.index("async function searchLensOfficialApi")
+        lens_end = script.index("async function selectWorkspaceModel", lens_start)
+        lens_flow = script[lens_start:lens_end]
+        self.assertEqual(
+            lens_flow.count("await refreshWorkspaceCapabilityDisclosure()"), 1
+        )
+        refresh_start = script.index(
+            "async function refreshWorkspaceCapabilityDisclosure"
+        )
+        refresh_end = script.index(
+            "function updateWorkspaceControlStates", refresh_start
+        )
+        refresh_flow = script[refresh_start:refresh_end]
+        self.assertEqual(refresh_flow.count('api("/api/workspace/capabilities")'), 1)
+        self.assertIn('updateExternalCallDisclosure("", null)', refresh_flow)
+        self.assertIn("ui.lensConnectorReady = false", refresh_flow)
+
+        self.assertIn("function syncModalBackgroundBlock()", script)
+        self.assertIn("shell.inert = modalOpen", script)
+        self.assertIn('shell.setAttribute("aria-hidden", "true")', script)
+        self.assertGreaterEqual(script.count("syncModalBackgroundBlock();"), 6)
+        self.assertIn(
+            'trapFocusWithin(event, $(".attachment-preview-dialog", attachmentLayer))',
+            script,
+        )
+        self.assertIn(
+            'trapFocusWithin(event, $(".proposal-review-dialog", proposalLayer))',
+            script,
+        )
+
+    def test_live_runtime_metric_validator_rejects_partial_and_out_of_range_data(
+        self,
+    ) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is not installed in this Python test environment")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        start = script.index("function normalizedLiveRuntimeMetrics")
+        end = script.index("\n}\n\nfunction showToast", start) + 2
+        validator = script[start:end]
+        valid = {
+            "evidence_kind": "live_runtime_validation",
+            "measured_at": "2026-07-17T00:00:00+00:00",
+            "source": "scripts/validate_gemma4_runtime.py --event-stream",
+            "target": "RTX 4090 24GB",
+            "verified_files": 6,
+            "model_class": "FakeGemma4",
+            "hidden_size": 64,
+            "load_seconds": 0.01,
+            "inference_seconds": 0.02,
+            "requested_depth": 100,
+            "reached_depth": 100,
+            "nodes_used": 301,
+            "node_capacity": 301,
+            "search_allocated_bytes": 14994009,
+            "transition_converged": True,
+            "transition_residual": 0.00390625,
+            "transition_used_fallback": False,
+            "cts_protocol_version": "SearchRequestV2",
+            "safe_for_decode": True,
+            "unsafe_silent_fallbacks": 0,
+            "linear_solve_fallbacks": 0,
+            "solver_rank": 16,
+            "solver_history_peak": 16,
+            "solver_failures": 0,
+            "failed_edges": 0,
+            "q_zero_backups": 0,
+            "mac_budget": 1000,
+            "mac_reserved": 900,
+            "act_applied": 301,
+            "trace_digest": "a" * 64,
+            "causal_bridge_answer_bearing": True,
+            "causal_bridge_bias_nonzero": True,
+            "causal_bridge_bias_max": 0.04980469,
+            "conditioned_generated_tokens": 1,
+            "peak_vram_gib": 14.856,
+            "vram_limit_gib": 16.7,
+            "finite": True,
+            "device": "CPU fixture",
+        }
+        probe = f"""
+const assert = require("node:assert/strict");
+const MAX_LIVE_VRAM_LIMIT_GIB = 16.7;
+function finiteNumber(value) {{ return typeof value === "number" && Number.isFinite(value); }}
+{validator}
+const valid = {json.dumps(valid, ensure_ascii=True)};
+assert.notEqual(normalizedLiveRuntimeMetrics(valid), null);
+assert.notEqual(normalizedLiveRuntimeMetrics({{ ...valid, transition_residual: 0.005 }}), null);
+assert.equal(normalizedLiveRuntimeMetrics({{ evidence_kind: "live_runtime_validation" }}), null);
+const partial = {{ ...valid }}; delete partial.hidden_size;
+assert.equal(normalizedLiveRuntimeMetrics(partial), null);
+assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, transition_residual: 0.005001 }}), null);
+assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, transition_residual: Number.NaN }}), null);
+assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, peak_vram_gib: Number.POSITIVE_INFINITY }}), null);
+assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, peak_vram_gib: 16.8 }}), null);
+assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, reached_depth: 99 }}), null);
+assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, unsafe_silent_fallbacks: 1 }}), null);
+"""
+        completed = subprocess.run(
+            [node, "-e", probe],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_business_claims_preserve_integrity_boundaries(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")

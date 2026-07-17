@@ -13,6 +13,7 @@ PROTOCOL_VERSION = 2
 MAX_EVENT_LINE_BYTES = 16 * 1024
 MAX_TEXT_LENGTH = 256
 ABSOLUTE_VRAM_LIMIT_GIB = 16.7
+MAX_TRANSITION_RESIDUAL = 0.005
 
 PHASE_STAGES = (
     "verifying",
@@ -192,8 +193,11 @@ def validate_terminal_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
         raise ProtocolError("search allocation telemetry must be positive")
     if not normalized["transition_converged"] or not normalized["finite"]:
         raise ProtocolError("runtime convergence and finiteness are mandatory")
-    if normalized["transition_residual"] < 0:
-        raise ProtocolError("transition residual cannot be negative")
+    residual = normalized["transition_residual"]
+    if not 0 <= residual <= MAX_TRANSITION_RESIDUAL:
+        raise ProtocolError(
+            "transition residual crossed the certified convergence threshold"
+        )
     if normalized["cts_protocol_version"] != "SearchRequestV2":
         raise ProtocolError("runtime validation must use certified SearchRequestV2")
     if (
@@ -299,6 +303,7 @@ __all__ = [
     "EVENT_SENTINEL",
     "EventEmitter",
     "MAX_EVENT_LINE_BYTES",
+    "MAX_TRANSITION_RESIDUAL",
     "PHASE_STAGES",
     "PROTOCOL_VERSION",
     "ProtocolError",

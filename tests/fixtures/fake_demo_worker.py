@@ -92,6 +92,8 @@ def main() -> int:
     result = metrics()
     if mode == "over_vram":
         result["peak_vram_gib"] = 17.0
+    if mode == "high_residual":
+        result["transition_residual"] = 0.005001
     event = {
         "v": 2,
         "seq": sequence,

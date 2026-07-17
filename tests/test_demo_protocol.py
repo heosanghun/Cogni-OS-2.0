@@ -8,6 +8,7 @@ import unittest
 from cogni_demo.protocol import (
     EVENT_SENTINEL,
     EventEmitter,
+    MAX_TRANSITION_RESIDUAL,
     ProtocolError,
     parse_event_line,
     validate_terminal_metrics,
@@ -94,6 +95,30 @@ class TestDemoWorkerProtocol(unittest.TestCase):
         cases.append(bad)
         for metrics in cases:
             with self.subTest(metrics=metrics):
+                with self.assertRaises(ProtocolError):
+                    validate_terminal_metrics(metrics)
+
+    def test_transition_residual_certification_boundary(self) -> None:
+        for residual in (0, MAX_TRANSITION_RESIDUAL):
+            with self.subTest(residual=residual):
+                metrics = valid_metrics()
+                metrics["transition_residual"] = residual
+                self.assertEqual(
+                    validate_terminal_metrics(metrics)["transition_residual"],
+                    float(residual),
+                )
+
+        rejected = (
+            math.nextafter(MAX_TRANSITION_RESIDUAL, math.inf),
+            math.nan,
+            math.inf,
+            -math.inf,
+            -math.ulp(0.0),
+        )
+        for residual in rejected:
+            with self.subTest(residual=residual):
+                metrics = valid_metrics()
+                metrics["transition_residual"] = residual
                 with self.assertRaises(ProtocolError):
                     validate_terminal_metrics(metrics)
 

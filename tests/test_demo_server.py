@@ -203,6 +203,23 @@ class TestDemoJobManager(unittest.TestCase):
                 self.assertIsNone(state["metrics"]["peak_vram_gib"])
                 self.assertIsNone(state["metrics"]["reached_depth"])
 
+    def test_high_residual_worker_fails_closed_and_clears_evidence(self) -> None:
+        manager = manager_for("high_residual")
+        manager.start()
+        state = wait_for_terminal(manager)
+
+        self.assertEqual(state["status"], "failed")
+        self.assertIsNotNone(state["error"])
+        self.assertEqual(state["metrics"]["evidence_kind"], "unverified")
+        for field in (
+            "peak_vram_gib",
+            "reached_depth",
+            "transition_residual",
+            "transition_converged",
+        ):
+            with self.subTest(field=field):
+                self.assertIsNone(state["metrics"][field])
+
     def test_stderr_flood_is_bounded_and_does_not_deadlock_success(self) -> None:
         for mode in ("stderr_flood", "stdout_flood"):
             with self.subTest(mode=mode):

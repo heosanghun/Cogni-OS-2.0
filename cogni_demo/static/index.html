@@ -619,6 +619,29 @@
     </section>
   </div>
 
+  <div class="evidence-drawer-layer" id="evidence-drawer-layer" hidden>
+    <aside class="evidence-drawer" id="evidence-drawer" role="dialog" aria-modal="true" aria-labelledby="evidence-drawer-title" aria-describedby="evidence-drawer-status" tabindex="-1">
+      <header>
+        <div><span class="section-kicker">EXACT LOCAL SOURCE</span><h2 id="evidence-drawer-title">근거 원문</h2></div>
+        <button type="button" data-action="rag-evidence-close" aria-label="근거 원문 닫기">×</button>
+      </header>
+      <p class="evidence-drawer-status" id="evidence-drawer-status" role="status" aria-live="polite" aria-atomic="true">근거를 불러올 준비가 되었습니다.</p>
+      <dl class="evidence-drawer-facts">
+        <div><dt>위치</dt><dd id="evidence-drawer-location">—</dd></div>
+        <div><dt>검색 점수</dt><dd id="evidence-drawer-score">—</dd></div>
+        <div><dt>원문 SHA-256</dt><dd id="evidence-drawer-digest">—</dd></div>
+      </dl>
+      <section class="evidence-drawer-excerpt" aria-labelledby="evidence-drawer-excerpt-title">
+        <h3 id="evidence-drawer-excerpt-title">검증된 원문 발췌</h3>
+        <pre id="evidence-drawer-excerpt" hidden></pre>
+        <p id="evidence-drawer-empty">근거 위치와 무결성을 확인하고 있습니다.</p>
+      </section>
+      <footer>
+        <span>로컬 첨부 저장소 · 읽기 전용</span>
+        <button type="button" data-action="rag-evidence-close">닫기</button>
+      </footer>
+    </aside>
+  </div>
   <div class="proposal-review-layer" id="proposal-review-layer" hidden>
     <section class="proposal-review-dialog" role="dialog" aria-modal="true" aria-labelledby="proposal-review-title" aria-describedby="proposal-review-copy" tabindex="-1">
       <header>

@@ -21,6 +21,25 @@ const MAX_PROPOSAL_REVIEW_TEXT_CHARS = 4096;
 const MAX_ATTACHMENT_UPLOAD_BYTES = 8 * 1024 * 1024;
 const MAX_ATTACHMENT_UPLOAD_COUNT = 32;
 const ATTACHMENT_CONTENT_ENDPOINT = "/api/workspace/attachments/content";
+const RAG_SOURCE_ENDPOINT = "/api/workspace/rag/source";
+const MAX_RAG_SOURCE_TEXT_CHARS = 12000;
+const RAG_SOURCE_OFFSET_BASES = new Set([
+  "normalized_document_text_v1",
+  "normalized_pdf_page_text_v1",
+]);
+const RAG_SOURCE_EXACT_KEYS = Object.freeze([
+  "schema_version",
+  "attachment_id",
+  "chunk_index",
+  "name",
+  "media_type",
+  "text",
+  "page_number",
+  "char_start",
+  "char_end",
+  "offset_basis",
+  "excerpt_sha256",
+].sort());
 const VOICE_SAMPLE_RATE = 16000;
 const VOICE_MAX_SECONDS = 30;
 const VOICE_MAX_SOURCE_RATE = 192000;
@@ -77,6 +96,9 @@ const API_ERROR_COPY = {
   PDF_TEXT_EXTRACTION_UNAVAILABLE: "로컬 PDF 추출기(pypdf)가 설치되지 않았습니다.",
   PDF_TEXT_LIMIT: "PDF에서 추출된 텍스트가 안전 처리 한도를 초과했습니다.",
   RAG_REINDEX_FAILED: "로컬 RAG 재색인을 완료하지 못했습니다.",
+  RAG_SOURCE_INTEGRITY_FAILED: "근거 원문 SHA-256 무결성 검증에 실패해 발췌를 표시하지 않았습니다.",
+  RAG_SOURCE_NOT_FOUND: "선택한 로컬 RAG 근거 원문을 찾을 수 없습니다.",
+  RAG_SOURCE_UNAVAILABLE: "선택한 로컬 RAG 근거 원문을 안전하게 불러올 수 없습니다.",
   MODEL_NOT_VERIFIED: "검증된 로컬 모델만 선택할 수 있습니다.",
   LOCAL_AUDIO_PREPROCESS_FAILED: "검증된 로컬 Gemma 오디오 전처리에 실패했습니다.",
   LOCAL_AUDIO_PROCESSOR_REQUIRED: "검증된 로컬 Gemma 오디오 프로세서가 필요합니다.",
@@ -263,6 +285,9 @@ const ui = {
   voicePlaybackText: "",
   previewObjectUrl: "",
   previewReturnFocus: null,
+  evidenceDrawerRequestId: 0,
+  evidenceDrawerAbortController: null,
+  evidenceDrawerReturnFocus: null,
 };
 
 function $(selector, root = document) {
@@ -369,6 +394,314 @@ function normalizedRetrievalSources(items) {
     });
   });
   return sources;
+}
+
+function configureRagEvidenceButton(button, source) {
+  if (!(button instanceof HTMLButtonElement)) return false;
+  if (
+    !source
+    || !/^[0-9a-f]{24}$/.test(source.attachmentId)
+    || !Number.isInteger(source.chunkIndex)
+    || source.chunkIndex < 0
+    || source.chunkIndex > 127
+  ) return false;
+  button.type = "button";
+  button.dataset.action = "rag-evidence-open";
+  button.dataset.sourceNumber = String(source.number);
+  button.dataset.attachmentId = source.attachmentId;
+  button.dataset.chunkIndex = String(source.chunkIndex);
+  button.dataset.sourceTitle = source.title;
+  button.dataset.sourceScore = source.score === null ? "" : String(source.score);
+  button.setAttribute("aria-label", `근거 ${source.number} 원문 열기: ${source.title}`);
+  button.setAttribute("aria-haspopup", "dialog");
+  button.setAttribute("aria-controls", "evidence-drawer-layer");
+  return true;
+}
+
+function ragSourceError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function evidenceSourceFromTrigger(trigger) {
+  if (!(trigger instanceof HTMLButtonElement)) return null;
+  const number = Number(trigger.dataset.sourceNumber);
+  const chunkIndex = Number(trigger.dataset.chunkIndex);
+  const attachmentId = trigger.dataset.attachmentId || "";
+  const rawTitle = trigger.dataset.sourceTitle || "";
+  const title = rawTitle.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim().slice(0, 160);
+  const rawScore = trigger.dataset.sourceScore;
+  const parsedScore = rawScore === "" || rawScore === undefined ? null : Number(rawScore);
+  if (
+    !Number.isInteger(number)
+    || number < 1
+    || number > 5
+    || !/^[0-9a-f]{24}$/.test(attachmentId)
+    || !Number.isInteger(chunkIndex)
+    || chunkIndex < 0
+    || chunkIndex > 127
+    || !title
+    || (parsedScore !== null && !Number.isFinite(parsedScore))
+  ) return null;
+  return {
+    number,
+    title,
+    attachmentId,
+    chunkIndex,
+    score: parsedScore === null ? null : Math.max(0, Math.min(1, parsedScore)),
+  };
+}
+
+function renderMessageContentWithCitations(container, text, sources) {
+  if (!(container instanceof HTMLElement) || typeof text !== "string") return;
+  const sourceByNumber = new Map(
+    sources
+      .filter(
+        (source) => (
+          /^[0-9a-f]{24}$/.test(source.attachmentId)
+          && Number.isInteger(source.chunkIndex)
+          && source.chunkIndex >= 0
+          && source.chunkIndex <= 127
+        ),
+      )
+      .map((source) => [source.number, source]),
+  );
+  const fragment = document.createDocumentFragment();
+  const citationPattern = /\[근거\s+([1-5])\]/g;
+  let cursor = 0;
+  let match;
+  while ((match = citationPattern.exec(text)) !== null) {
+    if (match.index > cursor) {
+      fragment.append(document.createTextNode(text.slice(cursor, match.index)));
+    }
+    const source = sourceByNumber.get(Number(match[1]));
+    if (source) {
+      const button = document.createElement("button");
+      button.className = "chat-citation-button";
+      configureRagEvidenceButton(button, source);
+      button.textContent = `[근거 ${source.number}]`;
+      fragment.append(button);
+    } else {
+      fragment.append(document.createTextNode(match[0]));
+    }
+    cursor = citationPattern.lastIndex;
+  }
+  if (cursor < text.length) fragment.append(document.createTextNode(text.slice(cursor)));
+  container.replaceChildren(fragment);
+}
+
+function normalizedExactRagSource(payload, requestedSource) {
+  if (
+    !payload
+    || typeof payload !== "object"
+    || Array.isArray(payload)
+  ) throw ragSourceError("RAG_SOURCE_UNAVAILABLE");
+  const payloadKeys = Object.keys(payload).sort();
+  if (
+    payloadKeys.length !== RAG_SOURCE_EXACT_KEYS.length
+    || payloadKeys.some((key, index) => key !== RAG_SOURCE_EXACT_KEYS[index])
+    || payload.schema_version !== 1
+    || payload.attachment_id !== requestedSource.attachmentId
+    || payload.chunk_index !== requestedSource.chunkIndex
+    || typeof payload.name !== "string"
+    || !payload.name
+    || payload.name.length > 128
+    || payload.name === "."
+    || payload.name === ".."
+    || /[\/\\\u0000-\u001f\u007f-\u009f]/.test(payload.name)
+    || typeof payload.media_type !== "string"
+    || !payload.media_type
+    || payload.media_type.length > 128
+    || !/^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(payload.media_type)
+    || typeof payload.text !== "string"
+    || !payload.text
+    || Array.from(payload.text).length > MAX_RAG_SOURCE_TEXT_CHARS
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(payload.text)
+    || !Number.isInteger(payload.char_start)
+    || payload.char_start < 0
+    || !Number.isInteger(payload.char_end)
+    || payload.char_end <= payload.char_start
+    || payload.char_end - payload.char_start !== Array.from(payload.text).length
+    || !RAG_SOURCE_OFFSET_BASES.has(payload.offset_basis)
+    || !/^[0-9a-f]{64}$/.test(payload.excerpt_sha256)
+  ) throw ragSourceError("RAG_SOURCE_UNAVAILABLE");
+  const pageNumber = payload.page_number;
+  const documentLocationValid = (
+    payload.offset_basis === "normalized_document_text_v1"
+    && pageNumber === null
+  );
+  const pdfLocationValid = (
+    payload.offset_basis === "normalized_pdf_page_text_v1"
+    && Number.isInteger(pageNumber)
+    && pageNumber >= 1
+    && pageNumber <= 128
+  );
+  if (!documentLocationValid && !pdfLocationValid) {
+    throw ragSourceError("RAG_SOURCE_UNAVAILABLE");
+  }
+  const name = payload.name
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .trim();
+  if (!name) throw ragSourceError("RAG_SOURCE_UNAVAILABLE");
+  return {
+    attachmentId: payload.attachment_id,
+    chunkIndex: payload.chunk_index,
+    name,
+    mediaType: payload.media_type,
+    text: payload.text,
+    pageNumber,
+    charStart: payload.char_start,
+    charEnd: payload.char_end,
+    offsetBasis: payload.offset_basis,
+    excerptSha256: payload.excerpt_sha256,
+  };
+}
+
+async function sha256HexUtf8(text) {
+  if (
+    typeof TextEncoder !== "function"
+    || !globalThis.crypto
+    || !globalThis.crypto.subtle
+  ) throw ragSourceError("RAG_SOURCE_INTEGRITY_FAILED");
+  const bytes = new TextEncoder().encode(text);
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(
+    new Uint8Array(digest),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+function setEvidenceDrawerState(state, copy) {
+  const drawer = $("#evidence-drawer");
+  const status = $("#evidence-drawer-status");
+  if (drawer) drawer.dataset.state = state;
+  if (!status) return;
+  status.textContent = String(copy || "").slice(0, 512);
+  status.setAttribute("role", state === "error" ? "alert" : "status");
+  status.setAttribute("aria-live", state === "error" ? "assertive" : "polite");
+}
+
+function closeRagEvidenceDrawer() {
+  ui.evidenceDrawerRequestId += 1;
+  if (ui.evidenceDrawerAbortController) {
+    ui.evidenceDrawerAbortController.abort();
+    ui.evidenceDrawerAbortController = null;
+  }
+  const layer = $("#evidence-drawer-layer");
+  const excerpt = $("#evidence-drawer-excerpt");
+  if (excerpt) {
+    excerpt.textContent = "";
+    excerpt.hidden = true;
+  }
+  if (layer) layer.hidden = true;
+  const returnFocus = ui.evidenceDrawerReturnFocus;
+  ui.evidenceDrawerReturnFocus = null;
+  if (returnFocus instanceof HTMLElement && returnFocus.isConnected) returnFocus.focus();
+}
+
+async function openRagEvidenceSource(source, returnFocus) {
+  if (
+    !source
+    || !/^[0-9a-f]{24}$/.test(source.attachmentId)
+    || !Number.isInteger(source.chunkIndex)
+    || source.chunkIndex < 0
+    || source.chunkIndex > 127
+  ) return;
+  if (ui.evidenceDrawerAbortController) ui.evidenceDrawerAbortController.abort();
+  const requestId = ui.evidenceDrawerRequestId + 1;
+  ui.evidenceDrawerRequestId = requestId;
+  ui.evidenceDrawerReturnFocus = returnFocus instanceof HTMLElement ? returnFocus : null;
+  const layer = $("#evidence-drawer-layer");
+  const drawer = $("#evidence-drawer");
+  const excerpt = $("#evidence-drawer-excerpt");
+  const empty = $("#evidence-drawer-empty");
+  if (!layer || !drawer || !excerpt || !empty) return;
+  excerpt.textContent = "";
+  excerpt.hidden = true;
+  empty.hidden = false;
+  empty.textContent = "근거 위치와 SHA-256 무결성을 확인하고 있습니다.";
+  setText("#evidence-drawer-title", `근거 ${source.number} 원문 확인 중`);
+  setText(
+    "#evidence-drawer-location",
+    `attachment_id ${source.attachmentId} · chunk ${source.chunkIndex}`,
+  );
+  setText(
+    "#evidence-drawer-score",
+    source.score === null ? "검색 점수 미제공" : source.score.toFixed(4),
+  );
+  setText("#evidence-drawer-digest", "검증 중");
+  setEvidenceDrawerState("loading", "정확한 로컬 원문을 불러오고 있습니다.");
+  layer.hidden = false;
+  drawer.focus();
+  const controller = new AbortController();
+  ui.evidenceDrawerAbortController = controller;
+  try {
+    const payload = await api(
+      `${RAG_SOURCE_ENDPOINT}?attachment_id=${encodeURIComponent(source.attachmentId)}&chunk_index=${encodeURIComponent(source.chunkIndex)}`,
+      { signal: controller.signal },
+    );
+    if (requestId !== ui.evidenceDrawerRequestId) return;
+    const exactSource = normalizedExactRagSource(payload, source);
+    setText("#evidence-drawer-title", exactSource.name);
+    const pageLocation = exactSource.pageNumber === null
+      ? "문서 단위"
+      : `PDF ${exactSource.pageNumber}쪽`;
+    setText(
+      "#evidence-drawer-location",
+      `${pageLocation} · 문자 ${exactSource.charStart}–${exactSource.charEnd} · ${exactSource.offsetBasis}`,
+    );
+    const actualDigest = await sha256HexUtf8(exactSource.text);
+    if (requestId !== ui.evidenceDrawerRequestId) return;
+    if (actualDigest !== exactSource.excerptSha256) {
+      throw ragSourceError("RAG_SOURCE_INTEGRITY_FAILED");
+    }
+    setText("#evidence-drawer-digest", exactSource.excerptSha256);
+    excerpt.textContent = exactSource.text;
+    excerpt.hidden = false;
+    empty.hidden = true;
+    setEvidenceDrawerState(
+      "ready",
+      `원문 SHA-256 확인 완료 · ${exactSource.mediaType}`,
+    );
+  } catch (error) {
+    if (requestId !== ui.evidenceDrawerRequestId) return;
+    excerpt.textContent = "";
+    excerpt.hidden = true;
+    empty.hidden = false;
+    empty.textContent = "무결성이 확인되지 않아 원문 발췌를 표시하지 않았습니다.";
+    setText("#evidence-drawer-digest", "검증 실패");
+    setEvidenceDrawerState(
+      "error",
+      describeApiError(error, "선택한 근거 원문을 안전하게 불러올 수 없습니다."),
+    );
+  } finally {
+    if (requestId === ui.evidenceDrawerRequestId) {
+      ui.evidenceDrawerAbortController = null;
+    }
+  }
+}
+
+function trapFocusWithin(event, root) {
+  if (event.key !== "Tab" || !(root instanceof HTMLElement)) return;
+  const candidates = $$(
+    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    root,
+  ).filter((candidate) => !candidate.hidden && candidate.getAttribute("aria-hidden") !== "true");
+  if (!candidates.length) {
+    event.preventDefault();
+    root.focus();
+    return;
+  }
+  const first = candidates[0];
+  const last = candidates[candidates.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !root.contains(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !root.contains(document.activeElement))) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function renderWorkspaceAttachments() {
@@ -2198,7 +2531,7 @@ function renderAgentConversation(messages = []) {
       generatedTokens: Number.isInteger(message.generated_tokens)
         ? Math.max(0, Math.min(1536, message.generated_tokens))
         : 0,
-      generationMode: ["cogni_core", "cogni_core_rag", "conversation_fastpath", "factbook", "quality_fallback"].includes(message.generation_mode)
+      generationMode: ["cogni_core", "cogni_core_rag", "rag_no_evidence", "conversation_fastpath", "factbook", "quality_fallback"].includes(message.generation_mode)
         ? message.generation_mode
         : null,
       sources: normalizedRetrievalSources(message.sources),
@@ -2255,6 +2588,8 @@ function renderAgentConversation(messages = []) {
           completionCopy = "FACT-BOOK · 검증된 사실";
         } else if (message.generationMode === "cogni_core_rag") {
           completionCopy = "로컬 RAG · 근거 연결 완료";
+        } else if (message.generationMode === "rag_no_evidence") {
+          completionCopy = "로컬 RAG · 근거 없음";
         } else if (message.generationMode === "quality_fallback") {
           completionCopy = "품질 검증 실패 · 복구 필요";
         } else {
@@ -2276,15 +2611,21 @@ function renderAgentConversation(messages = []) {
             : "";
     }
     const content = $(".chat-bubble p", item);
-    content.textContent = message.content;
+    renderMessageContentWithCitations(content, message.content, message.sources);
     const sources = $(".chat-sources", item);
     const sourcesList = $(".chat-sources ol", item);
     if (sources && sourcesList) {
       const fragment = document.createDocumentFragment();
       message.sources.forEach((source) => {
         const row = document.createElement("li");
-        const title = document.createElement("span");
+        const title = document.createElement("button");
         const score = document.createElement("small");
+        title.type = "button";
+        title.className = "chat-source-button";
+        if (!configureRagEvidenceButton(title, source)) {
+          title.disabled = true;
+          title.setAttribute("aria-label", `근거 ${source.number} 원문 위치 미제공`);
+        }
         title.textContent = `[근거 ${source.number}] ${source.title}`;
         const provenance = [];
         if (source.attachmentId) provenance.push(`attachment_id ${source.attachmentId}`);
@@ -2885,6 +3226,12 @@ function bindActions() {
       deleteWorkspaceAttachment(trigger.dataset.attachmentId);
     }
   });
+  $$('[data-action="rag-evidence-close"]').forEach((button) => {
+    button.addEventListener("click", closeRagEvidenceDrawer);
+  });
+  $("#evidence-drawer-layer")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeRagEvidenceDrawer();
+  });
   $('[data-action="workspace-rag-toggle"]')?.addEventListener("click", toggleWorkspaceRag);
   $('[data-action="workspace-rag-reindex"]')?.addEventListener("click", reindexWorkspaceAttachments);
   $('[data-action="workspace-preview-close"]')?.addEventListener("click", closeWorkspaceAttachmentPreview);
@@ -2902,6 +3249,12 @@ function bindActions() {
   $("#agent-lens-search-form")?.addEventListener("submit", searchLensOfficialApi);
   $("#agent-model-selector")?.addEventListener("change", selectWorkspaceModel);
   $("#chat-transcript")?.addEventListener("click", (event) => {
+    const evidenceTrigger = event.target.closest('[data-action="rag-evidence-open"]');
+    if (evidenceTrigger && !evidenceTrigger.disabled) {
+      const source = evidenceSourceFromTrigger(evidenceTrigger);
+      if (source) openRagEvidenceSource(source, evidenceTrigger);
+      return;
+    }
     const trigger = event.target.closest('[data-action="agent-focus"]');
     if (!trigger || trigger.disabled) return;
     const input = $("#agent-input");
@@ -2963,6 +3316,14 @@ function bindActions() {
 
 function bindKeyboard() {
   document.addEventListener("keydown", (event) => {
+    const evidenceLayer = $("#evidence-drawer-layer");
+    if (evidenceLayer && !evidenceLayer.hidden) {
+      if (event.key === "Escape") {
+        closeRagEvidenceDrawer();
+        return;
+      }
+      trapFocusWithin(event, $("#evidence-drawer"));
+    }
     if (event.key === "Escape" && !$("#tour-panel").hidden) closeTour();
     if (event.key === "Escape" && !$("#attachment-preview-layer")?.hidden) {
       closeWorkspaceAttachmentPreview();

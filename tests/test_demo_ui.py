@@ -277,7 +277,7 @@ class TestCogniBoardUI(unittest.TestCase):
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotRegex(script, forbidden)
-        self.assertIn("content.textContent = message.content", script)
+        self.assertIn("renderMessageContentWithCitations", script)
         self.assertIn("message.content.slice(0, MAX_AGENT_RESPONSE_CHARS)", script)
         self.assertIn('includes(message.role) ? message.role : "assistant"', script)
         self.assertIn("messages.slice(-MAX_AGENT_DOM_MESSAGES)", script)
@@ -338,6 +338,147 @@ class TestCogniBoardUI(unittest.TestCase):
         )
         self.assertIn("sourcesList.replaceChildren(fragment)", script)
         self.assertNotRegex(script, r"\.innerHTML\b|insertAdjacentHTML")
+
+    def test_rag_evidence_drawer_is_exact_integrity_checked_and_accessible(
+        self,
+    ) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+
+        self.assertRegex(
+            html,
+            r'id="evidence-drawer"[^>]*role="dialog"[^>]*aria-modal="true"'
+            r'[^>]*aria-labelledby="evidence-drawer-title"'
+            r'[^>]*aria-describedby="evidence-drawer-status"[^>]*tabindex="-1"',
+        )
+        for identifier in (
+            "evidence-drawer-layer",
+            "evidence-drawer-title",
+            "evidence-drawer-status",
+            "evidence-drawer-location",
+            "evidence-drawer-score",
+            "evidence-drawer-digest",
+            "evidence-drawer-excerpt",
+        ):
+            self.assertIn(f'id="{identifier}"', html)
+        self.assertRegex(
+            html,
+            r'id="evidence-drawer-status"[^>]*role="status"'
+            r'[^>]*aria-live="polite"[^>]*aria-atomic="true"',
+        )
+        self.assertGreaterEqual(html.count('data-action="rag-evidence-close"'), 2)
+
+        self.assertIn('const RAG_SOURCE_ENDPOINT = "/api/workspace/rag/source"', script)
+        self.assertIn(
+            "`${RAG_SOURCE_ENDPOINT}?attachment_id=${encodeURIComponent("
+            "source.attachmentId)}&chunk_index=${encodeURIComponent("
+            "source.chunkIndex)}`",
+            script,
+        )
+        self.assertIn('button.dataset.action = "rag-evidence-open"', script)
+        self.assertIn(
+            "document.createTextNode(text.slice(cursor, match.index))", script
+        )
+        self.assertIn("renderMessageContentWithCitations", script)
+        self.assertIn("container.replaceChildren(fragment)", script)
+        self.assertIn('aria-controls", "evidence-drawer-layer"', script)
+
+        for contract_check in (
+            "payload.schema_version !== 1",
+            "payload.attachment_id !== requestedSource.attachmentId",
+            "payload.chunk_index !== requestedSource.chunkIndex",
+            'typeof payload.name !== "string"',
+            'typeof payload.media_type !== "string"',
+            'typeof payload.text !== "string"',
+            "!Number.isInteger(payload.char_start)",
+            "!Number.isInteger(payload.char_end)",
+            "!RAG_SOURCE_OFFSET_BASES.has(payload.offset_basis)",
+            "!/^[0-9a-f]{64}$/.test(payload.excerpt_sha256)",
+        ):
+            with self.subTest(contract_check=contract_check):
+                self.assertIn(contract_check, script)
+        exact_keys_start = script.index("const RAG_SOURCE_EXACT_KEYS")
+        exact_keys_end = script.index("].sort());", exact_keys_start)
+        exact_keys = set(
+            re.findall(
+                r'"([a-z0-9_]+)"',
+                script[exact_keys_start:exact_keys_end],
+            )
+        )
+        self.assertEqual(
+            exact_keys,
+            {
+                "schema_version",
+                "attachment_id",
+                "chunk_index",
+                "name",
+                "media_type",
+                "text",
+                "page_number",
+                "char_start",
+                "char_end",
+                "offset_basis",
+                "excerpt_sha256",
+            },
+        )
+        self.assertIn("const payloadKeys = Object.keys(payload).sort()", script)
+        self.assertIn("payloadKeys.length !== RAG_SOURCE_EXACT_KEYS.length", script)
+        self.assertIn(
+            "payloadKeys.some((key, index) => key !== RAG_SOURCE_EXACT_KEYS[index])",
+            script,
+        )
+        self.assertIn(
+            "payload.char_end - payload.char_start !== Array.from(payload.text).length",
+            script,
+        )
+        self.assertIn("const documentLocationValid = (", script)
+        self.assertIn("const pdfLocationValid = (", script)
+        self.assertIn("if (!documentLocationValid && !pdfLocationValid)", script)
+        self.assertIn(
+            "!/^[a-z0-9.+-]+\\/[a-z0-9.+-]+$/.test(payload.media_type)", script
+        )
+        for forbidden_alias_pattern in (
+            r"payload\.title\b",
+            r"payload\.excerpt\b",
+            r"payload\.score\b",
+        ):
+            self.assertNotRegex(script, forbidden_alias_pattern)
+        self.assertIn("source.chunkIndex > 127", script)
+        self.assertIn('source.score === null ? "검색 점수 미제공"', script)
+
+        digest_start = script.index("const actualDigest = await sha256HexUtf8")
+        digest_compare = script.index(
+            "actualDigest !== exactSource.excerptSha256", digest_start
+        )
+        excerpt_display = script.index(
+            "excerpt.textContent = exactSource.text", digest_compare
+        )
+        self.assertLess(digest_start, digest_compare)
+        self.assertLess(digest_compare, excerpt_display)
+        self.assertIn('globalThis.crypto.subtle.digest("SHA-256", bytes)', script)
+        self.assertIn('throw ragSourceError("RAG_SOURCE_INTEGRITY_FAILED")', script)
+        self.assertIn("excerpt.hidden = true", script)
+
+        self.assertIn("ui.evidenceDrawerRequestId += 1", script)
+        self.assertIn("ui.evidenceDrawerAbortController.abort()", script)
+        self.assertIn("requestId !== ui.evidenceDrawerRequestId", script)
+        self.assertIn("returnFocus instanceof HTMLElement", script)
+        self.assertIn(
+            "event.target === event.currentTarget) closeRagEvidenceDrawer()", script
+        )
+        self.assertIn('event.key === "Escape"', script)
+        self.assertIn('trapFocusWithin(event, $("#evidence-drawer"))', script)
+
+        self.assertIn(".evidence-drawer-layer", stylesheet)
+        self.assertIn('.evidence-drawer[data-state="error"]', stylesheet)
+        self.assertRegex(
+            stylesheet,
+            r"(?s)@media \(max-width: 620px\).*?\.evidence-drawer\s*\{"
+            r"[^}]*width:\s*100vw;[^}]*height:\s*100dvh;",
+        )
+        self.assertIn('"rag_no_evidence"', script)
+        self.assertIn('completionCopy = "로컬 RAG · 근거 없음"', script)
 
     def test_streaming_cancelling_and_compute_button_states_fail_closed(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
@@ -404,7 +545,7 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("Runtime Fact-book", script)
         self.assertIn("FACT-BOOK · 검증된 사실", script)
         self.assertIn(
-            '["cogni_core", "cogni_core_rag", "conversation_fastpath", "factbook", "quality_fallback"]',
+            '["cogni_core", "cogni_core_rag", "rag_no_evidence", "conversation_fastpath", "factbook", "quality_fallback"]',
             script,
         )
         self.assertIn("대화 FAST PATH · 완료", script)

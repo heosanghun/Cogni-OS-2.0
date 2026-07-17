@@ -122,6 +122,49 @@ def _pdf_bytes(text: str) -> bytes:
 
 
 class TestWorkspaceCapabilities(unittest.TestCase):
+    def _assert_rag_quarantined(
+        self,
+        service: WorkspaceCapabilityService,
+        *,
+        attachment_id: str,
+        query: str,
+    ) -> None:
+        self.assertIsNone(service.akasicdb)
+        self.assertEqual(
+            service.akasicdb_error,
+            (
+                "RAG_OPERATOR_REVIEW_REQUIRED",
+                "local RAG state is quarantined pending operator review",
+            ),
+        )
+        capability = service.capability_payload()["rag"]
+        self.assertEqual(capability["state"], "unavailable")
+        self.assertFalse(capability["answer_integration"])
+        self.assertEqual(capability["error"]["code"], "RAG_OPERATOR_REVIEW_REQUIRED")
+
+        actions = (
+            ("query", lambda: service.query_rag(query)),
+            ("source", lambda: service.preview_rag_source(attachment_id, 0)),
+            ("index", lambda: service.index_attachments([attachment_id])),
+            ("reindex", lambda: service.reindex_attachments([attachment_id])),
+            ("delete", lambda: service.delete_attachment(attachment_id)),
+            (
+                "add",
+                lambda: service.add_attachment(
+                    name="blocked-after-quarantine.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"blocked after quarantine").decode(),
+                ),
+            ),
+        )
+        for label, action in actions:
+            with self.subTest(quarantined_action=label):
+                with self.assertRaises(WorkspaceCapabilityError) as captured:
+                    action()
+                self.assertEqual(
+                    captured.exception.code, "RAG_OPERATOR_REVIEW_REQUIRED"
+                )
+
     def test_lexical_sketch_does_not_cancel_colliding_terms(self) -> None:
         # These two terms land in the same signed-hash bucket with opposite
         # signs.  A legitimate query must not collapse to the zero vector.
@@ -1281,6 +1324,172 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 self.assertEqual(service._source_snapshots, previous_snapshots)
                 self.assertEqual(service._source_generation, previous_generation)
                 self.assertEqual(service.query_rag("delete rollback")["count"], 1)
+
+    def test_index_double_failure_quarantines_rag(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                first = service.add_attachment(
+                    name="committed.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"committed authority evidence").decode(),
+                )
+                second = service.add_attachment(
+                    name="candidate.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"candidate authority evidence").decode(),
+                )
+                first_id = first["attachment_id"]
+                second_id = second["attachment_id"]
+                service.index_attachments([first_id])
+                adapter = service.akasicdb
+                assert adapter is not None
+                previous_catalog = service.catalog_path.read_bytes()
+                previous_records = dict(service._attachments)
+                previous_ids = set(service._indexed_attachment_ids)
+                previous_snapshots = dict(service._source_snapshots)
+                previous_generation = service._source_generation
+
+                with patch.object(
+                    adapter,
+                    "index_document",
+                    side_effect=RuntimeError("persistent adapter failure"),
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        service.index_attachments([second_id])
+
+                self.assertEqual(captured.exception.code, "RAG_INDEX_ROLLBACK_FAILED")
+                self.assertEqual(service.catalog_path.read_bytes(), previous_catalog)
+                self.assertEqual(service._attachments, previous_records)
+                self.assertEqual(service._indexed_attachment_ids, previous_ids)
+                self.assertEqual(service._source_snapshots, previous_snapshots)
+                self.assertEqual(service._source_generation, previous_generation)
+                self._assert_rag_quarantined(
+                    service,
+                    attachment_id=first_id,
+                    query="committed authority",
+                )
+
+    def test_reindex_double_failure_quarantines_rag(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                admitted = service.add_attachment(
+                    name="reindex.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"reindex authority evidence").decode(),
+                )
+                attachment_id = admitted["attachment_id"]
+                service.index_attachments([attachment_id])
+                adapter = service.akasicdb
+                assert adapter is not None
+                previous_catalog = service.catalog_path.read_bytes()
+                previous_records = dict(service._attachments)
+                previous_ids = set(service._indexed_attachment_ids)
+                previous_snapshots = dict(service._source_snapshots)
+                previous_generation = service._source_generation
+
+                with patch.object(
+                    adapter,
+                    "index_document",
+                    side_effect=RuntimeError("persistent adapter failure"),
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        service.reindex_attachments([attachment_id])
+
+                self.assertEqual(captured.exception.code, "RAG_REINDEX_ROLLBACK_FAILED")
+                self.assertEqual(service.catalog_path.read_bytes(), previous_catalog)
+                self.assertEqual(service._attachments, previous_records)
+                self.assertEqual(service._indexed_attachment_ids, previous_ids)
+                self.assertEqual(service._source_snapshots, previous_snapshots)
+                self.assertEqual(service._source_generation, previous_generation)
+                self._assert_rag_quarantined(
+                    service,
+                    attachment_id=attachment_id,
+                    query="reindex authority",
+                )
+
+    def test_delete_double_failure_quarantines_rag(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                first = service.add_attachment(
+                    name="delete.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"delete authority evidence").decode(),
+                )
+                second = service.add_attachment(
+                    name="retain.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"retain authority evidence").decode(),
+                )
+                first_id = first["attachment_id"]
+                second_id = second["attachment_id"]
+                service.index_attachments([first_id, second_id])
+                adapter = service.akasicdb
+                assert adapter is not None
+                previous_catalog = service.catalog_path.read_bytes()
+                previous_records = dict(service._attachments)
+                previous_ids = set(service._indexed_attachment_ids)
+                previous_snapshots = dict(service._source_snapshots)
+                previous_generation = service._source_generation
+                stored_path = service._attachments[first_id].stored_path
+
+                with patch.object(
+                    adapter,
+                    "index_document",
+                    side_effect=RuntimeError("persistent adapter failure"),
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        service.delete_attachment(first_id)
+
+                self.assertEqual(
+                    captured.exception.code, "ATTACHMENT_DELETE_ROLLBACK_FAILED"
+                )
+                self.assertTrue(stored_path.is_file())
+                self.assertEqual(service.catalog_path.read_bytes(), previous_catalog)
+                self.assertEqual(service._attachments, previous_records)
+                self.assertEqual(service._indexed_attachment_ids, previous_ids)
+                self.assertEqual(service._source_snapshots, previous_snapshots)
+                self.assertEqual(service._source_generation, previous_generation)
+                self._assert_rag_quarantined(
+                    service,
+                    attachment_id=first_id,
+                    query="delete authority",
+                )
 
     def test_query_runtime_error_is_normalized(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

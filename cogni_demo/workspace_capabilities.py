@@ -1965,6 +1965,7 @@ class WorkspaceCapabilityService:
                 "INVALID_ATTACHMENT_NAME", "attachment path escaped storage root"
             )
         with self._lock:
+            self._raise_if_rag_quarantined_locked()
             existing = self._attachments.get(attachment_id)
             if existing is not None:
                 return {
@@ -2120,6 +2121,35 @@ class WorkspaceCapabilityService:
                 )
         return snapshots
 
+    def _quarantine_rag_locked(
+        self,
+        *,
+        previous_attachments: Mapping[str, AttachmentRecord],
+        previous_indexed_attachment_ids: set[str],
+        previous_snapshots: Mapping[tuple[str, int], IndexedSourceSnapshot],
+        previous_generation: int,
+    ) -> None:
+        """Fail closed after both a mutation and its rollback have failed."""
+
+        self.akasicdb_error = (
+            "RAG_OPERATOR_REVIEW_REQUIRED",
+            "local RAG state is quarantined pending operator review",
+        )
+        self.akasicdb = None
+        self._attachments = dict(previous_attachments)
+        self._indexed_attachment_ids = set(previous_indexed_attachment_ids)
+        self._source_snapshots = dict(previous_snapshots)
+        self._source_generation = previous_generation
+
+    def _raise_if_rag_quarantined_locked(self) -> None:
+        if (
+            self.akasicdb is None
+            and self.akasicdb_error is not None
+            and self.akasicdb_error[0] == "RAG_OPERATOR_REVIEW_REQUIRED"
+        ):
+            code, message = self.akasicdb_error
+            raise WorkspaceCapabilityError(code, message)
+
     def _rebuild_rag_index(self) -> None:
         with self._lock:
             if self.akasicdb is None:
@@ -2153,6 +2183,7 @@ class WorkspaceCapabilityService:
                 "INVALID_ATTACHMENT_ID", "attachment_id is invalid"
             )
         with self._lock:
+            self._raise_if_rag_quarantined_locked()
             record = self._attachments.get(attachment_id)
             if record is None:
                 raise WorkspaceCapabilityError(
@@ -2163,6 +2194,7 @@ class WorkspaceCapabilityService:
             # bounded blob before unlink so a later catalog/index failure can be
             # rolled back without leaving an inaccessible or misleading record.
             blob_content = self._verified_attachment_bytes(record)
+            previous_attachments = dict(self._attachments)
             previous_indexed = set(self._indexed_attachment_ids)
             previous_snapshots = dict(self._source_snapshots)
             previous_generation = self._source_generation
@@ -2189,8 +2221,12 @@ class WorkspaceCapabilityService:
                     self._persist_catalog()
                     self._rebuild_rag_index()
                 except Exception as rollback_exc:  # noqa: BLE001
-                    self._source_snapshots = previous_snapshots
-                    self._source_generation = previous_generation
+                    self._quarantine_rag_locked(
+                        previous_attachments=previous_attachments,
+                        previous_indexed_attachment_ids=previous_indexed,
+                        previous_snapshots=previous_snapshots,
+                        previous_generation=previous_generation,
+                    )
                     (
                         self._persisted_valid_blobs,
                         self._persisted_blob_count,
@@ -2389,6 +2425,12 @@ class WorkspaceCapabilityService:
                 "attachment_ids must be a unique bounded text list",
             )
         with self._lock:
+            if self.akasicdb is None:
+                code, message = self.akasicdb_error or (
+                    "AKASICDB_UNAVAILABLE",
+                    "AkasicDB is unavailable",
+                )
+                raise WorkspaceCapabilityError(code, message)
             records: dict[str, AttachmentRecord] = {}
             documents: dict[str, ExtractedDocument] = {}
             for attachment_id in attachment_ids:
@@ -2405,6 +2447,7 @@ class WorkspaceCapabilityService:
                 records[attachment_id] = record
                 documents[attachment_id] = self._read_attachment_document(record)
 
+            previous_attachments = dict(self._attachments)
             previous = set(self._indexed_attachment_ids)
             previous_snapshots = dict(self._source_snapshots)
             previous_generation = self._source_generation
@@ -2443,8 +2486,12 @@ class WorkspaceCapabilityService:
                     self._persist_catalog()
                     self._rebuild_rag_index()
                 except Exception as rollback_exc:  # noqa: BLE001
-                    self._source_snapshots = previous_snapshots
-                    self._source_generation = previous_generation
+                    self._quarantine_rag_locked(
+                        previous_attachments=previous_attachments,
+                        previous_indexed_attachment_ids=previous,
+                        previous_snapshots=previous_snapshots,
+                        previous_generation=previous_generation,
+                    )
                     raise WorkspaceCapabilityError(
                         "RAG_INDEX_ROLLBACK_FAILED",
                         "the local RAG rollback requires operator review",
@@ -2485,6 +2532,12 @@ class WorkspaceCapabilityService:
                 "attachment_ids must be a unique bounded text list",
             )
         with self._lock:
+            if self.akasicdb is None:
+                code, message = self.akasicdb_error or (
+                    "AKASICDB_UNAVAILABLE",
+                    "AkasicDB is unavailable",
+                )
+                raise WorkspaceCapabilityError(code, message)
             requested: list[AttachmentRecord] = []
             for attachment_id in attachment_ids:
                 record = self._attachments.get(attachment_id)
@@ -2499,6 +2552,7 @@ class WorkspaceCapabilityService:
                     )
                 requested.append(record)
 
+            previous_attachments = dict(self._attachments)
             previous = set(self._indexed_attachment_ids)
             previous_snapshots = dict(self._source_snapshots)
             previous_generation = self._source_generation
@@ -2534,8 +2588,12 @@ class WorkspaceCapabilityService:
                     self._persist_catalog()
                     self._rebuild_rag_index()
                 except Exception as rollback_exc:  # noqa: BLE001
-                    self._source_snapshots = previous_snapshots
-                    self._source_generation = previous_generation
+                    self._quarantine_rag_locked(
+                        previous_attachments=previous_attachments,
+                        previous_indexed_attachment_ids=previous,
+                        previous_snapshots=previous_snapshots,
+                        previous_generation=previous_generation,
+                    )
                     raise WorkspaceCapabilityError(
                         "RAG_REINDEX_ROLLBACK_FAILED",
                         "the local RAG rollback requires operator review",
@@ -2679,6 +2737,12 @@ class WorkspaceCapabilityService:
                 "INVALID_CHUNK_INDEX", "chunk_index is invalid"
             )
         with self._lock:
+            if self.akasicdb is None:
+                code, message = self.akasicdb_error or (
+                    "AKASICDB_UNAVAILABLE",
+                    "AkasicDB is unavailable",
+                )
+                raise WorkspaceCapabilityError(code, message)
             record = self._attachments.get(attachment_id)
             if record is None or attachment_id not in self._indexed_attachment_ids:
                 raise WorkspaceCapabilityError(

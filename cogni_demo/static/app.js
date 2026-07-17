@@ -131,13 +131,23 @@ const API_ERROR_COPY = {
   VOICE_WAV_TRUNCATED: "녹음된 WAV 데이터가 완전하지 않습니다.",
   VOICE_SILENCE_DETECTED: "말소리가 감지되지 않았습니다. 마이크를 가까이 두고 다시 시도해 주세요.",
 };
-const AGENT_MODULE_DEFAULTS = {
-  gemma: "LOCAL",
-  router: "READY",
-  swarm: "GATED",
-  cts: "READY",
-  fast: "GATED",
-};
+const RUNTIME_CAPABILITY_NAMES = Object.freeze([
+  "aflow",
+  "bio_hama",
+  "cts_deq",
+  "gemma4_e4b",
+  "self_harness",
+  "system_1_5",
+  "system_2_5",
+  "system_3",
+  "system_4",
+]);
+const RUNTIME_CAPABILITY_STATES = new Set([
+  "disabled", "research", "advisory", "canary", "authoritative",
+  "gated", "night_only", "proposal_only",
+]);
+const RUNTIME_EVIDENCE_CLASSES = new Set(["measured", "verified", "target", "plan"]);
+const EXECUTION_STATES = new Set(["active", "standby", "not_loaded", "off"]);
 const PHASE_ORDER = [
   "verifying",
   "loading_model",
@@ -207,17 +217,17 @@ const STORY = {
 };
 
 const NODE_COPY = {
-  rhythm: ["Bio Rhythm", "추론과 진화의 GPU 점유를 시간으로 분리합니다. 활성 추론이 끝나기 전에는 야간 변경 작업이 시작되지 않습니다.", "IMPLEMENTED + TESTED"],
-  router: ["BIO-HAMA Meta Router", "인지 부하와 불확실성을 고정 크기 텐서로 계산해 전략·전술·반응 모듈 예산을 조절합니다.", "IMPLEMENTED + TESTED"],
-  aflow: ["AFlow", "봉인된 held-in/held-out 평가로 bounded workflow 후보를 탐색합니다. 결과는 production에 설치되지 않고 연구 archive에만 남습니다.", "RESEARCH ARCHIVE ONLY"],
-  harness: ["Self-Harness", "성공 invariant와 실패 trace를 영속 저장하고, 서로 다른 K≥3 후보를 정책 검사 후 검토 대기 상태로 보존합니다. 실행·소스 수정·자동 승격 API는 없습니다.", "PROPOSAL ONLY"],
-  gemma: ["Local Gemma 4", "검증된 로컬 경로와 manifest만 허용합니다. Hub ID·URL·remote code·KV cache는 거부됩니다.", "LIVE VALIDATION REQUIRED"],
-  deq: ["DEQ Equilibrium", "제한 이력 Broyden solver가 고정점 잔차를 계산하고, 미수렴·비유한 상태를 성공으로 표시하지 않습니다.", "LIVE VALIDATION REQUIRED"],
-  cts: ["Cognitive Tree Search", "Depth가 커져도 사전 할당된 301-node arena와 bounded ancestor bank 안에서 탐색합니다.", "LIVE VALIDATION REQUIRED"],
-  fast: ["Fast Weight", "수렴된 상태를 bounded 저랭크 세션 overlay로 컴파일하며 원본 모델 가중치는 변경하지 않습니다. 실제 학습 checkpoint가 없으면 항상 꺼진 상태입니다.", "GATED · ARTIFACT REQUIRED"],
-  swarm: ["System 4", "28개 에이전트가 연속 텐서를 결합합니다. 지연 수치는 별도 현재 프로세스 벤치마크 증거가 연결되기 전에는 표시하지 않습니다.", "ADVISORY · BENCHMARK REQUIRED"],
-  experts: ["System 3", "8-slot top-2 pool에서 신규성 보정, C-FIRE, held-out, routed Fisher, canary, 독립 검증 순으로만 승격합니다.", "ADVISORY UNTIL ATTESTED"],
-  ewc: ["FP-EWC", "고정점 민감도를 matrix-free 방식으로 추정하고 C-FIRE 재투영으로 업데이트 후 안정성을 확인합니다.", "IMPLEMENTED + TESTED"],
+  rhythm: ["Bio Rhythm", "상태 기계는 추론과 진화의 동시 실행을 금지합니다. 이 제어 계약은 답변 권한과 별개입니다."],
+  router: ["BIO-HAMA Meta Router", "부하·불확실성 텔레메트리를 관측하는 advisory 경로입니다. 현재 답변 토큰을 결정하지 않습니다."],
+  aflow: ["AFlow", "봉인된 held-in/held-out 평가로 bounded workflow 후보를 탐색합니다. 결과는 production에 설치되지 않고 연구 archive에만 남습니다."],
+  harness: ["Self-Harness", "성공 invariant와 실패 trace를 영속 저장하고, 서로 다른 K≥3 후보를 정책 검사 후 검토 대기 상태로 보존합니다. 실행·소스 수정·자동 승격 API는 없습니다."],
+  gemma: ["Local Gemma 4", "검증된 로컬 경로와 manifest만 허용합니다. Hub ID·URL·remote code·KV cache는 거부됩니다."],
+  deq: ["DEQ Equilibrium", "제한 이력 Broyden solver가 고정점 잔차를 계산하고, 미수렴·비유한 상태를 성공으로 표시하지 않습니다."],
+  cts: ["Cognitive Tree Search", "사전 할당된 301-node arena와 bounded ancestor bank 안에서 탐색하는 canary answer path입니다."],
+  fast: ["Fast Weight", "수렴 상태의 bounded 저랭크 overlay 후보입니다. admitted checkpoint가 없으면 inference에서 꺼집니다."],
+  swarm: ["System 4", "bounded tensor swarm 상태를 텔레메트리로 노출합니다. 현재 답변 토큰을 변경하지 않으며 지연 수치는 live benchmark 전 표시하지 않습니다."],
+  experts: ["System 3", "bounded expert pool 상태를 텔레메트리로 노출합니다. 현재 답변 토큰을 변경하지 않으며 승격은 attestation 전 차단됩니다."],
+  ewc: ["FP-EWC", "evolution lifecycle의 night-only 업데이트 후보입니다. C-FIRE는 해당 업데이트 투영 범위에만 적용되며 decoder 전체 인증이 아닙니다."],
 };
 
 const TOUR = [
@@ -258,6 +268,8 @@ const ui = {
   validationConnectionLost: false,
   lastAgentErrorKey: "",
   lastEvolutionErrorKey: "",
+  runtimeCapabilities: Object.create(null),
+  runtimeExecutionModules: Object.create(null),
   workspaceCapabilities: null,
   workspaceCapabilitiesLoaded: false,
   workspaceRequestPending: false,
@@ -920,8 +932,39 @@ function renderWorkspaceModels(models) {
   );
 }
 
+function updateExternalCallDisclosure(mode, externalCalls) {
+  const validMode = mode === "air_gapped" || mode === "online_opt_in";
+  const validCalls = Number.isInteger(externalCalls) && externalCalls >= 0;
+  const verified = validMode && validCalls;
+  const networkLabel = !verified
+    ? "NETWORK UNVERIFIED"
+    : mode === "online_opt_in"
+      ? "ONLINE OPT-IN"
+      : "LOCAL ONLY";
+  const disclosure = !verified
+    ? "UNVERIFIED"
+    : mode === "online_opt_in"
+      ? `ONLINE OPT-IN · ${externalCalls} CALLS`
+      : `DISABLED · ${externalCalls} CALLS`;
+
+  setText("#network-mode-label", networkLabel);
+  setText("#external-call-count", verified ? String(externalCalls) : "—");
+  setText("#telemetry-external-calls", disclosure);
+  setText("#rail-external-calls", disclosure);
+  const pill = $("#network-mode-pill");
+  pill?.classList.toggle("status-local", verified && mode === "air_gapped");
+  pill?.classList.toggle("is-online-opt-in", verified && mode === "online_opt_in");
+  ["#telemetry-external-calls", "#rail-external-calls"].forEach((selector) => {
+    const element = $(selector);
+    element?.classList.toggle("positive", verified && mode === "air_gapped");
+  });
+}
+
 function applyWorkspaceCapabilities(capabilities) {
-  if (!capabilities || typeof capabilities !== "object") return;
+  if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
+    updateExternalCallDisclosure("", null);
+    return;
+  }
   ui.workspaceCapabilities = capabilities;
   ui.workspaceCapabilitiesLoaded = true;
   const attachments = capabilities.attachments || {};
@@ -966,11 +1009,11 @@ function applyWorkspaceCapabilities(capabilities) {
           ? "사용 가능"
           : "문서 필요",
   );
-  const networkMode = web.mode === "online_opt_in" ? "online_opt_in" : "air_gapped";
-  setText("#network-mode-label", networkMode === "online_opt_in" ? "ONLINE OPT-IN" : "LOCAL ONLY");
-  const externalCalls = Number.isInteger(lens.external_calls) ? Math.max(0, lens.external_calls) : 0;
-  setText("#external-call-count", String(externalCalls));
-  $("#network-mode-pill")?.classList.toggle("is-online-opt-in", networkMode === "online_opt_in");
+  const networkMode = web.mode === "air_gapped" || web.mode === "online_opt_in" ? web.mode : "";
+  const externalCalls = Number.isInteger(lens.external_calls) && lens.external_calls >= 0
+    ? lens.external_calls
+    : null;
+  updateExternalCallDisclosure(networkMode, externalCalls);
   ui.lensConnectorReady = WEB_SEARCH_UI_IMPLEMENTED
     && networkMode === "online_opt_in"
     && lens.executor_implemented === true
@@ -1218,8 +1261,7 @@ async function loadWorkspaceCapabilities() {
     setText("#agent-web-status", "오프라인");
     setText("#agent-microphone-status", "미연결");
     setText("#agent-model-status", "확인 실패");
-    setText("#network-mode-label", "LOCAL ONLY");
-    setText("#external-call-count", "0");
+    updateExternalCallDisclosure("", null);
     ui.lensConnectorReady = false;
     updateWorkspaceControlStates();
   }
@@ -1718,7 +1760,7 @@ async function searchLensOfficialApi(event) {
     renderLensSearchResults(results);
     const total = Number.isInteger(search?.total) ? Math.max(0, search.total) : results.length;
     const calls = Number.isInteger(search?.external_calls) ? Math.max(0, search.external_calls) : 0;
-    setText("#external-call-count", String(calls));
+    updateExternalCallDisclosure("online_opt_in", calls);
     setText(
       "#agent-lens-search-status",
       `${total.toLocaleString("ko-KR")}건 중 ${results.length}건 표시${shouldIndex ? " · 출처 포함 AkasicDB 인덱싱 요청 완료" : ""}`,
@@ -2753,27 +2795,148 @@ function renderAgentConversation(messages = []) {
   }
 }
 
-function updateAgentCore(core = {}) {
-  const active = new Set(Array.isArray(core.active_modules) ? core.active_modules : []);
-  const modelLoaded = core.model_loaded === true;
-  $$('[data-agent-module]').forEach((module) => {
-    const moduleName = module.dataset.agentModule;
-    const modelDependent = moduleName === "gemma" || moduleName === "cts";
-    const unavailable = modelDependent && !modelLoaded;
-    const enabled = active.has(moduleName) && !unavailable;
-    module.classList.toggle("is-active", enabled);
-    module.classList.toggle("is-unavailable", unavailable);
-    const state = $("b", module);
-    if (state && unavailable) state.textContent = "NOT LOADED";
-    else if (state && enabled) state.textContent = "ACTIVE";
-    else if (state && core.modules && typeof core.modules[moduleName] === "string") {
-      state.textContent = core.modules[moduleName].slice(0, 32).toUpperCase();
-    } else if (state) {
-      state.textContent = AGENT_MODULE_DEFAULTS[moduleName] || "READY";
+function normalizedRuntimeCapability(raw, expectedName) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (raw.name !== expectedName) return null;
+  if (!RUNTIME_CAPABILITY_STATES.has(raw.state)) return null;
+  if (!RUNTIME_EVIDENCE_CLASSES.has(raw.evidence)) return null;
+  if (typeof raw.answer_bearing !== "boolean") return null;
+  if (typeof raw.runtime_mutation_allowed !== "boolean") return null;
+  if (typeof raw.detail !== "string" || raw.detail.length < 1 || raw.detail.length > 256) return null;
+  const nonAnswerStates = new Set(["disabled", "research", "advisory", "night_only", "proposal_only"]);
+  if (nonAnswerStates.has(raw.state) && raw.answer_bearing) return null;
+  if (raw.state === "proposal_only" && raw.runtime_mutation_allowed) return null;
+  return Object.freeze({
+    name: expectedName,
+    state: raw.state,
+    evidence: raw.evidence,
+    answerBearing: raw.answer_bearing,
+    runtimeMutationAllowed: raw.runtime_mutation_allowed,
+    detail: raw.detail,
+  });
+}
+
+function normalizedRuntimeCapabilities(raw) {
+  const result = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return result;
+  RUNTIME_CAPABILITY_NAMES.forEach((name) => {
+    const record = normalizedRuntimeCapability(raw[name], name);
+    if (record) result[name] = record;
+  });
+  return result;
+}
+
+function capabilityAuthorityLabel(record) {
+  if (!record) return "UNVERIFIED · OFF";
+  if (record.state === "authoritative" && record.answerBearing) {
+    return "AUTHORITATIVE · ANSWER-BEARING";
+  }
+  if (record.state === "canary" && record.answerBearing) return "CANARY · ANSWER-BEARING";
+  if (record.state === "advisory" && !record.answerBearing) return "ADVISORY · TELEMETRY ONLY";
+  if (record.state === "gated" && !record.answerBearing) return "GATED · OFF";
+  if (record.state === "night_only" && !record.answerBearing) {
+    return "NIGHT ONLY · INFERENCE OFF";
+  }
+  if (record.state === "research" && !record.answerBearing) return "RESEARCH ARCHIVE ONLY";
+  if (
+    record.state === "proposal_only"
+    && !record.answerBearing
+    && !record.runtimeMutationAllowed
+  ) return "PROPOSAL ONLY · MUTATION BLOCKED";
+  if (record.state === "disabled" && !record.answerBearing) return "DISABLED · OFF";
+  return "UNVERIFIED · OFF";
+}
+
+function capabilityEvidenceLabel(record) {
+  return record ? `EVIDENCE ${record.evidence.toUpperCase()}` : "EVIDENCE UNVERIFIED";
+}
+
+function executionLabel(status) {
+  if (status === "active") return "ACTIVE";
+  if (status === "standby") return "STANDBY";
+  if (status === "not_loaded") return "NOT LOADED";
+  if (status === "off") return "OFF";
+  return "UNVERIFIED";
+}
+
+function renderCapabilityDisclosures() {
+  $$("[data-capability-name]").forEach((container) => {
+    const record = ui.runtimeCapabilities[container.dataset.capabilityName] || null;
+    const authority = capabilityAuthorityLabel(record);
+    const evidence = capabilityEvidenceLabel(record);
+    $$("[data-capability-authority]", container).forEach((element) => {
+      element.textContent = authority;
+    });
+    $$("[data-capability-evidence]", container).forEach((element) => {
+      element.textContent = evidence;
+    });
+    if (container.matches("button")) {
+      container.title = `${authority} · ${evidence}`;
     }
   });
-  const badge = $("#agent-core-badge");
-  if (badge) badge.textContent = typeof core.verdict === "string" ? core.verdict.slice(0, 64) : "대기";
+  const complete = RUNTIME_CAPABILITY_NAMES.every((name) => ui.runtimeCapabilities[name]);
+  setText("#agent-core-badge", complete ? "FACT-BOOK DISCLOSED" : "AUTHORITY UNVERIFIED");
+  setText(
+    "#architecture-authority-badge",
+    complete ? "FACT-BOOK DISCLOSED" : "AUTHORITY UNVERIFIED",
+  );
+}
+
+function updateExecutionIndicator(container, status) {
+  const label = executionLabel(status);
+  const active = status === "active";
+  const unavailable = status === "not_loaded" || status === "off" || !EXECUTION_STATES.has(status);
+  container.classList.toggle("is-active", active);
+  container.classList.toggle("is-unavailable", unavailable);
+  const element = $("[data-execution-status]", container);
+  if (element) element.textContent = label;
+}
+
+function updateNodeDetail(button) {
+  if (!button) return;
+  const nodeCopy = NODE_COPY[button.dataset.node];
+  if (!nodeCopy) return;
+  const panel = $("#node-detail");
+  if (!panel) return;
+  const [title, copy] = nodeCopy;
+  const capabilityName = button.dataset.capabilityName || "";
+  const executionModule = button.dataset.executionModule || "";
+  const record = capabilityName ? ui.runtimeCapabilities[capabilityName] || null : null;
+  const execution = executionModule
+    ? executionLabel(ui.runtimeExecutionModules[executionModule])
+    : button.dataset.node === "rhythm"
+      ? "STATE MACHINE"
+      : "UNVERIFIED";
+  $("h2", panel).textContent = title;
+  $("p", panel).textContent = copy;
+  setText("#node-detail-execution", execution);
+  setText("#node-detail-authority", capabilityAuthorityLabel(record));
+  setText("#node-detail-evidence", capabilityEvidenceLabel(record));
+}
+
+function updateAgentCore(core = {}) {
+  ui.runtimeCapabilities = normalizedRuntimeCapabilities(core.capabilities);
+  ui.runtimeExecutionModules = Object.create(null);
+  const allowedExecutionModules = new Set([
+    "gemma", "router", "swarm", "experts", "cts",
+    "fast", "stability", "aflow", "harness",
+  ]);
+  if (core.modules && typeof core.modules === "object" && !Array.isArray(core.modules)) {
+    Object.entries(core.modules).forEach(([name, status]) => {
+      if (allowedExecutionModules.has(name) && EXECUTION_STATES.has(status)) {
+        ui.runtimeExecutionModules[name] = status;
+      }
+    });
+  }
+
+  renderCapabilityDisclosures();
+  $$("[data-agent-module]").forEach((module) => {
+    updateExecutionIndicator(module, ui.runtimeExecutionModules[module.dataset.agentModule]);
+  });
+  $$("[data-execution-module]").forEach((module) => {
+    updateExecutionIndicator(module, ui.runtimeExecutionModules[module.dataset.executionModule]);
+  });
+  updateNodeDetail($("[data-node].is-selected"));
 }
 
 function updateEvolutionState(evolution = {}) {
@@ -3278,13 +3441,9 @@ function bindScenarios() {
 }
 
 function bindArchitecture() {
-  $$('[data-node]').forEach((button) => button.addEventListener("click", () => {
-    $$('[data-node]').forEach((item) => item.classList.toggle("is-selected", item === button));
-    const [title, copy, status] = NODE_COPY[button.dataset.node];
-    const panel = $("#node-detail");
-    $("h2", panel).textContent = title;
-    $("p", panel).textContent = copy;
-    $("div strong", panel).textContent = status;
+  $$("[data-node]").forEach((button) => button.addEventListener("click", () => {
+    $$("[data-node]").forEach((item) => item.classList.toggle("is-selected", item === button));
+    updateNodeDetail(button);
   }));
 }
 

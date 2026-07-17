@@ -32,10 +32,10 @@
       </a>
 
       <div class="topbar-status" aria-label="시스템 상태">
-        <span class="status-pill status-local" id="network-mode-pill"><i></i><b id="network-mode-label">LOCAL ONLY</b></span>
-        <span class="status-pill"><span class="status-label">외부 호출</span><b id="external-call-count">0</b></span>
+        <span class="status-pill" id="network-mode-pill"><i></i><b id="network-mode-label">NETWORK UNVERIFIED</b></span>
+        <span class="status-pill"><span class="status-label">외부 호출</span><b id="external-call-count">—</b></span>
         <span class="status-pill"><span class="status-label">리듬</span><b id="rhythm-value">INFERENCE</b></span>
-        <span class="status-pill status-runtime" id="runtime-pill"><i></i><b id="runtime-label">검증 READY</b></span>
+        <span class="status-pill status-runtime" id="runtime-pill"><i></i><b id="runtime-label">상태 확인 중</b></span>
       </div>
 
       <div class="topbar-actions">
@@ -218,15 +218,16 @@
 
           <aside class="agent-side-stack" aria-label="Cogni Agent 실행 상태">
             <article class="agent-runtime-card surface">
-              <div class="card-heading compact"><div><span class="section-kicker">COGNI-CORE ROUTE</span><h2>인지 파이프라인</h2></div><span class="evidence-badge verified" id="agent-core-badge" role="status">대기</span></div>
-              <div class="core-route" aria-label="대화 요청 처리 경로">
-                <div data-agent-module="gemma"><span>01</span><p><strong>Gemma 4 e4b</strong><small>로컬 생성 백본</small></p><b>LOCAL</b></div>
-                <div data-agent-module="router"><span>02</span><p><strong>BIO-HAMA</strong><small>부하·불확실성 라우팅</small></p><b>READY</b></div>
-                <div data-agent-module="swarm"><span>03</span><p><strong>System 4 · 3</strong><small>텐서 결합·전문가 자문</small></p><b>GATED</b></div>
-                <div data-agent-module="cts"><span>04</span><p><strong>DEQ · CTS</strong><small>bounded 숙고 경로</small></p><b>READY</b></div>
-                <div data-agent-module="fast"><span>05</span><p><strong>System 1.5</strong><small>검증된 세션 Fast Weight</small></p><b>GATED</b></div>
+              <div class="card-heading compact"><div><span class="section-kicker">COGNI-CORE ROUTE</span><h2>인지 파이프라인</h2></div><span class="evidence-badge" id="agent-core-badge" role="status">AUTHORITY UNVERIFIED</span></div>
+              <div class="core-route" aria-label="실행 상태와 Fact-book 권한이 분리된 대화 요청 처리 경로">
+                <div data-agent-module="gemma" data-capability-name="gemma4_e4b"><span>01</span><p><strong>Gemma 4 e4b</strong><small>로컬 생성 백본</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
+                <div data-agent-module="router" data-capability-name="bio_hama"><span>02</span><p><strong>BIO-HAMA</strong><small>부하·불확실성 라우팅</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
+                <div data-agent-module="swarm" data-capability-name="system_4"><span>03</span><p><strong>System 4</strong><small>텐서 결합 텔레메트리</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
+                <div data-agent-module="experts" data-capability-name="system_3"><span>04</span><p><strong>System 3</strong><small>전문가 텔레메트리</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
+                <div data-agent-module="cts" data-capability-name="cts_deq"><span>05</span><p><strong>DEQ · CTS</strong><small>bounded 숙고 경로</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
+                <div data-agent-module="fast" data-capability-name="system_1_5"><span>06</span><p><strong>System 1.5</strong><small>세션 Fast Weight 후보</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
               </div>
-              <div class="agent-core-foot"><span>System 2.5</span><strong>야간 FP-EWC · C-FIRE &lt; 0.95</strong></div>
+              <div class="agent-core-foot" data-capability-name="system_2_5"><span>System 2.5</span><strong data-capability-authority>UNVERIFIED · OFF</strong><em data-capability-evidence>EVIDENCE UNVERIFIED</em></div>
             </article>
 
             <article class="task-policy-card surface">
@@ -236,7 +237,8 @@
             </article>
 
             <article class="evolution-card surface">
-              <div class="card-heading compact"><div><span class="section-kicker">SELF-HARNESS</span><h2>자가 거울치료</h2></div><span class="evidence-badge planned" id="evolution-badge" role="status">감시 중</span></div>
+              <div class="card-heading compact"><div><span class="section-kicker">SELF-HARNESS</span><h2>자가 거울치료</h2></div><span class="evidence-badge planned" id="evolution-badge" role="status">실행 대기</span></div>
+              <p class="capability-disclosure" data-capability-name="self_harness"><strong data-capability-authority>UNVERIFIED · OFF</strong><span data-capability-evidence>EVIDENCE UNVERIFIED</span></p>
               <div class="evolution-cycle" aria-label="Self-Harness 제안 전용 단계"><span>실패·성공 증거</span><i>→</i><span>K≥3 후보</span><i>→</i><span>정책 검사</span><i>→</i><span>검토 대기</span></div>
               <dl class="evolution-facts"><div><dt>영속 실패 증거</dt><dd id="evolution-failures">0</dd></div><div><dt>증거 수집률</dt><dd id="evolution-coverage">100%</dd></div><div><dt>검토 대기 후보</dt><dd id="evolution-proposals">0</dd></div><div><dt>자동 승격</dt><dd id="evolution-sandbox">차단</dd></div></dl>
               <div class="evolution-actions">
@@ -346,7 +348,7 @@
             <ol class="phase-list" id="phase-list">
               <li data-phase="verify"><span><i></i></span><div><strong>Artifact integrity</strong><small>로컬 manifest · SHA-256 검증</small></div><b>01</b></li>
               <li data-phase="model_load"><span><i></i></span><div><strong>Local Gemma load</strong><small>원격 코드·Hub 요청 차단</small></div><b>02</b></li>
-              <li data-phase="runtime_build"><span><i></i></span><div><strong>Genesis runtime</strong><small>Fast Weight · System 3/4 · BIO-HAMA</small></div><b>03</b></li>
+              <li data-phase="runtime_build"><span><i></i></span><div><strong>Genesis runtime</strong><small>Gemma/CTS answer path · advisory telemetry · gated overlays</small></div><b>03</b></li>
               <li data-phase="inference"><span><i></i></span><div><strong>DEQ + CTS search</strong><small>고정 301-node arena · Depth 100</small></div><b>04</b></li>
               <li data-phase="postcheck"><span><i></i></span><div><strong>Safety postcheck</strong><small>VRAM · finite · residual · fallback</small></div><b>05</b></li>
             </ol>
@@ -398,11 +400,11 @@
               <div class="vram-visual"><progress class="vram-fill" id="telemetry-vram-fill" max="16.7" value="0" aria-label="현재 프로세스 VRAM 검증 전"></progress><span class="vram-limit">LIMIT</span><div class="vram-grid"></div></div>
             </div>
             <dl class="telemetry-list">
-              <div><dt>Contraction</dt><dd>0.40</dd></div>
-              <div><dt>Spectral margin</dt><dd>&lt; 0.95</dd></div>
+              <div><dt>Contraction</dt><dd>설계 상한 0.40</dd></div>
+              <div><dt>Spectral margin</dt><dd>업데이트 투영 &lt; 0.95</dd></div>
               <div><dt>Finite check</dt><dd id="telemetry-finite">미측정</dd></div>
               <div><dt>Fallback</dt><dd id="telemetry-fallback">미측정</dd></div>
-              <div><dt>App external calls</dt><dd class="positive">DISABLED</dd></div>
+              <div><dt>App external calls</dt><dd id="telemetry-external-calls">UNVERIFIED</dd></div>
             </dl>
             <button class="text-link" type="button" data-action="toggle-log">실행 이벤트 보기 <span>↗</span></button>
           </article>
@@ -416,38 +418,38 @@
 
       <section class="view" id="view-architecture" data-view-panel="architecture" aria-labelledby="architecture-title" hidden>
         <div class="view-heading">
-          <div><span class="section-kicker">AIR-GAPPED ARCHITECTURE</span><h1 id="architecture-title">문장은 경계에서 끝납니다.<br>내부에서는 텐서만 이동합니다.</h1><p>제어 평면과 GPU 인지 코어를 분리하고, 한 시점에 하나의 CUDA 소유자만 허용합니다.</p></div>
-          <span class="evidence-badge verified large">구성 검증</span>
+          <div><span class="section-kicker">AIR-GAPPED ARCHITECTURE</span><h1 id="architecture-title">모델 IPC 경계에서는 텐서가 이동합니다.<br>제어·증거 경계는 타입 계약을 따릅니다.</h1><p>GPU hot path는 bounded tensor protocol을 사용하고, 제어·저장·감사 경로는 bounded typed payload를 사용합니다. 이는 제품 전체의 tensor-only 주장이 아닙니다.</p></div>
+          <span class="evidence-badge large" id="architecture-authority-badge">AUTHORITY UNVERIFIED</span>
         </div>
 
         <article class="architecture-map surface" aria-label="Cogni-OS 시스템 아키텍처">
           <div class="arch-column flow-column">
             <div class="arch-column-title"><span>CPU CONTROL PLANE</span><h2>Cogni-Flow</h2><p>설계 · 운영 · 진화</p></div>
-            <button class="arch-node" type="button" data-node="rhythm"><i class="node-icon">01</i><span><strong>Bio Rhythm</strong><small>Day / Night exclusion</small></span><b>STATE</b></button>
-            <button class="arch-node" type="button" data-node="router"><i class="node-icon">02</i><span><strong>BIO-HAMA</strong><small>인지 부하 메타 라우팅</small></span><b>ROUTE</b></button>
-            <button class="arch-node" type="button" data-node="aflow"><i class="node-icon">03</i><span><strong>AFlow</strong><small>bounded workflow search</small></span><b>PLAN</b></button>
-            <button class="arch-node" type="button" data-node="harness"><i class="node-icon">04</i><span><strong>Self-Harness</strong><small>evidence-linked proposal ledger</small></span><b>PROPOSE</b></button>
+            <button class="arch-node" type="button" data-node="rhythm"><i class="node-icon">01</i><span><strong>Bio Rhythm</strong><small>Day / Night exclusion</small></span><b>STATE MACHINE</b></button>
+            <button class="arch-node" type="button" data-node="router" data-capability-name="bio_hama" data-execution-module="router"><i class="node-icon">02</i><span><strong>BIO-HAMA</strong><small>인지 부하 메타 라우팅</small></span><b data-execution-status>UNVERIFIED</b></button>
+            <button class="arch-node" type="button" data-node="aflow" data-capability-name="aflow" data-execution-module="aflow"><i class="node-icon">03</i><span><strong>AFlow</strong><small>bounded workflow archive</small></span><b data-execution-status>UNVERIFIED</b></button>
+            <button class="arch-node" type="button" data-node="harness" data-capability-name="self_harness" data-execution-module="harness"><i class="node-icon">04</i><span><strong>Self-Harness</strong><small>evidence-linked proposal ledger</small></span><b data-execution-status>UNVERIFIED</b></button>
           </div>
 
           <div class="arch-boundary">
-            <span class="boundary-label">BOUNDED TENSOR BOUNDARY</span>
+            <span class="boundary-label">MODEL IPC TENSOR BOUNDARY</span>
             <div class="tensor-stream" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
             <div class="protocol-stack"><span>INFER</span><span>PAUSE</span><span>RESUME</span><span>STOP</span></div>
-            <div class="boundary-note"><strong>4× CPU Tensor</strong><small>numeric protocol · timeout · bounded queue</small></div>
+            <div class="boundary-note"><strong>Bounded model IPC</strong><small>tensor hot path · typed control envelope · timeout · bounded queue</small></div>
           </div>
 
           <div class="arch-column core-column">
             <div class="arch-column-title"><span>SINGLE GPU DATA PLANE</span><h2>Cogni-Core</h2><p>지각 · 평형 · 탐색</p></div>
-            <button class="arch-node accent-node" type="button" data-node="gemma"><i class="node-icon">G4</i><span><strong>Local Gemma 4</strong><small>feature backbone · no KV cache</small></span><b>LOAD</b></button>
+            <button class="arch-node accent-node" type="button" data-node="gemma" data-capability-name="gemma4_e4b" data-execution-module="gemma"><i class="node-icon">G4</i><span><strong>Local Gemma 4</strong><small>answer-bearing backbone · no KV cache</small></span><b data-execution-status>UNVERIFIED</b></button>
             <div class="core-cluster">
-              <button type="button" data-node="deq"><strong>DEQ</strong><small>Broyden equilibrium</small></button>
-              <button type="button" data-node="cts"><strong>CTS</strong><small>fixed arena search</small></button>
-              <button type="button" data-node="fast"><strong>Fast Weight</strong><small>bounded overlay</small></button>
-              <button type="button" data-node="swarm"><strong>System 4</strong><small>tensor swarm</small></button>
-              <button type="button" data-node="experts"><strong>System 3</strong><small>sparse experts</small></button>
-              <button type="button" data-node="ewc"><strong>FP-EWC</strong><small>stability guard</small></button>
+              <button type="button" data-node="deq" data-capability-name="cts_deq" data-execution-module="cts"><strong>DEQ</strong><small>Broyden equilibrium</small></button>
+              <button type="button" data-node="cts" data-capability-name="cts_deq" data-execution-module="cts"><strong>CTS</strong><small>fixed arena search</small></button>
+              <button type="button" data-node="fast" data-capability-name="system_1_5" data-execution-module="fast"><strong>Fast Weight</strong><small>gated overlay candidate</small></button>
+              <button type="button" data-node="swarm" data-capability-name="system_4" data-execution-module="swarm"><strong>System 4</strong><small>telemetry-only tensor swarm</small></button>
+              <button type="button" data-node="experts" data-capability-name="system_3" data-execution-module="experts"><strong>System 3</strong><small>telemetry-only experts</small></button>
+              <button type="button" data-node="ewc" data-capability-name="system_2_5" data-execution-module="stability"><strong>FP-EWC</strong><small>night-only update guard</small></button>
             </div>
-            <div class="core-safety"><span>C-FIRE</span><strong>L &lt; 0.95</strong><small>spectral safety projection</small></div>
+            <div class="core-safety"><span>C-FIRE</span><strong>UPDATE PROJECTION</strong><small>target L &lt; 0.95 · not a decoder-wide certificate</small></div>
           </div>
         </article>
 
@@ -461,8 +463,10 @@
           <article class="node-detail surface" id="node-detail" aria-live="polite">
             <span class="section-kicker">SELECT A MODULE</span>
             <h2>안전한 마이크로서비스 경계</h2>
-            <p>GPU 모델은 worker 하나만 소유합니다. 요청과 응답은 고정된 텐서 프로토콜을 통과하며 문자열·JSON은 hot path에 들어가지 않습니다.</p>
-            <div><span>상태</span><strong>IMPLEMENTED + TESTED</strong></div>
+            <p>모델 IPC hot path와 제어·증거 경계는 서로 다른 제한 계약을 사용합니다. 모듈을 선택하면 실행 상태와 Fact-book 권한을 분리해 표시합니다.</p>
+            <div><span>실행</span><strong id="node-detail-execution">UNVERIFIED</strong></div>
+            <div><span>권한</span><strong id="node-detail-authority">UNVERIFIED · OFF</strong></div>
+            <div><span>증거</span><strong id="node-detail-evidence">EVIDENCE UNVERIFIED</strong></div>
           </article>
         </div>
       </section>
@@ -584,7 +588,7 @@
         <div><dt>Model</dt><dd>Gemma 4 e4b</dd></div>
         <div><dt>Manifest</dt><dd id="rail-files">—</dd></div>
         <div><dt>Runtime</dt><dd>Genesis v0.4.0</dd></div>
-        <div><dt>App external calls</dt><dd class="positive">DISABLED</dd></div>
+        <div><dt>App external calls</dt><dd id="rail-external-calls">UNVERIFIED</dd></div>
         <div><dt>KV cache</dt><dd>DISABLED</dd></div>
       </dl>
       <div class="rail-divider"></div>

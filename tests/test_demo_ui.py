@@ -177,8 +177,8 @@ class TestCogniBoardUI(unittest.TestCase):
         )
         self.assertIn("검증 모델 확인 중", html)
         self.assertIn('id="agent-model-status">확인 중', html)
-        self.assertIn('id="network-mode-label">LOCAL ONLY', html)
-        self.assertIn('id="external-call-count">0', html)
+        self.assertIn('id="network-mode-label">NETWORK UNVERIFIED', html)
+        self.assertIn('id="external-call-count">—', html)
         self.assertRegex(
             stylesheet,
             r"(?s)\.chat-composer\s*\{[^}]*position:\s*sticky;"
@@ -232,9 +232,14 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("about.lens.org/lens-api-terms-of-use/", markup)
         self.assertIn("microphone.runtime_audio_input === true", script)
         self.assertIn(
-            'networkMode === "online_opt_in" ? "ONLINE OPT-IN" : "LOCAL ONLY"', script
+            "function updateExternalCallDisclosure(mode, externalCalls)", script
         )
-        self.assertIn('setText("#external-call-count", "0")', script)
+        self.assertIn('mode === "online_opt_in"', script)
+        self.assertIn(
+            'setText("#external-call-count", verified ? String(externalCalls) : "—")',
+            script,
+        )
+        self.assertIn('updateExternalCallDisclosure("", null)', script)
         self.assertIn("chip.append(name, state, imageSelect, remove)", script)
         self.assertIn('data-action="workspace-attachment-delete"', script)
         self.assertIn('data-action="workspace-attachment-preview"', script)
@@ -246,6 +251,58 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("score ${source.score.toFixed(4)}", script)
         self.assertIn('"로컬 저장·모델 미전달"', script)
         self.assertIn("selector.replaceChildren(fragment)", script)
+
+    def test_runtime_authority_is_factbook_driven_and_fails_closed(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
+
+        for capability in (
+            "gemma4_e4b",
+            "cts_deq",
+            "bio_hama",
+            "system_1_5",
+            "system_2_5",
+            "system_3",
+            "system_4",
+            "aflow",
+            "self_harness",
+        ):
+            with self.subTest(capability=capability):
+                self.assertIn(f'data-capability-name="{capability}"', html)
+
+        for disclosure in (
+            "AUTHORITATIVE · ANSWER-BEARING",
+            "CANARY · ANSWER-BEARING",
+            "ADVISORY · TELEMETRY ONLY",
+            "GATED · OFF",
+            "NIGHT ONLY · INFERENCE OFF",
+            "RESEARCH ARCHIVE ONLY",
+            "PROPOSAL ONLY · MUTATION BLOCKED",
+        ):
+            with self.subTest(disclosure=disclosure):
+                self.assertIn(disclosure, script)
+
+        self.assertIn("normalizedRuntimeCapabilities(core.capabilities)", script)
+        self.assertIn('return "UNVERIFIED · OFF"', script)
+        self.assertIn('return "UNVERIFIED"', script)
+        self.assertNotIn("AGENT_MODULE_DEFAULTS", script)
+        self.assertIn('id="agent-core-badge" role="status">AUTHORITY UNVERIFIED', html)
+        self.assertIn(
+            'id="architecture-authority-badge">AUTHORITY UNVERIFIED',
+            html,
+        )
+        self.assertNotRegex(
+            html,
+            r'evidence-badge verified" id="(?:agent-core-badge|architecture-authority-badge)"',
+        )
+        self.assertNotIn("문장은 경계에서 끝납니다", html)
+        self.assertNotIn("내부에서는 텐서만 이동합니다", html)
+        self.assertIn("MODEL IPC TENSOR BOUNDARY", html)
+        self.assertIn("제품 전체의 tensor-only 주장이 아닙니다", html)
+        self.assertIn("not a decoder-wide certificate", html)
+        self.assertIn("[data-capability-authority]", stylesheet)
+        self.assertIn("[data-execution-module].is-unavailable", stylesheet)
 
     def test_image_chat_selection_is_explicit_single_turn_and_accessible(self) -> None:
         script = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -579,7 +636,7 @@ class TestCogniBoardUI(unittest.TestCase):
         script = (STATIC / "app.js").read_text(encoding="utf-8")
         stylesheet = (STATIC / "app.css").read_text(encoding="utf-8")
 
-        self.assertIn("검증 READY", html)
+        self.assertIn("상태 확인 중", html)
         self.assertIn("Runtime Fact-book", script)
         self.assertIn("FACT-BOOK · 검증된 사실", script)
         self.assertIn(
@@ -731,7 +788,8 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("if (!live) {", script)
         self.assertIn("data-live-evidence-badge", html)
         self.assertIn('class="rail-seal" data-state="ready"', html)
-        self.assertIn('App external calls</dt><dd class="positive">DISABLED', html)
+        self.assertIn('id="telemetry-external-calls">UNVERIFIED', html)
+        self.assertIn('id="rail-external-calls">UNVERIFIED', html)
         self.assertNotIn('<dt>Network</dt><dd class="positive">BLOCKED', html)
         self.assertNotIn("100% 폐쇄망", html)
 

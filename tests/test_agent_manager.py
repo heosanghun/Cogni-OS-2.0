@@ -796,6 +796,55 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(state["core"]["modules"]["gemma"], "not_loaded")
         self.assertEqual(rhythm.active_requests, 0)
 
+    def test_core_state_separates_execution_from_factbook_authority(self) -> None:
+        from tests.test_agent_quality_integration import _factbook
+
+        service = _Service()
+        service.is_running = True
+        manager = self.manager(
+            service,
+            fact_grounder=RuntimeFactGrounder(_factbook()),
+        )
+
+        core = manager.snapshot()["core"]
+        capabilities = core["capabilities"]
+
+        self.assertEqual(
+            set(capabilities),
+            {
+                "aflow",
+                "bio_hama",
+                "cts_deq",
+                "gemma4_e4b",
+                "self_harness",
+                "system_1_5",
+                "system_2_5",
+                "system_3",
+                "system_4",
+            },
+        )
+        self.assertEqual(capabilities["gemma4_e4b"]["state"], "authoritative")
+        self.assertTrue(capabilities["gemma4_e4b"]["answer_bearing"])
+        self.assertEqual(capabilities["cts_deq"]["state"], "canary")
+        self.assertTrue(capabilities["cts_deq"]["answer_bearing"])
+        self.assertEqual(capabilities["system_4"]["state"], "advisory")
+        self.assertFalse(capabilities["system_4"]["answer_bearing"])
+        self.assertEqual(capabilities["system_1_5"]["state"], "gated")
+        self.assertEqual(capabilities["system_2_5"]["state"], "night_only")
+        self.assertEqual(capabilities["self_harness"]["state"], "proposal_only")
+        self.assertFalse(capabilities["self_harness"]["runtime_mutation_allowed"])
+        self.assertEqual(core["modules"]["gemma"], "standby")
+        self.assertEqual(core["modules"]["router"], "standby")
+        self.assertEqual(core["modules"]["fast"], "off")
+
+    def test_core_state_fails_closed_without_factbook(self) -> None:
+        core = self.manager().snapshot()["core"]
+
+        self.assertEqual(core["capabilities"], {})
+        self.assertEqual(core["modules"]["gemma"], "not_loaded")
+        self.assertEqual(core["modules"]["cts"], "not_loaded")
+        self.assertEqual(core["modules"]["fast"], "off")
+
     def test_optional_conversation_fast_path_precedes_factbook(self) -> None:
         from tests.test_agent_quality_integration import _factbook
 

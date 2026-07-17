@@ -576,6 +576,18 @@ EvolutionSnapshot = Callable[[], Mapping[str, Any]]
 AvailabilityCheck = Callable[[], bool]
 TurnFinish = tuple[str, str, int]
 
+_UI_CAPABILITY_NAMES = (
+    "aflow",
+    "bio_hama",
+    "cts_deq",
+    "gemma4_e4b",
+    "self_harness",
+    "system_1_5",
+    "system_2_5",
+    "system_3",
+    "system_4",
+)
+
 
 class AgentManager:
     """Own one bounded conversational turn and expose immutable UI snapshots."""
@@ -3240,17 +3252,42 @@ class AgentManager:
             verdict = "실행 중"
         else:
             verdict = "모델 준비" if model_loaded else "모델 대기"
+
+        capability_payload: dict[str, dict[str, object]] = {}
+        if self.fact_grounder is not None:
+            try:
+                records = self.fact_grounder.factbook.capabilities.records
+            except (AttributeError, TypeError):
+                records = ()
+            capability_payload = {
+                record.name: record.as_payload()
+                for record in records
+                if record.name in _UI_CAPABILITY_NAMES
+            }
+
+        active_set = set(active)
+        execution_modules = {
+            "gemma": "active"
+            if "gemma" in active_set
+            else ("standby" if model_loaded else "not_loaded"),
+            "router": "active" if "router" in active_set else "standby",
+            "swarm": "active" if "swarm" in active_set else "standby",
+            "cts": "active" if "cts" in active_set else "standby",
+            "experts": "active" if "experts" in active_set else "standby",
+            "fast": "off",
+            "stability": "off",
+            "aflow": "off",
+            "harness": "off",
+        }
+        if not model_loaded:
+            execution_modules["cts"] = "not_loaded"
+
         return {
             "verdict": verdict,
             "active_modules": list(active),
             "model_loaded": model_loaded,
-            "modules": {
-                "gemma": "local" if model_loaded else "not_loaded",
-                "router": "ready",
-                "swarm": "advisory",
-                "cts": "ready" if model_loaded else "not_loaded",
-                "fast": "gated",
-            },
+            "modules": execution_modules,
+            "capabilities": capability_payload,
         }
 
     @staticmethod

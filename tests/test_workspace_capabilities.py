@@ -678,8 +678,20 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 attachment_id = admitted["attachment_id"]
                 service.index_attachments([attachment_id])
                 record = service._attachments[attachment_id]
+                original_unlink = Path.unlink
+
+                def fail_only_attachment_unlink(
+                    selected: Path, *args: object, **kwargs: object
+                ) -> None:
+                    if selected == record.stored_path:
+                        raise PermissionError("locked")
+                    original_unlink(selected, *args, **kwargs)
+
                 with patch.object(
-                    Path, "unlink", side_effect=PermissionError("locked")
+                    Path,
+                    "unlink",
+                    autospec=True,
+                    side_effect=fail_only_attachment_unlink,
                 ):
                     with self.assertRaisesRegex(
                         WorkspaceCapabilityError, "blob could not be deleted"
@@ -1380,6 +1392,18 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     attachment_id=first_id,
                     query="committed authority",
                 )
+                self.assertTrue(service.rag_quarantine_path.is_file())
+                restarted = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                self._assert_rag_quarantined(
+                    restarted,
+                    attachment_id=first_id,
+                    query="committed authority",
+                )
 
     def test_reindex_double_failure_quarantines_rag(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1427,6 +1451,18 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 self.assertEqual(service._source_generation, previous_generation)
                 self._assert_rag_quarantined(
                     service,
+                    attachment_id=attachment_id,
+                    query="reindex authority",
+                )
+                self.assertTrue(service.rag_quarantine_path.is_file())
+                restarted = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                self._assert_rag_quarantined(
+                    restarted,
                     attachment_id=attachment_id,
                     query="reindex authority",
                 )
@@ -1489,6 +1525,432 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     service,
                     attachment_id=first_id,
                     query="delete authority",
+                )
+                self.assertTrue(service.rag_quarantine_path.is_file())
+                restarted = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                self._assert_rag_quarantined(
+                    restarted,
+                    attachment_id=first_id,
+                    query="delete authority",
+                )
+
+    def test_delete_catalog_rollback_failure_cannot_promote_orphan_on_restart(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                victim = service.add_attachment(
+                    name="victim.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"victim authority evidence").decode(),
+                )
+                retained = service.add_attachment(
+                    name="retained.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"retained authority evidence").decode(),
+                )
+                victim_id = victim["attachment_id"]
+                retained_id = retained["attachment_id"]
+                service.index_attachments([victim_id, retained_id])
+                adapter = service.akasicdb
+                assert adapter is not None
+                original_persist = service._persist_catalog
+                persist_calls = 0
+
+                def persist_post_delete_then_fail_rollback() -> None:
+                    nonlocal persist_calls
+                    persist_calls += 1
+                    if persist_calls == 1:
+                        original_persist()
+                        return
+                    raise WorkspaceCapabilityError(
+                        "ATTACHMENT_CATALOG_WRITE_FAILED",
+                        "injected rollback persistence failure",
+                    )
+
+                with (
+                    patch.object(
+                        service,
+                        "_persist_catalog",
+                        side_effect=persist_post_delete_then_fail_rollback,
+                    ),
+                    patch.object(
+                        adapter,
+                        "index_document",
+                        side_effect=RuntimeError("injected rebuild failure"),
+                    ),
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        service.delete_attachment(victim_id)
+
+                self.assertEqual(
+                    captured.exception.code, "ATTACHMENT_DELETE_ROLLBACK_FAILED"
+                )
+                self.assertNotIn(victim_id, service.catalog_path.read_text())
+                orphan = service.storage_root / f"{victim_id}.md"
+                self.assertTrue(orphan.is_file())
+                restarted = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                self.assertEqual(restarted.list_attachments()["count"], 1)
+                self.assertNotIn(victim_id, restarted._attachments)
+                self.assertTrue(orphan.is_file())
+                self._assert_rag_quarantined(
+                    restarted,
+                    attachment_id=retained_id,
+                    query="retained authority",
+                )
+
+    def test_capability_waits_for_rag_transaction_and_never_reports_partial_ready(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                first = service.add_attachment(
+                    name="first.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"first authority evidence").decode(),
+                )
+                second = service.add_attachment(
+                    name="second.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"second authority evidence").decode(),
+                )
+                first_id = first["attachment_id"]
+                second_id = second["attachment_id"]
+                service.index_attachments([first_id])
+                adapter = service.akasicdb
+                assert adapter is not None
+                index_entered = Event()
+                release_index = Event()
+                capability_started = Event()
+                capability_done = Event()
+                mutation_errors: list[str] = []
+                capability_results: list[dict[str, object]] = []
+                index_calls = 0
+
+                def fail_both_mutation_and_rollback(**_kwargs: object) -> None:
+                    nonlocal index_calls
+                    index_calls += 1
+                    if index_calls == 1:
+                        index_entered.set()
+                        release_index.wait(2)
+                    raise RuntimeError("injected persistent adapter failure")
+
+                def mutate() -> None:
+                    try:
+                        service.index_attachments([second_id])
+                    except WorkspaceCapabilityError as exc:
+                        mutation_errors.append(exc.code)
+
+                def read_capability() -> None:
+                    capability_started.set()
+                    capability_results.append(service.capability_payload()["rag"])
+                    capability_done.set()
+
+                with patch.object(
+                    adapter,
+                    "index_document",
+                    side_effect=fail_both_mutation_and_rollback,
+                ):
+                    mutation_thread = Thread(target=mutate)
+                    mutation_thread.start()
+                    self.assertTrue(index_entered.wait(2))
+                    capability_thread = Thread(target=read_capability)
+                    capability_thread.start()
+                    self.assertTrue(capability_started.wait(2))
+                    self.assertFalse(capability_done.wait(0.05))
+                    release_index.set()
+                    mutation_thread.join(2)
+                    capability_thread.join(2)
+
+                self.assertFalse(mutation_thread.is_alive())
+                self.assertFalse(capability_thread.is_alive())
+                self.assertEqual(mutation_errors, ["RAG_INDEX_ROLLBACK_FAILED"])
+                self.assertEqual(capability_results[0]["state"], "unavailable")
+                self.assertFalse(capability_results[0]["answer_integration"])
+
+    def test_quarantine_marker_tamper_variants_fail_closed(self) -> None:
+        variants = {
+            "truncated": b'{"schema_version":1',
+            "duplicate": (
+                b'{"schema_version":1,"reason":"RAG_OPERATOR_REVIEW_REQUIRED",'
+                b'"reason":"RAG_OPERATOR_REVIEW_REQUIRED","catalog_sha256":"'
+                + b"a" * 64
+                + b'"}'
+            ),
+            "unknown": json.dumps(
+                {
+                    "schema_version": 1,
+                    "reason": "RAG_OPERATOR_REVIEW_REQUIRED",
+                    "catalog_sha256": "a" * 64,
+                    "unexpected": True,
+                }
+            ).encode(),
+            "bad_digest": json.dumps(
+                {
+                    "schema_version": 1,
+                    "reason": "RAG_OPERATOR_REVIEW_REQUIRED",
+                    "catalog_sha256": "not-a-digest",
+                }
+            ).encode(),
+            "oversized": b"x" * (capabilities.MAX_RAG_QUARANTINE_MARKER_BYTES + 1),
+        }
+        for label, marker_bytes in variants.items():
+            with (
+                self.subTest(marker_variant=label),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                project = root / "project"
+                clone = root / "AkasicDB"
+                project.mkdir()
+                clone.mkdir()
+                digests = _write_clone(clone)
+                with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                    service = WorkspaceCapabilityService(
+                        project,
+                        _model(),
+                        akasicdb_path=clone,
+                        answer_integration_enabled=True,
+                    )
+                    admitted = service.add_attachment(
+                        name="marker.md",
+                        media_type="text/markdown",
+                        content_base64=b64encode(b"marker authority evidence").decode(),
+                    )
+                    service.rag_quarantine_path.write_bytes(marker_bytes)
+                    restarted = WorkspaceCapabilityService(
+                        project,
+                        _model(),
+                        akasicdb_path=clone,
+                        answer_integration_enabled=True,
+                    )
+                    self._assert_rag_quarantined(
+                        restarted,
+                        attachment_id=admitted["attachment_id"],
+                        query="marker authority",
+                    )
+
+    def test_quarantine_marker_symlink_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                admitted = service.add_attachment(
+                    name="symlink.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"symlink authority evidence").decode(),
+                )
+                target = root / "marker-target.json"
+                target.write_text("{}", encoding="utf-8")
+                try:
+                    service.rag_quarantine_path.symlink_to(target)
+                except OSError as exc:
+                    self.skipTest(f"symlink creation unavailable: {exc}")
+                restarted = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                self._assert_rag_quarantined(
+                    restarted,
+                    attachment_id=admitted["attachment_id"],
+                    query="symlink authority",
+                )
+
+    def test_marker_publication_failure_aborts_before_reset_and_quarantines_process(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                admitted = service.add_attachment(
+                    name="publication.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(
+                        b"publication authority evidence"
+                    ).decode(),
+                )
+                attachment_id = admitted["attachment_id"]
+                adapter = service.akasicdb
+                assert adapter is not None
+                catalog_before = service.catalog_path.read_bytes()
+                with (
+                    patch.object(
+                        capabilities,
+                        "_atomic_rag_quarantine_write",
+                        side_effect=OSError("injected marker publication failure"),
+                    ),
+                    patch.object(adapter, "reset", wraps=adapter.reset) as reset,
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        service.index_attachments([attachment_id])
+                self.assertEqual(
+                    captured.exception.code, "RAG_OPERATOR_REVIEW_REQUIRED"
+                )
+                reset.assert_not_called()
+                self.assertEqual(service.catalog_path.read_bytes(), catalog_before)
+                self.assertFalse(service.rag_quarantine_path.exists())
+                self._assert_rag_quarantined(
+                    service,
+                    attachment_id=attachment_id,
+                    query="publication authority",
+                )
+
+    def test_marker_clear_failure_keeps_restart_quarantined(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                admitted = service.add_attachment(
+                    name="clear.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"clear authority evidence").decode(),
+                )
+                attachment_id = admitted["attachment_id"]
+                with patch.object(
+                    capabilities,
+                    "_remove_rag_quarantine_marker",
+                    side_effect=OSError("injected marker clear failure"),
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        service.index_attachments([attachment_id])
+                self.assertEqual(
+                    captured.exception.code, "RAG_OPERATOR_REVIEW_REQUIRED"
+                )
+                self.assertTrue(service.rag_quarantine_path.is_file())
+                restarted = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                self._assert_rag_quarantined(
+                    restarted,
+                    attachment_id=attachment_id,
+                    query="clear authority",
+                )
+
+    def test_marker_unlink_then_directory_fsync_failure_republishes_before_restart(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                admitted = service.add_attachment(
+                    name="fsync-clear.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(
+                        b"fsync clear authority evidence"
+                    ).decode(),
+                )
+                attachment_id = admitted["attachment_id"]
+                original_fsync = capabilities._fsync_directory
+
+                def fail_only_clear_fsync(
+                    path: Path, *, error_code: str, message: str
+                ) -> None:
+                    if error_code == "RAG_QUARANTINE_MARKER_CLEAR_FAILED":
+                        raise WorkspaceCapabilityError(error_code, message)
+                    original_fsync(path, error_code=error_code, message=message)
+
+                with patch.object(
+                    capabilities,
+                    "_fsync_directory",
+                    side_effect=fail_only_clear_fsync,
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        service.index_attachments([attachment_id])
+                self.assertEqual(
+                    captured.exception.code, "RAG_OPERATOR_REVIEW_REQUIRED"
+                )
+                self.assertTrue(service.rag_quarantine_path.is_file())
+                restarted = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    akasicdb_path=clone,
+                    answer_integration_enabled=True,
+                )
+                self._assert_rag_quarantined(
+                    restarted,
+                    attachment_id=attachment_id,
+                    query="fsync clear authority",
                 )
 
     def test_query_runtime_error_is_normalized(self) -> None:

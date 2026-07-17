@@ -56,6 +56,7 @@ MAX_ATTACHMENT_COUNT = 32
 MAX_ATTACHMENT_NAME_CHARS = 128
 MAX_ATTACHMENT_CATALOG_BYTES = 128 * 1024
 MAX_ATTACHMENT_PREVIEW_CHARS = 12_000
+MAX_RAG_QUARANTINE_MARKER_BYTES = 1_024
 MAX_JSON_ATTACHMENT_BYTES = 1024 * 1024
 MAX_JSON_NESTING = 64
 MAX_INDEXED_TEXT_CHARS = 256_000
@@ -107,6 +108,11 @@ _BLOB_NAME_RE = re.compile(r"(?P<digest>[0-9a-f]{24})(?P<suffix>\.[a-z0-9]+)\Z")
 _ATTACHMENT_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
 _CATALOG_FILENAME = "attachment-catalog.v1.json"
 _CATALOG_SCHEMA_VERSION = 1
+_RAG_QUARANTINE_FILENAME = "rag-quarantine.v1.json"
+_RAG_QUARANTINE_SCHEMA_VERSION = 1
+_RAG_QUARANTINE_CODE = "RAG_OPERATOR_REVIEW_REQUIRED"
+_RAG_QUARANTINE_MESSAGE = "local RAG state is quarantined pending operator review"
+_RAG_QUARANTINE_KEYS = {"schema_version", "reason", "catalog_sha256"}
 
 try:
     from pypdf import PdfReader as _PdfReader
@@ -707,6 +713,258 @@ def _atomic_json_write(path: Path, payload: Mapping[str, object]) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def _fsync_directory(path: Path, *, error_code: str, message: str) -> None:
+    """Make one marker publication/removal durable on the server filesystem."""
+
+    if os.name == "nt":
+        return
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise WorkspaceCapabilityError(error_code, message) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _catalog_digest_for_rag_marker(catalog_path: Path) -> str:
+    """Hash the bounded, regular catalog before any destructive RAG mutation."""
+
+    parent = catalog_path.parent.resolve(strict=True)
+    try:
+        resolved = catalog_path.resolve(strict=True)
+        if (
+            catalog_path.is_symlink()
+            or not resolved.is_relative_to(parent)
+            or not resolved.is_file()
+        ):
+            raise WorkspaceCapabilityError(
+                "RAG_QUARANTINE_MARKER_WRITE_FAILED",
+                "RAG transaction marker could not bind the attachment catalog",
+            )
+        size = resolved.stat().st_size
+        if not 1 <= size <= MAX_ATTACHMENT_CATALOG_BYTES:
+            raise WorkspaceCapabilityError(
+                "RAG_QUARANTINE_MARKER_WRITE_FAILED",
+                "RAG transaction marker could not bind the attachment catalog",
+            )
+        content = resolved.read_bytes()
+    except WorkspaceCapabilityError:
+        raise
+    except OSError as exc:
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_WRITE_FAILED",
+            "RAG transaction marker could not bind the attachment catalog",
+        ) from exc
+    if len(content) != size:
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_WRITE_FAILED",
+            "RAG transaction marker could not bind the attachment catalog",
+        )
+    return sha256(content).hexdigest()
+
+
+def _rag_quarantine_marker_payload(catalog_sha256: str) -> dict[str, object]:
+    if _SHA256_RE.fullmatch(catalog_sha256) is None:
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_INVALID",
+            "RAG quarantine marker digest is invalid",
+        )
+    return {
+        "schema_version": _RAG_QUARANTINE_SCHEMA_VERSION,
+        "reason": _RAG_QUARANTINE_CODE,
+        "catalog_sha256": catalog_sha256,
+    }
+
+
+def _atomic_rag_quarantine_write(path: Path, catalog_sha256: str) -> None:
+    """Publish a durable pre-mutation marker without exposing partial JSON."""
+
+    payload = _rag_quarantine_marker_payload(catalog_sha256)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    if not 1 <= len(encoded) <= MAX_RAG_QUARANTINE_MARKER_BYTES:
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_WRITE_FAILED",
+            "RAG quarantine marker exceeds its byte limit",
+        )
+    parent = path.parent.resolve(strict=True)
+    if path.parent.is_symlink() or not path.resolve(strict=False).is_relative_to(
+        parent
+    ):
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_WRITE_FAILED",
+            "RAG quarantine marker path is unsafe",
+        )
+    if path.exists() or path.is_symlink():
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_WRITE_FAILED",
+            "RAG quarantine marker already requires operator review",
+        )
+    temporary = parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(
+            parent,
+            error_code="RAG_QUARANTINE_MARKER_WRITE_FAILED",
+            message="RAG quarantine marker publication was not durable",
+        )
+        if (
+            path.is_symlink()
+            or not path.resolve(strict=True).is_relative_to(parent)
+            or not path.is_file()
+            or path.read_bytes() != encoded
+        ):
+            raise WorkspaceCapabilityError(
+                "RAG_QUARANTINE_MARKER_WRITE_FAILED",
+                "RAG quarantine marker publication failed verification",
+            )
+    except WorkspaceCapabilityError:
+        raise
+    except OSError as exc:
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_WRITE_FAILED",
+            "RAG quarantine marker could not be published",
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _load_rag_quarantine_marker(path: Path) -> str | None:
+    """Return the bound catalog digest; any present malformed marker fails closed."""
+
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_INVALID",
+            "RAG quarantine marker is not a regular file",
+        )
+    parent = path.parent.resolve(strict=True)
+    try:
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(parent):
+            raise WorkspaceCapabilityError(
+                "RAG_QUARANTINE_MARKER_INVALID",
+                "RAG quarantine marker escaped its workspace",
+            )
+        size = resolved.stat().st_size
+        if not 1 <= size <= MAX_RAG_QUARANTINE_MARKER_BYTES:
+            raise WorkspaceCapabilityError(
+                "RAG_QUARANTINE_MARKER_INVALID",
+                "RAG quarantine marker exceeds its byte limit",
+            )
+        encoded = resolved.read_bytes()
+        if len(encoded) != size:
+            raise WorkspaceCapabilityError(
+                "RAG_QUARANTINE_MARKER_INVALID",
+                "RAG quarantine marker changed while being read",
+            )
+
+        def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate marker key")
+                result[key] = value
+            return result
+
+        payload = json.loads(
+            encoded.decode("utf-8"), object_pairs_hook=reject_duplicates
+        )
+    except WorkspaceCapabilityError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_INVALID",
+            "RAG quarantine marker is invalid",
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _RAG_QUARANTINE_KEYS
+        or payload.get("schema_version") != _RAG_QUARANTINE_SCHEMA_VERSION
+        or isinstance(payload.get("schema_version"), bool)
+        or payload.get("reason") != _RAG_QUARANTINE_CODE
+        or not isinstance(payload.get("catalog_sha256"), str)
+        or _SHA256_RE.fullmatch(payload["catalog_sha256"]) is None
+    ):
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_INVALID",
+            "RAG quarantine marker schema is invalid",
+        )
+    return payload["catalog_sha256"]
+
+
+def _remove_rag_quarantine_marker(path: Path, expected_catalog_sha256: str) -> None:
+    observed = _load_rag_quarantine_marker(path)
+    if observed is None or observed != expected_catalog_sha256:
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_CLEAR_FAILED",
+            "RAG quarantine marker no longer matches this transaction",
+        )
+    parent = path.parent.resolve(strict=True)
+    try:
+        path.unlink()
+        try:
+            _fsync_directory(
+                parent,
+                error_code="RAG_QUARANTINE_MARKER_CLEAR_FAILED",
+                message="RAG quarantine marker removal was not durable",
+            )
+        except WorkspaceCapabilityError as clear_exc:
+            # `unlink` already changed the live namespace. Re-publish the same
+            # pending marker before returning an error so an ordinary restart
+            # cannot auto-promote an outcome whose removal was not durable.
+            try:
+                _atomic_rag_quarantine_write(path, expected_catalog_sha256)
+            except Exception:  # noqa: BLE001 - best-effort durable re-publication
+                # The writer replaces before its directory fsync/post-check; a
+                # raised durability error can therefore still leave the valid
+                # marker in place for restart. The caller remains quarantined.
+                pass
+            raise clear_exc
+    except WorkspaceCapabilityError:
+        raise
+    except OSError as exc:
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_CLEAR_FAILED",
+            "RAG quarantine marker could not be removed",
+        ) from exc
+    if path.exists() or path.is_symlink():
+        raise WorkspaceCapabilityError(
+            "RAG_QUARANTINE_MARKER_CLEAR_FAILED",
+            "RAG quarantine marker removal failed verification",
+        )
 
 
 def _load_attachment_catalog(
@@ -1620,6 +1878,7 @@ class WorkspaceCapabilityService:
         self.answer_integration_enabled = answer_integration_enabled
         self.storage_root = _prepare_storage_root(root)
         self.catalog_path = self.storage_root.parent / _CATALOG_FILENAME
+        self.rag_quarantine_path = self.storage_root.parent / _RAG_QUARANTINE_FILENAME
         (
             self._persisted_valid_blobs,
             self._persisted_blob_count,
@@ -1633,8 +1892,23 @@ class WorkspaceCapabilityService:
         self._source_generation = 0
         self.akasicdb: AkasicDBAdapter | None = None
         self.akasicdb_error: tuple[str, str] | None = None
-        selected_path = self._discover_akasicdb(akasicdb_path)
-        if selected_path is None:
+        try:
+            rag_quarantine_present = (
+                _load_rag_quarantine_marker(self.rag_quarantine_path) is not None
+            )
+        except WorkspaceCapabilityError:
+            # A malformed, truncated, oversized, or unsafe marker remains an
+            # operator-review condition; startup must never auto-clear it.
+            rag_quarantine_present = True
+        selected_path = (
+            None if rag_quarantine_present else self._discover_akasicdb(akasicdb_path)
+        )
+        if rag_quarantine_present:
+            self.akasicdb_error = (
+                _RAG_QUARANTINE_CODE,
+                _RAG_QUARANTINE_MESSAGE,
+            )
+        elif selected_path is None:
             self.akasicdb_error = (
                 "AKASICDB_NOT_CONFIGURED",
                 "set COGNI_OS_AKASICDB_DIR to an audited local clone",
@@ -1820,6 +2094,10 @@ class WorkspaceCapabilityService:
         return self._read_attachment_document(record).text
 
     def capability_payload(self) -> dict[str, object]:
+        with self._lock:
+            return self._capability_payload_locked()
+
+    def _capability_payload_locked(self) -> dict[str, object]:
         rag: dict[str, object]
         if self.akasicdb is None:
             assert self.akasicdb_error is not None
@@ -2131,11 +2409,7 @@ class WorkspaceCapabilityService:
     ) -> None:
         """Fail closed after both a mutation and its rollback have failed."""
 
-        self.akasicdb_error = (
-            "RAG_OPERATOR_REVIEW_REQUIRED",
-            "local RAG state is quarantined pending operator review",
-        )
-        self.akasicdb = None
+        self._activate_rag_quarantine_locked()
         self._attachments = dict(previous_attachments)
         self._indexed_attachment_ids = set(previous_indexed_attachment_ids)
         self._source_snapshots = dict(previous_snapshots)
@@ -2149,6 +2423,40 @@ class WorkspaceCapabilityService:
         ):
             code, message = self.akasicdb_error
             raise WorkspaceCapabilityError(code, message)
+
+    def _activate_rag_quarantine_locked(self) -> None:
+        self.akasicdb_error = (
+            _RAG_QUARANTINE_CODE,
+            _RAG_QUARANTINE_MESSAGE,
+        )
+        self.akasicdb = None
+
+    def _begin_rag_transaction_locked(self) -> str:
+        """Durably mark an ambiguous transaction before reset/unlink begins."""
+
+        self._raise_if_rag_quarantined_locked()
+        try:
+            catalog_sha256 = _catalog_digest_for_rag_marker(self.catalog_path)
+            _atomic_rag_quarantine_write(self.rag_quarantine_path, catalog_sha256)
+        except Exception as exc:  # noqa: BLE001 - durable fail-closed boundary
+            self._activate_rag_quarantine_locked()
+            raise WorkspaceCapabilityError(
+                _RAG_QUARANTINE_CODE,
+                _RAG_QUARANTINE_MESSAGE,
+            ) from exc
+        return catalog_sha256
+
+    def _complete_rag_transaction_locked(self, catalog_sha256: str) -> None:
+        """Remove only this transaction's verified marker after a stable outcome."""
+
+        try:
+            _remove_rag_quarantine_marker(self.rag_quarantine_path, catalog_sha256)
+        except Exception as exc:  # noqa: BLE001 - durable fail-closed boundary
+            self._activate_rag_quarantine_locked()
+            raise WorkspaceCapabilityError(
+                _RAG_QUARANTINE_CODE,
+                _RAG_QUARANTINE_MESSAGE,
+            ) from exc
 
     def _rebuild_rag_index(self) -> None:
         with self._lock:
@@ -2198,9 +2506,11 @@ class WorkspaceCapabilityService:
             previous_indexed = set(self._indexed_attachment_ids)
             previous_snapshots = dict(self._source_snapshots)
             previous_generation = self._source_generation
+            transaction_catalog_sha256 = self._begin_rag_transaction_locked()
             try:
                 record.stored_path.unlink()
             except OSError as exc:
+                self._complete_rag_transaction_locked(transaction_catalog_sha256)
                 raise WorkspaceCapabilityError(
                     "ATTACHMENT_DELETE_FAILED",
                     "attachment blob could not be deleted",
@@ -2227,26 +2537,40 @@ class WorkspaceCapabilityService:
                         previous_snapshots=previous_snapshots,
                         previous_generation=previous_generation,
                     )
-                    (
-                        self._persisted_valid_blobs,
-                        self._persisted_blob_count,
-                        self._persisted_blob_bytes,
-                    ) = _inventory_storage_root(self.storage_root)
+                    try:
+                        (
+                            self._persisted_valid_blobs,
+                            self._persisted_blob_count,
+                            self._persisted_blob_bytes,
+                        ) = _inventory_storage_root(self.storage_root)
+                    except WorkspaceCapabilityError:
+                        # Preserve the stable rollback failure at this boundary.
+                        # The durable marker already prevents restart promotion.
+                        pass
                     raise WorkspaceCapabilityError(
                         "ATTACHMENT_DELETE_ROLLBACK_FAILED",
                         "attachment deletion rollback requires operator review",
                     ) from rollback_exc
                 self._source_snapshots = previous_snapshots
                 self._source_generation = previous_generation
+                self._complete_rag_transaction_locked(transaction_catalog_sha256)
                 raise WorkspaceCapabilityError(
                     "ATTACHMENT_DELETE_FAILED",
                     "attachment deletion could not be committed",
                 ) from exc
-            (
-                self._persisted_valid_blobs,
-                self._persisted_blob_count,
-                self._persisted_blob_bytes,
-            ) = _inventory_storage_root(self.storage_root)
+            try:
+                (
+                    self._persisted_valid_blobs,
+                    self._persisted_blob_count,
+                    self._persisted_blob_bytes,
+                ) = _inventory_storage_root(self.storage_root)
+            except WorkspaceCapabilityError as exc:
+                self._activate_rag_quarantine_locked()
+                raise WorkspaceCapabilityError(
+                    _RAG_QUARANTINE_CODE,
+                    _RAG_QUARANTINE_MESSAGE,
+                ) from exc
+            self._complete_rag_transaction_locked(transaction_catalog_sha256)
         return {
             "attachment_id": attachment_id,
             "deleted": True,
@@ -2464,6 +2788,7 @@ class WorkspaceCapabilityService:
             target_snapshots = self._build_source_snapshots(
                 target_records, target_documents
             )
+            transaction_catalog_sha256 = self._begin_rag_transaction_locked()
             try:
                 self.akasicdb.reset()
                 indexed_results: dict[str, dict[str, object]] = {}
@@ -2498,11 +2823,13 @@ class WorkspaceCapabilityService:
                     ) from rollback_exc
                 self._source_snapshots = previous_snapshots
                 self._source_generation = previous_generation
+                self._complete_rag_transaction_locked(transaction_catalog_sha256)
                 if isinstance(exc, WorkspaceCapabilityError):
                     raise
                 raise WorkspaceCapabilityError(
                     "RAG_INDEX_FAILED", "the local RAG index could not be committed"
                 ) from exc
+            self._complete_rag_transaction_locked(transaction_catalog_sha256)
             results = [indexed_results[item] for item in attachment_ids]
         return {
             "engine": "AkasicDB",
@@ -2569,6 +2896,7 @@ class WorkspaceCapabilityService:
                 for item, document in documents.items()
             }
             target_snapshots = self._build_source_snapshots(records, documents)
+            transaction_catalog_sha256 = self._begin_rag_transaction_locked()
             try:
                 self.akasicdb.reset()
                 for item, record in records.items():
@@ -2600,9 +2928,11 @@ class WorkspaceCapabilityService:
                     ) from rollback_exc
                 self._source_snapshots = previous_snapshots
                 self._source_generation = previous_generation
+                self._complete_rag_transaction_locked(transaction_catalog_sha256)
                 raise WorkspaceCapabilityError(
                     "RAG_REINDEX_FAILED", "the local RAG rebuild could not be committed"
                 ) from exc
+            self._complete_rag_transaction_locked(transaction_catalog_sha256)
         return {
             "engine": "AkasicDB",
             "reindexed_attachment_ids": list(attachment_ids),

@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from importlib.util import module_from_spec, spec_from_file_location
 import json
-from math import sqrt
+from math import isfinite, sqrt
 import os
 from pathlib import Path
 import re
@@ -1652,7 +1652,7 @@ class WorkspaceCapabilityService:
         if self.akasicdb is not None and self._indexed_attachment_ids:
             try:
                 self._rebuild_rag_index()
-            except (OSError, UnicodeError, WorkspaceCapabilityError):
+            except Exception:  # noqa: BLE001 - pinned adapter startup boundary
                 self.akasicdb = None
                 self.akasicdb_error = (
                     "AKASICDB_REINDEX_FAILED",
@@ -2121,27 +2121,28 @@ class WorkspaceCapabilityService:
         return snapshots
 
     def _rebuild_rag_index(self) -> None:
-        if self.akasicdb is None:
-            return
-        records = {
-            attachment_id: self._attachments[attachment_id]
-            for attachment_id in sorted(self._indexed_attachment_ids)
-        }
-        documents = {
-            attachment_id: self._read_attachment_document(record)
-            for attachment_id, record in records.items()
-        }
-        snapshots = self._build_source_snapshots(records, documents)
-        self.akasicdb.reset()
-        for attachment_id, record in records.items():
-            self.akasicdb.index_document(
-                attachment_id=record.attachment_id,
-                name=record.name,
-                media_type=record.media_type,
-                document=documents[attachment_id],
-            )
-        self._source_snapshots = snapshots
-        self._source_generation += 1
+        with self._lock:
+            if self.akasicdb is None:
+                return
+            records = {
+                attachment_id: self._attachments[attachment_id]
+                for attachment_id in sorted(self._indexed_attachment_ids)
+            }
+            documents = {
+                attachment_id: self._read_attachment_document(record)
+                for attachment_id, record in records.items()
+            }
+            snapshots = self._build_source_snapshots(records, documents)
+            self.akasicdb.reset()
+            for attachment_id, record in records.items():
+                self.akasicdb.index_document(
+                    attachment_id=record.attachment_id,
+                    name=record.name,
+                    media_type=record.media_type,
+                    document=documents[attachment_id],
+                )
+            self._source_snapshots = snapshots
+            self._source_generation += 1
 
     def delete_attachment(self, attachment_id: str) -> dict[str, object]:
         if (
@@ -2163,6 +2164,8 @@ class WorkspaceCapabilityService:
             # rolled back without leaving an inaccessible or misleading record.
             blob_content = self._verified_attachment_bytes(record)
             previous_indexed = set(self._indexed_attachment_ids)
+            previous_snapshots = dict(self._source_snapshots)
+            previous_generation = self._source_generation
             try:
                 record.stored_path.unlink()
             except OSError as exc:
@@ -2176,7 +2179,7 @@ class WorkspaceCapabilityService:
             try:
                 self._persist_catalog()
                 self._rebuild_rag_index()
-            except (OSError, UnicodeError, WorkspaceCapabilityError) as exc:
+            except Exception as exc:  # noqa: BLE001 - transactional adapter boundary
                 self._attachments[attachment_id] = record
                 self._indexed_attachment_ids = previous_indexed
                 try:
@@ -2185,11 +2188,9 @@ class WorkspaceCapabilityService:
                     )
                     self._persist_catalog()
                     self._rebuild_rag_index()
-                except (
-                    OSError,
-                    UnicodeError,
-                    WorkspaceCapabilityError,
-                ) as rollback_exc:
+                except Exception as rollback_exc:  # noqa: BLE001
+                    self._source_snapshots = previous_snapshots
+                    self._source_generation = previous_generation
                     (
                         self._persisted_valid_blobs,
                         self._persisted_blob_count,
@@ -2199,6 +2200,8 @@ class WorkspaceCapabilityService:
                         "ATTACHMENT_DELETE_ROLLBACK_FAILED",
                         "attachment deletion rollback requires operator review",
                     ) from rollback_exc
+                self._source_snapshots = previous_snapshots
+                self._source_generation = previous_generation
                 raise WorkspaceCapabilityError(
                     "ATTACHMENT_DELETE_FAILED",
                     "attachment deletion could not be committed",
@@ -2403,6 +2406,8 @@ class WorkspaceCapabilityService:
                 documents[attachment_id] = self._read_attachment_document(record)
 
             previous = set(self._indexed_attachment_ids)
+            previous_snapshots = dict(self._source_snapshots)
+            previous_generation = self._source_generation
             target = previous | set(attachment_ids)
             target_records = {item: self._attachments[item] for item in sorted(target)}
             target_documents = {
@@ -2438,10 +2443,14 @@ class WorkspaceCapabilityService:
                     self._persist_catalog()
                     self._rebuild_rag_index()
                 except Exception as rollback_exc:  # noqa: BLE001
+                    self._source_snapshots = previous_snapshots
+                    self._source_generation = previous_generation
                     raise WorkspaceCapabilityError(
                         "RAG_INDEX_ROLLBACK_FAILED",
                         "the local RAG rollback requires operator review",
                     ) from rollback_exc
+                self._source_snapshots = previous_snapshots
+                self._source_generation = previous_generation
                 if isinstance(exc, WorkspaceCapabilityError):
                     raise
                 raise WorkspaceCapabilityError(
@@ -2491,6 +2500,8 @@ class WorkspaceCapabilityService:
                 requested.append(record)
 
             previous = set(self._indexed_attachment_ids)
+            previous_snapshots = dict(self._source_snapshots)
+            previous_generation = self._source_generation
             target = previous | set(attachment_ids)
             records = {item: self._attachments[item] for item in sorted(target)}
             # Read, integrity-check, extract, and chunk every source before the
@@ -2517,20 +2528,20 @@ class WorkspaceCapabilityService:
                 self._persist_catalog()
                 self._source_snapshots = target_snapshots
                 self._source_generation += 1
-            except (OSError, UnicodeError, WorkspaceCapabilityError) as exc:
+            except Exception as exc:  # noqa: BLE001 - transactional adapter boundary
                 self._indexed_attachment_ids = previous
                 try:
                     self._persist_catalog()
                     self._rebuild_rag_index()
-                except (
-                    OSError,
-                    UnicodeError,
-                    WorkspaceCapabilityError,
-                ) as rollback_exc:
+                except Exception as rollback_exc:  # noqa: BLE001
+                    self._source_snapshots = previous_snapshots
+                    self._source_generation = previous_generation
                     raise WorkspaceCapabilityError(
                         "RAG_REINDEX_ROLLBACK_FAILED",
                         "the local RAG rollback requires operator review",
                     ) from rollback_exc
+                self._source_snapshots = previous_snapshots
+                self._source_generation = previous_generation
                 raise WorkspaceCapabilityError(
                     "RAG_REINDEX_FAILED", "the local RAG rebuild could not be committed"
                 ) from exc
@@ -2551,19 +2562,95 @@ class WorkspaceCapabilityService:
         }
 
     def query_rag(self, query: str, *, limit: int = 5) -> dict[str, object]:
-        if self.akasicdb is None:
-            code, message = self.akasicdb_error or (
-                "AKASICDB_UNAVAILABLE",
-                "AkasicDB is unavailable",
-            )
-            raise WorkspaceCapabilityError(code, message)
-        result = self.akasicdb.query(query, limit=limit)
-        return {
-            "engine": "AkasicDB",
-            "embedding": "stable_sha256_lexical_sketch_v1",
-            "answer_integration": self.answer_integration_enabled,
-            **result,
-        }
+        with self._lock:
+            if self.akasicdb is None:
+                code, message = self.akasicdb_error or (
+                    "AKASICDB_UNAVAILABLE",
+                    "AkasicDB is unavailable",
+                )
+                raise WorkspaceCapabilityError(code, message)
+            try:
+                result = self.akasicdb.query(query, limit=limit)
+            except WorkspaceCapabilityError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - pinned adapter query boundary
+                raise WorkspaceCapabilityError(
+                    "RAG_QUERY_FAILED", "the local RAG query could not be completed"
+                ) from exc
+            if (
+                not isinstance(result, Mapping)
+                or set(result) != {"query", "results", "count"}
+                or result.get("query") != query
+                or not isinstance(result.get("results"), list)
+                or not isinstance(result.get("count"), int)
+                or isinstance(result.get("count"), bool)
+                or result.get("count") != len(result["results"])
+            ):
+                raise WorkspaceCapabilityError(
+                    "RAG_QUERY_INTEGRITY_FAILED",
+                    "the local RAG query returned an invalid result envelope",
+                )
+
+            verified_results: list[dict[str, object]] = []
+            for candidate in result["results"]:
+                if not isinstance(candidate, Mapping):
+                    raise WorkspaceCapabilityError(
+                        "RAG_QUERY_INTEGRITY_FAILED",
+                        "the local RAG query returned a malformed candidate",
+                    )
+                attachment_id = candidate.get("attachment_id")
+                if not isinstance(attachment_id, str):
+                    raise WorkspaceCapabilityError(
+                        "RAG_QUERY_INTEGRITY_FAILED",
+                        "the local RAG query returned a malformed candidate",
+                    )
+                if attachment_id not in self._indexed_attachment_ids:
+                    # Lens entries are transient search material. Without an
+                    # immutable local snapshot they cannot ground an answer.
+                    continue
+                chunk_index = candidate.get("chunk_index")
+                score = candidate.get("score")
+                if (
+                    not isinstance(chunk_index, int)
+                    or isinstance(chunk_index, bool)
+                    or not isinstance(score, (int, float))
+                    or isinstance(score, bool)
+                    or not isfinite(float(score))
+                    or not 0.0 < float(score) <= 1.00000001
+                ):
+                    raise WorkspaceCapabilityError(
+                        "RAG_QUERY_INTEGRITY_FAILED",
+                        "the local RAG query result did not match its source snapshot",
+                    )
+                snapshot = self._source_snapshots.get((attachment_id, chunk_index))
+                record = self._attachments.get(attachment_id)
+                if snapshot is None or record is None:
+                    raise WorkspaceCapabilityError(
+                        "RAG_QUERY_INTEGRITY_FAILED",
+                        "the local RAG query result did not match its source snapshot",
+                    )
+                authority = snapshot.as_payload()
+                if set(candidate) != set(authority) | {"score"}:
+                    raise WorkspaceCapabilityError(
+                        "RAG_QUERY_INTEGRITY_FAILED",
+                        "the local RAG query result did not match its source snapshot",
+                    )
+                returned_authority = {key: candidate[key] for key in authority}
+                if not snapshot.matches(record, returned_authority):
+                    raise WorkspaceCapabilityError(
+                        "RAG_QUERY_INTEGRITY_FAILED",
+                        "the local RAG query result did not match its source snapshot",
+                    )
+                verified_results.append({**authority, "score": float(score)})
+
+            return {
+                "engine": "AkasicDB",
+                "embedding": "stable_sha256_lexical_sketch_v1",
+                "answer_integration": self.answer_integration_enabled,
+                "query": query,
+                "results": verified_results,
+                "count": len(verified_results),
+            }
 
     def preview_rag_source(
         self, attachment_id: str, chunk_index: int

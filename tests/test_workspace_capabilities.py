@@ -1051,6 +1051,274 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     service.preview_rag_source(attachment_id, 0)
                 self.assertEqual(captured.exception.code, "RAG_SOURCE_NOT_FOUND")
 
+    def test_query_rag_returns_only_exact_service_owned_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                admitted = service.add_attachment(
+                    name="authority.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"exact authority evidence").decode(),
+                )
+                attachment_id = admitted["attachment_id"]
+                service.index_attachments([attachment_id])
+
+                normal = service.query_rag("authority evidence")
+                self.assertEqual(normal["count"], 1)
+                exact = service.preview_rag_source(attachment_id, 0)
+                for key, value in exact.items():
+                    if key != "schema_version":
+                        self.assertEqual(normal["results"][0][key], value)
+
+                mismatched = dict(normal["results"][0])
+                mismatched["text"] = "tampered authority evidence"
+                transient_lens = dict(normal["results"][0])
+                transient_lens["attachment_id"] = "lens-temporary-result"
+                with patch.object(
+                    service.akasicdb,
+                    "query",
+                    return_value={
+                        "query": "authority evidence",
+                        "results": [mismatched],
+                        "count": 1,
+                    },
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        service.query_rag("authority evidence")
+                self.assertEqual(captured.exception.code, "RAG_QUERY_INTEGRITY_FAILED")
+
+                with patch.object(
+                    service.akasicdb,
+                    "query",
+                    return_value={
+                        "query": "authority evidence",
+                        "results": [transient_lens],
+                        "count": 1,
+                    },
+                ):
+                    filtered = service.query_rag("authority evidence")
+                self.assertEqual(filtered["results"], [])
+                self.assertEqual(filtered["count"], 0)
+
+    def test_query_rag_serializes_with_reindex_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                admitted = service.add_attachment(
+                    name="serialized.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"serialized committed evidence").decode(),
+                )
+                attachment_id = admitted["attachment_id"]
+                service.index_attachments([attachment_id])
+                assert service.akasicdb is not None
+                original_index = service.akasicdb.index_document
+                entered = Event()
+                release = Event()
+                query_started = Event()
+                query_finished = Event()
+                blocked_once = False
+                errors: list[BaseException] = []
+                queried: list[dict[str, object]] = []
+
+                def blocking_index(**kwargs):
+                    nonlocal blocked_once
+                    if not blocked_once:
+                        blocked_once = True
+                        entered.set()
+                        if not release.wait(timeout=2):
+                            raise TimeoutError("test reindex release timed out")
+                    return original_index(**kwargs)
+
+                def reindex() -> None:
+                    try:
+                        service.reindex_attachments([attachment_id])
+                    except BaseException as exc:  # pragma: no cover - surfaced below
+                        errors.append(exc)
+
+                def query() -> None:
+                    query_started.set()
+                    try:
+                        queried.append(service.query_rag("committed evidence"))
+                    except BaseException as exc:  # pragma: no cover - surfaced below
+                        errors.append(exc)
+                    finally:
+                        query_finished.set()
+
+                with patch.object(
+                    service.akasicdb, "index_document", side_effect=blocking_index
+                ):
+                    mutation = Thread(target=reindex)
+                    reader = Thread(target=query)
+                    mutation.start()
+                    self.assertTrue(entered.wait(timeout=2))
+                    reader.start()
+                    self.assertTrue(query_started.wait(timeout=2))
+                    self.assertFalse(query_finished.wait(timeout=0.1))
+                    release.set()
+                    mutation.join(timeout=2)
+                    reader.join(timeout=2)
+                self.assertFalse(mutation.is_alive())
+                self.assertFalse(reader.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(queried[0]["count"], 1)
+                self.assertEqual(
+                    queried[0]["results"][0]["attachment_id"], attachment_id
+                )
+
+    def test_reindex_runtime_error_restores_all_authority_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                admitted = service.add_attachment(
+                    name="rollback.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"runtime rollback evidence").decode(),
+                )
+                attachment_id = admitted["attachment_id"]
+                service.index_attachments([attachment_id])
+                assert service.akasicdb is not None
+                original_index = service.akasicdb.index_document
+                previous_catalog = service.catalog_path.read_bytes()
+                previous_ids = set(service._indexed_attachment_ids)
+                previous_snapshots = dict(service._source_snapshots)
+                previous_generation = service._source_generation
+                failed_once = False
+
+                def fail_once(**kwargs):
+                    nonlocal failed_once
+                    if not failed_once:
+                        failed_once = True
+                        raise RuntimeError("synthetic adapter failure")
+                    return original_index(**kwargs)
+
+                with patch.object(
+                    service.akasicdb, "index_document", side_effect=fail_once
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        service.reindex_attachments([attachment_id])
+                self.assertEqual(captured.exception.code, "RAG_REINDEX_FAILED")
+                self.assertEqual(service.catalog_path.read_bytes(), previous_catalog)
+                self.assertEqual(service._indexed_attachment_ids, previous_ids)
+                self.assertEqual(service._source_snapshots, previous_snapshots)
+                self.assertEqual(service._source_generation, previous_generation)
+                self.assertEqual(service.query_rag("rollback evidence")["count"], 1)
+
+    def test_delete_runtime_error_restores_all_authority_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                first = service.add_attachment(
+                    name="delete-target.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"delete rollback authority").decode(),
+                )
+                second = service.add_attachment(
+                    name="retained.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode(b"retained rebuild authority").decode(),
+                )
+                first_id = first["attachment_id"]
+                second_id = second["attachment_id"]
+                service.index_attachments([first_id, second_id])
+                assert service.akasicdb is not None
+                original_index = service.akasicdb.index_document
+                previous_catalog = service.catalog_path.read_bytes()
+                previous_ids = set(service._indexed_attachment_ids)
+                previous_snapshots = dict(service._source_snapshots)
+                previous_generation = service._source_generation
+                stored_path = service._attachments[first_id].stored_path
+                failed_once = False
+
+                def fail_once(**kwargs):
+                    nonlocal failed_once
+                    if not failed_once:
+                        failed_once = True
+                        raise RuntimeError("synthetic delete rebuild failure")
+                    return original_index(**kwargs)
+
+                with patch.object(
+                    service.akasicdb, "index_document", side_effect=fail_once
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        service.delete_attachment(first_id)
+                self.assertEqual(captured.exception.code, "ATTACHMENT_DELETE_FAILED")
+                self.assertTrue(stored_path.is_file())
+                self.assertEqual(service.catalog_path.read_bytes(), previous_catalog)
+                self.assertEqual(service._indexed_attachment_ids, previous_ids)
+                self.assertEqual(service._source_snapshots, previous_snapshots)
+                self.assertEqual(service._source_generation, previous_generation)
+                self.assertEqual(service.query_rag("delete rollback")["count"], 1)
+
+    def test_query_runtime_error_is_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                assert service.akasicdb is not None
+                with patch.object(
+                    service.akasicdb,
+                    "query",
+                    side_effect=RuntimeError("synthetic query failure"),
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        service.query_rag("bounded query")
+                self.assertEqual(captured.exception.code, "RAG_QUERY_FAILED")
+
+                invalid_results = (
+                    {"query": "bounded query", "results": [], "count": 1},
+                    {"query": "bounded query", "results": [None], "count": 1},
+                )
+                for invalid in invalid_results:
+                    with (
+                        self.subTest(invalid=invalid),
+                        patch.object(service.akasicdb, "query", return_value=invalid),
+                        self.assertRaises(WorkspaceCapabilityError) as captured,
+                    ):
+                        service.query_rag("bounded query")
+                    self.assertEqual(
+                        captured.exception.code, "RAG_QUERY_INTEGRITY_FAILED"
+                    )
+
     def test_invalid_url_port_is_a_bounded_policy_error(self) -> None:
         policy = WebAccessPolicy(online_mode=True, allowlist=("api.lens.org",))
         with self.assertRaisesRegex(WorkspaceCapabilityError, "port is invalid"):

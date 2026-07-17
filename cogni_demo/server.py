@@ -105,6 +105,25 @@ MAX_SESSION_BYTES = 4096
 SESSION_VERSION = 1
 SERVICE_MARKER = "cogniboard"
 
+_RAG_SOURCE_RESPONSE_KEYS = frozenset(
+    {
+        "schema_version",
+        "attachment_id",
+        "chunk_index",
+        "name",
+        "media_type",
+        "text",
+        "page_number",
+        "char_start",
+        "char_end",
+        "offset_basis",
+        "excerpt_sha256",
+    }
+)
+_RAG_SOURCE_OFFSET_BASES = frozenset(
+    {"normalized_document_text_v1", "normalized_pdf_page_text_v1"}
+)
+
 _ACTIVE_STATUSES = {"starting", "running", "cancelling"}
 _STATIC_ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -205,6 +224,66 @@ def _agent_failure_route(code: str) -> tuple[str, str, str]:
     if not isinstance(code, str) or not code or len(code) > 128:
         return _UNCLASSIFIED_AGENT_FAILURE
     return _AGENT_FAILURE_ROUTES.get(code, _UNCLASSIFIED_AGENT_FAILURE)
+
+
+def _rag_source_payload_is_valid(
+    payload: object, *, attachment_id: str, chunk_index: int
+) -> bool:
+    """Validate the exact browser-visible source schema at the HTTP boundary."""
+
+    if not isinstance(payload, dict) or set(payload) != _RAG_SOURCE_RESPONSE_KEYS:
+        return False
+    schema_version = payload.get("schema_version")
+    name = payload.get("name")
+    media_type = payload.get("media_type")
+    text = payload.get("text")
+    page_number = payload.get("page_number")
+    char_start = payload.get("char_start")
+    char_end = payload.get("char_end")
+    offset_basis = payload.get("offset_basis")
+    excerpt_sha256 = payload.get("excerpt_sha256")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+        or payload.get("attachment_id") != attachment_id
+        or payload.get("chunk_index") != chunk_index
+        or not isinstance(name, str)
+        or not 1 <= len(name) <= 128
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or any(ord(character) < 32 for character in name)
+        or not isinstance(media_type, str)
+        or re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", media_type) is None
+        or not isinstance(text, str)
+        or not 1 <= len(text) <= MAX_RAG_EVIDENCE_CHUNK_CHARS
+        or not text.strip()
+        or any(
+            (ord(character) < 32 and character not in "\t\r\n")
+            or 127 <= ord(character) <= 159
+            for character in text
+        )
+        or not isinstance(char_start, int)
+        or isinstance(char_start, bool)
+        or char_start < 0
+        or not isinstance(char_end, int)
+        or isinstance(char_end, bool)
+        or char_end <= char_start
+        or char_end - char_start != len(text)
+        or offset_basis not in _RAG_SOURCE_OFFSET_BASES
+        or not isinstance(excerpt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", excerpt_sha256) is None
+        or excerpt_sha256 != sha256(text.encode("utf-8")).hexdigest()
+    ):
+        return False
+    if offset_basis == "normalized_document_text_v1":
+        return page_number is None
+    return (
+        isinstance(page_number, int)
+        and not isinstance(page_number, bool)
+        and 1 <= page_number <= 128
+    )
 
 
 class DemoServerError(RuntimeError):
@@ -1978,6 +2057,53 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                     self._send(HTTPStatus.OK, content, media_type)
             except WorkspaceCapabilityError as exc:
                 self._workspace_error(exc)
+            return
+        if parsed.path == "/api/workspace/rag/source":
+            workspace = self.server.workspace_service
+            if workspace is None:
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE"
+                )
+                return
+            values = parse_qs(parsed.query, keep_blank_values=True)
+            if (
+                set(values) != {"attachment_id", "chunk_index"}
+                or len(values["attachment_id"]) != 1
+                or len(values["chunk_index"]) != 1
+            ):
+                self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_QUERY")
+                return
+            attachment_id = values["attachment_id"][0]
+            raw_chunk_index = values["chunk_index"][0]
+            if (
+                re.fullmatch(r"[0-9a-f]{24}", attachment_id) is None
+                or re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", raw_chunk_index) is None
+            ):
+                self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_QUERY")
+                return
+            chunk_index = int(raw_chunk_index)
+            if chunk_index >= 128:
+                self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_QUERY")
+                return
+            self.server.touch_authenticated_state_poll()
+            try:
+                payload = workspace.preview_rag_source(attachment_id, chunk_index)
+            except WorkspaceCapabilityError as exc:
+                self._workspace_error(exc)
+                return
+            except (OSError, RuntimeError, TypeError, ValueError):
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_RESPONSE_INVALID"
+                )
+                return
+            if not _rag_source_payload_is_valid(
+                payload, attachment_id=attachment_id, chunk_index=chunk_index
+            ):
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_RESPONSE_INVALID"
+                )
+                return
+            self._json(HTTPStatus.OK, payload)
             return
         asset = _STATIC_ASSETS.get(parsed.path)
         if asset is None or parsed.query:

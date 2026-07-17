@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from http.client import HTTPConnection
 import json
 from pathlib import Path
@@ -86,6 +87,9 @@ class _Workspace:
         ]
         self.queries: list[str] = []
         self.lens_queries: list[dict[str, object]] = []
+        self.source_requests: list[tuple[str, int]] = []
+        self.raise_source: WorkspaceCapabilityError | None = None
+        self.source_payload: dict[str, object] | None = None
 
     def capability_payload(self):
         return {
@@ -159,6 +163,27 @@ class _Workspace:
             "query": query,
             "count": len(results) if isinstance(results, list) else 0,
             "results": results[:limit] if isinstance(results, list) else results,
+        }
+
+    def preview_rag_source(self, attachment_id, chunk_index):
+        self.source_requests.append((attachment_id, chunk_index))
+        if self.raise_source is not None:
+            raise self.raise_source
+        if self.source_payload is not None:
+            return self.source_payload
+        text = "검증된 로컬 검색 근거"
+        return {
+            "schema_version": 1,
+            "attachment_id": attachment_id,
+            "chunk_index": chunk_index,
+            "name": "paper.md",
+            "media_type": "text/markdown",
+            "text": text,
+            "page_number": None,
+            "char_start": 4,
+            "char_end": 4 + len(text),
+            "offset_basis": "normalized_document_text_v1",
+            "excerpt_sha256": sha256(text.encode()).hexdigest(),
         }
 
     def select_model(self, model_id):
@@ -292,6 +317,91 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
             self._get("/api/workspace/capabilities", authenticated=False)[0], 403
         )
         self.assertEqual(self._get("/api/workspace/capabilities?debug=1")[0], 404)
+
+    def test_exact_rag_source_get_is_authenticated_and_query_strict(self) -> None:
+        attachment_id = "a" * 24
+        route = (
+            "/api/workspace/rag/source?attachment_id="
+            + attachment_id
+            + "&chunk_index=0"
+        )
+        status, payload = self._get(route)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            set(payload),
+            {
+                "schema_version",
+                "attachment_id",
+                "chunk_index",
+                "name",
+                "media_type",
+                "text",
+                "page_number",
+                "char_start",
+                "char_end",
+                "offset_basis",
+                "excerpt_sha256",
+            },
+        )
+        self.assertEqual(payload["attachment_id"], attachment_id)
+        self.assertEqual(payload["chunk_index"], 0)
+        self.assertEqual(
+            payload["excerpt_sha256"], sha256(payload["text"].encode()).hexdigest()
+        )
+        self.assertEqual(self.workspace.source_requests, [(attachment_id, 0)])
+        self.assertEqual(self._get(route, authenticated=False)[0], 403)
+
+        invalid_routes = (
+            "/api/workspace/rag/source",
+            "/api/workspace/rag/source?attachment_id=" + attachment_id,
+            "/api/workspace/rag/source?chunk_index=0",
+            route + "&debug=1",
+            route + "&attachment_id=" + attachment_id,
+            route + "&chunk_index=1",
+            "/api/workspace/rag/source?attachment_id=" + "A" * 24 + "&chunk_index=0",
+            "/api/workspace/rag/source?attachment_id=" + "a" * 23 + "&chunk_index=0",
+            "/api/workspace/rag/source?attachment_id=../../private&chunk_index=0",
+            "/api/workspace/rag/source?attachment_id="
+            + attachment_id
+            + "&chunk_index=-1",
+            "/api/workspace/rag/source?attachment_id="
+            + attachment_id
+            + "&chunk_index=128",
+            "/api/workspace/rag/source?attachment_id="
+            + attachment_id
+            + "&chunk_index=00",
+            "/api/workspace/rag/source?attachment_id="
+            + attachment_id
+            + "&chunk_index=%2B1",
+        )
+        for invalid in invalid_routes:
+            status, error = self._get(invalid)
+            self.assertEqual(status, 400, invalid)
+            self.assertEqual(error["error"]["code"], "INVALID_QUERY", invalid)
+        self.assertEqual(self.workspace.source_requests, [(attachment_id, 0)])
+
+    def test_exact_rag_source_errors_and_malformed_payload_are_path_free(self) -> None:
+        attachment_id = "a" * 24
+        route = (
+            "/api/workspace/rag/source?attachment_id="
+            + attachment_id
+            + "&chunk_index=0"
+        )
+        self.workspace.raise_source = WorkspaceCapabilityError(
+            "RAG_SOURCE_NOT_FOUND", "C:\\private\\index must not leak"
+        )
+        status, payload = self._get(route)
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "RAG_SOURCE_NOT_FOUND")
+        self.assertNotIn("private", json.dumps(payload))
+
+        self.workspace.raise_source = None
+        valid = self.workspace.preview_rag_source(attachment_id, 0)
+        self.workspace.source_payload = {**valid, "host_path": "/home/private/index"}
+        status, payload = self._get(route)
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"]["code"], "WORKSPACE_RESPONSE_INVALID")
+        self.assertNotIn("/home/private", json.dumps(payload))
 
     def test_workspace_post_routes_and_bounded_errors(self) -> None:
         status, payload = self._post(
@@ -611,6 +721,11 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(payload["error"]["code"], "WORKSPACE_UNAVAILABLE")
         status, payload = self._post("/api/workspace/rag/query", {"query": "local"})
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"]["code"], "WORKSPACE_UNAVAILABLE")
+        status, payload = self._get(
+            "/api/workspace/rag/source?attachment_id=" + "a" * 24 + "&chunk_index=0"
+        )
         self.assertEqual(status, 503)
         self.assertEqual(payload["error"]["code"], "WORKSPACE_UNAVAILABLE")
 

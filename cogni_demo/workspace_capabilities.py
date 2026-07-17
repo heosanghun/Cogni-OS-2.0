@@ -1302,6 +1302,96 @@ class AkasicDBAdapter:
             "page_count": document.page_count,
         }
 
+    def source_preview(
+        self, *, attachment_id: str, chunk_index: int
+    ) -> dict[str, object]:
+        """Return one exact indexed relational record without exposing internals."""
+
+        if (
+            not isinstance(attachment_id, str)
+            or _ATTACHMENT_ID_RE.fullmatch(attachment_id) is None
+        ):
+            raise WorkspaceCapabilityError(
+                "INVALID_ATTACHMENT_ID", "attachment_id is invalid"
+            )
+        if (
+            not isinstance(chunk_index, int)
+            or isinstance(chunk_index, bool)
+            or not 0 <= chunk_index < MAX_RAG_CHUNKS_PER_DOCUMENT
+        ):
+            raise WorkspaceCapabilityError(
+                "INVALID_CHUNK_INDEX", "chunk_index is invalid"
+            )
+        entity = f"chunk:{attachment_id}:{chunk_index}"
+        with self._lock:
+            if entity not in self._chunk_ids:
+                raise WorkspaceCapabilityError(
+                    "RAG_SOURCE_NOT_FOUND", "the indexed source was not found"
+                )
+            try:
+                record = self.relational_store.get(entity)
+            except Exception as exc:  # noqa: BLE001 - pinned adapter trust boundary
+                raise WorkspaceCapabilityError(
+                    "RAG_SOURCE_INTEGRITY_FAILED",
+                    "the indexed source record could not be verified",
+                ) from exc
+        if not isinstance(record, Mapping):
+            raise WorkspaceCapabilityError(
+                "RAG_SOURCE_INTEGRITY_FAILED",
+                "the indexed source record could not be verified",
+            )
+        text = record.get("chunk")
+        page_number = record.get("page_number")
+        char_start = record.get("char_start")
+        char_end = record.get("char_end")
+        offset_basis = record.get("offset_basis")
+        excerpt_sha256 = record.get("excerpt_sha256")
+        page_locator_valid = (
+            offset_basis == "normalized_document_text_v1" and page_number is None
+        ) or (
+            offset_basis == "normalized_pdf_page_text_v1"
+            and isinstance(page_number, int)
+            and not isinstance(page_number, bool)
+            and 1 <= page_number <= MAX_PDF_PAGES
+        )
+        if (
+            record.get("type") != "LocalDocumentChunk"
+            or record.get("attachment_id") != attachment_id
+            or record.get("chunk_index") != chunk_index
+            or not _attachment_name_is_safe(record.get("name"))
+            or record.get("media_type") not in set(_ALLOWED_MEDIA_TYPES.values())
+            or not isinstance(text, str)
+            or not 1 <= len(text) <= RAG_CHUNK_CHARS
+            or _normalize_index_source(text) != text
+            or not isinstance(char_start, int)
+            or isinstance(char_start, bool)
+            or char_start < 0
+            or not isinstance(char_end, int)
+            or isinstance(char_end, bool)
+            or char_end <= char_start
+            or char_end - char_start != len(text)
+            or not page_locator_valid
+            or not isinstance(excerpt_sha256, str)
+            or _SHA256_RE.fullmatch(excerpt_sha256) is None
+            or excerpt_sha256 != sha256(text.encode("utf-8")).hexdigest()
+        ):
+            raise WorkspaceCapabilityError(
+                "RAG_SOURCE_INTEGRITY_FAILED",
+                "the indexed source record could not be verified",
+            )
+        return {
+            "attachment_id": attachment_id,
+            "chunk_index": chunk_index,
+            "name": record["name"],
+            "media_type": record["media_type"],
+            "text": text,
+            "page_number": page_number,
+            "char_start": char_start,
+            "char_end": char_end,
+            "offset_basis": offset_basis,
+            "excerpt_sha256": excerpt_sha256,
+        }
+
     def query(self, query: str, *, limit: int = 5) -> dict[str, object]:
         if not isinstance(query, str) or not query.strip():
             raise WorkspaceCapabilityError("INVALID_QUERY", "query must contain text")
@@ -2390,6 +2480,69 @@ class WorkspaceCapabilityService:
             "answer_integration": self.answer_integration_enabled,
             **result,
         }
+
+    def preview_rag_source(
+        self, attachment_id: str, chunk_index: int
+    ) -> dict[str, object]:
+        """Rebuild provenance and return only the exact indexed source record."""
+
+        if self.akasicdb is None:
+            code, message = self.akasicdb_error or (
+                "AKASICDB_UNAVAILABLE",
+                "AkasicDB is unavailable",
+            )
+            raise WorkspaceCapabilityError(code, message)
+        if (
+            not isinstance(attachment_id, str)
+            or _ATTACHMENT_ID_RE.fullmatch(attachment_id) is None
+        ):
+            raise WorkspaceCapabilityError(
+                "INVALID_ATTACHMENT_ID", "attachment_id is invalid"
+            )
+        if (
+            not isinstance(chunk_index, int)
+            or isinstance(chunk_index, bool)
+            or not 0 <= chunk_index < MAX_RAG_CHUNKS_PER_DOCUMENT
+        ):
+            raise WorkspaceCapabilityError(
+                "INVALID_CHUNK_INDEX", "chunk_index is invalid"
+            )
+        with self._lock:
+            record = self._attachments.get(attachment_id)
+            if record is None or attachment_id not in self._indexed_attachment_ids:
+                raise WorkspaceCapabilityError(
+                    "RAG_SOURCE_NOT_FOUND", "the indexed source was not found"
+                )
+            indexed = self.akasicdb.source_preview(
+                attachment_id=attachment_id, chunk_index=chunk_index
+            )
+            # Re-read and integrity-check the admitted blob, then reproduce the
+            # normalized chunk.  This prevents a mutable in-memory adapter
+            # record from becoming browser-visible source authority.
+            expected_chunks = _chunk_document(self._read_attachment_document(record))
+            expected = next(
+                (item for item in expected_chunks if item.chunk_index == chunk_index),
+                None,
+            )
+            if expected is None:
+                raise WorkspaceCapabilityError(
+                    "RAG_SOURCE_INTEGRITY_FAILED",
+                    "the indexed source no longer matches the admitted attachment",
+                )
+            expected_payload = expected.as_payload()
+            if (
+                indexed.get("attachment_id") != record.attachment_id
+                or indexed.get("name") != record.name
+                or indexed.get("media_type") != record.media_type
+                or any(
+                    indexed.get(key) != value for key, value in expected_payload.items()
+                )
+            ):
+                raise WorkspaceCapabilityError(
+                    "RAG_SOURCE_INTEGRITY_FAILED",
+                    "the indexed source no longer matches the admitted attachment",
+                )
+        return {"schema_version": 1, **indexed}
 
     def search_lens(
         self,

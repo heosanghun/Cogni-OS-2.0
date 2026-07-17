@@ -256,6 +256,38 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     sha256(source["text"].encode()).hexdigest(),
                 )
                 self.assertGreater(source["score"], 0)
+                exact = service.preview_rag_source(
+                    admitted["attachment_id"], source["chunk_index"]
+                )
+                self.assertEqual(
+                    set(exact),
+                    {
+                        "schema_version",
+                        "attachment_id",
+                        "chunk_index",
+                        "name",
+                        "media_type",
+                        "text",
+                        "page_number",
+                        "char_start",
+                        "char_end",
+                        "offset_basis",
+                        "excerpt_sha256",
+                    },
+                )
+                for key in (
+                    "attachment_id",
+                    "chunk_index",
+                    "name",
+                    "media_type",
+                    "text",
+                    "page_number",
+                    "char_start",
+                    "char_end",
+                    "offset_basis",
+                    "excerpt_sha256",
+                ):
+                    self.assertEqual(exact[key], source[key])
                 rebuilt = service.reindex_attachments([admitted["attachment_id"]])
                 self.assertEqual(
                     rebuilt["reindexed_attachment_ids"], [admitted["attachment_id"]]
@@ -328,6 +360,22 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                         source["excerpt_sha256"],
                         sha256(source["text"].encode()).hexdigest(),
                     )
+                    exact = selected.preview_rag_source(
+                        admitted["attachment_id"], source["chunk_index"]
+                    )
+                    for key in (
+                        "attachment_id",
+                        "chunk_index",
+                        "name",
+                        "media_type",
+                        "text",
+                        "page_number",
+                        "char_start",
+                        "char_end",
+                        "offset_basis",
+                        "excerpt_sha256",
+                    ):
+                        self.assertEqual(exact[key], source[key])
 
                 assert_page_three_source(service)
                 restarted = WorkspaceCapabilityService(
@@ -789,6 +837,33 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     (entity, -0.25),
                 ]
                 self.assertEqual(adapter.query("평형", limit=5)["results"], [])
+
+    def test_exact_source_fails_closed_when_indexed_record_is_mutated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            clone = root / "AkasicDB"
+            project.mkdir()
+            clone.mkdir()
+            digests = _write_clone(clone)
+            with patch.dict(AKASICDB_AUDITED_DIGESTS, digests, clear=True):
+                service = WorkspaceCapabilityService(
+                    project, _model(), akasicdb_path=clone
+                )
+                admitted = service.add_attachment(
+                    name="evidence.md",
+                    media_type="text/markdown",
+                    content_base64=b64encode("평형 근거 문서".encode()).decode(),
+                )
+                service.index_attachments([admitted["attachment_id"]])
+                assert service.akasicdb is not None
+                entity = f"chunk:{admitted['attachment_id']}:0"
+                service.akasicdb.relational_store.records[entity]["excerpt_sha256"] = (
+                    "0" * 64
+                )
+                with self.assertRaises(WorkspaceCapabilityError) as captured:
+                    service.preview_rag_source(admitted["attachment_id"], 0)
+                self.assertEqual(captured.exception.code, "RAG_SOURCE_INTEGRITY_FAILED")
 
     def test_invalid_url_port_is_a_bounded_policy_error(self) -> None:
         policy = WebAccessPolicy(online_mode=True, allowlist=("api.lens.org",))

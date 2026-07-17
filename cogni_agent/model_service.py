@@ -111,6 +111,7 @@ from .prompting import reserved_stop_sequences
 HARD_MAX_PROMPT_CHARS = 64_000
 HARD_MAX_RESPONSE_CHARS = 64_000
 DEFAULT_RESPONSE_QUEUE_SIZE = 64
+WORKER_RETIRE_ACK_TIMEOUT_SECONDS = 2.0
 MAX_SIGNATURE_TENSORS = 16_384
 MAX_SIGNATURE_MODULES = 32_768
 CONTENT_FINGERPRINT_TENSOR_BUDGET = 128
@@ -1575,6 +1576,18 @@ def _validate_worker_request_authority(
             raise WorkerAuthorityError("request authority exceeds its GPU lease")
 
 
+def _await_retirement_ack(retire_ack_event: Any) -> None:
+    """Keep terminal tensor storage alive until its parent reconstructs it."""
+
+    if retire_ack_event is None:
+        return
+    try:
+        retire_ack_event.wait(timeout=WORKER_RETIRE_ACK_TIMEOUT_SECONDS)
+    except BaseException:
+        # Retirement is still bounded and unconditional when IPC is broken.
+        pass
+
+
 def _worker_main(
     model_factory: Callable[[], nn.Module],
     core_pipeline_factory: Callable[[nn.Module], CoreTurnPipeline] | None,
@@ -1588,6 +1601,7 @@ def _worker_main(
     core_workspace_bytes: int,
     worker_authority: Tensor | None = None,
     startup_status: Tensor | None = None,
+    retire_ack_event: Any = None,
 ) -> None:
     stage = "worker_startup"
     try:
@@ -1698,6 +1712,7 @@ def _worker_main(
             finally:
                 # A stale/expired launch fence means this resident must not
                 # continue owning CUDA, even if the request itself was forged.
+                _await_retirement_ack(retire_ack_event)
                 return
         last_request_id = authority.request_id
         seen_job_ids.add(authority.job_id)
@@ -1887,6 +1902,7 @@ def _worker_main(
         if status in {STATUS_BASE_MUTATED, STATUS_AUTHORITY_REJECTED}:
             # Never continue serving from a model whose invariant or immutable
             # launch/request capability was broken.
+            _await_retirement_ack(retire_ack_event)
             return
 
 
@@ -2024,6 +2040,7 @@ class ModelService:
         self._request_queue: Any = None
         self._response_queue: Any = None
         self._cancel_event: Any = None
+        self._retire_ack_event: Any = None
         self._ready_event: Any = None
         self._failed_event: Any = None
         self._gpu_lease: GPULease | None = None
@@ -2234,6 +2251,7 @@ class ModelService:
                         maxsize=DEFAULT_RESPONSE_QUEUE_SIZE
                     )
                     self._cancel_event = self._context.Event()
+                    self._retire_ack_event = self._context.Event()
                     self._ready_event = self._context.Event()
                     self._failed_event = self._context.Event()
                     self._worker_authority = _worker_authority_tensor(
@@ -2255,6 +2273,7 @@ class ModelService:
                             self.core_workspace_bytes,
                             self._worker_authority,
                             self._startup_status,
+                            self._retire_ack_event,
                         ),
                         name="cogni-local-model",
                         daemon=True,
@@ -2598,6 +2617,13 @@ class ModelService:
                         "worker response protocol failed"
                     ) from exc
                 authority.validate_frame(frame)
+                if frame.final and frame.status in {
+                    STATUS_BASE_MUTATED,
+                    STATUS_AUTHORITY_REJECTED,
+                }:
+                    retire_ack_event = self._retire_ack_event
+                    if retire_ack_event is not None:
+                        retire_ack_event.set()
                 expected_total = observed_total + int(frame.token_ids.numel())
                 if frame.generated_total != expected_total:
                     raise WorkerExecutionError(
@@ -2817,6 +2843,7 @@ class ModelService:
                 self._response_queue = None
                 self._cancel_event = None
                 self._ready_event = None
+                self._retire_ack_event = None
                 self._failed_event = None
                 self._worker_authority = None
                 self._startup_status = None
@@ -2907,6 +2934,7 @@ class ModelService:
                     close_error = error
             self._cancel_event = None
             self._ready_event = None
+            self._retire_ack_event = None
             self._failed_event = None
             self._worker_authority = None
             self._startup_status = None
@@ -2969,6 +2997,13 @@ class ModelService:
                 except WorkerAuthorityError:
                     return False
             if frame.request_id == request_id and frame.final:
+                if frame.status in {
+                    STATUS_BASE_MUTATED,
+                    STATUS_AUTHORITY_REJECTED,
+                }:
+                    retire_ack_event = self._retire_ack_event
+                    if retire_ack_event is not None:
+                        retire_ack_event.set()
                 return True
         return not self.is_running
 

@@ -43,7 +43,7 @@ ACT_BOUNDS = (4.0, 32.0)
 DEFAULT_CHECKPOINT_PATH = Path(__file__).with_name("cts_policy_checkpoint.json")
 # This code-anchored digest is the trust root for the bundled text checkpoint.
 DEFAULT_CHECKPOINT_SHA256 = (
-    "0ccf6188f654cfe1cbbb92831dc18f97bd6fc6d9f32f6152ce66b5111b3939cf"
+    "2fb1e2abd586c4c7fc5541bed7d3cdab22edc4b7582a94d2b083398a0ce723ef"
 )
 
 _VERIFIED_LOAD_TOKEN = object()
@@ -448,6 +448,49 @@ def _state_tensors(state: Mapping[str, Any]) -> dict[str, Tensor]:
     return tensors
 
 
+def _stable_sigmoid(value: float) -> float:
+    """Return sigmoid without backend-specific vector approximations."""
+
+    if value >= 0.0:
+        inverse = math.exp(-value)
+        return 1.0 / (1.0 + inverse)
+    exponential = math.exp(value)
+    return exponential / (1.0 + exponential)
+
+
+def _deterministic_activation_mae(
+    features: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    targets: Tensor,
+    *,
+    activation: Any,
+) -> float:
+    """Reproduce held-out scalar evidence independent of BLAS kernels."""
+
+    feature_rows = features.detach().to("cpu", dtype=torch.float32).tolist()
+    weight_rows = weight.detach().to("cpu", dtype=torch.float32).tolist()
+    bias_values = bias.detach().to("cpu", dtype=torch.float32).tolist()
+    target_rows = targets.detach().to("cpu", dtype=torch.float32).tolist()
+    errors: list[float] = []
+    for feature_row, target_row in zip(feature_rows, target_rows, strict=True):
+        for head_index, weight_row in enumerate(weight_rows):
+            raw = float(bias_values[head_index]) + math.fsum(
+                float(coefficient) * float(feature)
+                for coefficient, feature in zip(
+                    weight_row,
+                    feature_row,
+                    strict=True,
+                )
+            )
+            errors.append(
+                abs(activation(raw) - activation(float(target_row[head_index])))
+            )
+    if not errors:
+        raise CTSCheckpointError("held-out evidence cannot be empty")
+    return math.fsum(errors) / len(errors)
+
+
 def _evidence_from_state(
     state: Mapping[str, Any],
     summaries: Tensor,
@@ -463,23 +506,23 @@ def _evidence_from_state(
         tensors["policy_head.weight"],
         tensors["policy_head.bias"],
     )
-    critic_raw = torch.nn.functional.linear(
-        features,
-        tensors["critic_head.weight"],
-        tensors["critic_head.bias"],
-    )
-    meta_raw = torch.nn.functional.linear(
-        features,
-        tensors["meta_head.weight"],
-        tensors["meta_head.bias"],
-    )
     expected_actions = policy_targets[heldout].argmax(dim=1)
     predicted_actions = policy_raw.argmax(dim=1)
     policy_accuracy = float((predicted_actions == expected_actions).float().mean())
-    critic_expected = torch.tanh(critic_targets[heldout].to(torch.float32))
-    critic_mae = float((torch.tanh(critic_raw) - critic_expected).abs().mean())
-    meta_expected = torch.sigmoid(meta_targets[heldout].to(torch.float32))
-    meta_mae = float((torch.sigmoid(meta_raw) - meta_expected).abs().mean())
+    critic_mae = _deterministic_activation_mae(
+        features,
+        tensors["critic_head.weight"],
+        tensors["critic_head.bias"],
+        critic_targets[heldout],
+        activation=math.tanh,
+    )
+    meta_mae = _deterministic_activation_mae(
+        features,
+        tensors["meta_head.weight"],
+        tensors["meta_head.bias"],
+        meta_targets[heldout],
+        activation=_stable_sigmoid,
+    )
     counts = torch.bincount(predicted_actions, minlength=ACTION_WIDTH)
     return CTSCalibrationEvidence(
         policy_accuracy=policy_accuracy,

@@ -281,7 +281,9 @@ def _straight_through_top_k(
     boundary = masked_logits.gather(-1, indices[..., -1:]).detach()
     relaxed = torch.sigmoid((masked_logits - boundary) / temperature)
     relaxed = relaxed * allowed.to(dtype=logits.dtype)
-    mask = hard + relaxed - relaxed.detach()
+    # Keep the forward value exactly k-hot on every backend. Grouping the
+    # zero-valued gradient carrier avoids an associativity-dependent 1 ulp loss.
+    mask = hard + (relaxed - relaxed.detach())
     probabilities = _masked_probabilities(logits, allowed, temperature)
     return mask, probabilities
 

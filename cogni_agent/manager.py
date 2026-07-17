@@ -130,6 +130,11 @@ SAFE_QUALITY_FALLBACK = (
     "로컬 모델의 답변 후보가 품질 검증을 통과하지 못했습니다. 이번에는 "
     "추측해서 답하지 않았습니다. 표현을 바꿔 다시 요청해 주세요."
 )
+RAG_NO_EVIDENCE_RESPONSE = (
+    "현재 로컬 RAG 인덱스에서 이 질문과 관련된 근거를 찾지 못했습니다. "
+    "일반 지식으로 추측해 답하지 않았습니다. "
+    "문서를 추가·색인하거나 검색어를 바꿔 다시 요청해 주세요."
+)
 _QUALITY_FALLBACK_MARKER = "로컬 모델의 답변 후보가 품질 검증을 통과하지 못했습니다."
 _FALLBACK_ROLE_RE = re.compile(
     r"(?i)(?:^|\s)(?:user|assistant|system|model|tool|사용자|시스템)\s*:\s*"
@@ -738,17 +743,21 @@ class AgentManager:
         *,
         evidence: tuple[RetrievalEvidence, ...] = (),
         image_content: bytes | None = None,
+        retrieval_requested: bool = False,
     ) -> str:
         text = self._validate_message(message)
         if mode not in {"chat", "task"}:
             raise ValueError("mode must be chat or task")
+        if type(retrieval_requested) is not bool:
+            raise TypeError("retrieval_requested must be a bool")
         bounded_evidence = self._validate_retrieval_evidence(evidence)
         bounded_image = self._validate_image_content(image_content)
-        if mode == "task" and bounded_evidence:
+        retrieval_requested = retrieval_requested or bool(bounded_evidence)
+        if mode == "task" and retrieval_requested:
             raise ValueError("retrieval evidence is available only in chat mode")
         if mode == "task" and bounded_image is not None:
             raise ValueError("image content is available only in chat mode")
-        if bounded_evidence and bounded_image is not None:
+        if retrieval_requested and bounded_image is not None:
             raise ValueError("image content cannot be combined with retrieval evidence")
         if (
             bounded_image is not None
@@ -786,6 +795,7 @@ class AgentManager:
                     resume_truncated,
                     bounded_evidence,
                     bounded_image,
+                    retrieval_requested,
                 ),
                 name=f"cogni-agent-{turn_id[:8]}",
                 daemon=True,
@@ -839,6 +849,7 @@ class AgentManager:
         resume_truncated: bool,
         evidence: tuple[RetrievalEvidence, ...],
         image_content: bytes | None,
+        retrieval_requested: bool,
     ) -> None:
         try:
             with self.rhythm.inference_slot():
@@ -852,6 +863,7 @@ class AgentManager:
                         resume_truncated=resume_truncated,
                         evidence=evidence,
                         image_content=image_content,
+                        retrieval_requested=retrieval_requested,
                     )
             if finish is not None:
                 with self._condition:
@@ -902,9 +914,17 @@ class AgentManager:
         resume_truncated: bool,
         evidence: tuple[RetrievalEvidence, ...],
         image_content: bytes | None,
+        retrieval_requested: bool,
     ) -> TurnFinish | None:
+        if retrieval_requested and not evidence:
+            return self._run_retrieval_no_evidence_answer(
+                turn_id,
+                user_sequence,
+                message,
+            )
         if (
             image_content is None
+            and not retrieval_requested
             and self.conversation_fast_path is not None
             and not resume_truncated
         ):
@@ -922,6 +942,7 @@ class AgentManager:
                 )
         if (
             image_content is None
+            and not retrieval_requested
             and self.fact_grounder is not None
             and not resume_truncated
         ):
@@ -1867,6 +1888,52 @@ class AgentManager:
                 state="complete",
                 finish_reason="stop",
                 generation_mode="conversation_fastpath",
+            )
+            self._core = self._core_state()
+        return "succeeded", "complete", 100
+
+    def _run_retrieval_no_evidence_answer(
+        self,
+        turn_id: str,
+        user_sequence: int,
+        question: str,
+    ) -> TurnFinish | None:
+        """Publish a bounded no-hit result without invoking unrelated responders."""
+
+        with self._condition:
+            if self._active_turn != turn_id:
+                return None
+            self._core = self._core_state(active=("rag",))
+            self._transition_locked("executing", "rag_no_evidence", 50)
+        if self._cancel_event.is_set():
+            raise GenerationCancelled("retrieval no-evidence response cancelled")
+        response, clipped = self._clip_response(RAG_NO_EVIDENCE_RESPONSE)
+        quality = inspect_response(response, final=True)
+        if clipped or quality.recommended_action is not QualityAction.ACCEPT:
+            raise ResponseQualityError(
+                "retrieval no-evidence response failed its bounded contract"
+            )
+        self.conversations.commit_assistant_turn(
+            self.session_id,
+            user_sequence,
+            response,
+        )
+        with self._condition:
+            self._model_excluded_exchanges.append((question, response))
+            self._append_message(
+                "assistant",
+                response,
+                streaming=False,
+                finish_reason="stop",
+                continuations=0,
+                truncated=False,
+                generated_tokens=0,
+                generation_mode="rag_no_evidence",
+            )
+            self._completion = self._completion_state(
+                state="complete",
+                finish_reason="stop",
+                generation_mode="rag_no_evidence",
             )
             self._core = self._core_state()
         return "succeeded", "complete", 100
@@ -3058,6 +3125,7 @@ class AgentManager:
                     "factbook",
                     "quality_fallback",
                     "cogni_core_rag",
+                    "rag_no_evidence",
                 }:
                     raise ValueError("generation_mode is invalid")
                 payload.update(
@@ -3106,6 +3174,7 @@ class AgentManager:
                             "factbook",
                             "quality_fallback",
                             "cogni_core_rag",
+                            "rag_no_evidence",
                         }:
                             raise ValueError("generation_mode is invalid")
                         message["generation_mode"] = generation_mode
@@ -3147,6 +3216,7 @@ class AgentManager:
             "factbook",
             "quality_fallback",
             "cogni_core_rag",
+            "rag_no_evidence",
         }:
             raise ValueError("generation_mode is invalid")
         return {

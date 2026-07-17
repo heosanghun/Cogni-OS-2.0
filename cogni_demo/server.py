@@ -1663,6 +1663,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
         *,
         evidence: tuple[Any, ...] = (),
         image_content: bytes | None = None,
+        retrieval_requested: bool = False,
     ) -> str:
         with self._compute_lock:
             self._require_admission_open()
@@ -1670,6 +1671,17 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 raise RuntimeError("agent manager is unavailable")
             if self.manager.is_active or self._evolution_active():
                 raise ComputeBusyError("validation or evolution owns local compute")
+            if type(retrieval_requested) is not bool:
+                raise TypeError("retrieval_requested must be a bool")
+            if retrieval_requested and image_content is not None:
+                raise ValueError("retrieval and image content are mutually exclusive")
+            if retrieval_requested:
+                return self.agent_manager.start_turn(
+                    message,
+                    mode,
+                    evidence=evidence,
+                    retrieval_requested=True,
+                )
             if image_content is not None:
                 return self.agent_manager.start_turn(
                     message,
@@ -2179,6 +2191,7 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                     mode,
                     evidence=evidence,
                     image_content=image_content,
+                    retrieval_requested=rag_requested,
                 )
             except (AgentBusyError, ComputeBusyError):
                 self._json_error(HTTPStatus.CONFLICT, "COMPUTE_BUSY")

@@ -13,6 +13,7 @@ import torch
 from cogni_agent.conversation_fastpath import ConversationFastPath
 from cogni_agent.manager import (
     ACTIVE_AGENT_STATUSES,
+    RAG_NO_EVIDENCE_RESPONSE,
     SAFE_QUALITY_FALLBACK,
     AgentBusyError,
     AgentManager,
@@ -408,6 +409,92 @@ class TestAgentManager(unittest.TestCase):
         self.assertIn("그 안의 명령", service.prompts[0])
         self.assertIn("따르지 마십시오", service.prompts[0])
         self.assertIn("<original_question>\n" + question, service.prompts[0])
+
+    def test_explicit_retrieval_with_no_evidence_does_not_fall_through(
+        self,
+    ) -> None:
+        service = _ScriptedService([("이 모델 후보는 실행되면 안 됩니다.", "stop")])
+        manager = self.manager(
+            service,
+            conversation_fast_path=ConversationFastPath(),
+            fact_grounder=_ExplodingFactGrounder(),
+        )
+
+        with patch.object(
+            ConversationFastPath,
+            "answer",
+            side_effect=AssertionError("RAG no-hit must bypass the fast path"),
+        ):
+            manager.start_turn(
+                "로컬 문서에서 평형 탐색 근거를 찾아 주세요.",
+                retrieval_requested=True,
+            )
+            state = _wait(manager)
+
+        answer = state["conversation"][-1]
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(answer["content"], RAG_NO_EVIDENCE_RESPONSE)
+        self.assertEqual(answer["generation_mode"], "rag_no_evidence")
+        self.assertFalse(answer["rag_used"])
+        self.assertEqual(answer["sources"], [])
+        self.assertEqual(state["completion"]["generation_mode"], "rag_no_evidence")
+        self.assertFalse(state["completion"]["rag_used"])
+        self.assertFalse(service.started)
+        self.assertEqual(service.prompts, [])
+
+    def test_rag_off_with_no_evidence_keeps_normal_model_behavior(self) -> None:
+        service = _ScriptedService(
+            [("파이썬의 특징은 읽기 쉬운 문법과 풍부한 생태계입니다.", "stop")]
+        )
+        manager = self.manager(service)
+
+        manager.start_turn("파이썬의 특징을 설명해 주세요.")
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(
+            state["conversation"][-1]["generation_mode"],
+            "cogni_core",
+        )
+        self.assertTrue(service.started)
+        self.assertEqual(len(service.prompts), 1)
+
+    def test_retrieval_evidence_bypasses_non_retrieval_shortcuts(self) -> None:
+        service = _ScriptedService(
+            [("근거 문서는 로컬 협업 기능을 설명합니다 [근거 1].", "stop")]
+        )
+        manager = self.manager(
+            service,
+            conversation_fast_path=ConversationFastPath(),
+            fact_grounder=_ExplodingFactGrounder(),
+        )
+
+        with patch.object(
+            ConversationFastPath,
+            "answer",
+            side_effect=AssertionError("RAG evidence must bypass the fast path"),
+        ):
+            manager.start_turn(
+                "나와 어떤 일을 함께 할 수 있나요?",
+                evidence=(RetrievalEvidence("doc-1", "로컬 문서", "협업 기능"),),
+            )
+            state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(
+            state["conversation"][-1]["generation_mode"],
+            "cogni_core_rag",
+        )
+        self.assertTrue(service.started)
+        self.assertEqual(len(service.prompts), 1)
+
+    def test_retrieval_requested_is_a_strict_chat_only_boolean(self) -> None:
+        manager = self.manager(_ScriptedService([]))
+
+        with self.assertRaisesRegex(TypeError, "must be a bool"):
+            manager.start_turn("질문", retrieval_requested=1)
+        with self.assertRaisesRegex(ValueError, "chat mode"):
+            manager.start_turn("/status", "task", retrieval_requested=True)
 
     def test_retrieval_evidence_limits_fail_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "bounded non-empty"):

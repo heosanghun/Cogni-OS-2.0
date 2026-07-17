@@ -32,16 +32,26 @@ class _Agent:
         self.evidence: tuple[object, ...] = ()
         self.image_content: bytes | None = None
         self.messages: list[str] = []
+        self.retrieval_requested = False
         self.shutdown_called = False
 
     @property
     def is_active(self) -> bool:
         return False
 
-    def start_turn(self, _message, _mode="chat", *, evidence=(), image_content=None):
+    def start_turn(
+        self,
+        _message,
+        _mode="chat",
+        *,
+        evidence=(),
+        image_content=None,
+        retrieval_requested=False,
+    ):
         self.messages.append(_message)
         self.evidence = tuple(evidence)
         self.image_content = image_content
+        self.retrieval_requested = retrieval_requested
         return "turn-rag"
 
     def snapshot(self):
@@ -545,6 +555,7 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         self.assertTrue(payload["rag_requested"])
         self.assertEqual(payload["rag_evidence_count"], 1)
         self.assertEqual(len(self.agent.evidence), 1)
+        self.assertTrue(self.agent.retrieval_requested)
         self.assertEqual(self.agent.evidence[0].source_id, f"{'a' * 24}.0")
 
         self.workspace.rag_results = []
@@ -555,6 +566,7 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
             )
         self.assertEqual(status, 202)
         self.assertEqual(payload["rag_evidence_count"], 0)
+        self.assertTrue(self.agent.retrieval_requested)
 
     def test_rag_chat_bounds_five_full_chunks_to_six_thousand_characters(self) -> None:
         self.workspace.rag_results = [

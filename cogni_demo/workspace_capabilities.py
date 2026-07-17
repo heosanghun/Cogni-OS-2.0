@@ -443,8 +443,8 @@ def _run_pdf_extractor_document(content: bytes) -> ExtractedDocument:
         page_number = raw_page.get("page_number")
         text = raw_page.get("text")
         if (
-            page_number != expected_page_number
-            or isinstance(page_number, bool)
+            type(page_number) is not int
+            or page_number != expected_page_number
             or not isinstance(text, str)
             or _normalize_extracted_text(text) != text
         ):
@@ -1092,11 +1092,14 @@ def _chunk_normalized_source(
 def _chunk_document(document: ExtractedDocument) -> tuple[IndexedChunk, ...]:
     if not isinstance(document, ExtractedDocument):
         raise TypeError("document must be ExtractedDocument")
-    if not document.text or len(document.text) > MAX_INDEXED_TEXT_CHARS:
-        code = "EMPTY_DOCUMENT" if not document.text else "DOCUMENT_TOO_LARGE"
+    bounded_text = (
+        document.text if document.pages else _normalize_index_source(document.text)
+    )
+    if not bounded_text or len(bounded_text) > MAX_INDEXED_TEXT_CHARS:
+        code = "EMPTY_DOCUMENT" if not bounded_text else "DOCUMENT_TOO_LARGE"
         message = (
             "document has no text"
-            if not document.text
+            if not bounded_text
             else "document exceeds the local index character limit"
         )
         raise WorkspaceCapabilityError(code, message)
@@ -1114,7 +1117,7 @@ def _chunk_document(document: ExtractedDocument) -> tuple[IndexedChunk, ...]:
     else:
         chunks.extend(
             _chunk_normalized_source(
-                document.text,
+                bounded_text,
                 page_number=None,
                 offset_basis="normalized_document_text_v1",
                 first_chunk_index=0,

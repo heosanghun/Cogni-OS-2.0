@@ -86,6 +86,7 @@ def main() -> int:
         if not 1 <= page_count <= MAX_PAGES:
             return _fail("PDF_PAGE_LIMIT", "PDF page count exceeds its limit")
         pages: list[dict[str, object]] = []
+        total_chars = 0
         for page_number, page in enumerate(reader.pages, start=1):
             raw = page.extract_text()
             if raw is None:
@@ -96,14 +97,18 @@ def main() -> int:
                     "the PDF extractor returned invalid text",
                 )
             text = _normalize(raw)
+            projected_total = total_chars + (2 if pages else 0) + len(text)
+            if projected_total > MAX_TEXT_CHARS:
+                return _fail(
+                    "PDF_TEXT_LIMIT",
+                    "extracted PDF text exceeds its limit",
+                )
+            total_chars = projected_total
             pages.append({"page_number": page_number, "text": text})
     except Exception:  # noqa: BLE001 - parser errors never cross the boundary
         return _fail("PDF_TEXT_EXTRACTION_FAILED", "the PDF parser rejected the file")
     if not any(page["text"] for page in pages):
         return _fail("PDF_NO_EXTRACTABLE_TEXT", "the PDF has no extractable text")
-    document_text = "\n\n".join(str(page["text"]) for page in pages)
-    if len(document_text) > MAX_TEXT_CHARS:
-        return _fail("PDF_TEXT_LIMIT", "extracted PDF text exceeds its limit")
     return _emit(
         {
             "ok": True,

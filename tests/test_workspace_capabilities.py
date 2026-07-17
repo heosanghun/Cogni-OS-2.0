@@ -470,6 +470,51 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 capabilities._run_pdf_extractor_document(b"%PDF-1.4\nlocal")
         self.assertEqual(raised.exception.code, "PDF_TEXT_EXTRACTION_FAILED")
 
+    def test_pdf_parent_rejects_non_integer_worker_page_number(self) -> None:
+        class _InvalidPageTypeProcess:
+            returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                del input, timeout
+                payload = {
+                    "ok": True,
+                    "pages": [{"page_number": 1.0, "text": "first"}],
+                }
+                return json.dumps(payload).encode(), b""
+
+        with (
+            patch.object(
+                capabilities.subprocess,
+                "Popen",
+                return_value=_InvalidPageTypeProcess(),
+            ),
+            patch.object(capabilities, "_assign_windows_pdf_job", return_value=0),
+        ):
+            with self.assertRaisesRegex(
+                WorkspaceCapabilityError, "page sequence"
+            ) as raised:
+                capabilities._run_pdf_extractor_document(b"%PDF-1.4\nlocal")
+        self.assertEqual(raised.exception.code, "PDF_TEXT_EXTRACTION_FAILED")
+
+    def test_nonpaginated_length_limit_applies_after_normalization(self) -> None:
+        document = capabilities.ExtractedDocument(
+            text="alpha   ",
+            page_count=0,
+            pages=(),
+        )
+        with patch.object(capabilities, "MAX_INDEXED_TEXT_CHARS", 5):
+            chunks = capabilities._chunk_document(document)
+        self.assertEqual(tuple(chunk.text for chunk in chunks), ("alpha",))
+        chunk = chunks[0]
+        self.assertIsNone(chunk.page_number)
+        self.assertEqual(chunk.char_start, 0)
+        self.assertEqual(chunk.char_end, 5)
+        self.assertEqual(chunk.offset_basis, "normalized_document_text_v1")
+        self.assertEqual(
+            chunk.excerpt_sha256,
+            sha256(b"alpha").hexdigest(),
+        )
+
     def test_encoded_length_is_rejected_before_base64_decode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             service = WorkspaceCapabilityService(temporary, _model())

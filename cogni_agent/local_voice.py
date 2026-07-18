@@ -433,7 +433,10 @@ class LocalVoiceService:
         preprocessor_factory: Callable[[], Any] | None = None,
         transcriber: LocalSpeechTranscriber | None = None,
         synthesizer: LocalSpeechSynthesizer | None = None,
+        tts_host_probe_passed: bool = False,
     ) -> None:
+        if not isinstance(tts_host_probe_passed, bool):
+            raise TypeError("tts_host_probe_passed must be bool")
         if transcriber is not None and (
             getattr(transcriber, "local_only", False) is not True
             or getattr(transcriber, "artifact_verified", False) is not True
@@ -443,6 +446,8 @@ class LocalVoiceService:
             )
         self._preprocessor_factory = preprocessor_factory
         self._processor: Any | None = None
+        self._processor_probe_passed = False
+        self._model_inference_attested = False
         self._transcriber = transcriber
         if synthesizer is not None and (
             getattr(synthesizer, "local_only", False) is not True
@@ -452,6 +457,7 @@ class LocalVoiceService:
                 "local TTS synthesizer must be local-only and artifact-verified"
             )
         self._synthesizer = synthesizer
+        self._tts_host_probe_passed = synthesizer is not None and tts_host_probe_passed
         self._lock = RLock()
 
     @classmethod
@@ -462,6 +468,7 @@ class LocalVoiceService:
         *,
         transcriber: LocalSpeechTranscriber | None = None,
         synthesizer: LocalSpeechSynthesizer | None = None,
+        tts_host_probe_passed: bool = False,
     ) -> "LocalVoiceService":
         root = Path(model_root)
         manifest = Path(manifest_path)
@@ -475,16 +482,40 @@ class LocalVoiceService:
             preprocessor_factory=load_processor,
             transcriber=transcriber,
             synthesizer=synthesizer,
+            tts_host_probe_passed=tts_host_probe_passed,
         )
 
     def capability_payload(self) -> dict[str, object]:
-        transcription_ready = self._transcriber is not None
+        transcriber_configured = self._transcriber is not None
         processor_configured = self._preprocessor_factory is not None
+        with self._lock:
+            processor_probe_passed = self._processor_probe_passed
+            model_inference_attested = self._model_inference_attested
+        transcription_ready = (
+            transcriber_configured
+            and processor_configured
+            and processor_probe_passed
+            and model_inference_attested
+        )
+        tts_configured = self._synthesizer is not None
+        tts_ready = tts_configured and self._tts_host_probe_passed
         return {
-            "state": "capture_transport_ready",
+            "state": (
+                "ready"
+                if transcription_ready
+                else "configured_unverified"
+                if transcriber_configured and processor_configured
+                else "capture_transport_configured"
+            ),
             "capture_state": "browser_get_user_media",
             "permission_state": "requested_only_on_user_action",
             "transport_state": "authenticated_loopback_ready",
+            "capture_transport": {
+                "state": "configured",
+                "browser_feature_probe": "client_required",
+                "permission_request": "user_action_only",
+                "transport": "authenticated_loopback",
+            },
             "external_calls": 0,
             "input_format": {
                 "container": "wav",
@@ -495,32 +526,78 @@ class LocalVoiceService:
                 "max_bytes": MAX_VOICE_WAV_BYTES,
             },
             "processor_state": (
-                "verified_gemma4_loader_configured"
+                "probed"
+                if processor_probe_passed
+                else "configured_unverified"
                 if processor_configured
                 else "not_configured"
             ),
-            "transcription_state": (
-                "ready" if transcription_ready else "local_artifact_required"
+            "processor": {
+                "configured": processor_configured,
+                "probe_passed": processor_probe_passed,
+                "state": (
+                    "probed"
+                    if processor_probe_passed
+                    else "configured_unverified"
+                    if processor_configured
+                    else "not_configured"
+                ),
+            },
+            "transcriber": {
+                "configured": transcriber_configured,
+                "artifact_verified": transcriber_configured,
+                "state": (
+                    "configured_unverified"
+                    if transcriber_configured and not model_inference_attested
+                    else "attested"
+                    if model_inference_attested
+                    else "not_configured"
+                ),
+            },
+            "model_inference_attested": model_inference_attested,
+            "attestation_path": (
+                "successful_local_transcription_or_guarded_validation"
             ),
-            "runtime_audio_input": transcription_ready and processor_configured,
+            "transcription_state": (
+                "ready"
+                if transcription_ready
+                else "configured_unverified"
+                if transcriber_configured and processor_configured
+                else "local_artifact_required"
+            ),
+            "runtime_audio_input": transcription_ready,
             "stt": {
                 "mode": "local_only",
-                "artifact_verified": transcription_ready,
+                "artifact_verified": transcriber_configured,
+                "runtime_ready": transcription_ready,
                 "disabled_reason": (
-                    None if transcription_ready else "LOCAL_STT_ARTIFACT_REQUIRED"
+                    None
+                    if transcription_ready
+                    else "LOCAL_STT_INFERENCE_UNVERIFIED"
+                    if transcriber_configured and processor_configured
+                    else "LOCAL_STT_ARTIFACT_REQUIRED"
                 ),
             },
             "tts": {
-                "state": "ready" if self._synthesizer is not None else "disabled",
+                "state": (
+                    "ready"
+                    if tts_ready
+                    else "configured_unverified"
+                    if tts_configured
+                    else "disabled"
+                ),
                 "mode": "local_only",
                 "source": (
-                    "verified_windows_system_speech"
-                    if self._synthesizer is not None
-                    else None
+                    "verified_windows_system_speech" if tts_configured else None
                 ),
+                "host_probe_passed": self._tts_host_probe_passed,
+                "browser_playback_verified": False,
+                "browser_playback_state": "unverified",
                 "disabled_reason": (
                     None
-                    if self._synthesizer is not None
+                    if tts_ready
+                    else "LOCAL_TTS_HOST_PROBE_REQUIRED"
+                    if tts_configured
                     else "LOCAL_TTS_ARTIFACT_REQUIRED"
                 ),
             },
@@ -580,6 +657,8 @@ class LocalVoiceService:
                 "LOCAL_AUDIO_PREPROCESS_FAILED",
                 "audio processor returned an unverified bundle",
             )
+        with self._lock:
+            self._processor_probe_passed = True
         try:
             transcript = self._transcriber.transcribe(
                 wav=wav,
@@ -601,6 +680,8 @@ class LocalVoiceService:
             raise LocalVoiceError(
                 "LOCAL_STT_OUTPUT_INVALID", "local STT returned invalid text"
             )
+        with self._lock:
+            self._model_inference_attested = True
         return {
             "transcript": transcript.strip(),
             "language": language,

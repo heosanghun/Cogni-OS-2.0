@@ -122,6 +122,10 @@ class TestLocalVoice(unittest.TestCase):
         self.assertEqual(payload["transport_state"], "authenticated_loopback_ready")
         self.assertEqual(payload["transcription_state"], "local_artifact_required")
         self.assertFalse(payload["runtime_audio_input"])
+        self.assertTrue(payload["processor"]["configured"])
+        self.assertFalse(payload["processor"]["probe_passed"])
+        self.assertFalse(payload["transcriber"]["configured"])
+        self.assertFalse(payload["model_inference_attested"])
         self.assertEqual(payload["external_calls"], 0)
         self.assertEqual(
             payload["tts"]["disabled_reason"], "LOCAL_TTS_ARTIFACT_REQUIRED"
@@ -151,6 +155,33 @@ class TestLocalVoice(unittest.TestCase):
         self.assertEqual(result["external_calls"], 0)
         self.assertEqual(processor.calls, 1)
         self.assertEqual(transcriber.calls, 1)
+        capability = service.capability_payload()
+        self.assertEqual(capability["transcription_state"], "ready")
+        self.assertTrue(capability["processor"]["probe_passed"])
+        self.assertTrue(capability["model_inference_attested"])
+        self.assertTrue(capability["runtime_audio_input"])
+
+    def test_configured_processor_failure_never_attests_runtime(self) -> None:
+        def fail_processor():
+            raise RuntimeError("processor failed")
+
+        service = LocalVoiceService(
+            preprocessor_factory=fail_processor,
+            transcriber=_Transcriber(),
+        )
+        before = service.capability_payload()
+        self.assertEqual(before["transcription_state"], "configured_unverified")
+        self.assertFalse(before["runtime_audio_input"])
+        self.assertFalse(before["processor"]["probe_passed"])
+        self.assertFalse(before["model_inference_attested"])
+
+        with self.assertRaises(LocalVoiceError) as caught:
+            service.transcribe_base64(b64encode(_wav()).decode("ascii"), language="ko")
+        self.assertEqual(caught.exception.code, "LOCAL_AUDIO_PROCESSOR_REQUIRED")
+        after = service.capability_payload()
+        self.assertEqual(after["transcription_state"], "configured_unverified")
+        self.assertFalse(after["processor"]["probe_passed"])
+        self.assertFalse(after["model_inference_attested"])
 
     def test_unverified_or_nonlocal_transcriber_is_rejected(self) -> None:
         for local_only, artifact_verified in ((False, True), (True, False)):

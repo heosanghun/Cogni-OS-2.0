@@ -232,7 +232,12 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("Data Sourced from The Lens", markup)
         self.assertIn("www.lens.org", markup)
         self.assertIn("about.lens.org/lens-api-terms-of-use/", markup)
+        self.assertIn("앱 밖의", markup)
+        self.assertIn("외부 사이트", script)
         self.assertIn("microphone.runtime_audio_input === true", script)
+        self.assertIn("microphone.model_inference_attested === true", script)
+        self.assertIn("processor.probe_passed === true", script)
+        self.assertIn("tts.host_probe_passed === true", script)
         self.assertIn(
             "function updateExternalCallDisclosure(mode, externalCalls)", script
         )
@@ -363,6 +368,8 @@ class TestCogniBoardUI(unittest.TestCase):
 
         self.assertIn('selectedImageAttachmentId: ""', script)
         self.assertIn("attachments.image_to_model_integration === true", script)
+        self.assertIn("imageCapability.runtime_ready === true", script)
+        self.assertIn("imageCapability.model_inference_attested === true", script)
         self.assertIn("function selectWorkspaceImageAttachment", script)
         self.assertIn('imageSelect.setAttribute("aria-pressed"', script)
         self.assertIn(

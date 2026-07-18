@@ -107,9 +107,11 @@ const API_ERROR_COPY = {
   LOCAL_AUDIO_PREPROCESS_FAILED: "검증된 로컬 Gemma 오디오 전처리에 실패했습니다.",
   LOCAL_AUDIO_PROCESSOR_REQUIRED: "검증된 로컬 Gemma 오디오 프로세서가 필요합니다.",
   LOCAL_STT_ARTIFACT_REQUIRED: "녹음·로컬 전송·WAV 검증은 완료했지만, 전사를 위한 검증된 로컬 STT 모델이 필요합니다.",
+  LOCAL_STT_INFERENCE_UNVERIFIED: "로컬 음성 전사는 구성되었지만 실제 실행 검증 전입니다.",
   LOCAL_STT_FAILED: "검증된 로컬 음성 인식기가 전사를 완료하지 못했습니다.",
   LOCAL_STT_OUTPUT_INVALID: "로컬 음성 인식 결과가 안전한 텍스트 형식이 아닙니다.",
   LOCAL_TTS_ARTIFACT_REQUIRED: "검증된 Windows 로컬 음성이 없어 읽어주기를 사용할 수 없습니다.",
+  LOCAL_TTS_HOST_PROBE_REQUIRED: "로컬 음성 합성기는 구성되었지만 호스트 실행 검증 전입니다.",
   LOCAL_TTS_FAILED: "검증된 로컬 음성 합성을 완료하지 못했습니다.",
   LOCAL_TTS_OUTPUT_INVALID: "로컬 음성 합성 결과가 안전한 WAV 형식이 아닙니다.",
   TTS_TEXT_INVALID: "읽어줄 답변은 1~2,000자의 안전한 텍스트여야 합니다.",
@@ -294,6 +296,7 @@ const ui = {
   voiceSession: null,
   voiceTranscriptionReady: false,
   voiceTransportReady: false,
+  voiceBrowserCaptureReady: false,
   voiceSynthesisReady: false,
   voiceSynthesisDisabledReason: "LOCAL_TTS_ARTIFACT_REQUIRED",
   voicePlaybackState: "idle",
@@ -1208,8 +1211,23 @@ function revokeWorkspaceCapabilities() {
   ui.selectedImageAttachmentId = "";
   ui.lensConnectorReady = false;
   ui.voiceTransportReady = false;
+  ui.voiceBrowserCaptureReady = false;
   ui.voiceTranscriptionReady = false;
   ui.voiceSynthesisReady = false;
+}
+
+function browserMicrophoneSupport() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (window.isSecureContext !== true) {
+    return { ready: false, reason: "보안 컨텍스트가 아니어서 마이크를 사용할 수 없습니다." };
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return { ready: false, reason: "이 브라우저는 getUserMedia를 지원하지 않습니다." };
+  }
+  if (!AudioContextClass) {
+    return { ready: false, reason: "이 브라우저는 AudioContext를 지원하지 않습니다." };
+  }
+  return { ready: true, reason: "" };
 }
 
 function applyWorkspaceCapabilities(capabilities) {
@@ -1225,6 +1243,9 @@ function applyWorkspaceCapabilities(capabilities) {
   const attachments = capabilities.attachments || {};
   const rag = capabilities.rag || {};
   const microphone = capabilities.microphone || {};
+  const captureTransport = microphone.capture_transport || {};
+  const processor = microphone.processor || {};
+  const transcriber = microphone.transcriber || {};
   const tts = microphone.tts || {};
   const web = capabilities.web_search || {};
   const lens = web.official_lens_connector || {};
@@ -1232,7 +1253,10 @@ function applyWorkspaceCapabilities(capabilities) {
   ui.ragAnswerIntegrationReady = ui.ragBackendReady
     && rag.answer_integration === true
     && rag.answer_integration_schema === "cogni.agent.retrieval-evidence.v1";
-  ui.imageModelIntegrationReady = attachments.image_to_model_integration === true;
+  const imageCapability = attachments.image_capability || {};
+  ui.imageModelIntegrationReady = attachments.image_to_model_integration === true
+    && imageCapability.runtime_ready === true
+    && imageCapability.model_inference_attested === true;
   if (!ui.imageModelIntegrationReady) ui.selectedImageAttachmentId = "";
   ui.ragDocumentCount = Number.isInteger(rag.documents) ? Math.max(0, rag.documents) : 0;
   if (
@@ -1241,13 +1265,20 @@ function applyWorkspaceCapabilities(capabilities) {
   ) {
     ui.ragEnabled = false;
   }
-  ui.voiceTransportReady = microphone.capture_state === "browser_get_user_media"
+  const browserCapture = browserMicrophoneSupport();
+  ui.voiceBrowserCaptureReady = browserCapture.ready;
+  ui.voiceTransportReady = captureTransport.state === "configured"
+    && microphone.capture_state === "browser_get_user_media"
     && microphone.transport_state === "authenticated_loopback_ready";
   ui.voiceTranscriptionReady = microphone.transcription_state === "ready"
-    && microphone.runtime_audio_input === true;
+    && microphone.runtime_audio_input === true
+    && processor.probe_passed === true
+    && transcriber.configured === true
+    && microphone.model_inference_attested === true;
   ui.voiceSynthesisReady = tts.state === "ready"
     && tts.mode === "local_only"
-    && tts.source === "verified_windows_system_speech";
+    && tts.source === "verified_windows_system_speech"
+    && tts.host_probe_passed === true;
   ui.voiceSynthesisDisabledReason = typeof tts.disabled_reason === "string"
     ? tts.disabled_reason.slice(0, 64)
     : "LOCAL_TTS_ARTIFACT_REQUIRED";
@@ -1305,15 +1336,23 @@ function applyWorkspaceCapabilities(capabilities) {
     lensIndex.disabled = !ui.ragBackendReady || lens.lens_to_akasicdb !== true;
     if (lensIndex.disabled) lensIndex.checked = false;
   }
+  const sttConfigured = processor.configured === true && transcriber.configured === true;
   setText(
     "#agent-microphone-status",
-    MICROPHONE_CAPTURE_UI_IMPLEMENTED && ui.voiceTransportReady
-      ? ui.voiceTranscriptionReady ? "로컬 STT" : "STT 필요"
+    MICROPHONE_CAPTURE_UI_IMPLEMENTED && ui.voiceTransportReady && ui.voiceBrowserCaptureReady
+      ? ui.voiceTranscriptionReady
+        ? "로컬 STT"
+        : sttConfigured
+          ? "구성됨·실행 미검증"
+          : "STT 필요"
+      : !ui.voiceBrowserCaptureReady ? "브라우저 미지원"
       : "미연결",
   );
   const microphoneButton = $('[data-action="workspace-microphone"]');
   if (microphoneButton) {
-    const captureReady = MICROPHONE_CAPTURE_UI_IMPLEMENTED && ui.voiceTransportReady;
+    const captureReady = MICROPHONE_CAPTURE_UI_IMPLEMENTED
+      && ui.voiceTransportReady
+      && ui.voiceBrowserCaptureReady;
     microphoneButton.setAttribute(
       "aria-label",
       captureReady
@@ -1323,12 +1362,20 @@ function applyWorkspaceCapabilities(capabilities) {
     microphoneButton.title = captureReady
       ? ui.voiceTranscriptionReady
         ? "마이크 권한은 이 버튼을 누를 때만 요청되며 외부로 전송하지 않습니다."
-        : "녹음과 loopback 전송은 검증할 수 있지만 텍스트 전사에는 별도 검증된 로컬 STT 모델이 필요합니다."
-      : "브라우저 캡처와 인증된 로컬 전송 경로가 준비되지 않았습니다.";
+        : sttConfigured
+          ? "로컬 STT 구성은 확인됐지만 프로세서와 실제 모델 전사 성공이 아직 검증되지 않았습니다."
+          : "텍스트 전사에는 검증된 로컬 STT와 오디오 프로세서가 필요합니다."
+      : browserCapture.reason || "브라우저 캡처와 인증된 로컬 전송 경로가 준비되지 않았습니다.";
   }
   setText(
     "#agent-tts-status",
-    ui.voiceSynthesisReady ? "로컬 TTS" : "음성 필요",
+    ui.voiceSynthesisReady
+      ? tts.browser_playback_verified === true
+        ? "로컬 TTS"
+        : "호스트 검증·재생 미검증"
+      : tts.state === "configured_unverified"
+        ? "구성됨·실행 미검증"
+        : "음성 필요",
   );
   renderWorkspaceModels(capabilities.models || {});
   renderWorkspaceAttachments();
@@ -1424,6 +1471,7 @@ function updateWorkspaceControlStates() {
         || !MICROPHONE_CAPTURE_UI_IMPLEMENTED
         || microphone.capture_state !== "browser_get_user_media"
         || microphone.transport_state !== "authenticated_loopback_ready"
+        || !ui.voiceBrowserCaptureReady
         || !ui.voiceTranscriptionReady
         || ["requesting", "encoding", "uploading"].includes(ui.voiceCaptureState);
   }
@@ -1442,7 +1490,8 @@ function updateWorkspaceControlStates() {
     const loading = ui.voicePlaybackState === "loading";
     const capabilityReady = ui.voiceSynthesisReady
       && tts.state === "ready"
-      && tts.source === "verified_windows_system_speech";
+      && tts.source === "verified_windows_system_speech"
+      && tts.host_probe_passed === true;
     ttsPlay.disabled = unavailable
       || voiceComputeBusy
       || ui.voiceCaptureState !== "idle"
@@ -1472,7 +1521,9 @@ function updateWorkspaceControlStates() {
         ? "화면에 표시된 완료 답변이 있어야 읽어줄 수 있습니다."
         : playing
           ? "재생 중지 버튼으로 멈출 수 있습니다."
-          : "현재 화면에 표시된 마지막 Cogni Agent 답변을 로컬 Windows 음성으로 읽습니다.";
+          : tts.browser_playback_verified === true
+            ? "현재 화면에 표시된 마지막 Cogni Agent 답변을 로컬 Windows 음성으로 읽습니다."
+            : "호스트 WAV 합성은 검증됐지만 이 브라우저의 실제 오디오 재생은 아직 검증 전입니다.";
   }
   const ttsStop = $('[data-action="workspace-tts-stop"]');
   if (ttsStop) {
@@ -1991,7 +2042,9 @@ function renderLensSearchResults(results) {
     link.href = canonicalUrl;
     link.target = "_blank";
     link.rel = "noopener noreferrer";
-    link.textContent = `Lens ID ${lensId}`;
+    link.textContent = `Lens ID ${lensId} · 외부 사이트`;
+    link.title = "선택하면 앱 밖의 lens.org 페이지가 새 탭에서 열립니다.";
+    link.setAttribute("aria-label", `Lens ID ${lensId}, 외부 lens.org 페이지 새 탭에서 열기`);
     top.append(title, link);
     const metadata = document.createElement("small");
     const kind = result.kind === "patent" ? "특허" : "논문";
@@ -2361,13 +2414,16 @@ async function startVoiceCapture() {
   if (
     ui.voiceCaptureState !== "idle"
     || !ui.voiceTransportReady
+    || !ui.voiceBrowserCaptureReady
     || !ui.voiceTranscriptionReady
   ) return;
   if (ui.voicePlaybackState !== "idle") stopVoicePlayback();
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-  if (!navigator.mediaDevices?.getUserMedia || !AudioContextClass) {
-    setVoiceCaptureState("idle", "이 브라우저는 로컬 마이크 캡처를 지원하지 않습니다.");
-    showToast("이 브라우저는 로컬 마이크 캡처를 지원하지 않습니다.", "warning");
+  const browserCapture = browserMicrophoneSupport();
+  if (!browserCapture.ready || !navigator.mediaDevices?.getUserMedia || !AudioContextClass) {
+    const copy = browserCapture.reason || "이 브라우저는 로컬 마이크 캡처를 지원하지 않습니다.";
+    setVoiceCaptureState("idle", copy);
+    showToast(copy, "warning");
     return;
   }
   const session = { cancelled: false, chunks: [], frameCount: 0 };

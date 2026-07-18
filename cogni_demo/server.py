@@ -2048,13 +2048,23 @@ class DemoHTTPServer(ThreadingHTTPServer):
         }
 
     def image_to_model_integration_ready(self) -> bool:
-        """Expose image chat only for the manifest-verified Gemma runtime.
+        """Return only answer-bearing, currently attested image readiness."""
+
+        return bool(self.image_to_model_integration_status()["runtime_ready"])
+
+    def image_to_model_integration_status(self) -> dict[str, object]:
+        """Separate image configuration from processor and inference proof.
 
         A similarly shaped test double or arbitrary generation backend is not a
         product capability.  The exact production manager, ModelService, local
         Gemma factory, artifact digest and processor binding must all agree.
+        Merely satisfying those structural checks is configuration evidence,
+        not proof that an image processor or answer-bearing model inference ran
+        successfully in this process.
         """
 
+        configured = False
+        processor_probed = False
         try:
             from cogni_agent.manager import AgentManager
             from cogni_agent.model_service import LocalGemmaModelFactory, ModelService
@@ -2063,28 +2073,54 @@ class DemoHTTPServer(ThreadingHTTPServer):
             if not isinstance(
                 agent, AgentManager
             ) or not self._has_explicit_image_parameter(agent.start_turn):
-                return False
+                raise TypeError("production agent image boundary is not configured")
             service = getattr(agent, "model_service", None)
             if not isinstance(
                 service, ModelService
             ) or not self._has_explicit_image_parameter(service.iter_generate_tokens):
-                return False
+                raise TypeError("production model image boundary is not configured")
             factory = getattr(service, "model_factory", None)
             if (
                 not isinstance(factory, LocalGemmaModelFactory)
                 or factory.manifest_path is None
                 or service.artifact_digest != factory.artifact_digest
             ):
-                return False
+                raise TypeError("model artifact authority is not configured")
             processor = getattr(service, "_multimodal_processor_config", None)
             if not isinstance(processor, tuple) or len(processor) != 2:
-                return False
+                raise TypeError("multimodal processor is not configured")
             processor_root, processor_manifest = map(Path, processor)
-            return processor_root == Path(
+            configured = processor_root == Path(
                 factory.model_path
             ) and processor_manifest == Path(factory.manifest_path)
+            # A lazily constructed processor object is not probe evidence: it
+            # can exist even when preprocessing later fails.  A future guarded
+            # validation path must supply an explicit successful probe and
+            # answer-bearing inference attestation before runtime enablement.
+            processor_probed = False
         except (AttributeError, ImportError, OSError, TypeError, ValueError):
-            return False
+            configured = False
+            processor_probed = False
+        return {
+            "state": (
+                "processor_probed_inference_unattested"
+                if processor_probed
+                else "configured_unverified"
+                if configured
+                else "not_configured"
+            ),
+            "selected_model_only": True,
+            "configured": configured,
+            "processor_probed": processor_probed,
+            "model_inference_attested": False,
+            "runtime_ready": False,
+            "attestation_path": "guarded_current_process_model_inference_required",
+            "disabled_reason": (
+                "IMAGE_MODEL_INFERENCE_NOT_ATTESTED"
+                if configured
+                else "IMAGE_MODEL_NOT_CONFIGURED"
+            ),
+        }
 
     def touch_authenticated_state_poll(self) -> None:
         with self._lifecycle_lock:
@@ -2451,39 +2487,57 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             payload = deepcopy(payload)
             models = payload.get("models")
             model_items = models.get("items") if isinstance(models, dict) else None
-            checkpoint_image = bool(
-                isinstance(model_items, list)
-                and any(
-                    isinstance(item, dict)
-                    and isinstance(item.get("checkpoint_modalities"), list)
-                    and "image" in item["checkpoint_modalities"]
+            selected_items = (
+                [
+                    item
                     for item in model_items
-                )
+                    if isinstance(item, dict) and item.get("selected") is True
+                ]
+                if isinstance(model_items, list)
+                else []
             )
-            image_integration = (
-                checkpoint_image and self.server.image_to_model_integration_ready()
+            selected_model = selected_items[0] if len(selected_items) == 1 else None
+            checkpoint_image = bool(
+                isinstance(selected_model, dict)
+                and isinstance(selected_model.get("checkpoint_modalities"), list)
+                and "image" in selected_model["checkpoint_modalities"]
             )
+            image_capability = self.server.image_to_model_integration_status()
+            if not checkpoint_image:
+                image_capability = {
+                    **image_capability,
+                    "state": "selected_checkpoint_not_supported",
+                    "configured": False,
+                    "processor_probed": False,
+                    "model_inference_attested": False,
+                    "runtime_ready": False,
+                    "disabled_reason": "SELECTED_MODEL_IMAGE_NOT_ADVERTISED",
+                }
+            image_integration = bool(image_capability.get("runtime_ready") is True)
             attachment_capability = payload.get("attachments")
             if isinstance(attachment_capability, dict):
                 attachment_capability["image_to_model_integration"] = image_integration
+                attachment_capability["image_capability"] = image_capability
                 attachment_capability["image_selection"] = (
                     "explicit_single_next_turn" if image_integration else "disabled"
                 )
             if isinstance(models, dict):
                 models["image_to_model_integration"] = image_integration
-            if image_integration and isinstance(model_items, list):
-                for item in model_items:
-                    if not isinstance(item, dict):
-                        continue
-                    runtime_modalities = item.get("runtime_input_modalities")
-                    if (
-                        isinstance(runtime_modalities, list)
-                        and "image" not in runtime_modalities
-                    ):
-                        runtime_modalities.append("image")
-                    unwired = item.get("unwired_checkpoint_modalities")
+                models["image_capability"] = image_capability
+            if image_integration and isinstance(selected_model, dict):
+                runtime_modalities = selected_model.get("runtime_input_modalities")
+                if (
+                    isinstance(runtime_modalities, list)
+                    and "image" not in runtime_modalities
+                ):
+                    runtime_modalities.append("image")
+                for key in (
+                    "advertised_but_not_wired",
+                    "unwired_checkpoint_modalities",
+                ):
+                    unwired = selected_model.get(key)
                     if isinstance(unwired, list):
-                        item["unwired_checkpoint_modalities"] = [
+                        selected_model[key] = [
                             modality for modality in unwired if modality != "image"
                         ]
             checkpoint_microphone = payload.get("microphone")
@@ -3287,6 +3341,7 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
 
     def _security_headers(self) -> None:
         self.send_header("Content-Security-Policy", _CSP)
+        self.send_header("Permissions-Policy", "microphone=(self)")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -3473,6 +3528,7 @@ def _build_local_voice_service(
         pass
 
     synthesizer = None
+    tts_host_probe_passed = False
     try:
         candidate = WindowsSpeechSynthesizer()
         probe = candidate.synthesize(text="Cogni", language="auto")
@@ -3484,6 +3540,7 @@ def _build_local_voice_service(
         ):
             raise ValueError("Windows TTS probe returned invalid evidence")
         synthesizer = candidate
+        tts_host_probe_passed = True
     except (LocalVoiceError, OSError, TypeError, ValueError):
         pass
 
@@ -3492,6 +3549,7 @@ def _build_local_voice_service(
         manifest_path,
         transcriber=transcriber,
         synthesizer=synthesizer,
+        tts_host_probe_passed=tts_host_probe_passed,
     )
 
 

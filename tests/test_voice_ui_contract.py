@@ -16,6 +16,11 @@ class TestVoiceUIContract(unittest.TestCase):
 
         self.assertIn("MICROPHONE_CAPTURE_UI_IMPLEMENTED = true", script)
         self.assertIn("navigator.mediaDevices.getUserMedia", script)
+        self.assertIn("function browserMicrophoneSupport()", script)
+        self.assertIn("window.isSecureContext !== true", script)
+        self.assertIn("ui.voiceBrowserCaptureReady", script)
+        self.assertIn("processor.probe_passed === true", script)
+        self.assertIn("microphone.model_inference_attested === true", script)
         self.assertIn("createScriptProcessor(4096, 1, 1)", script)
         self.assertIn("VOICE_SAMPLE_RATE = 16000", script)
         self.assertIn('writeAscii(0, "RIFF")', script)
@@ -50,6 +55,9 @@ class TestVoiceUIContract(unittest.TestCase):
         self.assertIn(".voice-playback-panel", stylesheet)
         self.assertIn('.voice-playback-panel[data-state="playing"]', stylesheet)
         self.assertIn("media-src 'self' blob:", server)
+        self.assertIn('"Permissions-Policy", "microphone=(self)"', server)
+        self.assertIn("tts.host_probe_passed === true", script)
+        self.assertIn("tts.browser_playback_verified === true", script)
 
 
 if __name__ == "__main__":

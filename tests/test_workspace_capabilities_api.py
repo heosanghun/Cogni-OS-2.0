@@ -21,6 +21,18 @@ from cogni_demo.workspace_capabilities import WorkspaceCapabilityError
 from tests.test_demo_server import manager_for
 
 
+def _attested_image_status() -> dict[str, object]:
+    return {
+        "state": "ready",
+        "selected_model_only": True,
+        "configured": True,
+        "processor_probed": True,
+        "model_inference_attested": True,
+        "runtime_ready": True,
+        "disabled_reason": None,
+    }
+
+
 @dataclass(frozen=True)
 class _Evidence:
     source_id: str
@@ -102,6 +114,7 @@ class _Workspace:
             "models": {
                 "items": [
                     {
+                        "selected": True,
                         "checkpoint_modalities": ["text", "image"],
                         "runtime_input_modalities": ["text"],
                         "unwired_checkpoint_modalities": ["image"],
@@ -619,12 +632,22 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
 
     def test_image_chat_is_explicit_single_turn_bounded_and_path_free(self) -> None:
         attachment_id = "a" * 24
-        with patch.object(
-            self.server, "image_to_model_integration_ready", return_value=True
+        with (
+            patch.object(
+                self.server,
+                "image_to_model_integration_status",
+                return_value=_attested_image_status(),
+            ),
+            patch.object(
+                self.server, "image_to_model_integration_ready", return_value=True
+            ),
         ):
             status, capability = self._get("/api/workspace/capabilities")
             self.assertEqual(status, 200)
             self.assertTrue(capability["attachments"]["image_to_model_integration"])
+            self.assertTrue(
+                capability["attachments"]["image_capability"]["runtime_ready"]
+            )
             self.assertEqual(
                 capability["attachments"]["image_selection"],
                 "explicit_single_next_turn",
@@ -661,6 +684,10 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         status, capability = self._get("/api/workspace/capabilities")
         self.assertEqual(status, 200)
         self.assertFalse(capability["attachments"]["image_to_model_integration"])
+        self.assertFalse(
+            capability["attachments"]["image_capability"]["model_inference_attested"]
+        )
+        self.assertFalse(capability["attachments"]["image_capability"]["runtime_ready"])
 
         text_only_capability = {
             "schema_version": 1,
@@ -669,6 +696,7 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
             "models": {
                 "items": [
                     {
+                        "selected": True,
                         "checkpoint_modalities": ["text"],
                         "runtime_input_modalities": ["text"],
                     }
@@ -677,7 +705,9 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         }
         with (
             patch.object(
-                self.server, "image_to_model_integration_ready", return_value=True
+                self.server,
+                "image_to_model_integration_status",
+                return_value=_attested_image_status(),
             ),
             patch.object(
                 self.workspace,
@@ -688,6 +718,49 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
             status, capability = self._get("/api/workspace/capabilities")
         self.assertEqual(status, 200)
         self.assertFalse(capability["attachments"]["image_to_model_integration"])
+        self.assertEqual(
+            capability["attachments"]["image_capability"]["state"],
+            "selected_checkpoint_not_supported",
+        )
+
+        misleading_discovered_capability = {
+            "schema_version": 1,
+            "attachments": {"state": "enabled"},
+            "rag": {"state": "local_index_ready"},
+            "models": {
+                "items": [
+                    {
+                        "selected": True,
+                        "checkpoint_modalities": ["text"],
+                        "runtime_input_modalities": ["text"],
+                    },
+                    {
+                        "selected": False,
+                        "checkpoint_modalities": ["text", "image"],
+                        "runtime_input_modalities": ["text"],
+                    },
+                ]
+            },
+        }
+        with (
+            patch.object(
+                self.server,
+                "image_to_model_integration_status",
+                return_value=_attested_image_status(),
+            ),
+            patch.object(
+                self.workspace,
+                "capability_payload",
+                return_value=misleading_discovered_capability,
+            ),
+        ):
+            status, capability = self._get("/api/workspace/capabilities")
+        self.assertEqual(status, 200)
+        self.assertFalse(capability["attachments"]["image_to_model_integration"])
+        self.assertEqual(
+            capability["models"]["items"][1]["runtime_input_modalities"],
+            ["text"],
+        )
 
         invalid_bodies = (
             {"message": "x", "image_attachment_id": None},

@@ -82,6 +82,7 @@ class TestVoiceHTTPAPI(unittest.TestCase):
                 preprocessor_factory=lambda: _Processor(),
                 transcriber=_Transcriber(),
                 synthesizer=_Synthesizer(),
+                tts_host_probe_passed=True,
             ),
             port=0,
             token="v" * 32,
@@ -148,7 +149,16 @@ class TestVoiceHTTPAPI(unittest.TestCase):
             payload["microphone"]["transport_state"], "authenticated_loopback_ready"
         )
         self.assertEqual(payload["microphone"]["external_calls"], 0)
+        self.assertEqual(
+            payload["microphone"]["transcription_state"],
+            "configured_unverified",
+        )
+        self.assertFalse(payload["microphone"]["runtime_audio_input"])
+        self.assertFalse(payload["microphone"]["processor"]["probe_passed"])
+        self.assertFalse(payload["microphone"]["model_inference_attested"])
         self.assertEqual(payload["microphone"]["tts"]["state"], "ready")
+        self.assertTrue(payload["microphone"]["tts"]["host_probe_passed"])
+        self.assertFalse(payload["microphone"]["tts"]["browser_playback_verified"])
         self.assertEqual(
             payload["microphone"]["tts"]["source"],
             "verified_windows_system_speech",
@@ -164,6 +174,19 @@ class TestVoiceHTTPAPI(unittest.TestCase):
         self.assertEqual(payload["transcript"], "인증된 로컬 전사")
         self.assertEqual(payload["external_calls"], 0)
         self.assertEqual(self._post(body, origin=False)[0], 403)
+
+        connection = self._connection()
+        connection.request(
+            "GET", "/api/workspace/capabilities", headers={"Cookie": self.cookie}
+        )
+        response = connection.getresponse()
+        capability = json.loads(response.read())
+        connection.close()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(capability["microphone"]["transcription_state"], "ready")
+        self.assertTrue(capability["microphone"]["processor"]["probe_passed"])
+        self.assertTrue(capability["microphone"]["model_inference_attested"])
+        self.assertTrue(capability["microphone"]["runtime_audio_input"])
 
         self.server.voice_service = LocalVoiceService(
             preprocessor_factory=lambda: _Processor()
@@ -261,6 +284,7 @@ class TestVoiceProductComposition(unittest.TestCase):
             "manifest",
             transcriber=transcriber.return_value,
             synthesizer=synthesizer.return_value,
+            tts_host_probe_passed=True,
         )
 
     def test_failed_windows_probe_keeps_tts_disabled(self) -> None:
@@ -284,6 +308,7 @@ class TestVoiceProductComposition(unittest.TestCase):
             "manifest",
             transcriber=transcriber.return_value,
             synthesizer=None,
+            tts_host_probe_passed=False,
         )
 
 

@@ -50,8 +50,20 @@ class TestLocalTTS(unittest.TestCase):
             disabled.synthesize("안녕하세요", language="ko")
         self.assertEqual(caught.exception.code, "LOCAL_TTS_ARTIFACT_REQUIRED")
 
-        enabled = LocalVoiceService(synthesizer=_Synthesizer())
+        configured = LocalVoiceService(synthesizer=_Synthesizer())
+        configured_tts = configured.capability_payload()["tts"]
+        self.assertEqual(configured_tts["state"], "configured_unverified")
+        self.assertFalse(configured_tts["host_probe_passed"])
+        self.assertFalse(configured_tts["browser_playback_verified"])
+
+        enabled = LocalVoiceService(
+            synthesizer=_Synthesizer(), tts_host_probe_passed=True
+        )
         self.assertEqual(enabled.capability_payload()["tts"]["state"], "ready")
+        self.assertTrue(enabled.capability_payload()["tts"]["host_probe_passed"])
+        self.assertFalse(
+            enabled.capability_payload()["tts"]["browser_playback_verified"]
+        )
         result = enabled.synthesize("안녕하세요", language="ko")
         self.assertEqual(result["external_calls"], 0)
         self.assertEqual(result["source"], "verified_windows_system_speech")

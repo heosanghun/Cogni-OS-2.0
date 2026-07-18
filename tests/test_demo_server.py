@@ -986,6 +986,7 @@ class TestDemoHTTPControlPlane(unittest.TestCase):
         self.assertIn(
             "default-src 'self'", response.getheader("Content-Security-Policy")
         )
+        self.assertEqual(response.getheader("Permissions-Policy"), "microphone=(self)")
         self.assertIsNone(response.getheader("Access-Control-Allow-Origin"))
         connection.close()
 

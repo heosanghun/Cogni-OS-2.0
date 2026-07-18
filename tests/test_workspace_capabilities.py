@@ -88,6 +88,49 @@ def _write_clone(root: Path) -> dict[str, str]:
     return digests
 
 
+def _write_model_registry_candidate(
+    registry: Path, name: str = "trusted-e4b"
+) -> tuple[Path, Path]:
+    model = registry / name
+    model.mkdir()
+    config = {
+        "architectures": ["Gemma4ForConditionalGeneration"],
+        "vision_config": {},
+        "image_token_id": 7,
+        "video_token_id": 8,
+        "audio_config": {},
+        "audio_token_id": 9,
+    }
+    (model / "config.json").write_text(
+        json.dumps(config, sort_keys=True), encoding="utf-8"
+    )
+    (model / "model.safetensors").write_bytes(b"bounded-test-weights")
+    digests = {
+        relative: sha256((model / relative).read_bytes()).hexdigest()
+        for relative in ("config.json", "model.safetensors")
+    }
+    manifest = registry / f"{name}.manifest.toml"
+    manifest.write_text(
+        "\n".join(
+            (
+                "[model]",
+                'family = "gemma4"',
+                'variant = "e4b"',
+                'role = "instruction_tuned"',
+                'source = "google/gemma-4-E4B-it"',
+                'revision = "a4c2d58be94dda072b918d9db64ee85c8ed34e3f"',
+                "",
+                "[files]",
+                f'"config.json" = "{digests["config.json"]}"',
+                (f'"model.safetensors" = "{digests["model.safetensors"]}"'),
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    return model, manifest
+
+
 def _pdf_pages_bytes(page_texts: tuple[str | None, ...]) -> bytes:
     from pypdf import PdfWriter
     from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
@@ -191,6 +234,166 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 checkpoint_modalities=("text",),
                 runtime_input_modalities=("text",),
             )
+
+    def test_local_model_discovery_is_bounded_verified_and_non_selectable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            registry = root / "registry"
+            project.mkdir()
+            registry.mkdir()
+            _write_model_registry_candidate(registry)
+
+            with patch(
+                "cogni_agent.model_service._verify_instruction_tuned_e4b_snapshot"
+            ) as trusted_fingerprint:
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    model_registry_root=registry,
+                )
+
+            trusted_fingerprint.assert_called_once()
+            payload = service.capability_payload()["models"]
+            self.assertEqual(payload["state"], "verified_local_registry")
+            self.assertEqual(payload["switching"], "idempotent_current_model_only")
+            self.assertEqual(payload["discovery"]["state"], "verified")
+            self.assertEqual(payload["discovery"]["verified_count"], 1)
+            self.assertEqual(payload["discovery"]["rejected_count"], 0)
+            self.assertEqual(len(payload["items"]), 2)
+            selected, discovered = payload["items"]
+            self.assertTrue(selected["selected"])
+            self.assertTrue(selected["selectable"])
+            self.assertFalse(discovered["selected"])
+            self.assertFalse(discovered["selectable"])
+            self.assertEqual(
+                discovered["verification"],
+                "closed_world_manifest_and_trusted_fingerprint",
+            )
+            self.assertEqual(
+                discovered["runtime_input_modalities"],
+                ["text"],
+            )
+            self.assertEqual(
+                discovered["checkpoint_modalities"],
+                ["text", "image", "video", "audio"],
+            )
+            self.assertNotIn(str(registry), json.dumps(payload))
+            with self.assertRaises(WorkspaceCapabilityError) as captured:
+                service.select_model(discovered["model_id"])
+            self.assertEqual(captured.exception.code, "MODEL_SWITCH_UNAVAILABLE")
+
+    def test_local_model_discovery_rejects_tamper_without_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            registry = root / "registry"
+            project.mkdir()
+            registry.mkdir()
+            model, _manifest = _write_model_registry_candidate(registry)
+            (model / "config.json").write_text("{}", encoding="utf-8")
+
+            service = WorkspaceCapabilityService(
+                project,
+                _model(),
+                model_registry_root=registry,
+            )
+
+            payload = service.capability_payload()["models"]
+            self.assertEqual(payload["discovery"]["state"], "verified_with_rejections")
+            self.assertEqual(payload["discovery"]["verified_count"], 0)
+            self.assertEqual(payload["discovery"]["rejected_count"], 1)
+            self.assertEqual(
+                payload["discovery"]["rejections"][0]["code"],
+                "MODEL_VERIFICATION_FAILED",
+            )
+            self.assertEqual(len(payload["items"]), 1)
+
+    def test_local_model_discovery_requires_pinned_trusted_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            registry = root / "registry"
+            project.mkdir()
+            registry.mkdir()
+            _write_model_registry_candidate(registry)
+
+            service = WorkspaceCapabilityService(
+                project,
+                _model(),
+                model_registry_root=registry,
+            )
+
+            discovery = service.capability_payload()["models"]["discovery"]
+            self.assertEqual(discovery["verified_count"], 0)
+            self.assertEqual(discovery["rejected_count"], 1)
+            self.assertEqual(
+                discovery["rejections"][0]["code"], "MODEL_VERIFICATION_FAILED"
+            )
+
+    def test_local_model_discovery_rejects_unsafe_and_oversized_registries(
+        self,
+    ) -> None:
+        self.assertFalse(capabilities._safe_local_model_name("google/gemma-4-E4B-it"))
+        self.assertFalse(capabilities._safe_local_model_name("https://example.test"))
+        self.assertFalse(capabilities._safe_local_model_name("../model"))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            registry = root / "registry"
+            project.mkdir()
+            registry.mkdir()
+            for index in range(3):
+                (registry / f"entry-{index}.txt").write_text("x", encoding="ascii")
+
+            with patch.object(capabilities, "MAX_LOCAL_MODEL_REGISTRY_ENTRIES", 2):
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    model_registry_root=registry,
+                )
+            discovery = service.capability_payload()["models"]["discovery"]
+            self.assertEqual(discovery["state"], "rejected")
+            self.assertEqual(
+                discovery["rejections"][0]["code"], "MODEL_REGISTRY_TOO_LARGE"
+            )
+
+            relative = capabilities.discover_verified_local_models(
+                "relative-registry", selected_model=_model()
+            )
+            self.assertEqual(relative.state, "rejected")
+            self.assertEqual(relative.rejections[0].code, "MODEL_REGISTRY_PATH_UNSAFE")
+
+    def test_local_model_discovery_rejects_link_or_reparse_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            registry = root / "registry"
+            project.mkdir()
+            registry.mkdir()
+            candidate, _manifest = _write_model_registry_candidate(registry)
+            original = capabilities._path_is_link_or_reparse
+
+            def synthetic_reparse(path: Path) -> bool:
+                if path == candidate:
+                    return True
+                return original(path)
+
+            with patch.object(
+                capabilities,
+                "_path_is_link_or_reparse",
+                side_effect=synthetic_reparse,
+            ):
+                service = WorkspaceCapabilityService(
+                    project,
+                    _model(),
+                    model_registry_root=registry,
+                )
+            rejection = service.capability_payload()["models"]["discovery"][
+                "rejections"
+            ][0]
+            self.assertEqual(rejection["candidate"], "trusted-e4b")
+            self.assertEqual(rejection["code"], "MODEL_CANDIDATE_UNSAFE")
 
     def test_attachment_admission_is_atomic_bounded_and_path_free(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -6,8 +6,8 @@
 ## 현재 집계
 
 - 전체 미완료: **170개**
-- 구현됐으나 승인 증거 미결합: **97개**
-- 코드/제품 경로 미구현: **9개**
+- 구현됐으나 승인 증거 미결합: **98개**
+- 코드/제품 경로 미구현: **8개**
 - 부분 구현 또는 검증 잔여: **59개**
 - 외부 장치·토큰·아티팩트 차단: **5개**
 
@@ -78,6 +78,7 @@
 | 109 | [ ] | 선택적 로컬 TTS | Windows System.Speech 고정 runner, 실제 Microsoft Heami ko-KR WAV smoke, 인증 API와 play/stop/object-URL cleanup tests | 설치 voice probe·사용자 실행·stop·크기/시간 상한과 외부 호출 0 유지 |
 | 110 | [ ] | 음성 미지원 이유 명시 | capability payload와 disabled microphone tooltip/status | 지원 전까지 enabled 표시 금지 |
 | 112 | [ ] | 현재 선택 Gemma 상태 표시 | workspace capability/UI model selector tests | Fact-book와 실시간 일치 유지 |
+| 113 | [ ] | 로컬 모델 자동 발견 | `cogni_demo/workspace_capabilities.py::discover_verified_local_models`, `tests/test_workspace_capabilities.py`; 명시적 absolute registry의 직접 자식만 bounded scan하고 sibling manifest·closed-world layout·고정 E4B-it fingerprint를 검증하며 symlink/reparse/UNC/URL/Hub ID를 차단 | exact-commit CPU attestation과 독립 evidence 결합; 발견 모델은 ID 116 전까지 로드 불가 유지 |
 | 117 | [ ] | 실제 모델과 목표 모델 구분 | artifact/Fact-book/UI evidence rail | live verification 전 과거 모델 수치 재사용 금지 |
 | 118 | [ ] | 웹 검색 기본 OFF | `WebAccessPolicy`, UI capability state, tests | 모든 세션 시작을 offline으로 유지 |
 | 126 | [ ] | 검색 query/domain/time 감사 provenance | 고정 host/endpoint, retrieved time, query SHA-256, source-record SHA-256, Lens ID/canonical URL과 secret-redaction tests | token·원문 body 비노출, endpoint/time/query/source digest 계약 유지 |
@@ -123,7 +124,6 @@
 | 75 | [ ] | UI가 아닌 실제 자가수정 E2E | Self-Harness UI는 proposal-only 상태 표시 | 실패 재현→patch→격리검증→승인→승격→rollback E2E |
 | 85 | [ ] | 비디오 processor 연결 | video token/config 표시는 실행 권한이 아님 | frame/sampling/time/VRAM 상한과 실제 추론 |
 | 100 | [ ] | 검증된 로컬 semantic embedder | 현재 검색은 안정적 lexical projection | 모델 artifact/manifest, 품질·VRAM·라이선스 검증 |
-| 113 | [ ] | 로컬 모델 자동 발견 | 고정 manifest 외 directory scan 없음 | 안전한 root, symlink/remote ID 차단, manifest 검증 |
 | 116 | [ ] | 안전한 unload/load 전환 | 단일 worker lifecycle만 존재 | lease drain→unload→memory check→load→rollback E2E |
 | 120 | [ ] | 일반 웹 검색 connector | 정책과 UI 상태만 존재 | 승인 provider, bounded schema, URL/time provenance |
 

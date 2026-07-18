@@ -101,6 +101,7 @@ const API_ERROR_COPY = {
   RAG_SOURCE_NOT_FOUND: "선택한 로컬 RAG 근거 원문을 찾을 수 없습니다.",
   RAG_SOURCE_UNAVAILABLE: "선택한 로컬 RAG 근거 원문을 안전하게 불러올 수 없습니다.",
   MODEL_NOT_VERIFIED: "검증된 로컬 모델만 선택할 수 있습니다.",
+  MODEL_SWITCH_UNAVAILABLE: "모델은 검증되었지만 안전한 전환 기능은 아직 활성화되지 않았습니다.",
   LOCAL_AUDIO_PREPROCESS_FAILED: "검증된 로컬 Gemma 오디오 전처리에 실패했습니다.",
   LOCAL_AUDIO_PROCESSOR_REQUIRED: "검증된 로컬 Gemma 오디오 프로세서가 필요합니다.",
   LOCAL_STT_ARTIFACT_REQUIRED: "녹음·로컬 전송·WAV 검증은 완료했지만, 전사를 위한 검증된 로컬 STT 모델이 필요합니다.",
@@ -1031,14 +1032,22 @@ function renderWorkspaceModels(models) {
       option.value = item.model_id.slice(0, 256);
       option.textContent = item.label.slice(0, 128);
       option.selected = item.selected === true;
+      option.disabled = item.selectable !== true && item.selected !== true;
       fragment.append(option);
     });
   }
   selector.replaceChildren(fragment);
   selector.dataset.verifiedCount = String(items.length);
+  selector.dataset.selectableCount = String(
+    items.filter((item) => item.selectable === true).length,
+  );
   setText(
     "#agent-model-status",
-    items.length > 1 ? `검증 모델 ${items.length}개` : items.length === 1 ? "검증 모델 고정" : "사용 불가",
+    items.length > 1
+      ? items.filter((item) => item.selectable === true).length > 1
+        ? `검증 모델 ${items.length}개`
+        : `검증 모델 ${items.length}개 · 전환 잠금`
+      : items.length === 1 ? "검증 모델 고정" : "사용 불가",
   );
 }
 

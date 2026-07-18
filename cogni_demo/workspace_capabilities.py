@@ -46,6 +46,7 @@ from cogni_demo.lens_api import (
     LensApiError,
     LensSearchKind,
 )
+from cogni_os.artifacts import ArtifactVerificationError, verify_artifact_manifest
 from cogni_os.factbook import RuntimeFactBook
 
 
@@ -77,6 +78,11 @@ RAG_VECTOR_DIMENSIONS = 256
 RAG_CHUNK_CHARS = 1_600
 RAG_CHUNK_OVERLAP_CHARS = 200
 MAX_WEB_ALLOWLIST_HOSTS = 32
+MAX_LOCAL_MODEL_REGISTRY_ENTRIES = 64
+MAX_LOCAL_MODEL_CANDIDATES = 16
+MAX_LOCAL_MODEL_MANIFEST_BYTES = 128 * 1024
+MAX_LOCAL_MODEL_CONFIG_BYTES = 1024 * 1024
+LOCAL_MODEL_MANIFEST_SUFFIX = ".manifest.toml"
 
 AKASICDB_REPOSITORY = "https://github.com/heosanghun/AkasicDB.git"
 AKASICDB_AUDITED_REVISION = "a6c8e8ebd487e7cb86079f9804a66aaf0914d1dc"
@@ -108,6 +114,7 @@ _BINARY_MEDIA_TYPES = {
 _ALLOWED_MEDIA_TYPES = {**_TEXT_MEDIA_TYPES, **_BINARY_MEDIA_TYPES}
 _TOKEN_RE = re.compile(r"[0-9a-zA-Z_\u3131-\u318e\uac00-\ud7a3]{2,}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_LOCAL_MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _BLOB_NAME_RE = re.compile(r"(?P<digest>[0-9a-f]{24})(?P<suffix>\.[a-z0-9]+)\Z")
 _ATTACHMENT_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
 _CATALOG_FILENAME = "attachment-catalog.v1.json"
@@ -572,6 +579,7 @@ class VerifiedModelMetadata:
     config_sha256: str
     checkpoint_modalities: tuple[str, ...]
     runtime_input_modalities: tuple[str, ...]
+    verification: str = "runtime_factbook_and_config_digest"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_id, str) or not self.model_id:
@@ -582,6 +590,11 @@ class VerifiedModelMetadata:
             raise ValueError("architecture must be non-empty text")
         _require_sha256(self.manifest_sha256, "manifest_sha256")
         _require_sha256(self.config_sha256, "config_sha256")
+        if self.verification not in {
+            "runtime_factbook_and_config_digest",
+            "closed_world_manifest_and_trusted_fingerprint",
+        }:
+            raise ValueError("model verification authority is invalid")
         allowed = {"text", "image", "audio", "video"}
         if (
             not self.checkpoint_modalities
@@ -593,7 +606,15 @@ class VerifiedModelMetadata:
         ):
             raise ValueError("model modalities are invalid")
 
-    def as_payload(self) -> dict[str, object]:
+    def as_payload(
+        self, *, selected: bool = True, selectable: bool | None = None
+    ) -> dict[str, object]:
+        if not isinstance(selected, bool):
+            raise TypeError("selected must be bool")
+        if selectable is None:
+            selectable = selected
+        if not isinstance(selectable, bool):
+            raise TypeError("selectable must be bool")
         unavailable = sorted(
             set(self.checkpoint_modalities) - set(self.runtime_input_modalities)
         )
@@ -601,14 +622,352 @@ class VerifiedModelMetadata:
             "model_id": self.model_id,
             "label": self.label,
             "architecture": self.architecture,
-            "verification": "runtime_factbook_and_config_digest",
+            "verification": self.verification,
             "manifest_sha256": self.manifest_sha256,
             "config_sha256": self.config_sha256,
             "checkpoint_modalities": list(self.checkpoint_modalities),
             "runtime_input_modalities": list(self.runtime_input_modalities),
             "advertised_but_not_wired": unavailable,
-            "selected": True,
+            "selected": selected,
+            "selectable": selectable,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class LocalModelDiscoveryRejection:
+    candidate: str
+    code: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.candidate, str)
+            or not 1 <= len(self.candidate) <= 64
+            or any(ord(character) < 32 for character in self.candidate)
+        ):
+            raise ValueError("candidate must be bounded display text")
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", self.code) is None:
+            raise ValueError("discovery rejection code is invalid")
+
+    def as_payload(self) -> dict[str, str]:
+        return {"candidate": self.candidate, "code": self.code}
+
+
+@dataclass(frozen=True, slots=True)
+class LocalModelDiscoveryResult:
+    state: str
+    models: tuple[VerifiedModelMetadata, ...] = ()
+    rejections: tuple[LocalModelDiscoveryRejection, ...] = ()
+    scanned_candidates: int = 0
+
+    def __post_init__(self) -> None:
+        if self.state not in {
+            "not_configured",
+            "verified",
+            "verified_with_rejections",
+            "rejected",
+        }:
+            raise ValueError("local model discovery state is invalid")
+        if (
+            not isinstance(self.scanned_candidates, int)
+            or not 0 <= self.scanned_candidates <= MAX_LOCAL_MODEL_CANDIDATES
+        ):
+            raise ValueError("scanned_candidates is invalid")
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "state": self.state,
+            "configured": self.state != "not_configured",
+            "verified_count": len(self.models),
+            "rejected_count": len(self.rejections),
+            "scanned_candidates": self.scanned_candidates,
+            "max_candidates": MAX_LOCAL_MODEL_CANDIDATES,
+            "max_registry_entries": MAX_LOCAL_MODEL_REGISTRY_ENTRIES,
+            "layout": (
+                "<registry>/<candidate>/ + <registry>/<candidate>.manifest.toml"
+            ),
+            "rejections": [item.as_payload() for item in self.rejections],
+        }
+
+
+def _path_is_link_or_reparse(path: Path) -> bool:
+    """Detect POSIX links and Windows reparse points without following them."""
+
+    metadata = path.lstat()
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400))
+    return stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag)
+
+
+def _safe_local_model_name(name: object) -> bool:
+    """Accept a bounded local basename, never a path, URL, or Hub-style ID."""
+
+    return bool(
+        isinstance(name, str)
+        and _LOCAL_MODEL_NAME_RE.fullmatch(name)
+        and Path(name).parts == (name,)
+        and ":" not in name
+        and "/" not in name
+        and "\\" not in name
+    )
+
+
+def _bounded_registry_entries(root: Path) -> tuple[Path, ...]:
+    entries: list[Path] = []
+    try:
+        with os.scandir(root) as stream:
+            for item in stream:
+                if len(entries) >= MAX_LOCAL_MODEL_REGISTRY_ENTRIES:
+                    raise WorkspaceCapabilityError(
+                        "MODEL_REGISTRY_TOO_LARGE",
+                        "local model registry exceeds its entry bound",
+                    )
+                entries.append(root / item.name)
+    except WorkspaceCapabilityError:
+        raise
+    except OSError as exc:
+        raise WorkspaceCapabilityError(
+            "MODEL_REGISTRY_UNAVAILABLE",
+            "local model registry could not be inventoried",
+        ) from exc
+    return tuple(entries)
+
+
+def _verified_model_modalities(payload: Mapping[str, object]) -> tuple[str, ...]:
+    modalities = ["text"]
+    if isinstance(payload.get("vision_config"), dict):
+        if isinstance(payload.get("image_token_id"), int):
+            modalities.append("image")
+        if isinstance(payload.get("video_token_id"), int):
+            modalities.append("video")
+    if isinstance(payload.get("audio_config"), dict) and isinstance(
+        payload.get("audio_token_id"), int
+    ):
+        modalities.append("audio")
+    return tuple(modalities)
+
+
+def _metadata_from_verified_model(
+    *,
+    model_root: Path,
+    manifest_sha256: str,
+    verified_config_sha256: str,
+    label: str,
+    fallback_architecture: str,
+) -> VerifiedModelMetadata:
+    _require_sha256(manifest_sha256, "manifest_sha256")
+    _require_sha256(verified_config_sha256, "verified_config_sha256")
+    config = model_root / "config.json"
+    try:
+        config_metadata = config.lstat()
+        if (
+            _path_is_link_or_reparse(config)
+            or not stat.S_ISREG(config_metadata.st_mode)
+            or config_metadata.st_size > MAX_LOCAL_MODEL_CONFIG_BYTES
+        ):
+            raise WorkspaceCapabilityError(
+                "MODEL_CONFIG_INVALID", "model config failed its local safety bound"
+            )
+        config_bytes = config.read_bytes()
+        if (
+            len(config_bytes) != config_metadata.st_size
+            or sha256(config_bytes).hexdigest() != verified_config_sha256
+        ):
+            raise WorkspaceCapabilityError(
+                "MODEL_CONFIG_CHANGED",
+                "model config changed after manifest verification",
+            )
+        payload = json.loads(config_bytes.decode("utf-8"))
+    except WorkspaceCapabilityError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise WorkspaceCapabilityError(
+            "MODEL_CONFIG_INVALID", "model config is invalid"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise WorkspaceCapabilityError(
+            "MODEL_CONFIG_INVALID", "model config must be an object"
+        )
+    architectures = payload.get("architectures")
+    architecture = fallback_architecture
+    if (
+        isinstance(architectures, list)
+        and len(architectures) == 1
+        and isinstance(architectures[0], str)
+        and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", architectures[0])
+    ):
+        architecture = architectures[0]
+    return VerifiedModelMetadata(
+        model_id=f"{label}:{manifest_sha256[:12]}",
+        label=label,
+        architecture=architecture,
+        manifest_sha256=manifest_sha256,
+        config_sha256=verified_config_sha256,
+        checkpoint_modalities=_verified_model_modalities(payload),
+        # Discovery proves local artifact identity, not processor/runtime wiring.
+        runtime_input_modalities=("text",),
+        verification="closed_world_manifest_and_trusted_fingerprint",
+    )
+
+
+def _rejection(candidate: str, code: str) -> LocalModelDiscoveryRejection:
+    display = candidate if _safe_local_model_name(candidate) else "<unsafe>"
+    return LocalModelDiscoveryRejection(display, code)
+
+
+def discover_verified_local_models(
+    registry_root: str | Path | None,
+    *,
+    selected_model: VerifiedModelMetadata,
+) -> LocalModelDiscoveryResult:
+    """Discover trusted models from one explicit, bounded, non-link directory.
+
+    Each immediate child directory ``name`` requires a sibling
+    ``name.manifest.toml``.  Candidates never grant loading authority: the current
+    worker remains selected until the separately attested model-switch transaction
+    is implemented.
+    """
+
+    if registry_root is None:
+        return LocalModelDiscoveryResult("not_configured")
+    if not isinstance(selected_model, VerifiedModelMetadata):
+        raise TypeError("selected_model must be VerifiedModelMetadata")
+    raw = Path(registry_root).expanduser()
+    if not raw.is_absolute() or (os.name == "nt" and str(raw).startswith("\\\\")):
+        return LocalModelDiscoveryResult(
+            "rejected",
+            rejections=(_rejection("<unsafe>", "MODEL_REGISTRY_PATH_UNSAFE"),),
+        )
+    try:
+        absolute = Path(os.path.abspath(raw))
+        current = Path(absolute.anchor)
+        for part in absolute.parts[1:]:
+            current /= part
+            if _path_is_link_or_reparse(current):
+                raise WorkspaceCapabilityError(
+                    "MODEL_REGISTRY_PATH_UNSAFE",
+                    "local model registry may not traverse a link or reparse point",
+                )
+        root = absolute.resolve(strict=True)
+        if not root.is_dir():
+            raise WorkspaceCapabilityError(
+                "MODEL_REGISTRY_PATH_UNSAFE",
+                "local model registry must be a directory",
+            )
+        entries = _bounded_registry_entries(root)
+    except (OSError, WorkspaceCapabilityError) as exc:
+        code = (
+            exc.code
+            if isinstance(exc, WorkspaceCapabilityError)
+            else "MODEL_REGISTRY_UNAVAILABLE"
+        )
+        return LocalModelDiscoveryResult(
+            "rejected", rejections=(_rejection("<unsafe>", code),)
+        )
+
+    entry_by_name = {entry.name: entry for entry in entries}
+    candidates: list[Path] = []
+    rejections: list[LocalModelDiscoveryRejection] = []
+    for entry in entries:
+        try:
+            metadata = entry.lstat()
+        except OSError:
+            rejections.append(_rejection(entry.name, "MODEL_CANDIDATE_UNAVAILABLE"))
+            continue
+        try:
+            unsafe_entry = _path_is_link_or_reparse(entry)
+        except OSError:
+            rejections.append(_rejection(entry.name, "MODEL_CANDIDATE_UNAVAILABLE"))
+            continue
+        if unsafe_entry:
+            if not entry.name.endswith(LOCAL_MODEL_MANIFEST_SUFFIX):
+                rejections.append(_rejection(entry.name, "MODEL_CANDIDATE_UNSAFE"))
+            continue
+        if stat.S_ISDIR(metadata.st_mode):
+            if len(candidates) >= MAX_LOCAL_MODEL_CANDIDATES:
+                return LocalModelDiscoveryResult(
+                    "rejected",
+                    rejections=(
+                        _rejection("<unsafe>", "MODEL_CANDIDATE_LIMIT_EXCEEDED"),
+                    ),
+                )
+            candidates.append(entry)
+
+    models: list[VerifiedModelMetadata] = []
+    seen_ids = {selected_model.model_id}
+    seen_configs = {selected_model.config_sha256}
+    for candidate in sorted(candidates, key=lambda item: item.name.casefold()):
+        name = candidate.name
+        if not _safe_local_model_name(name):
+            rejections.append(_rejection(name, "MODEL_CANDIDATE_NAME_UNSAFE"))
+            continue
+        manifest = entry_by_name.get(f"{name}{LOCAL_MODEL_MANIFEST_SUFFIX}")
+        if manifest is None:
+            rejections.append(_rejection(name, "MODEL_MANIFEST_MISSING"))
+            continue
+        try:
+            manifest_metadata = manifest.lstat()
+            candidate_resolved = candidate.resolve(strict=True)
+            manifest_resolved = manifest.resolve(strict=True)
+            if (
+                _path_is_link_or_reparse(candidate)
+                or _path_is_link_or_reparse(manifest)
+                or not stat.S_ISREG(manifest_metadata.st_mode)
+                or manifest_metadata.st_size > MAX_LOCAL_MODEL_MANIFEST_BYTES
+                or candidate_resolved.parent != root
+                or manifest_resolved.parent != root
+            ):
+                raise WorkspaceCapabilityError(
+                    "MODEL_CANDIDATE_UNSAFE",
+                    "model candidate escaped its bounded registry layout",
+                )
+            manifest_digest = _sha256_file(manifest_resolved)
+            verified = verify_artifact_manifest(candidate_resolved, manifest_resolved)
+            from cogni_agent.model_service import (
+                _verify_instruction_tuned_e4b_snapshot,
+            )
+
+            _verify_instruction_tuned_e4b_snapshot(verified)
+            verified_digests = dict(verified.digests)
+            config_digest = verified_digests.get("config.json")
+            if (
+                config_digest is None
+                or _sha256_file(manifest_resolved) != manifest_digest
+            ):
+                raise WorkspaceCapabilityError(
+                    "MODEL_MANIFEST_CHANGED",
+                    "model manifest changed during candidate verification",
+                )
+            metadata = _metadata_from_verified_model(
+                model_root=candidate_resolved,
+                manifest_sha256=manifest_digest,
+                verified_config_sha256=config_digest,
+                label=selected_model.label,
+                fallback_architecture=selected_model.architecture,
+            )
+            if _sha256_file(manifest_resolved) != manifest_digest:
+                raise WorkspaceCapabilityError(
+                    "MODEL_MANIFEST_CHANGED",
+                    "model manifest changed during metadata admission",
+                )
+        except WorkspaceCapabilityError as exc:
+            rejections.append(_rejection(name, exc.code))
+            continue
+        except (ArtifactVerificationError, OSError, ValueError):
+            rejections.append(_rejection(name, "MODEL_VERIFICATION_FAILED"))
+            continue
+        if metadata.model_id in seen_ids or metadata.config_sha256 in seen_configs:
+            continue
+        seen_ids.add(metadata.model_id)
+        seen_configs.add(metadata.config_sha256)
+        models.append(metadata)
+
+    state = "verified_with_rejections" if rejections else "verified"
+    return LocalModelDiscoveryResult(
+        state,
+        models=tuple(models),
+        rejections=tuple(rejections[:MAX_LOCAL_MODEL_CANDIDATES]),
+        scanned_candidates=len(candidates),
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -1982,6 +2341,7 @@ class WorkspaceCapabilityService:
         project_root: str | Path,
         model: VerifiedModelMetadata,
         *,
+        model_registry_root: str | Path | None = None,
         akasicdb_path: str | Path | None = None,
         web_policy: WebAccessPolicy | None = None,
         lens_client: LensApiClient | None = None,
@@ -1994,6 +2354,12 @@ class WorkspaceCapabilityService:
             raise TypeError("model must be VerifiedModelMetadata")
         self.project_root = root
         self.model = model
+        self.model_discovery = discover_verified_local_models(
+            model_registry_root, selected_model=model
+        )
+        self._discovered_models = {
+            item.model_id: item for item in self.model_discovery.models
+        }
         self.web_policy = web_policy or WebAccessPolicy()
         self.lens_client = lens_client or LensApiClient.from_environment({})
         if not isinstance(answer_integration_enabled, bool):
@@ -2110,23 +2476,13 @@ class WorkspaceCapabilityService:
             raise WorkspaceCapabilityError(
                 "MODEL_CONFIG_INVALID", "model config must be an object"
             )
-        modalities = ["text"]
-        if isinstance(payload.get("vision_config"), dict):
-            if isinstance(payload.get("image_token_id"), int):
-                modalities.append("image")
-            if isinstance(payload.get("video_token_id"), int):
-                modalities.append("video")
-        if isinstance(payload.get("audio_config"), dict) and isinstance(
-            payload.get("audio_token_id"), int
-        ):
-            modalities.append("audio")
         model = VerifiedModelMetadata(
             model_id=(f"{factbook.model.label}:{factbook.model.manifest_sha256[:12]}"),
             label=factbook.model.label,
             architecture=factbook.model.architecture,
             manifest_sha256=factbook.model.manifest_sha256,
             config_sha256=factbook.model.config_sha256,
-            checkpoint_modalities=tuple(modalities),
+            checkpoint_modalities=_verified_model_modalities(payload),
             # The current ModelService and AgentManager accept text prompts only.
             runtime_input_modalities=("text",),
         )
@@ -2296,9 +2652,21 @@ class WorkspaceCapabilityService:
             },
             "rag": rag,
             "models": {
-                "state": "single_verified_model_only",
+                "state": (
+                    "verified_local_registry"
+                    if self.model_discovery.state
+                    in {"verified", "verified_with_rejections"}
+                    else "single_verified_model_only"
+                ),
                 "switching": "idempotent_current_model_only",
-                "items": [self.model.as_payload()],
+                "items": [
+                    self.model.as_payload(selected=True, selectable=True),
+                    *(
+                        model.as_payload(selected=False, selectable=False)
+                        for model in self.model_discovery.models
+                    ),
+                ],
+                "discovery": self.model_discovery.as_payload(),
             },
             "microphone": {
                 "capture_state": "frontend_not_connected",
@@ -3283,11 +3651,20 @@ class WorkspaceCapabilityService:
             raise WorkspaceCapabilityError(exc.code, str(exc)) from exc
 
     def select_model(self, model_id: str) -> dict[str, object]:
-        if not isinstance(model_id, str) or model_id != self.model.model_id:
+        if not isinstance(model_id, str):
             raise WorkspaceCapabilityError(
                 "MODEL_NOT_VERIFIED", "requested model is not in the verified registry"
             )
-        return self.model.as_payload()
+        if model_id == self.model.model_id:
+            return self.model.as_payload(selected=True, selectable=True)
+        if model_id in self._discovered_models:
+            raise WorkspaceCapabilityError(
+                "MODEL_SWITCH_UNAVAILABLE",
+                "model is verified but lease-safe switching is not implemented",
+            )
+        raise WorkspaceCapabilityError(
+            "MODEL_NOT_VERIFIED", "requested model is not in the verified registry"
+        )
 
 
 def web_policy_from_environment(environment: Mapping[str, str]) -> WebAccessPolicy:
@@ -3319,12 +3696,17 @@ __all__ = [
     "MAX_ATTACHMENT_TOTAL_BYTES",
     "MAX_JSON_ATTACHMENT_BYTES",
     "MAX_JSON_NESTING",
+    "MAX_LOCAL_MODEL_CANDIDATES",
+    "MAX_LOCAL_MODEL_REGISTRY_ENTRIES",
     "MAX_PDF_EXTRACTED_CHARS",
     "MAX_PDF_PAGES",
     "MAX_RAG_RESULTS",
+    "LocalModelDiscoveryRejection",
+    "LocalModelDiscoveryResult",
     "VerifiedModelMetadata",
     "WebAccessPolicy",
     "WorkspaceCapabilityError",
     "WorkspaceCapabilityService",
+    "discover_verified_local_models",
     "web_policy_from_environment",
 ]

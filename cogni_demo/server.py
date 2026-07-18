@@ -3144,6 +3144,7 @@ def _build_product_controls(
             model_path,
             manifest_path,
             factbook,
+            model_registry_root=(os.environ.get("COGNI_OS_MODEL_REGISTRY_DIR") or None),
             akasicdb_path=os.environ.get("COGNI_OS_AKASICDB_DIR") or None,
             web_policy=web_policy_from_environment(os.environ),
             lens_client=LensApiClient.from_environment(os.environ),

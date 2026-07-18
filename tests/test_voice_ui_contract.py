@@ -21,12 +21,44 @@ class TestVoiceUIContract(unittest.TestCase):
         self.assertIn("ui.voiceBrowserCaptureReady", script)
         self.assertIn("processor.probe_passed === true", script)
         self.assertIn("microphone.model_inference_attested === true", script)
+        self.assertIn("voiceTranscriptionConfigured: false", script)
+        self.assertIn(
+            'microphone.transcription_state === "configured_unverified"', script
+        )
+        self.assertIn('stt.mode === "local_only"', script)
+        self.assertIn("transcriber.artifact_verified === true", script)
+        self.assertIn(
+            "ui.voiceTranscriptionAttemptReady = ui.voiceTranscriptionReady", script
+        )
+        self.assertIn("|| !ui.voiceTranscriptionAttemptReady", script)
+        controls_start = script.index("function updateWorkspaceControlStates")
+        controls_end = script.index("async function loadWorkspaceCapabilities")
+        controls = script[controls_start:controls_end]
+        capture_start = script.index("async function startVoiceCapture")
+        capture_end = script.index("async function stopVoiceCapture", capture_start)
+        capture = script[capture_start:capture_end]
+        self.assertNotIn("|| !ui.voiceTranscriptionReady", controls)
+        self.assertNotIn("|| !ui.voiceTranscriptionReady", capture)
         self.assertIn("createScriptProcessor(4096, 1, 1)", script)
         self.assertIn("VOICE_SAMPLE_RATE = 16000", script)
         self.assertIn('writeAscii(0, "RIFF")', script)
         self.assertIn('writeAscii(8, "WAVE")', script)
         self.assertIn("/api/workspace/voice/transcribe", script)
         self.assertIn("LOCAL_STT_ARTIFACT_REQUIRED", script)
+        stop_start = script.index("async function stopVoiceCapture")
+        stop_end = script.index("function cancelVoiceCapture", stop_start)
+        stop_flow = script[stop_start:stop_end]
+        response_index = stop_flow.index(
+            'await api("/api/workspace/voice/transcribe"'
+        )
+        refresh_index = stop_flow.index(
+            "await refreshWorkspaceCapabilityDisclosure()"
+        )
+        ready_index = stop_flow.index("!ui.voiceTranscriptionReady", refresh_index)
+        insert_index = stop_flow.index("insertVoiceTranscript", ready_index)
+        self.assertLess(response_index, refresh_index)
+        self.assertLess(refresh_index, ready_index)
+        self.assertLess(ready_index, insert_index)
         self.assertIn('data-action="workspace-voice-stop"', html)
         self.assertIn('data-action="workspace-voice-cancel"', html)
         self.assertIn('id="agent-voice-capture"', html)

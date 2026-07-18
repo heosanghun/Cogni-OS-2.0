@@ -282,7 +282,7 @@ class TestCogniBoardUI(unittest.TestCase):
         controls_start = script.index("function updateWorkspaceControlStates")
         controls_end = script.index("async function loadWorkspaceCapabilities")
         controls = script[controls_start:controls_end]
-        self.assertIn("|| !ui.voiceTranscriptionReady", controls)
+        self.assertIn("|| !ui.voiceTranscriptionAttemptReady", controls)
         self.assertIn(
             'const selectableCount = Number(modelSelector.dataset.selectableCount || "0")',
             controls,
@@ -292,7 +292,10 @@ class TestCogniBoardUI(unittest.TestCase):
 
         voice_start = script.index("async function startVoiceCapture")
         voice_end = script.index("function stopVoiceCapture", voice_start)
-        self.assertIn("|| !ui.voiceTranscriptionReady", script[voice_start:voice_end])
+        self.assertIn(
+            "|| !ui.voiceTranscriptionAttemptReady",
+            script[voice_start:voice_end],
+        )
 
         revoke_start = script.index("function revokeWorkspaceCapabilities")
         revoke_end = script.index("function applyWorkspaceCapabilities", revoke_start)
@@ -304,7 +307,9 @@ class TestCogniBoardUI(unittest.TestCase):
             "ui.ragEnabled = false",
             "ui.imageModelIntegrationReady = false",
             "ui.lensConnectorReady = false",
+            "ui.voiceTranscriptionConfigured = false",
             "ui.voiceTranscriptionReady = false",
+            "ui.voiceTranscriptionAttemptReady = false",
             "ui.voiceSynthesisReady = false",
         ):
             with self.subTest(contract=contract):

@@ -294,7 +294,9 @@ const ui = {
   lensSearchResults: [],
   voiceCaptureState: "idle",
   voiceSession: null,
+  voiceTranscriptionConfigured: false,
   voiceTranscriptionReady: false,
+  voiceTranscriptionAttemptReady: false,
   voiceTransportReady: false,
   voiceBrowserCaptureReady: false,
   voiceSynthesisReady: false,
@@ -1212,7 +1214,9 @@ function revokeWorkspaceCapabilities() {
   ui.lensConnectorReady = false;
   ui.voiceTransportReady = false;
   ui.voiceBrowserCaptureReady = false;
+  ui.voiceTranscriptionConfigured = false;
   ui.voiceTranscriptionReady = false;
+  ui.voiceTranscriptionAttemptReady = false;
   ui.voiceSynthesisReady = false;
 }
 
@@ -1246,6 +1250,7 @@ function applyWorkspaceCapabilities(capabilities) {
   const captureTransport = microphone.capture_transport || {};
   const processor = microphone.processor || {};
   const transcriber = microphone.transcriber || {};
+  const stt = microphone.stt || {};
   const tts = microphone.tts || {};
   const web = capabilities.web_search || {};
   const lens = web.official_lens_connector || {};
@@ -1275,6 +1280,18 @@ function applyWorkspaceCapabilities(capabilities) {
     && processor.probe_passed === true
     && transcriber.configured === true
     && microphone.model_inference_attested === true;
+  ui.voiceTranscriptionConfigured = microphone.transcription_state === "configured_unverified"
+    && microphone.runtime_audio_input === false
+    && microphone.model_inference_attested === false
+    && processor.configured === true
+    && transcriber.configured === true
+    && transcriber.artifact_verified === true
+    && stt.mode === "local_only"
+    && stt.artifact_verified === true
+    && stt.runtime_ready === false
+    && stt.disabled_reason === "LOCAL_STT_INFERENCE_UNVERIFIED";
+  ui.voiceTranscriptionAttemptReady = ui.voiceTranscriptionReady
+    || ui.voiceTranscriptionConfigured;
   ui.voiceSynthesisReady = tts.state === "ready"
     && tts.mode === "local_only"
     && tts.source === "verified_windows_system_speech"
@@ -1336,7 +1353,7 @@ function applyWorkspaceCapabilities(capabilities) {
     lensIndex.disabled = !ui.ragBackendReady || lens.lens_to_akasicdb !== true;
     if (lensIndex.disabled) lensIndex.checked = false;
   }
-  const sttConfigured = processor.configured === true && transcriber.configured === true;
+  const sttConfigured = ui.voiceTranscriptionConfigured;
   setText(
     "#agent-microphone-status",
     MICROPHONE_CAPTURE_UI_IMPLEMENTED && ui.voiceTransportReady && ui.voiceBrowserCaptureReady
@@ -1356,14 +1373,18 @@ function applyWorkspaceCapabilities(capabilities) {
     microphoneButton.setAttribute(
       "aria-label",
       captureReady
-        ? ui.voiceTranscriptionReady ? "로컬 음성 입력 시작" : "음성 입력 사용 불가: 검증된 로컬 STT 모델 필요"
+        ? ui.voiceTranscriptionReady
+          ? "로컬 음성 입력 시작"
+          : sttConfigured
+            ? "로컬 음성 입력 시작 및 첫 실행 검증"
+            : "음성 입력 사용 불가: 검증된 로컬 STT 모델 필요"
         : "음성 입력, 로컬 캡처 파이프라인 미연결",
     );
     microphoneButton.title = captureReady
       ? ui.voiceTranscriptionReady
         ? "마이크 권한은 이 버튼을 누를 때만 요청되며 외부로 전송하지 않습니다."
         : sttConfigured
-          ? "로컬 STT 구성은 확인됐지만 프로세서와 실제 모델 전사 성공이 아직 검증되지 않았습니다."
+          ? "로컬 STT 구성은 확인됐습니다. 첫 사용자 주도 전사가 성공하면 실행 검증 상태로 전환합니다."
           : "텍스트 전사에는 검증된 로컬 STT와 오디오 프로세서가 필요합니다."
       : browserCapture.reason || "브라우저 캡처와 인증된 로컬 전송 경로가 준비되지 않았습니다.";
   }
@@ -1472,7 +1493,7 @@ function updateWorkspaceControlStates() {
         || microphone.capture_state !== "browser_get_user_media"
         || microphone.transport_state !== "authenticated_loopback_ready"
         || !ui.voiceBrowserCaptureReady
-        || !ui.voiceTranscriptionReady
+        || !ui.voiceTranscriptionAttemptReady
         || ["requesting", "encoding", "uploading"].includes(ui.voiceCaptureState);
   }
   const voiceStop = $('[data-action="workspace-voice-stop"]');
@@ -2415,7 +2436,7 @@ async function startVoiceCapture() {
     ui.voiceCaptureState !== "idle"
     || !ui.voiceTransportReady
     || !ui.voiceBrowserCaptureReady
-    || !ui.voiceTranscriptionReady
+    || !ui.voiceTranscriptionAttemptReady
   ) return;
   if (ui.voicePlaybackState !== "idle") stopVoicePlayback();
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -2510,6 +2531,10 @@ async function stopVoiceCapture() {
       signal: session.abortController.signal,
     });
     if (session.cancelled || ui.voiceSession !== session) return;
+    const refreshed = await refreshWorkspaceCapabilityDisclosure();
+    if (!refreshed || !ui.voiceTranscriptionReady) {
+      throw new Error("LOCAL_STT_INFERENCE_UNVERIFIED");
+    }
     if (!insertVoiceTranscript(result?.transcript)) throw new Error("LOCAL_STT_OUTPUT_INVALID");
     setVoiceCaptureState("idle", "검증된 로컬 STT 결과를 입력창에 추가했습니다. 자동 전송하지 않습니다.");
     showToast("로컬 음성 전사를 입력창에 추가했습니다.", "success");

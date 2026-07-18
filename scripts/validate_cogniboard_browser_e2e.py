@@ -30,15 +30,18 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import socket
+import stat
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from threading import Thread
 from time import monotonic, sleep
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
 RESULT_SCHEMA = "cogni.browser-e2e.v1"
@@ -53,7 +56,43 @@ ASSISTANT_COMPLETION = (
 )
 VOICE_TRANSCRIPT = "음성 첫 사용 검증 문장"
 W3C_ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
+STARTUP_ERROR_SCRIPT = b"""
+window.__cogniE2EErrors = [];
+window.__cogniE2EHookInstalled = true;
+window.addEventListener('error', event => {
+  window.__cogniE2EErrors.push(String(event.message || 'window error').slice(0, 512));
+});
+window.addEventListener('unhandledrejection', event => {
+  window.__cogniE2EErrors.push(String(event.reason || 'unhandled rejection').slice(0, 512));
+});
+"""
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+_WEBDRIVER_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_PASS_CHECK_NAMES = {
+    "executable_identity",
+    "browser_capability_identity",
+    "viewport_fail_closed_1366x768",
+    "viewport_fail_closed_1920x1080",
+    "capabilities_disabled",
+    "viewport_enabled_1366x768",
+    "viewport_enabled_1920x1080",
+    "capabilities_enabled",
+    "optional_ui_interactions",
+    "single_complete_conversation",
+    "assistant_not_repeated",
+    "javascript_errors",
+    "webdriver_loopback_only",
+    "fixture_requests_same_origin",
+    "boundary_rechecked",
+}
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    """Never let an initially-loopback WebDriver request follow a redirect."""
+
+    def redirect_request(self, *_args: object, **_kwargs: object):
+        return None
 
 
 class BrowserE2EError(RuntimeError):
@@ -172,6 +211,143 @@ def require_execution_boundary(boundary: ExecutionBoundary) -> None:
 Transport = Callable[[Request, float], Any]
 
 
+@dataclass(frozen=True)
+class ExecutableIdentity:
+    path: str
+    sha256: str
+    size_bytes: int
+    device: int
+    inode: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+            "device": self.device,
+            "inode": self.inode,
+        }
+
+
+def inspect_executable(path: Path, *, label: str) -> ExecutableIdentity:
+    """Hash one canonical, non-link regular executable and detect read races."""
+
+    if not path.is_absolute():
+        raise BrowserE2EError(f"{label} path must be absolute")
+    try:
+        before = os.lstat(path)
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise BrowserE2EError(f"{label} path is invalid") from error
+    if (
+        resolved != path
+        or stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+    ):
+        raise BrowserE2EError(f"{label} must be one canonical non-symlink file")
+    if os.name == "posix" and not os.access(path, os.X_OK):
+        raise BrowserE2EError(f"{label} is not executable")
+    digest = sha256()
+    try:
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        after = os.lstat(path)
+    except OSError as error:
+        raise BrowserE2EError(f"{label} could not be attested") from error
+    identity = (before.st_dev, before.st_ino, before.st_size)
+    if identity != (opened.st_dev, opened.st_ino, opened.st_size) or identity != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+    ):
+        raise BrowserE2EError(f"{label} changed while it was attested")
+    return ExecutableIdentity(
+        path=str(resolved),
+        sha256=digest.hexdigest(),
+        size_bytes=before.st_size,
+        device=before.st_dev,
+        inode=before.st_ino,
+    )
+
+
+def attest_browser_process(
+    client: "W3CWebDriverClient", firefox: ExecutableIdentity
+) -> dict[str, object]:
+    """Bind returned Firefox capabilities to the exact executable on Linux."""
+
+    pid = client.browser_process_id
+    if os.name != "posix" or not isinstance(pid, int) or pid <= 1:
+        raise BrowserE2EError("Firefox process identity is unavailable")
+    proc_exe = Path(f"/proc/{pid}/exe")
+    try:
+        resolved = proc_exe.resolve(strict=True)
+        observed = os.stat(proc_exe)
+    except OSError as error:
+        raise BrowserE2EError("Firefox process executable is unavailable") from error
+    if (
+        str(resolved) != firefox.path
+        or observed.st_dev != firefox.device
+        or observed.st_ino != firefox.inode
+    ):
+        raise BrowserE2EError("Firefox process executable identity did not match")
+    return {
+        "browser_name": client.capabilities["browserName"],
+        "browser_version": str(client.capabilities["browserVersion"])[:128],
+        "process_id": pid,
+        "binary_sha256": firefox.sha256,
+    }
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def cleanup_process_tree(
+    process: subprocess.Popen[Any], *, browser_pid: int | None
+) -> None:
+    """Best-effort TERM/KILL of the isolated driver group and browser PID."""
+
+    if os.name != "posix":
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        return
+
+    targets = {pid for pid in (browser_pid,) if isinstance(pid, int) and pid > 1}
+    for selected_signal in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, selected_signal)
+        except ProcessLookupError:
+            pass
+        for pid in targets:
+            if _pid_alive(pid):
+                try:
+                    os.kill(pid, selected_signal)
+                except ProcessLookupError:
+                    pass
+        deadline = monotonic() + (3.0 if selected_signal == signal.SIGTERM else 2.0)
+        while monotonic() < deadline:
+            driver_dead = process.poll() is not None
+            browser_dead = all(not _pid_alive(pid) for pid in targets)
+            if driver_dead and browser_dead:
+                return
+            sleep(0.05)
+    if process.poll() is None or any(_pid_alive(pid) for pid in targets):
+        raise BrowserE2EError("browser process tree did not terminate")
+
+
 class W3CWebDriverClient:
     """Small bounded W3C client; all traffic is restricted to 127.0.0.1."""
 
@@ -183,18 +359,28 @@ class W3CWebDriverClient:
         transport: Transport | None = None,
     ) -> None:
         endpoint = endpoint.rstrip("/")
-        if not _is_loopback_url(endpoint):
+        parsed_endpoint = urlsplit(endpoint)
+        if (
+            not _is_loopback_url(endpoint)
+            or parsed_endpoint.path not in {"", "/"}
+            or parsed_endpoint.query
+        ):
             raise ValueError("WebDriver endpoint must be http://127.0.0.1:<port>")
         if timeout <= 0 or timeout > 60:
             raise ValueError("timeout must be in (0, 60]")
-        self.endpoint = endpoint
+        self.endpoint = f"http://127.0.0.1:{parsed_endpoint.port}"
         self.timeout = float(timeout)
         self._transport = transport or self._default_transport
         self.session_id: str | None = None
+        self.capabilities: dict[str, object] = {}
+        self.browser_process_id: int | None = None
+        self.request_urls: list[str] = []
 
     @staticmethod
     def _default_transport(request: Request, timeout: float):
-        return urlopen(request, timeout=timeout)  # noqa: S310 - loopback is enforced
+        return build_opener(ProxyHandler({}), _RejectRedirects()).open(
+            request, timeout=timeout
+        )
 
     def request(
         self,
@@ -215,16 +401,33 @@ class W3CWebDriverClient:
                 raise ValueError("WebDriver request is too large")
             headers["Content-Type"] = "application/json"
         request = Request(url, data=body, headers=headers, method=method)
+        self.request_urls.append(url)
         try:
             response = self._transport(request, self.timeout)
             with response:
                 raw = response.read(MAX_DRIVER_RESPONSE_BYTES + 1)
                 status = int(getattr(response, "status", 200))
+                final_url = str(response.geturl())
+                headers_object = getattr(response, "headers", None)
+                content_type = (
+                    headers_object.get_content_type()
+                    if headers_object is not None
+                    and callable(getattr(headers_object, "get_content_type", None))
+                    else ""
+                )
         except HTTPError as error:
             raw = error.read(MAX_DRIVER_RESPONSE_BYTES + 1)
             status = error.code
+            final_url = str(error.geturl())
+            content_type = error.headers.get_content_type() if error.headers else ""
         except (OSError, URLError) as error:
             raise WebDriverProtocolError("WebDriver connection failed") from error
+        if final_url != url:
+            raise WebDriverProtocolError("WebDriver response escaped its exact origin")
+        if not 200 <= status < 300:
+            raise WebDriverProtocolError(f"unexpected WebDriver HTTP status {status}")
+        if content_type != "application/json":
+            raise WebDriverProtocolError("WebDriver response is not application/json")
         if len(raw) > MAX_DRIVER_RESPONSE_BYTES:
             raise WebDriverProtocolError("WebDriver response exceeded its limit")
         try:
@@ -234,9 +437,7 @@ class W3CWebDriverClient:
         if not isinstance(decoded, dict) or "value" not in decoded:
             raise WebDriverProtocolError("WebDriver response schema is invalid")
         value = decoded["value"]
-        if status >= 400 or (
-            isinstance(value, dict) and isinstance(value.get("error"), str)
-        ):
+        if isinstance(value, dict) and isinstance(value.get("error"), str):
             code = (
                 value.get("error", "webdriver_error")
                 if isinstance(value, dict)
@@ -257,7 +458,7 @@ class W3CWebDriverClient:
             sleep(0.05)
         raise WebDriverProtocolError("geckodriver did not become ready")
 
-    def create_session(self, firefox_binary: str | None = None) -> str:
+    def create_session(self, firefox_binary: str) -> str:
         options: dict[str, object] = {
             "args": ["-headless"],
             "prefs": {
@@ -278,11 +479,10 @@ class W3CWebDriverClient:
             },
             "log": {"level": "warn"},
         }
-        if firefox_binary:
-            selected = Path(firefox_binary)
-            if not selected.is_absolute():
-                raise ValueError("Firefox binary must be absolute")
-            options["binary"] = str(selected)
+        selected = Path(firefox_binary)
+        if not selected.is_absolute():
+            raise ValueError("Firefox binary must be absolute")
+        options["binary"] = str(selected)
         value = self.request(
             "POST",
             "/session",
@@ -298,7 +498,23 @@ class W3CWebDriverClient:
         )
         if not isinstance(value, dict) or not isinstance(value.get("sessionId"), str):
             raise WebDriverProtocolError("session id is missing")
-        self.session_id = value["sessionId"]
+        session_id = value["sessionId"]
+        capabilities = value.get("capabilities")
+        if _WEBDRIVER_ID_RE.fullmatch(session_id) is None:
+            raise WebDriverProtocolError("session id is invalid")
+        if (
+            not isinstance(capabilities, dict)
+            or capabilities.get("browserName") != "firefox"
+            or not isinstance(capabilities.get("browserVersion"), str)
+            or not capabilities["browserVersion"][:128]
+            or not isinstance(capabilities.get("moz:processID"), int)
+            or isinstance(capabilities.get("moz:processID"), bool)
+            or capabilities["moz:processID"] <= 1
+        ):
+            raise WebDriverProtocolError("Firefox capability identity is invalid")
+        self.session_id = session_id
+        self.capabilities = dict(capabilities)
+        self.browser_process_id = capabilities["moz:processID"]
         return self.session_id
 
     def _session_path(self, suffix: str) -> str:
@@ -339,7 +555,10 @@ class W3CWebDriverClient:
             value.get(W3C_ELEMENT_KEY), str
         ):
             raise WebDriverProtocolError("element id is missing")
-        return value[W3C_ELEMENT_KEY]
+        element_id = value[W3C_ELEMENT_KEY]
+        if _WEBDRIVER_ID_RE.fullmatch(element_id) is None:
+            raise WebDriverProtocolError("element id is invalid")
+        return element_id
 
     def element_enabled(self, element_id: str) -> bool:
         return bool(
@@ -356,6 +575,9 @@ class W3CWebDriverClient:
             {"text": text, "value": list(text)},
         )
 
+    def clear(self, element_id: str) -> None:
+        self.request("POST", self._session_path(f"/element/{element_id}/clear"), {})
+
     def close(self) -> None:
         session = self.session_id
         self.session_id = None
@@ -363,12 +585,14 @@ class W3CWebDriverClient:
             self.request("DELETE", f"/session/{session}")
 
 
-def _model_item(model_id: str, label: str, *, selected: bool) -> dict[str, object]:
+def _model_item(
+    model_id: str, label: str, *, selected: bool, selectable: bool
+) -> dict[str, object]:
     return {
         "model_id": model_id,
         "label": label,
         "selected": selected,
-        "selectable": True,
+        "selectable": selectable,
         "verification": "fixture_verified",
         "checkpoint_modalities": ["text"],
         "runtime_input_modalities": ["text"],
@@ -471,16 +695,30 @@ class FixtureState:
         }
 
     def capability_payload(self) -> dict[str, object]:
-        models = [_model_item("fixture-current", "Fixture current", selected=True)]
+        models = [
+            _model_item(
+                "fixture-current",
+                "Fixture current",
+                selected=True,
+                selectable=True,
+            )
+        ]
         if self.enabled:
             models.append(
-                _model_item("fixture-secondary", "Fixture secondary", selected=False)
+                _model_item(
+                    "fixture-secondary",
+                    "Fixture secondary",
+                    selected=False,
+                    selectable=False,
+                )
             )
         return {
             "schema_version": 1,
             "fixture_schema": FIXTURE_SCHEMA,
             "attachments": {
                 "state": "enabled" if self.enabled else "disabled",
+                "max_bytes_each": 1024 * 1024,
+                "accepted_media_types": ["text/markdown", "text/plain"],
                 "image_to_model_integration": False,
                 "image_capability": {
                     "runtime_ready": False,
@@ -495,7 +733,11 @@ class FixtureState:
                 if self.enabled
                 else None,
             },
-            "models": {"items": models},
+            "models": {
+                "state": "verified_local_registry",
+                "switching": "idempotent_current_model_only",
+                "items": models,
+            },
             "microphone": self.voice_payload(),
             "web_search": {
                 "mode": "air_gapped",
@@ -566,6 +808,14 @@ class BrowserFixtureServer(ThreadingHTTPServer):
     def bootstrap_url(self) -> str:
         return f"{self.origin}/?token={self.token}"
 
+    def instrumented_index(self) -> bytes:
+        raw = (self.assets / "index.html").read_bytes()
+        marker = b"<head>"
+        if raw.count(marker) != 1:
+            raise BrowserE2EError("production index cannot be instrumented safely")
+        hook = b'<script src="/__e2e__/startup-errors.js"></script>'
+        return raw.replace(marker, marker + hook, 1)
+
 
 class BrowserFixtureHandler(BaseHTTPRequestHandler):
     server: BrowserFixtureServer
@@ -614,8 +864,14 @@ class BrowserFixtureHandler(BaseHTTPRequestHandler):
         )
 
     def _record(self) -> None:
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        if parsed.query:
+            path += (
+                "?<redacted>" if "token=" in parsed.query else "?" + parsed.query[:256]
+            )
         self.server.state.requests.append(
-            {"method": self.command, "path": self.path[:512]}
+            {"method": self.command, "origin": self.server.origin, "path": path[:512]}
         )
 
     def _read_json(self) -> dict[str, object]:
@@ -660,12 +916,23 @@ class BrowserFixtureHandler(BaseHTTPRequestHandler):
             return
 
         static = {
-            "/": ("index.html", "text/html; charset=utf-8"),
-            "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-            "/app.css": ("app.css", "text/css; charset=utf-8"),
-            "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+            "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
+            "/assets/app.css": ("app.css", "text/css; charset=utf-8"),
+            "/assets/favicon.svg": ("favicon.svg", "image/svg+xml"),
         }
-        if parsed.path in static and not parsed.query:
+        if parsed.path == "/" and not parsed.query:
+            self._bytes(
+                HTTPStatus.OK,
+                "text/html; charset=utf-8",
+                self.server.instrumented_index(),
+            )
+        elif parsed.path == "/__e2e__/startup-errors.js" and not parsed.query:
+            self._bytes(
+                HTTPStatus.OK,
+                "text/javascript; charset=utf-8",
+                STARTUP_ERROR_SCRIPT,
+            )
+        elif parsed.path in static and not parsed.query:
             name, content_type = static[parsed.path]
             self._bytes(
                 HTTPStatus.OK, content_type, (self.server.assets / name).read_bytes()
@@ -701,6 +968,8 @@ class BrowserFixtureHandler(BaseHTTPRequestHandler):
             if path == "/api/workspace/attachments/add":
                 if not self.server.state.enabled:
                     raise BrowserE2EError("ATTACHMENTS_DISABLED")
+                if set(body) != {"content_base64", "name", "media_type"}:
+                    raise BrowserE2EError("INVALID_BODY")
                 raw = body.get("content_base64")
                 name = body.get("name")
                 media_type = body.get("media_type")
@@ -733,8 +1002,20 @@ class BrowserFixtureHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.CREATED, item)
                 return
             if path in {"/api/workspace/rag/index", "/api/workspace/rag/reindex"}:
+                if not self.server.state.enabled or set(body) != {"attachment_ids"}:
+                    raise BrowserE2EError("RAG_UNAVAILABLE")
                 ids = body.get("attachment_ids")
-                if not isinstance(ids, list):
+                known = {
+                    str(item["attachment_id"]) for item in self.server.state.attachments
+                }
+                if (
+                    not isinstance(ids, list)
+                    or not ids
+                    or any(
+                        not isinstance(value, str) or value not in known
+                        for value in ids
+                    )
+                ):
                     raise BrowserE2EError("INVALID_BODY")
                 self._json(
                     HTTPStatus.OK,
@@ -749,6 +1030,20 @@ class BrowserFixtureHandler(BaseHTTPRequestHandler):
             if path == "/api/workspace/voice/transcribe":
                 if not self.server.state.enabled:
                     raise BrowserE2EError("LOCAL_STT_ARTIFACT_REQUIRED")
+                if set(body) not in (
+                    {"audio_wav_base64"},
+                    {"audio_wav_base64", "language"},
+                ):
+                    raise BrowserE2EError("INVALID_BODY")
+                encoded = body.get("audio_wav_base64")
+                if not isinstance(encoded, str) or not encoded:
+                    raise BrowserE2EError("INVALID_BODY")
+                try:
+                    wav = b64decode(encoded, validate=True)
+                except (ValueError, binascii.Error) as error:
+                    raise BrowserE2EError("VOICE_WAV_FORMAT_INVALID") from error
+                if len(wav) < 44 or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
+                    raise BrowserE2EError("VOICE_WAV_FORMAT_INVALID")
                 self.server.state.voice_attested = True
                 self._json(
                     HTTPStatus.OK,
@@ -761,12 +1056,23 @@ class BrowserFixtureHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/workspace/models/select":
                 model_id = body.get("model_id")
-                if not self.server.state.enabled or model_id not in {
-                    "fixture-current",
-                    "fixture-secondary",
-                }:
+                if set(body) != {"model_id"}:
+                    raise BrowserE2EError("INVALID_BODY")
+                if model_id == "fixture-secondary":
                     raise BrowserE2EError("MODEL_SWITCH_UNAVAILABLE")
-                self._json(HTTPStatus.OK, {"model_id": model_id, "selected": True})
+                if model_id != "fixture-current":
+                    raise BrowserE2EError("MODEL_NOT_VERIFIED")
+                self._json(
+                    HTTPStatus.OK,
+                    {
+                        **_model_item(
+                            "fixture-current",
+                            "Fixture current",
+                            selected=True,
+                            selectable=True,
+                        )
+                    },
+                )
                 return
         except BrowserE2EError as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
@@ -834,33 +1140,98 @@ def validate_result_schema(payload: Mapping[str, object]) -> None:
         for item in checks
     ):
         raise BrowserE2EError("result checks are invalid")
+    check_names = [str(item["name"]) for item in checks]
+    if len(check_names) != len(set(check_names)):
+        raise BrowserE2EError("result check names are not unique")
     errors = payload.get("js_errors")
     if not isinstance(errors, list) or any(
         not isinstance(item, str) for item in errors
     ):
         raise BrowserE2EError("JavaScript error list is invalid")
-    if payload.get("status") == "PASS" and (
-        not payload.get("executed")
-        or errors
-        or not checks
-        or not all(item["passed"] for item in checks)
+    driver_log = payload.get("driver_log")
+    if not isinstance(driver_log, str) or len(driver_log) > MAX_DRIVER_LOG_CHARS:
+        raise BrowserE2EError("driver log is invalid")
+    assets = payload.get("assets")
+    if (
+        not isinstance(assets, dict)
+        or set(assets) != {"index.html", "app.js", "app.css"}
+        or any(_SHA256_RE.fullmatch(str(value)) is None for value in assets.values())
     ):
-        raise BrowserE2EError("PASS result contains unverified evidence")
+        raise BrowserE2EError("asset evidence is invalid")
+    network_requests = payload.get("network_requests")
+    if not isinstance(network_requests, list) or any(
+        not isinstance(item, dict)
+        or set(item) != {"method", "origin", "path"}
+        or item["method"] not in {"GET", "POST"}
+        or not isinstance(item["origin"], str)
+        or not isinstance(item["path"], str)
+        or "token=" in item["path"]
+        for item in network_requests
+    ):
+        raise BrowserE2EError("network request evidence is invalid")
+
+    status = payload.get("status")
+    if status == "PASS":
+        policy = payload.get("policy")
+        viewports = payload.get("viewports")
+        profiles = payload.get("profiles")
+        expected_viewports = {
+            (profile, width, height)
+            for profile in ("fail_closed", "enabled")
+            for width, height in VIEWPORTS
+        }
+        observed_viewports: set[tuple[str, int, int]] = set()
+        if not isinstance(viewports, list):
+            raise BrowserE2EError("PASS viewport evidence is invalid")
+        for item in viewports:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"profile", "requested", "observed", "passed"}
+                or item.get("passed") is not True
+                or not isinstance(item.get("requested"), list)
+                or len(item["requested"]) != 2
+                or any(not isinstance(value, int) for value in item["requested"])
+            ):
+                raise BrowserE2EError("PASS viewport evidence is invalid")
+            observed_viewports.add(
+                (str(item["profile"]), item["requested"][0], item["requested"][1])
+            )
+        profile_map = (
+            {
+                item.get("name"): item.get("checks")
+                for item in profiles
+                if isinstance(item, dict) and set(item) == {"name", "checks"}
+            }
+            if isinstance(profiles, list)
+            else {}
+        )
+        if (
+            payload.get("executed") is not True
+            or not isinstance(policy, dict)
+            or policy.get("ready") is not True
+            or errors
+            or set(check_names) != _PASS_CHECK_NAMES
+            or not all(item["passed"] for item in checks)
+            or observed_viewports != expected_viewports
+            or profile_map != {"fail_closed": 3, "enabled": 6}
+            or not network_requests
+        ):
+            raise BrowserE2EError("PASS result contains unverified evidence")
+    elif status == "NOT_RUN" and (
+        payload.get("executed") is not False
+        or payload.get("viewports") != []
+        or payload.get("profiles") != []
+        or payload.get("network_requests") != []
+    ):
+        raise BrowserE2EError("NOT_RUN result contains execution evidence")
 
 
-def _install_js_error_collector(client: W3CWebDriverClient) -> None:
-    client.execute(
-        """
-        window.__cogniE2EErrors = [];
-        window.addEventListener('error', event => {
-          window.__cogniE2EErrors.push(String(event.message || 'window error').slice(0, 512));
-        });
-        window.addEventListener('unhandledrejection', event => {
-          window.__cogniE2EErrors.push(String(event.reason || 'unhandled rejection').slice(0, 512));
-        });
-        return true;
-        """
+def _verify_startup_js_error_collector(client: W3CWebDriverClient) -> None:
+    installed = client.execute(
+        "return window.__cogniE2EHookInstalled === true && Array.isArray(window.__cogniE2EErrors);"
     )
+    if installed is not True:
+        raise BrowserE2EError("startup JavaScript error collector was not installed")
 
 
 def _wait_script(
@@ -884,13 +1255,19 @@ def _profile_checks(
     server: BrowserFixtureServer,
     *,
     enabled: bool,
+    upload_path: Path,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     checks: list[dict[str, object]] = []
     viewports: list[dict[str, object]] = []
+    profile = "enabled" if enabled else "fail_closed"
     client.navigate(server.bootstrap_url)
     _wait_script(client, "return document.readyState === 'complete';")
-    _install_js_error_collector(client)
+    _verify_startup_js_error_collector(client)
     _wait_script(client, "return document.querySelector('#agent-input') !== null;")
+    _wait_script(
+        client,
+        "return document.querySelector('#agent-model-selector')?.dataset.selectableCount === '1';",
+    )
     for width, height in VIEWPORTS:
         client.set_window_rect(width, height)
         geometry = client.execute(
@@ -914,9 +1291,14 @@ def _profile_checks(
             and geometry.get("horizontalOverflow") is False
         )
         viewports.append(
-            {"requested": [width, height], "observed": geometry, "passed": passed}
+            {
+                "profile": profile,
+                "requested": [width, height],
+                "observed": geometry,
+                "passed": passed,
+            }
         )
-        checks.append(_check(f"viewport_{width}x{height}", passed, geometry))
+        checks.append(_check(f"viewport_{profile}_{width}x{height}", passed, geometry))
 
     states = client.execute(
         """
@@ -934,8 +1316,8 @@ def _profile_checks(
         "attachmentDisabled": not enabled,
         "ragDisabled": not enabled,
         "microphoneDisabled": not enabled,
-        "modelDisabled": not enabled,
-        "modelSelectableCount": 2 if enabled else 1,
+        "modelDisabled": True,
+        "modelSelectableCount": 1,
     }
     checks.append(
         _check(
@@ -946,9 +1328,64 @@ def _profile_checks(
     )
 
     if enabled:
+        attachment_input_id = client.find("#agent-attachment-input")
+        client.send_keys(attachment_input_id, str(upload_path))
+        attachment_ready = _wait_script(
+            client,
+            """
+            return [...document.querySelectorAll('#agent-attachment-list .attachment-chip')]
+              .some(item => item.textContent.includes('browser-e2e.txt'));
+            """,
+        )
+        rag_id = client.find('[data-action="workspace-rag-toggle"]')
+        client.click(rag_id)
+        rag_ready = _wait_script(
+            client,
+            """return document.querySelector('[data-action="workspace-rag-toggle"]')
+              ?.getAttribute('aria-pressed') === 'true';""",
+        )
+        microphone_id = client.find('[data-action="workspace-microphone"]')
+        client.click(microphone_id)
+        _wait_script(
+            client,
+            """return document.querySelector('[data-action="workspace-microphone"]')
+              ?.getAttribute('aria-pressed') === 'true';""",
+        )
+        sleep(0.25)
+        client.click(microphone_id)
+        voice_ready = _wait_script(
+            client,
+            "return document.querySelector('#agent-input')?.value.includes("
+            + json.dumps(VOICE_TRANSCRIPT)
+            + ");",
+        )
+        routes = {
+            (item.get("method"), item.get("path")) for item in server.state.requests
+        }
+        expected_routes = {
+            ("POST", "/api/workspace/attachments/add"),
+            ("POST", "/api/workspace/rag/index"),
+            ("POST", "/api/workspace/voice/transcribe"),
+        }
+        checks.append(
+            _check(
+                "optional_ui_interactions",
+                attachment_ready is True
+                and rag_ready is True
+                and voice_ready is True
+                and expected_routes <= routes,
+                {
+                    "attachment": attachment_ready,
+                    "rag": rag_ready,
+                    "microphone": voice_ready,
+                    "api_routes": sorted(f"{method} {path}" for method, path in routes),
+                },
+            )
+        )
         input_id = client.find("#agent-input")
         send_id = client.find('[data-action="agent-send"]')
         prompt = "한 번만 자연스럽게 답해 주세요."
+        client.clear(input_id)
         client.send_keys(input_id, prompt)
         client.click(send_id)
         conversation = _wait_script(
@@ -979,8 +1416,13 @@ def _profile_checks(
             _check(
                 "assistant_not_repeated",
                 isinstance(conversation, list)
-                and ASSISTANT_COMPLETION.count("브라우저 E2E 검증 응답입니다.") == 1,
-                ASSISTANT_COMPLETION,
+                and sum(
+                    str(item.get("text", "")).count(ASSISTANT_COMPLETION)
+                    for item in conversation
+                    if isinstance(item, dict)
+                )
+                == 1,
+                conversation,
             )
         )
 
@@ -995,12 +1437,10 @@ def run_browser_e2e(
     boundary: ExecutionBoundary,
 ) -> dict[str, object]:
     require_execution_boundary(boundary)
-    if not geckodriver.is_absolute() or not geckodriver.is_file():
-        raise BrowserE2EError("geckodriver path is invalid")
-    if firefox_binary is not None and (
-        not firefox_binary.is_absolute() or not firefox_binary.is_file()
-    ):
-        raise BrowserE2EError("Firefox binary path is invalid")
+    if firefox_binary is None:
+        raise BrowserE2EError("an explicit Firefox binary is required")
+    driver_identity = inspect_executable(geckodriver, label="geckodriver")
+    firefox_identity = inspect_executable(firefox_binary, label="Firefox")
     assets = (project_root / "cogni_demo" / "static").resolve(strict=True)
     source_commit = _git_commit(project_root)
     started_at = _utc_now()
@@ -1010,6 +1450,7 @@ def run_browser_e2e(
     js_errors: list[str] = []
     network_requests: list[dict[str, str]] = []
     driver_log = ""
+    final_boundary: ExecutionBoundary | None = None
 
     with TemporaryDirectory(prefix="cogniboard-browser-e2e-") as temporary:
         temp = Path(temporary)
@@ -1030,6 +1471,8 @@ def run_browser_e2e(
         }
         (temp / "home").mkdir()
         (temp / "runtime").mkdir(mode=0o700)
+        upload_path = temp / "browser-e2e.txt"
+        upload_path.write_text("bounded browser E2E attachment\n", encoding="utf-8")
         with log_path.open("w", encoding="utf-8") as log:
             process = subprocess.Popen(  # noqa: S603 - absolute validated binary
                 [
@@ -1047,19 +1490,52 @@ def run_browser_e2e(
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 shell=False,
+                start_new_session=True,
             )
+            if inspect_executable(geckodriver, label="geckodriver") != driver_identity:
+                cleanup_process_tree(process, browser_pid=None)
+                raise BrowserE2EError("geckodriver changed before process start")
             client = W3CWebDriverClient(f"http://127.0.0.1:{driver_port}")
             servers: list[tuple[BrowserFixtureServer, Thread]] = []
+            cleanup_errors: list[str] = []
+            browser_identity: dict[str, object] | None = None
             try:
                 client.wait_ready()
-                client.create_session(str(firefox_binary) if firefox_binary else None)
+                if (
+                    inspect_executable(firefox_binary, label="Firefox")
+                    != firefox_identity
+                ):
+                    raise BrowserE2EError("Firefox changed before session start")
+                client.create_session(firefox_identity.path)
+                browser_identity = attest_browser_process(client, firefox_identity)
+                if (
+                    inspect_executable(firefox_binary, label="Firefox")
+                    != firefox_identity
+                ):
+                    raise BrowserE2EError("Firefox changed during session start")
+                checks.append(
+                    _check(
+                        "executable_identity",
+                        True,
+                        {
+                            "geckodriver": driver_identity.to_dict(),
+                            "firefox": firefox_identity.to_dict(),
+                        },
+                    )
+                )
+                checks.append(
+                    _check("browser_capability_identity", True, browser_identity)
+                )
                 for enabled in (False, True):
                     server = BrowserFixtureServer(assets, enabled=enabled)
                     thread = Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     servers.append((server, thread))
                     selected_checks, selected_viewports = _profile_checks(
-                        client, server, enabled=enabled
+                        client,
+                        server,
+                        enabled=enabled,
+                        upload_path=upload_path,
                     )
                     checks.extend(selected_checks)
                     viewports.extend(selected_viewports)
@@ -1074,21 +1550,31 @@ def run_browser_e2e(
                         }
                     )
             finally:
+                primary_error = sys.exc_info()[0] is not None
                 try:
                     client.close()
-                except BrowserE2EError:
-                    pass
+                except Exception as error:  # cleanup must continue independently
+                    cleanup_errors.append(f"webdriver_close:{type(error).__name__}")
                 for server, thread in servers:
-                    server.shutdown()
-                    server.server_close()
-                    thread.join(timeout=2)
-                if process.poll() is None:
-                    process.terminate()
                     try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
+                        server.shutdown()
+                    except Exception as error:
+                        cleanup_errors.append(f"server_shutdown:{type(error).__name__}")
+                    try:
+                        server.server_close()
+                    except Exception as error:
+                        cleanup_errors.append(f"server_close:{type(error).__name__}")
+                    thread.join(timeout=2)
+                    if thread.is_alive():
+                        cleanup_errors.append("server_thread:alive")
+                try:
+                    cleanup_process_tree(process, browser_pid=client.browser_process_id)
+                except Exception as error:
+                    cleanup_errors.append(f"process_tree:{type(error).__name__}")
+                if cleanup_errors and not primary_error:
+                    raise BrowserE2EError(
+                        "browser cleanup failed: " + ",".join(cleanup_errors)
+                    )
         try:
             driver_log = log_path.read_text(encoding="utf-8", errors="replace")[
                 -MAX_DRIVER_LOG_CHARS:
@@ -1096,12 +1582,38 @@ def run_browser_e2e(
         except OSError:
             driver_log = ""
 
+    final_boundary = inspect_execution_boundary()
     checks.append(_check("javascript_errors", not js_errors, js_errors))
     checks.append(
         _check(
-            "network_loopback_only",
-            all(item.get("path", "").startswith("/") for item in network_requests),
-            {"request_count": len(network_requests)},
+            "webdriver_loopback_only",
+            bool(client.request_urls)
+            and all(_is_loopback_url(url) for url in client.request_urls),
+            {"request_count": len(client.request_urls)},
+        )
+    )
+    allowed_fixture_origins = {str(item.get("origin", "")) for item in network_requests}
+    checks.append(
+        _check(
+            "fixture_requests_same_origin",
+            bool(network_requests)
+            and all(
+                _is_loopback_url(str(item.get("origin", "")))
+                and str(item.get("path", "")).startswith("/")
+                and "token=" not in str(item.get("path", ""))
+                for item in network_requests
+            ),
+            {
+                "request_count": len(network_requests),
+                "origins": sorted(allowed_fixture_origins),
+            },
+        )
+    )
+    checks.append(
+        _check(
+            "boundary_rechecked",
+            final_boundary.ready and final_boundary == boundary,
+            {"initial": boundary.to_dict(), "final": final_boundary.to_dict()},
         )
     )
     status = "PASS" if checks and all(item["passed"] for item in checks) else "FAIL"

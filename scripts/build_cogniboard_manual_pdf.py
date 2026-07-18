@@ -414,6 +414,18 @@ def markdown_story(path: Path, styles: dict[str, ParagraphStyle]):
             story.append(Paragraph(inline_markup(" ".join(paragraph)), styles["body"]))
             paragraph.clear()
 
+    def consume_list_continuations(value: str, next_index: int) -> tuple[str, int]:
+        """Join Markdown list continuation lines into one indivisible item."""
+
+        parts = [value]
+        while next_index < len(lines):
+            continuation = lines[next_index].rstrip()
+            if not continuation or not continuation[:1].isspace():
+                break
+            parts.append(continuation.strip())
+            next_index += 1
+        return " ".join(parts), next_index
+
     index = 0
     while index < len(lines):
         line = lines[index].rstrip()
@@ -477,25 +489,34 @@ def markdown_story(path: Path, styles: dict[str, ParagraphStyle]):
         if line.startswith("- "):
             flush_paragraph()
             value = line[2:].strip()
+            value, index = consume_list_continuations(value, index + 1)
             marker = "□" if value.startswith("[ ]") else "•"
             value = value[3:].strip() if value.startswith("[ ]") else value
             story.append(
-                Paragraph(
-                    f"{marker}&nbsp;&nbsp;{inline_markup(value)}", styles["bullet"]
+                KeepTogether(
+                    [
+                        Paragraph(
+                            f"{marker}&nbsp;&nbsp;{inline_markup(value)}",
+                            styles["bullet"],
+                        )
+                    ]
                 )
             )
-            index += 1
             continue
         numbered = re.match(r"^(\d+)\.\s+(.+)$", line)
         if numbered:
             flush_paragraph()
+            value, index = consume_list_continuations(numbered.group(2), index + 1)
             story.append(
-                Paragraph(
-                    f"<b>{numbered.group(1)}.</b>&nbsp;&nbsp;{inline_markup(numbered.group(2))}",
-                    styles["number"],
+                KeepTogether(
+                    [
+                        Paragraph(
+                            f"<b>{numbered.group(1)}.</b>&nbsp;&nbsp;{inline_markup(value)}",
+                            styles["number"],
+                        )
+                    ]
                 )
             )
-            index += 1
             continue
         paragraph.append(line.strip())
         index += 1

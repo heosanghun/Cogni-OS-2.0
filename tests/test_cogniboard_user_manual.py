@@ -61,11 +61,25 @@ class TestCogniBoardUserManual(unittest.TestCase):
                 self.assertIn(marker, self.text)
 
     def test_print_layout_keeps_code_and_major_sections_together(self) -> None:
-        self.assertEqual(self.text.count("<!-- PDF_PAGE_BREAK -->"), 2)
+        self.assertEqual(self.text.count("<!-- PDF_PAGE_BREAK -->"), 3)
         builder = PDF_BUILDER.read_text(encoding="utf-8")
         self.assertIn('line == "<!-- PDF_PAGE_BREAK -->"', builder)
         self.assertIn("KeepTogether", builder)
         self.assertIn('Preformatted("\\n".join(block)', builder)
+        self.assertIn("consume_list_continuations", builder)
+        self.assertIn("not continuation[:1].isspace()", builder)
+
+    def test_wrapped_markdown_list_items_exist_as_layout_regressions(self) -> None:
+        self.assertIn(
+            "- `외부 호출 0`: 현재 앱이 기록한 외부 호출 수다. 독립 패킷 감사를 대신하지\n"
+            "  않는다.",
+            self.text,
+        )
+        self.assertIn(
+            "2. 브라우저에서 `LOCAL ONLY`, 리듬 `INFERENCE`, 오른쪽 Evidence Rail을\n"
+            "   확인한다.",
+            self.text,
+        )
 
 
 if __name__ == "__main__":

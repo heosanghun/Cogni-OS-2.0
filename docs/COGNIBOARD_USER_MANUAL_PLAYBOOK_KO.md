@@ -260,6 +260,8 @@ resident worker의 텐서 경계까지 구현되어 있다. 제품 화면은 다
 - 같은 모델 루트·manifest에 묶인 검증된 Gemma4Processor
 - 명시적 `image_content` 파라미터와 bounded tensor IPC 지원
 
+<!-- PDF_PAGE_BREAK -->
+
 사용 순서:
 
 1. 8MiB 이하 PNG/JPEG/WebP를 첨부한다.

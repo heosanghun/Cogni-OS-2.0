@@ -33,6 +33,19 @@ def _attested_image_status() -> dict[str, object]:
     }
 
 
+def _configured_unverified_image_status() -> dict[str, object]:
+    return {
+        "state": "configured_unverified",
+        "selected_model_only": True,
+        "configured": True,
+        "processor_probed": False,
+        "model_inference_attested": False,
+        "runtime_ready": False,
+        "first_use_attestation_allowed": True,
+        "disabled_reason": "IMAGE_MODEL_INFERENCE_NOT_ATTESTED",
+    }
+
+
 @dataclass(frozen=True)
 class _Evidence:
     source_id: str
@@ -40,6 +53,35 @@ class _Evidence:
     text: str
     score: float | None = None
     provenance: object | None = None
+
+
+@dataclass(frozen=True)
+class _ImageProbe:
+    turn_id: str
+    image_sha256: str
+    started_at: str
+
+
+@dataclass(frozen=True)
+class _RuntimeIdentity:
+    service_nonce: str = "service-a"
+    worker_incarnation: int = 1
+    worker_pid: int = 4321
+    lease_epoch: int = 7
+    lease_deadline_ns: int = 99
+    artifact_digest: str = "a" * 64
+    model_root: str = "model"
+    manifest_path: str = "manifest"
+    processor_root: str = "model"
+    processor_manifest_path: str = "manifest"
+
+
+class _RuntimeService:
+    def __init__(self, identity: _RuntimeIdentity | None) -> None:
+        self.identity = identity
+
+    def runtime_identity(self) -> _RuntimeIdentity | None:
+        return self.identity
 
 
 class _Agent:
@@ -677,6 +719,102 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         encoded = json.dumps(payload)
         self.assertNotIn("89504e47", encoded.casefold())
         self.assertNotIn("C:\\", encoded)
+
+    def test_configured_image_chat_admits_one_first_use_attestation_probe(self) -> None:
+        attachment_id = "a" * 24
+        with (
+            patch.object(
+                self.server,
+                "image_to_model_integration_status",
+                return_value=_configured_unverified_image_status(),
+            ),
+            patch.object(
+                self.server,
+                "image_to_model_integration_ready",
+                return_value=False,
+            ),
+            patch.object(
+                self.server,
+                "start_image_agent_turn",
+                return_value=("turn-image-probe", True),
+            ) as start_probe,
+        ):
+            status, payload = self._post(
+                "/api/agent/chat",
+                {
+                    "message": "이 이미지로 첫 사용 경로를 검증해 주세요.",
+                    "mode": "chat",
+                    "rag": False,
+                    "image_attachment_id": attachment_id,
+                },
+            )
+
+        self.assertEqual(status, 202)
+        self.assertTrue(payload["image_attestation_probe"])
+        self.assertTrue(payload["image_input_admitted"])
+        start_probe.assert_called_once_with(
+            "이 이미지로 첫 사용 경로를 검증해 주세요.",
+            b"\x89PNG\r\n\x1a\n",
+        )
+
+    def test_image_attestation_is_current_worker_bound_and_fail_closed(self) -> None:
+        identity = _RuntimeIdentity()
+        service = _RuntimeService(identity)
+        probe = _ImageProbe("turn-image", "b" * 64, "2026-07-19T00:00:00+00:00")
+        completion = {
+            "state": "complete",
+            "finish_reason": "stop",
+            "generation_mode": "cogni_core_image",
+            "truncated": False,
+            "generated_tokens": 3,
+        }
+        with patch.object(
+            self.server,
+            "_configured_image_model_service",
+            return_value=service,
+        ):
+            self.server._image_attestation_probe = probe
+            self.server._finish_first_image_attestation(
+                probe,
+                {
+                    "turn_id": probe.turn_id,
+                    "status": "succeeded",
+                    "completion": completion,
+                },
+            )
+            status = self.server.image_to_model_integration_status()
+            self.assertEqual(status["state"], "ready")
+            self.assertTrue(status["runtime_ready"])
+            self.assertTrue(status["model_inference_attested"])
+            self.assertRegex(str(status["attestation_id"]), r"^img1-[0-9a-f]{64}$")
+
+            service.identity = _RuntimeIdentity(worker_incarnation=2)
+            stale = self.server.image_to_model_integration_status()
+            self.assertEqual(stale["state"], "configured_unverified")
+            self.assertFalse(stale["runtime_ready"])
+            self.assertTrue(stale["first_use_attestation_allowed"])
+
+            failed_probe = _ImageProbe(
+                "turn-fallback",
+                "c" * 64,
+                "2026-07-19T00:01:00+00:00",
+            )
+            self.server._image_attestation_probe = failed_probe
+            self.server._finish_first_image_attestation(
+                failed_probe,
+                {
+                    "turn_id": failed_probe.turn_id,
+                    "status": "succeeded",
+                    "completion": {
+                        **completion,
+                        "generation_mode": "quality_fallback",
+                    },
+                },
+            )
+            failed = self.server.image_to_model_integration_status()
+            self.assertEqual(failed["state"], "configured_unverified")
+            self.assertFalse(failed["runtime_ready"])
+            self.assertIsNone(failed["attestation_id"])
 
     def test_image_chat_rejects_invalid_id_media_rag_task_and_unverified_runtime(
         self,

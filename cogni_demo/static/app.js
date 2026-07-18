@@ -283,6 +283,8 @@ const ui = {
   workspaceAttachments: [],
   selectedImageAttachmentId: "",
   imageModelIntegrationReady: false,
+  imageModelFirstUseReady: false,
+  imageAttestationPending: false,
   indexedAttachmentIds: new Set(),
   ragBackendReady: false,
   ragAnswerIntegrationReady: false,
@@ -1045,7 +1047,10 @@ function renderWorkspaceAttachments() {
     const imageSelect = document.createElement("button");
     const remove = document.createElement("button");
     const indexed = ui.indexedAttachmentIds.has(attachment.attachment_id);
-    const imageSelectable = ui.imageModelIntegrationReady
+    const imageSelectable = (
+      ui.imageModelIntegrationReady || ui.imageModelFirstUseReady
+    )
+      && !ui.imageAttestationPending
       && IMAGE_CHAT_MEDIA_TYPES.has(attachment.media_type);
     const imageSelected = imageSelectable
       && ui.selectedImageAttachmentId === attachment.attachment_id;
@@ -1069,7 +1074,9 @@ function renderWorkspaceAttachments() {
       : imageSelected
         ? "다음 대화 이미지"
         : imageSelectable
-          ? "이미지 선택 가능"
+          ? ui.imageModelIntegrationReady
+            ? "이미지 선택 가능"
+            : "첫 사용 검증"
       : attachment.text_indexable
         ? "인덱스 대기"
         : attachment.media_type === "application/pdf"
@@ -1089,7 +1096,9 @@ function renderWorkspaceAttachments() {
     imageSelect.title = imageSelected
       ? "다음 대화 이미지 선택 해제"
       : imageSelectable
-        ? "이 이미지 한 장을 다음 대화에만 사용"
+        ? ui.imageModelIntegrationReady
+          ? "이 이미지 한 장을 다음 대화에만 사용"
+          : "이 이미지 한 장으로 로컬 모델 경로를 처음 검증한 뒤 답변"
         : "검증된 로컬 이미지 모델 경로가 필요합니다.";
     imageSelect.textContent = imageSelected ? "선택됨" : "이미지 사용";
     imageSelect.hidden = !IMAGE_CHAT_MEDIA_TYPES.has(attachment.media_type);
@@ -1210,6 +1219,8 @@ function revokeWorkspaceCapabilities() {
   ui.ragAnswerIntegrationReady = false;
   ui.ragEnabled = false;
   ui.imageModelIntegrationReady = false;
+  ui.imageModelFirstUseReady = false;
+  ui.imageAttestationPending = false;
   ui.selectedImageAttachmentId = "";
   ui.lensConnectorReady = false;
   ui.voiceTransportReady = false;
@@ -1262,7 +1273,13 @@ function applyWorkspaceCapabilities(capabilities) {
   ui.imageModelIntegrationReady = attachments.image_to_model_integration === true
     && imageCapability.runtime_ready === true
     && imageCapability.model_inference_attested === true;
-  if (!ui.imageModelIntegrationReady) ui.selectedImageAttachmentId = "";
+  ui.imageModelFirstUseReady = attachments.state === "enabled"
+    && imageCapability.state === "configured_unverified"
+    && imageCapability.configured === true
+    && imageCapability.first_use_attestation_allowed === true;
+  if (!ui.imageModelIntegrationReady && !ui.imageModelFirstUseReady) {
+    ui.selectedImageAttachmentId = "";
+  }
   ui.ragDocumentCount = Number.isInteger(rag.documents) ? Math.max(0, rag.documents) : 0;
   if (
     !ui.ragAnswerIntegrationReady
@@ -1307,7 +1324,16 @@ function applyWorkspaceCapabilities(capabilities) {
       ? "파일은 이 PC의 content-addressed 저장소에만 보관됩니다."
       : "백엔드가 로컬 첨부 기능을 활성화하지 않았습니다.";
   }
-  setText("#agent-attachment-status", attachments.state === "enabled" ? "로컬" : "사용 불가");
+  setText(
+    "#agent-attachment-status",
+    ui.imageAttestationPending
+      ? "이미지 검증 중"
+      : ui.imageModelFirstUseReady
+        ? "구성됨 · 첫 이미지 검증 필요"
+        : attachments.state === "enabled"
+          ? "로컬"
+          : "사용 불가",
+  );
   setText("#agent-rag-status", workspaceRagStatusLabel());
   const networkMode = web.mode === "air_gapped" || web.mode === "online_opt_in" ? web.mode : "";
   const externalCalls = Number.isInteger(lens.external_calls) && lens.external_calls >= 0
@@ -1564,7 +1590,8 @@ function updateWorkspaceControlStates() {
   $$('.attachment-image-select').forEach((button) => {
     button.disabled = unavailable
       || ui.agentMode !== "chat"
-      || !ui.imageModelIntegrationReady;
+      || ui.imageAttestationPending
+      || (!ui.imageModelIntegrationReady && !ui.imageModelFirstUseReady);
   });
   const reindexButton = $('[data-action="workspace-rag-reindex"]');
   if (reindexButton) {
@@ -1607,6 +1634,23 @@ async function loadWorkspaceCapabilities() {
     updateExternalCallDisclosure("", null);
     updateWorkspaceControlStates();
   }
+}
+
+async function settleFirstImageAttestation() {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await refreshWorkspaceCapabilityDisclosure();
+    const imageCapability = ui.workspaceCapabilities?.attachments?.image_capability || {};
+    if (ui.imageModelIntegrationReady) {
+      showToast("현재 로컬 모델의 이미지 전처리·추론 경로가 검증되었습니다.", "success");
+      return;
+    }
+    if (imageCapability.state !== "first_image_attestation_in_progress") {
+      showToast("첫 이미지 검증을 통과하지 못했습니다. 이미지 기능은 미검증 상태로 유지됩니다.", "warning");
+      return;
+    }
+  }
+  showToast("이미지 검증 결과를 확인하지 못해 기능을 활성화하지 않았습니다.", "warning");
 }
 
 async function indexWorkspaceAttachment(attachment) {
@@ -1728,7 +1772,8 @@ function selectWorkspaceImageAttachment(attachmentId) {
   if (
     ui.workspaceRequestPending
     || ui.agentMode !== "chat"
-    || !ui.imageModelIntegrationReady
+    || ui.imageAttestationPending
+    || (!ui.imageModelIntegrationReady && !ui.imageModelFirstUseReady)
     || typeof attachmentId !== "string"
   ) return;
   const attachment = ui.workspaceAttachments.find(
@@ -3451,6 +3496,14 @@ function updateAgentState(state) {
   if (Array.isArray(state.conversation)) renderAgentConversation(state.conversation);
   updateAgentCore(state.core || {});
   updateEvolutionState(state.evolution || {});
+  if (
+    ui.imageAttestationPending
+    && ["succeeded", "cancelled", "failed"].includes(ui.agentStatus)
+  ) {
+    ui.imageAttestationPending = false;
+    ui.imageModelFirstUseReady = false;
+    void settleFirstImageAttestation();
+  }
   updateControlStates();
   if (state.error && typeof state.error.message === "string") {
     const errorKey = `${state.error.code || "ERROR"}:${state.error.message}`;
@@ -3510,7 +3563,7 @@ async function sendAgentMessage() {
     };
     if (
       ui.agentMode === "chat"
-      && ui.imageModelIntegrationReady
+      && (ui.imageModelIntegrationReady || ui.imageModelFirstUseReady)
       && ui.selectedImageAttachmentId
     ) {
       requestBody.image_attachment_id = ui.selectedImageAttachmentId;
@@ -3523,6 +3576,10 @@ async function sendAgentMessage() {
     if (state?.image_input_admitted === true) {
       ui.selectedImageAttachmentId = "";
       renderWorkspaceAttachments();
+    }
+    if (state?.image_attestation_probe === true) {
+      ui.imageAttestationPending = true;
+      showToast("첫 이미지로 로컬 전처리·모델 추론 경로를 검증하고 있습니다.", "info");
     }
     updateAgentCharacterCount();
     updateAgentState(state);

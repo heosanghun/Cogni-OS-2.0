@@ -799,6 +799,7 @@ class AgentManager:
         self._model_excluded_exchanges: deque[tuple[str, str]] = deque(maxlen=24)
         self._active_turn: str | None = None
         self._active_user_sequence: int | None = None
+        self._last_finished_turn: dict[str, Any] | None = None
         self._cancel_event = Event()
         self._thread: Thread | None = None
         self._error: dict[str, str] | None = None
@@ -837,6 +838,7 @@ class AgentManager:
                 "events": deepcopy(events),
                 "conversation": deepcopy(list(self._messages)),
                 "active_turn": self._active_turn,
+                "last_finished_turn": deepcopy(self._last_finished_turn),
                 "error": deepcopy(self._error),
                 "core": deepcopy(self._core),
                 "completion": deepcopy(self._completion),
@@ -934,6 +936,7 @@ class AgentManager:
             self.session_id = f"conversation-{secrets.token_hex(12)}"
             self._messages.clear()
             self._model_excluded_exchanges.clear()
+            self._last_finished_turn = None
             self._error = None
             self._completion = self._completion_state()
             self._transition_locked("ready", "ready", 100)
@@ -3187,6 +3190,12 @@ class AgentManager:
     ) -> None:
         if self._active_turn != turn_id:
             return
+        self._last_finished_turn = {
+            "turn_id": turn_id,
+            "status": status,
+            "stage": stage,
+            "completion": deepcopy(self._completion),
+        }
         self._active_turn = None
         self._active_user_sequence = None
         self._transition_locked(status, stage, progress)

@@ -571,6 +571,57 @@ def service_for(
 
 
 class TestResidentModelService(unittest.TestCase):
+    def test_runtime_identity_is_manifest_processor_and_worker_bound(self):
+        class _LiveProcess:
+            pid = 4321
+
+            @staticmethod
+            def is_alive():
+                return True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "model"
+            root.mkdir()
+            manifest = Path(temporary) / "manifest.toml"
+            manifest.write_bytes(b"schema_version = 1\n")
+            digest = sha256(manifest.read_bytes()).hexdigest()
+
+            # Build the already-verified immutable production value directly;
+            # this unit test exercises service identity, not artifact parsing.
+            factory = object.__new__(LocalGemmaModelFactory)
+            object.__setattr__(factory, "model_path", str(root))
+            object.__setattr__(factory, "vram_limit_gib", 16.7)
+            object.__setattr__(factory, "manifest_path", str(manifest))
+            object.__setattr__(factory, "artifact_digest", digest)
+            service = ModelService(
+                FakeTokenizer(),
+                factory,
+                artifact_digest=digest,
+                multimodal_processor_config=(root, manifest),
+            )
+            ready = Event()
+            ready.set()
+            service._process = _LiveProcess()
+            service._ready_event = ready
+            service._worker_incarnation = 1
+
+            first = service.runtime_identity()
+            self.assertIsNotNone(first)
+            self.assertEqual(first.worker_pid, 4321)
+            self.assertEqual(first.worker_incarnation, 1)
+            self.assertEqual(first.artifact_digest, digest)
+
+            service._worker_incarnation = 2
+            second = service.runtime_identity()
+            self.assertIsNotNone(second)
+            self.assertNotEqual(first, second)
+
+            ready.clear()
+            self.assertIsNone(service.runtime_identity())
+            ready.set()
+            manifest.write_bytes(b"schema_version = 2\n")
+            self.assertIsNone(service.runtime_identity())
+
     def test_checkpoint_integrity_failure_is_reported_from_spawned_worker(self):
         service = service_for(core_pipeline_factory=CheckpointFailingCoreFactory())
 

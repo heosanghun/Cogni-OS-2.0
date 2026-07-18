@@ -375,6 +375,11 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("attachments.image_to_model_integration === true", script)
         self.assertIn("imageCapability.runtime_ready === true", script)
         self.assertIn("imageCapability.model_inference_attested === true", script)
+        self.assertIn('imageCapability.state === "configured_unverified"', script)
+        self.assertIn("imageCapability.first_use_attestation_allowed === true", script)
+        self.assertIn("구성됨 · 첫 이미지 검증 필요", script)
+        self.assertIn("function settleFirstImageAttestation", script)
+        self.assertIn("state?.image_attestation_probe === true", script)
         self.assertIn("function selectWorkspaceImageAttachment", script)
         self.assertIn('imageSelect.setAttribute("aria-pressed"', script)
         self.assertIn(

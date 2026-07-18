@@ -497,6 +497,27 @@ class ComputeBusyError(DemoServerError):
     """Raised before a second local workload can acquire the GPU owner slot."""
 
 
+class ImageModelUnavailableError(DemoServerError):
+    """Raised when neither ready nor first-use image admission is authorized."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ImageAttestationProbe:
+    turn_id: str
+    image_sha256: str
+    started_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CurrentProcessImageAttestation:
+    attestation_id: str
+    process_nonce: str
+    turn_id: str
+    image_sha256: str
+    recorded_at: str
+    runtime_identity: object
+
+
 class WorkerTerminationError(DemoServerError):
     """Raised when a validation worker cannot be proven dead within bounds."""
 
@@ -2005,6 +2026,11 @@ class DemoHTTPServer(ThreadingHTTPServer):
         self._lifecycle_lock = RLock()
         self._component_shutdown_condition = Condition(self._lifecycle_lock)
         self._compute_lock = RLock()
+        self._image_attestation_lock = RLock()
+        self._image_process_nonce = secrets.token_hex(16)
+        self._image_attestation: _CurrentProcessImageAttestation | None = None
+        self._image_attestation_probe: _ImageAttestationProbe | None = None
+        self._image_attestation_thread: Thread | None = None
         self._watchdog_stop = Event()
         self._watchdog_thread: Thread | None = None
         self._last_state_poll = monotonic()
@@ -2052,6 +2078,46 @@ class DemoHTTPServer(ThreadingHTTPServer):
 
         return bool(self.image_to_model_integration_status()["runtime_ready"])
 
+    def _configured_image_model_service(self) -> object | None:
+        """Return only the exact production image pipeline service."""
+
+        try:
+            from cogni_agent.manager import AgentManager
+            from cogni_agent.model_service import LocalGemmaModelFactory, ModelService
+
+            agent = self.agent_manager
+            if type(
+                agent
+            ) is not AgentManager or not self._has_explicit_image_parameter(
+                agent.start_turn
+            ):
+                return None
+            service = getattr(agent, "model_service", None)
+            if type(
+                service
+            ) is not ModelService or not self._has_explicit_image_parameter(
+                service.iter_generate_tokens
+            ):
+                return None
+            factory = getattr(service, "model_factory", None)
+            if (
+                type(factory) is not LocalGemmaModelFactory
+                or factory.manifest_path is None
+                or service.artifact_digest != factory.artifact_digest
+            ):
+                return None
+            processor = getattr(service, "_multimodal_processor_config", None)
+            if not isinstance(processor, tuple) or len(processor) != 2:
+                return None
+            processor_root, processor_manifest = map(Path, processor)
+            if processor_root != Path(factory.model_path) or processor_manifest != Path(
+                factory.manifest_path
+            ):
+                return None
+            return service
+        except (AttributeError, ImportError, OSError, TypeError, ValueError):
+            return None
+
     def image_to_model_integration_status(self) -> dict[str, object]:
         """Separate image configuration from processor and inference proof.
 
@@ -2063,63 +2129,67 @@ class DemoHTTPServer(ThreadingHTTPServer):
         successfully in this process.
         """
 
-        configured = False
-        processor_probed = False
-        try:
-            from cogni_agent.manager import AgentManager
-            from cogni_agent.model_service import LocalGemmaModelFactory, ModelService
-
-            agent = self.agent_manager
-            if not isinstance(
-                agent, AgentManager
-            ) or not self._has_explicit_image_parameter(agent.start_turn):
-                raise TypeError("production agent image boundary is not configured")
-            service = getattr(agent, "model_service", None)
-            if not isinstance(
-                service, ModelService
-            ) or not self._has_explicit_image_parameter(service.iter_generate_tokens):
-                raise TypeError("production model image boundary is not configured")
-            factory = getattr(service, "model_factory", None)
-            if (
-                not isinstance(factory, LocalGemmaModelFactory)
-                or factory.manifest_path is None
-                or service.artifact_digest != factory.artifact_digest
-            ):
-                raise TypeError("model artifact authority is not configured")
-            processor = getattr(service, "_multimodal_processor_config", None)
-            if not isinstance(processor, tuple) or len(processor) != 2:
-                raise TypeError("multimodal processor is not configured")
-            processor_root, processor_manifest = map(Path, processor)
-            configured = processor_root == Path(
-                factory.model_path
-            ) and processor_manifest == Path(factory.manifest_path)
-            # A lazily constructed processor object is not probe evidence: it
-            # can exist even when preprocessing later fails.  A future guarded
-            # validation path must supply an explicit successful probe and
-            # answer-bearing inference attestation before runtime enablement.
-            processor_probed = False
-        except (AttributeError, ImportError, OSError, TypeError, ValueError):
-            configured = False
-            processor_probed = False
+        service = self._configured_image_model_service()
+        configured = service is not None
+        with self._image_attestation_lock:
+            attestation = self._image_attestation
+            probe = self._image_attestation_probe
+        identity = None
+        if configured and attestation is not None:
+            try:
+                identity = service.runtime_identity()
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                identity = None
+        ready = bool(
+            configured
+            and attestation is not None
+            and identity is not None
+            and attestation.process_nonce == self._image_process_nonce
+            and attestation.runtime_identity == identity
+        )
+        if attestation is not None and not ready:
+            with self._image_attestation_lock:
+                if self._image_attestation is attestation:
+                    self._image_attestation = None
+        processor_probed = ready
+        state = (
+            "ready"
+            if ready
+            else "first_image_attestation_in_progress"
+            if configured and probe is not None
+            else "configured_unverified"
+            if configured
+            else "not_configured"
+        )
+        disabled_reason = (
+            None
+            if ready
+            else "IMAGE_MODEL_ATTESTATION_IN_PROGRESS"
+            if configured and probe is not None
+            else "IMAGE_MODEL_INFERENCE_NOT_ATTESTED"
+            if configured
+            else "IMAGE_MODEL_NOT_CONFIGURED"
+        )
         return {
-            "state": (
-                "processor_probed_inference_unattested"
-                if processor_probed
-                else "configured_unverified"
-                if configured
-                else "not_configured"
-            ),
+            "state": state,
             "selected_model_only": True,
             "configured": configured,
             "processor_probed": processor_probed,
-            "model_inference_attested": False,
-            "runtime_ready": False,
-            "attestation_path": "guarded_current_process_model_inference_required",
-            "disabled_reason": (
-                "IMAGE_MODEL_INFERENCE_NOT_ATTESTED"
-                if configured
-                else "IMAGE_MODEL_NOT_CONFIGURED"
+            "model_inference_attested": ready,
+            "runtime_ready": ready,
+            "first_use_attestation_allowed": bool(
+                configured and not ready and probe is None
             ),
+            "attestation_path": "first_selected_image_current_process_inference",
+            "attestation_id": (
+                attestation.attestation_id
+                if ready and attestation is not None
+                else None
+            ),
+            "attested_at": (
+                attestation.recorded_at if ready and attestation is not None else None
+            ),
+            "disabled_reason": disabled_reason,
         }
 
     def touch_authenticated_state_poll(self) -> None:
@@ -2158,7 +2228,11 @@ class DemoHTTPServer(ThreadingHTTPServer):
 
         with self._compute_lock:
             self._require_admission_open()
-            if self._agent_active() or self._evolution_active():
+            if (
+                self._agent_active()
+                or self._evolution_active()
+                or self._image_probe_active()
+            ):
                 raise ComputeBusyError("agent or evolution owns local compute")
             if self.agent_manager is not None:
                 # A resident but idle chat model still owns the model VRAM.
@@ -2179,7 +2253,11 @@ class DemoHTTPServer(ThreadingHTTPServer):
             self._require_admission_open()
             if self.agent_manager is None:
                 raise RuntimeError("agent manager is unavailable")
-            if self.manager.is_active or self._evolution_active():
+            if (
+                self.manager.is_active
+                or self._evolution_active()
+                or self._image_probe_active()
+            ):
                 raise ComputeBusyError("validation or evolution owns local compute")
             if type(retrieval_requested) is not bool:
                 raise TypeError("retrieval_requested must be a bool")
@@ -2214,6 +2292,163 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 )
             return self.agent_manager.start_turn(message, mode)
 
+    def start_image_agent_turn(
+        self,
+        message: str,
+        image_content: bytes,
+    ) -> tuple[str, bool]:
+        """Admit ready image chat or one fail-closed first-use attestation turn."""
+
+        if type(image_content) is not bytes or not image_content:
+            raise ValueError("image_content must be non-empty immutable bytes")
+        with self._compute_lock:
+            status = self.image_to_model_integration_status()
+            if status.get("runtime_ready") is True:
+                return (
+                    self.start_agent_turn(
+                        message,
+                        "chat",
+                        image_content=image_content,
+                    ),
+                    False,
+                )
+            if status.get("first_use_attestation_allowed") is not True:
+                if status.get("state") == "first_image_attestation_in_progress":
+                    raise ComputeBusyError("image attestation is already in progress")
+                raise ImageModelUnavailableError(
+                    "image model is not configured for first-use attestation"
+                )
+            turn_id = self.start_agent_turn(
+                message,
+                "chat",
+                image_content=image_content,
+            )
+            probe = _ImageAttestationProbe(
+                turn_id=turn_id,
+                image_sha256=sha256(image_content).hexdigest(),
+                started_at=datetime.now(timezone.utc).isoformat(),
+            )
+            with self._image_attestation_lock:
+                self._image_attestation_probe = probe
+            thread = Thread(
+                target=self._watch_first_image_attestation,
+                args=(probe,),
+                name=f"cogni-image-attestation-{turn_id[:8]}",
+                daemon=True,
+            )
+            with self._image_attestation_lock:
+                self._image_attestation_thread = thread
+            thread.start()
+            return turn_id, True
+
+    def _watch_first_image_attestation(self, probe: _ImageAttestationProbe) -> None:
+        """Publish only after the exact image turn reaches a trusted terminal state."""
+
+        agent = self.agent_manager
+        deadline = monotonic() + min(
+            180.0,
+            max(30.0, float(getattr(agent, "max_decode_seconds", 120.0)) + 30.0),
+        )
+        finished: dict[str, object] | None = None
+        try:
+            while monotonic() < deadline:
+                snapshot = agent.snapshot()
+                candidate = snapshot.get("last_finished_turn")
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("turn_id") == probe.turn_id
+                ):
+                    finished = candidate
+                    break
+                after = snapshot.get("seq")
+                if not isinstance(after, int) or isinstance(after, bool) or after < 0:
+                    break
+                agent.wait_snapshot(after, timeout=min(1.0, deadline - monotonic()))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            finished = None
+        with self._compute_lock:
+            self._finish_first_image_attestation(probe, finished)
+
+    def _finish_first_image_attestation(
+        self,
+        probe: _ImageAttestationProbe,
+        finished: dict[str, object] | None,
+    ) -> None:
+        with self._image_attestation_lock:
+            if self._image_attestation_probe != probe:
+                return
+        completion = finished.get("completion") if isinstance(finished, dict) else None
+        successful = bool(
+            isinstance(finished, dict)
+            and finished.get("turn_id") == probe.turn_id
+            and finished.get("status") == "succeeded"
+            and isinstance(completion, dict)
+            and completion.get("state") == "complete"
+            and completion.get("finish_reason") == "stop"
+            and completion.get("generation_mode") == "cogni_core_image"
+            and completion.get("truncated") is False
+            and isinstance(completion.get("generated_tokens"), int)
+            and not isinstance(completion.get("generated_tokens"), bool)
+            and completion["generated_tokens"] > 0
+        )
+        service = self._configured_image_model_service() if successful else None
+        identity = None
+        if service is not None:
+            try:
+                identity = service.runtime_identity()
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                identity = None
+        attestation: _CurrentProcessImageAttestation | None = None
+        if identity is not None:
+            recorded_at = datetime.now(timezone.utc).isoformat()
+            identity_payload = {
+                name: getattr(identity, name, None)
+                for name in (
+                    "service_nonce",
+                    "worker_incarnation",
+                    "worker_pid",
+                    "lease_epoch",
+                    "lease_deadline_ns",
+                    "artifact_digest",
+                    "model_root",
+                    "manifest_path",
+                    "processor_root",
+                    "processor_manifest_path",
+                )
+            }
+            payload = {
+                "schema_version": 1,
+                "process_nonce": self._image_process_nonce,
+                "turn_id": probe.turn_id,
+                "image_sha256": probe.image_sha256,
+                "recorded_at": recorded_at,
+                "runtime_identity": identity_payload,
+                "generation_mode": "cogni_core_image",
+                "finish_reason": "stop",
+            }
+            attestation = _CurrentProcessImageAttestation(
+                attestation_id="img1-"
+                + sha256(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest(),
+                process_nonce=self._image_process_nonce,
+                turn_id=probe.turn_id,
+                image_sha256=probe.image_sha256,
+                recorded_at=recorded_at,
+                runtime_identity=identity,
+            )
+        with self._image_attestation_lock:
+            if self._image_attestation_probe == probe:
+                self._image_attestation = attestation
+                self._image_attestation_probe = None
+                self._image_attestation_thread = None
+
     def transcribe_voice(
         self, audio_wav_base64: object, *, language: object = "auto"
     ) -> dict[str, object]:
@@ -2225,6 +2460,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 self.manager.is_active
                 or self._agent_active()
                 or self._evolution_active()
+                or self._image_probe_active()
             ):
                 raise ComputeBusyError("local compute is already in use")
             return self.voice_service.transcribe_base64(
@@ -2243,6 +2479,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 self.manager.is_active
                 or self._agent_active()
                 or self._evolution_active()
+                or self._image_probe_active()
             ):
                 raise ComputeBusyError("local compute is already in use")
             return self.voice_service.synthesize(text, language=language)
@@ -2252,7 +2489,11 @@ class DemoHTTPServer(ThreadingHTTPServer):
             self._require_admission_open()
             if self.evolution_manager is None:
                 raise RuntimeError("evolution manager is unavailable")
-            if self.manager.is_active or self._agent_active():
+            if (
+                self.manager.is_active
+                or self._agent_active()
+                or self._image_probe_active()
+            ):
                 raise ComputeBusyError("validation or agent owns local compute")
             if self.agent_manager is not None:
                 self.agent_manager.stop_model()
@@ -2275,14 +2516,30 @@ class DemoHTTPServer(ThreadingHTTPServer):
             and getattr(self.evolution_manager, "is_active", False)
         )
 
+    def _image_probe_active(self) -> bool:
+        with self._image_attestation_lock:
+            return self._image_attestation_probe is not None
+
     def _validation_compute_available(self) -> bool:
-        return not self._agent_active() and not self._evolution_active()
+        return (
+            not self._agent_active()
+            and not self._evolution_active()
+            and not self._image_probe_active()
+        )
 
     def _agent_compute_available(self) -> bool:
-        return not self.manager.is_active and not self._evolution_active()
+        return (
+            not self.manager.is_active
+            and not self._evolution_active()
+            and not self._image_probe_active()
+        )
 
     def _evolution_compute_available(self) -> bool:
-        return not self.manager.is_active and not self._agent_active()
+        return (
+            not self.manager.is_active
+            and not self._agent_active()
+            and not self._image_probe_active()
+        )
 
     def request_shutdown(self) -> None:
         """Close admission immediately and trigger transport shutdown once."""
@@ -2789,6 +3046,7 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             evidence: tuple[Any, ...] = ()
             image_content: bytes | None = None
             image_media_type: str | None = None
+            image_attestation_probe = False
             if rag_requested:
                 if self.server.workspace_service is None:
                     self._json_error(
@@ -2813,9 +3071,26 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                         HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE"
                     )
                     return
-                if not self.server.image_to_model_integration_ready():
+                image_status = self.server.image_to_model_integration_status()
+                image_ready = self.server.image_to_model_integration_ready()
+                image_attestation_probe = bool(
+                    not image_ready
+                    and image_status.get("first_use_attestation_allowed") is True
+                )
+                if not image_ready and not image_attestation_probe:
+                    error_status = (
+                        HTTPStatus.CONFLICT
+                        if image_status.get("state")
+                        == "first_image_attestation_in_progress"
+                        else HTTPStatus.SERVICE_UNAVAILABLE
+                    )
                     self._json_error(
-                        HTTPStatus.SERVICE_UNAVAILABLE, "IMAGE_MODEL_UNAVAILABLE"
+                        error_status,
+                        (
+                            "COMPUTE_BUSY"
+                            if error_status == HTTPStatus.CONFLICT
+                            else "IMAGE_MODEL_UNAVAILABLE"
+                        ),
                     )
                     return
                 try:
@@ -2840,15 +3115,31 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                     )
                     return
             try:
-                turn_id = self.server.start_agent_turn(
-                    message,
-                    mode,
-                    evidence=evidence,
-                    image_content=image_content,
-                    retrieval_requested=rag_requested,
-                )
+                if image_content is not None:
+                    if image_attestation_probe:
+                        turn_id, image_attestation_probe = (
+                            self.server.start_image_agent_turn(message, image_content)
+                        )
+                    else:
+                        turn_id = self.server.start_agent_turn(
+                            message,
+                            mode,
+                            image_content=image_content,
+                        )
+                else:
+                    turn_id = self.server.start_agent_turn(
+                        message,
+                        mode,
+                        evidence=evidence,
+                        retrieval_requested=rag_requested,
+                    )
             except (AgentBusyError, ComputeBusyError):
                 self._json_error(HTTPStatus.CONFLICT, "COMPUTE_BUSY")
+                return
+            except ImageModelUnavailableError:
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "IMAGE_MODEL_UNAVAILABLE"
+                )
                 return
             except (TypeError, ValueError):
                 self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_BODY")
@@ -2861,6 +3152,7 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                     "rag_evidence_count": len(evidence),
                     "image_requested": image_requested,
                     "image_input_admitted": image_content is not None,
+                    "image_attestation_probe": image_attestation_probe,
                     "image_media_type": image_media_type,
                     **self.server.agent_manager.snapshot(),
                 },

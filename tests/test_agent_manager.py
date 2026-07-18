@@ -338,7 +338,7 @@ class TestAgentManager(unittest.TestCase):
             "answer",
             side_effect=AssertionError("image turns must bypass text fast path"),
         ):
-            manager.start_turn(
+            turn_id = manager.start_turn(
                 "사진 속 파란 원을 자연스럽게 설명해 주세요.",
                 image_content=image,
             )
@@ -348,6 +348,15 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(state["status"], "succeeded")
         self.assertEqual(answer["generation_mode"], "cogni_core_image")
         self.assertEqual(state["completion"]["generation_mode"], "cogni_core_image")
+        self.assertEqual(
+            state["last_finished_turn"],
+            {
+                "turn_id": turn_id,
+                "status": "succeeded",
+                "stage": "complete",
+                "completion": state["completion"],
+            },
+        )
         self.assertEqual(len(service.images), 1)
         self.assertIs(service.images[0], image)
         self.assertNotIn("image_content", state["conversation"][0])

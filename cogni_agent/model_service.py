@@ -11,6 +11,7 @@ import multiprocessing
 import os
 from pathlib import Path
 from queue import Empty, Full
+import secrets
 import sys
 from threading import Lock, RLock
 from time import monotonic, monotonic_ns, sleep
@@ -279,6 +280,22 @@ class GenerationResult:
     text: str
     finish_reason: str
     generation_mode: str = "cogni_core"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRuntimeIdentity:
+    """Process-local identity of one live, manifest-bound resident worker."""
+
+    service_nonce: str
+    worker_incarnation: int
+    worker_pid: int
+    lease_epoch: int
+    lease_deadline_ns: int
+    artifact_digest: str
+    model_root: str
+    manifest_path: str
+    processor_root: str
+    processor_manifest_path: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -2036,6 +2053,8 @@ class ModelService:
         self._state_lock = RLock()
         self._next_request_id = 1
         self._active_request_id: int | None = None
+        self._service_nonce = secrets.token_hex(16)
+        self._worker_incarnation = 0
         self._process: Any = None
         self._request_queue: Any = None
         self._response_queue: Any = None
@@ -2131,6 +2150,65 @@ class ModelService:
     def gpu_lease(self) -> GPULease | None:
         with self._state_lock:
             return self._gpu_lease
+
+    def runtime_identity(self) -> ModelRuntimeIdentity | None:
+        """Return identity only while the exact configured worker is live.
+
+        The incarnation counter changes for every spawn attempt.  A prior
+        image attestation therefore cannot survive worker death/restart even
+        if the operating system later reuses the same PID.
+        """
+
+        with self._state_lock:
+            process = self._process
+            ready = self._ready_event
+            factory = self.model_factory
+            processor = self._multimodal_processor_config
+            if (
+                type(factory) is not LocalGemmaModelFactory
+                or factory.manifest_path is None
+                or self.artifact_digest is None
+                or factory.artifact_digest != self.artifact_digest
+                or not isinstance(processor, tuple)
+                or len(processor) != 2
+                or process is None
+                or ready is None
+                or not ready.is_set()
+                or self._worker_incarnation < 1
+            ):
+                return None
+            try:
+                factory_root = Path(factory.model_path)
+                factory_manifest = Path(factory.manifest_path)
+                processor_root, processor_manifest = processor
+                if (
+                    processor_root != factory_root
+                    or processor_manifest != factory_manifest
+                    or _sha256_file(factory_manifest) != self.artifact_digest
+                ):
+                    return None
+                if not process.is_alive() or process.pid is None:
+                    return None
+                self._validate_running_gpu_lease()
+            except BaseException:
+                return None
+            lease = self._gpu_lease
+            lease_epoch = 0 if lease is None else int(lease.epoch)
+            lease_deadline_ns = (
+                0 if lease is None else int(lease.deadline * 1_000_000_000)
+            )
+            return ModelRuntimeIdentity(
+                service_nonce=self._service_nonce,
+                worker_incarnation=self._worker_incarnation,
+                worker_pid=int(process.pid),
+                lease_epoch=lease_epoch,
+                lease_deadline_ns=lease_deadline_ns,
+                artifact_digest=self.artifact_digest,
+                model_root=str(factory_root),
+                manifest_path=str(factory_manifest),
+                processor_root=str(processor_root),
+                processor_manifest_path=str(processor_manifest),
+            )
 
     @staticmethod
     def _bounded_gpu_label(value: object, field: str) -> str:
@@ -2245,6 +2323,9 @@ class ModelService:
                 self.stop()
             if self._process is None:
                 created_attempt = True
+                # Increment before any fallible setup.  Failed attempts consume
+                # an incarnation so no later worker can ever compare equal.
+                self._worker_incarnation += 1
                 try:
                     self._request_queue = self._context.Queue(maxsize=2)
                     self._response_queue = self._context.Queue(
@@ -3026,6 +3107,7 @@ __all__ = [
     "HARD_MAX_RESPONSE_CHARS",
     "LocalGemmaCorePipelineFactory",
     "LocalGemmaModelFactory",
+    "ModelRuntimeIdentity",
     "ModelService",
     "ModelServiceError",
     "RequestLimitError",

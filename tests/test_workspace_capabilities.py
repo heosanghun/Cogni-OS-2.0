@@ -484,6 +484,34 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 capabilities._run_pdf_extractor_subprocess(b"%PDF-1.4\nlocal")
         self.assertEqual(raised.exception.code, "PDF_TEXT_EXTRACTION_TIMEOUT")
         self.assertTrue(process.killed)
+        self.assertEqual(process.calls, 2)
+
+    def test_pdf_subprocess_timeout_closes_job_and_reaps_worker(self) -> None:
+        class _TimedOutJobProcess:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def communicate(self, input=None, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise capabilities.subprocess.TimeoutExpired("pdf", timeout)
+                self.reap_input = input
+                self.reap_timeout = timeout
+                return b"", b""
+
+        process = _TimedOutJobProcess()
+        with (
+            patch.object(capabilities.subprocess, "Popen", return_value=process),
+            patch.object(capabilities, "_assign_windows_pdf_job", return_value=73),
+            patch.object(capabilities, "_close_windows_handle") as close_handle,
+        ):
+            with self.assertRaises(WorkspaceCapabilityError) as raised:
+                capabilities._run_pdf_extractor_subprocess(b"%PDF-1.4\nlocal")
+        self.assertEqual(raised.exception.code, "PDF_TEXT_EXTRACTION_TIMEOUT")
+        self.assertEqual(process.calls, 2)
+        self.assertIsNone(process.reap_input)
+        self.assertIsNone(process.reap_timeout)
+        close_handle.assert_called_once_with(73)
 
     def test_pdf_parent_rejects_nonsequential_worker_pages(self) -> None:
         class _InvalidSequenceProcess:

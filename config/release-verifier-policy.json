@@ -1,0 +1,6 @@
+{
+  "schema": "cogni.release.verifier-policy.v1",
+  "status": "unconfigured",
+  "verifier_id": null,
+  "public_key_sha256": null
+}

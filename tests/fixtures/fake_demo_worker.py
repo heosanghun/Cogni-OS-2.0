@@ -52,6 +52,8 @@ def metrics() -> dict:
         "causal_bridge_bias_nonzero": True,
         "causal_bridge_bias_max": 0.04980469,
         "conditioned_generated_tokens": 1,
+        "peak_allocated_vram_gib": 14.5,
+        "peak_reserved_vram_gib": 14.856,
         "peak_vram_gib": 14.856,
         "vram_limit_gib": 16.7,
         "finite": True,
@@ -91,6 +93,7 @@ def main() -> int:
     sequence += 1
     result = metrics()
     if mode == "over_vram":
+        result["peak_reserved_vram_gib"] = 17.0
         result["peak_vram_gib"] = 17.0
     if mode == "high_residual":
         result["transition_residual"] = 0.005001

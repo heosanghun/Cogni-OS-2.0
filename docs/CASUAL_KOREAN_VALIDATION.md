@@ -6,8 +6,10 @@
 않는다. v0.3.1에서는 짧은 협업 제안과 후속 질문이 모델 후보 폐기 후 고정된
 `quality_fallback` 문구로 끝났지만, 기존 검증 corpus에는 이 사용 흐름이 없었다.
 
-`scripts/validate_agent_casual_korean.py`는 이 누락을 별도의 필수 게이트로 다룬다.
-규칙 기반 관측만 사용하며 또 다른 언어 모델로 답변을 채점하지 않는다.
+`scripts/validate_agent_casual_korean.py`는 이 누락을 재현하는 소스 수준 진단
+harness다. 규칙 기반 관측만 사용하며 또 다른 언어 모델로 답변을 채점하지 않는다.
+현재 릴리스에서 실제 실행 가능한 제품 게이트는 같은 범주를 포함한 통합 20턴
+`product-e4b-it-20` 하나뿐이다.
 
 ## 정확한 결함 재현
 
@@ -36,13 +38,11 @@
 
 ## 실행
 
-```powershell
-python scripts\validate_agent_casual_korean.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --timeout 120 `
-  --output C:\Project\cognios-evidence\casual-korean-v0.3.2.json
-```
+직접 실행은 `BLOCKED`다. E4B-it 전용 guard profile은 구현되어 있지만 이 10턴
+validator argv는 의도적으로 guarded `run` allowlist에 넣지 않았다. 더 작은 진단
+corpus가 제품 릴리스 증거로 오인되는 것을 막기 위해서다. `docker-argv`는 명령 모양만
+검사하며 실행이나 증거 생성을 하지 않는다. 현재 scope의 제품 대화 증거는
+`docs/VALIDATION.md`에 적힌 통합 exact-20 명령으로만 생성한다.
 
 증거 JSON은 소스 트리 밖에 원자적으로 기록한다. 제품 대화용 E4B-it 모델과
 manifest의 일곱 파일은 로드 전에 검증되며, 네트워크를 사용하지 않는다. pretrained
@@ -65,8 +65,9 @@ base 체크포인트는 이 제품 대화 게이트의 입력으로 허용하지
 10. 종료 시 모델 워커와 GPU lease가 모두 정리된다.
 
 단어 다양성과 키워드는 퇴행을 잡기 위한 결정론적 하한이지, 주관적인 답변 품질
-점수나 사실성 인증이 아니다. 릴리스 승인은 이 게이트와 기존 completion stress,
-전체 회귀 테스트, 실제 UI HTTP 경로 검증을 함께 요구한다.
+점수나 사실성 인증이 아니다. 이 합격 조건은 진단 코드 자체의 계약이다. 릴리스
+승인은 이 harness를 별도로 실행해서 얻지 않으며, 같은 회귀 범주를 포함한 통합
+exact-20 결과와 전체 회귀 테스트, 실제 UI HTTP 경로 검증을 함께 요구한다.
 
 ## UI 표시 원칙
 

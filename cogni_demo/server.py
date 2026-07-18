@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,7 +29,7 @@ import signal
 import stat
 import subprocess
 import sys
-from threading import Condition, Event, RLock, Thread
+from threading import Condition, Event, RLock, Thread, get_ident
 from time import monotonic, sleep
 from typing import Any, BinaryIO
 from urllib.parse import parse_qs, urlsplit
@@ -52,7 +53,6 @@ from cogni_demo.workspace_capabilities import (
     WorkspaceCapabilityService,
     web_policy_from_environment,
 )
-from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError
 from cogni_agent.tools import (
     MAX_PROJECT_COMMAND_BYTES,
     ToolPolicyError,
@@ -102,9 +102,72 @@ READ_CHUNK_BYTES = 4096
 MAX_ASSET_BYTES = 2 * 1024 * 1024
 DEFAULT_PORT = 8765
 DEFAULT_WATCHDOG_SECONDS = 60.0
+COMPONENT_SHUTDOWN_WAIT_SECONDS = 45.0
+SERVER_GPU_IDENTITY_PROBE_TIMEOUT_SECONDS = 45.0
 MAX_SESSION_BYTES = 4096
 SESSION_VERSION = 1
 SERVICE_MARKER = "cogniboard"
+DESKTOP_VALIDATION_PROFILE = "desktop-ui-only"
+SERVER_GPU5_VALIDATION_PROFILE = "server-gpu5-native"
+SERVER_VALIDATION_PHYSICAL_GPU_INDEX = 5
+SERVER_VALIDATION_GPU_QUERY_CONTEXT = "native-host"
+SERVER_VALIDATION_GPU_UUID = "GPU-84d7eeb0-65e0-a5b1-d7db-d09ef59fe03a"
+_EXPECTED_SOURCE_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+_NATIVE_GPU5_LIFECYCLE_ERROR_MESSAGE = (
+    "native GPU5 server lifecycle reported multiple failures"
+)
+_NATIVE_GPU5_LIFECYCLE_TOKEN = object()
+
+_SERVER_VALIDATION_ENVIRONMENT = {
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "CUDA_VISIBLE_DEVICES": SERVER_VALIDATION_GPU_UUID,
+    "NVIDIA_VISIBLE_DEVICES": SERVER_VALIDATION_GPU_UUID,
+}
+_SERVER_REJECTED_PARENT_ENVIRONMENT = frozenset(
+    {
+        "LD_PRELOAD",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+    }
+)
+_SERVER_CHILD_REMOVED_ENVIRONMENT = frozenset(
+    {
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+    }
+)
+_SERVER_CHILD_FIXED_ENVIRONMENT = {
+    "LD_PRELOAD": "",
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONHASHSEED": "0",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONPATH": "/nonexistent-cogniboard-pythonpath",
+    "PYTHONSAFEPATH": "1",
+}
+
+_SERVER_IDENTITY_PROBE_FIXED_ENVIRONMENT = {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "HF_HUB_OFFLINE": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "HF_DATASETS_OFFLINE": "1",
+    "WANDB_MODE": "offline",
+    "TOKENIZERS_PARALLELISM": "false",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONHASHSEED": "0",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONSAFEPATH": "1",
+    "COGNI_OS_GPU_UUID": SERVER_VALIDATION_GPU_UUID,
+    **_SERVER_VALIDATION_ENVIRONMENT,
+}
 
 _RAG_SOURCE_RESPONSE_KEYS = frozenset(
     {
@@ -157,6 +220,8 @@ INITIAL_METRICS: dict[str, Any] = {
     "evidence_kind": "unverified",
     "measured_at": None,
     "source": None,
+    "peak_allocated_vram_gib": None,
+    "peak_reserved_vram_gib": None,
     "peak_vram_gib": None,
     "vram_limit_gib": None,
     "requested_depth": None,
@@ -323,6 +388,72 @@ class WorkerTerminationError(DemoServerError):
     """Raised when a validation worker cannot be proven dead within bounds."""
 
 
+class _ComponentShutdownState(Enum):
+    IDLE = "idle"
+    RUNNING = "running"
+    DONE = "done"
+
+
+class GPUExecutionBoundaryError(DemoServerError):
+    """Raised when live model validation lacks an exact server GPU boundary."""
+
+
+_CLEANUP_ERROR_MESSAGE = "CogniBoard cleanup reported multiple failures"
+
+
+def _append_cleanup_failure(
+    failures: list[BaseException], error: BaseException
+) -> None:
+    """Flatten only groups produced by this helper while preserving order."""
+
+    if (
+        isinstance(error, BaseExceptionGroup)
+        and error.message == _CLEANUP_ERROR_MESSAGE
+    ):
+        for nested in error.exceptions:
+            _append_cleanup_failure(failures, nested)
+        return
+    failures.append(error)
+
+
+def _run_best_effort_cleanup(
+    callbacks: Sequence[Callable[[], object]],
+    *,
+    primary: BaseException | None = None,
+) -> None:
+    """Run every cleanup step and retain every failure in execution order."""
+
+    failures: list[BaseException] = []
+    if primary is not None:
+        failures.append(primary)
+    for callback in callbacks:
+        try:
+            callback()
+        except BaseException as error:
+            _append_cleanup_failure(failures, error)
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup(_CLEANUP_ERROR_MESSAGE, failures)
+
+
+def _shutdown_product_components(
+    manager: object,
+    evolution_manager: object | None,
+    agent_manager: object | None,
+    *,
+    primary: BaseException | None = None,
+) -> None:
+    """Shut down validation, evolution, and resident-model owners independently."""
+
+    callbacks: list[Callable[[], object]] = []
+    for component in (manager, evolution_manager, agent_manager):
+        shutdown = getattr(component, "shutdown", None)
+        if callable(shutdown):
+            callbacks.append(shutdown)
+    _run_best_effort_cleanup(callbacks, primary=primary)
+
+
 class EvolutionAlreadyRunningError(DemoServerError):
     pass
 
@@ -354,6 +485,76 @@ class WorkerLaunch:
     command: tuple[str, ...]
     cwd: Path
     environment: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class GPUExecutionBoundary:
+    """Explicit authority for a native-host live validation subprocess.
+
+    The Windows appliance may start in ``desktop-ui-only`` mode without this
+    authority.  In that mode conversation and other local UI features remain
+    available, while a live hardware-validation request fails before Popen.
+    """
+
+    physical_gpu_index: int
+    gpu_query_context: str
+    gpu_uuid: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.physical_gpu_index) is not int
+            or self.physical_gpu_index != SERVER_VALIDATION_PHYSICAL_GPU_INDEX
+        ):
+            raise GPUExecutionBoundaryError(
+                "server validation physical GPU index is not the pinned project index"
+            )
+        if self.gpu_query_context != SERVER_VALIDATION_GPU_QUERY_CONTEXT:
+            raise GPUExecutionBoundaryError(
+                "the direct product worker requires the native-host query context"
+            )
+        if self.gpu_uuid != SERVER_VALIDATION_GPU_UUID:
+            raise GPUExecutionBoundaryError(
+                "server validation GPU UUID does not match the pinned project device"
+            )
+
+    def require_native_environment(self, environment: Mapping[str, str]) -> None:
+        """Reject a server process that was not isolated before Python started."""
+
+        for name, expected in _SERVER_VALIDATION_ENVIRONMENT.items():
+            if environment.get(name) != expected:
+                raise GPUExecutionBoundaryError(
+                    f"server validation requires exact pre-start environment: {name}"
+                )
+        for name in _SERVER_REJECTED_PARENT_ENVIRONMENT:
+            if environment.get(name):
+                raise GPUExecutionBoundaryError(
+                    f"server validation rejects pre-start environment: {name}"
+                )
+
+    def child_environment(self, environment: Mapping[str, str]) -> dict[str, str]:
+        """Return the exact inherited child environment, rejecting conflicts."""
+
+        child = dict(environment)
+        for name, expected in _SERVER_VALIDATION_ENVIRONMENT.items():
+            configured = child.get(name)
+            if configured is not None and configured != expected:
+                raise GPUExecutionBoundaryError(
+                    f"conflicting server validation environment: {name}"
+                )
+            child[name] = expected
+        for name in _SERVER_CHILD_REMOVED_ENVIRONMENT:
+            child.pop(name, None)
+        child.update(_SERVER_CHILD_FIXED_ENVIRONMENT)
+        return child
+
+    @property
+    def validator_arguments(self) -> tuple[str, ...]:
+        return (
+            "--physical-gpu-index",
+            str(self.physical_gpu_index),
+            "--gpu-query-context",
+            self.gpu_query_context,
+        )
 
 
 LaunchFactory = Callable[[str], WorkerLaunch]
@@ -618,14 +819,64 @@ def open_graphical_app(url: str) -> str:
     return "browser"
 
 
+def _validated_python_invocation_path(value: str | Path) -> str:
+    """Validate a lexical interpreter path without dereferencing a venv link."""
+
+    raw = os.fspath(value)
+    if not isinstance(raw, str):
+        raise TypeError("python_executable must be a text path")
+    if (
+        not raw
+        or len(raw) > 4096
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    ):
+        raise ValueError("python_executable contains an invalid path")
+    if not Path(raw).is_absolute():
+        raise ValueError("python_executable must be an absolute path")
+    if os.path.normpath(raw) != raw:
+        raise ValueError("python_executable must be lexically normalized")
+    invocation = Path(raw)
+    if not invocation.is_file():
+        raise ValueError("python_executable must name an existing file")
+    if os.name != "nt" and not os.access(raw, os.X_OK):
+        raise ValueError("python_executable is not executable")
+    # Returning the trusted lexical name is intentional. Resolving a venv
+    # ``bin/python`` symlink would silently select its base interpreter.
+    return raw
+
+
+def _identity_probe_environment(boundary: GPUExecutionBoundary) -> dict[str, str]:
+    """Build the exact, closed-world environment for the identity child."""
+
+    if not isinstance(boundary, GPUExecutionBoundary):
+        raise TypeError("boundary must be GPUExecutionBoundary")
+    home = os.environ.get("HOME", "")
+    if (
+        not home.startswith("/")
+        or len(home) > 4096
+        or any(ord(character) < 32 or ord(character) == 127 for character in home)
+    ):
+        raise GPUExecutionBoundaryError("identity probe HOME is invalid")
+    environment = dict(_SERVER_IDENTITY_PROBE_FIXED_ENVIRONMENT)
+    environment["HOME"] = home
+    boundary.require_native_environment(environment)
+    return environment
+
+
 def production_launch_factory(
     project_root: str | Path,
     model_directory: str | Path,
     manifest: str | Path,
     *,
     python_executable: str | Path = sys.executable,
+    gpu_boundary: GPUExecutionBoundary | None = None,
 ) -> LaunchFactory:
-    """Create the fixed, shell-free command for the sole CUDA owner."""
+    """Create the fixed, shell-free command for the sole CUDA owner.
+
+    A desktop appliance may construct the factory without a server boundary so
+    the UI and conversation runtime remain available.  The returned callable
+    then rejects live hardware validation before a child process is spawned.
+    """
 
     root = Path(project_root).resolve(strict=True)
     worker = (root / "scripts" / "validate_gemma4_runtime.py").resolve(strict=True)
@@ -633,11 +884,21 @@ def production_launch_factory(
     manifest_path = Path(manifest).resolve(strict=True)
     if not root.is_dir() or not model.is_dir() or not manifest_path.is_file():
         raise ValueError("production demo paths are incomplete")
-    executable = str(Path(python_executable).resolve(strict=True))
+    executable = _validated_python_invocation_path(python_executable)
+    if gpu_boundary is not None:
+        if not isinstance(gpu_boundary, GPUExecutionBoundary):
+            raise TypeError("gpu_boundary must be GPUExecutionBoundary or None")
+        gpu_boundary.require_native_environment(os.environ)
 
     def build(prompt: str) -> WorkerLaunch:
+        if gpu_boundary is None:
+            raise GPUExecutionBoundaryError(
+                "live model validation is disabled in the desktop-ui-only profile"
+            )
         command = [
             executable,
+            "-I",
+            "-B",
             "-u",
             str(worker),
             "--model",
@@ -650,9 +911,10 @@ def production_launch_factory(
             "512",
             "--event-stream",
         ]
+        command.extend(gpu_boundary.validator_arguments)
         if prompt:
             command.extend(("--prompt", prompt))
-        environment = os.environ.copy()
+        environment = gpu_boundary.child_environment(os.environ)
         environment.update(
             {
                 "HF_HUB_OFFLINE": "1",
@@ -1628,13 +1890,16 @@ class DemoHTTPServer(ThreadingHTTPServer):
             None if watchdog_timeout is None else float(watchdog_timeout)
         )
         self._lifecycle_lock = RLock()
+        self._component_shutdown_condition = Condition(self._lifecycle_lock)
         self._compute_lock = RLock()
         self._watchdog_stop = Event()
         self._watchdog_thread: Thread | None = None
         self._last_state_poll = monotonic()
         self._shutdown_requested = False
-        self._components_shutdown = False
-        self._components_shutdown_in_progress = False
+        self._transport_shutdown_thread: Thread | None = None
+        self._component_shutdown_state = _ComponentShutdownState.IDLE
+        self._components_shutdown_owner: int | None = None
+        self._components_shutdown_error: BaseException | None = None
         self.manager.availability_check = self._validation_compute_available
         if self.agent_manager is not None and hasattr(
             self.agent_manager, "availability_check"
@@ -1834,8 +2099,9 @@ class DemoHTTPServer(ThreadingHTTPServer):
             return self.evolution_manager.start()
 
     def _require_admission_open(self) -> None:
-        if self._shutdown_requested or self._components_shutdown:
-            raise ComputeBusyError("local compute is shutting down")
+        with self._lifecycle_lock:
+            if self._shutdown_requested:
+                raise ComputeBusyError("local compute is shutting down")
 
     def _agent_active(self) -> bool:
         return bool(
@@ -1859,53 +2125,119 @@ class DemoHTTPServer(ThreadingHTTPServer):
         return not self.manager.is_active and not self._agent_active()
 
     def request_shutdown(self) -> None:
-        with self._lifecycle_lock:
-            if self._shutdown_requested:
-                return
+        """Close admission immediately and trigger transport shutdown once."""
+
+        with self._component_shutdown_condition:
             self._shutdown_requested = True
             self._watchdog_stop.set()
+            if self._transport_shutdown_thread is not None:
+                return
 
-        def stop() -> None:
+            def stop() -> None:
+                _run_best_effort_cleanup((self.shutdown_components, self.shutdown))
+
+            thread = Thread(
+                target=stop,
+                name="cogni-demo-shutdown",
+                daemon=True,
+            )
+            self._transport_shutdown_thread = thread
             try:
-                self.shutdown_components()
-            finally:
-                self.shutdown()
-
-        Thread(target=stop, name="cogni-demo-shutdown", daemon=True).start()
+                # Publish and start under one short lifecycle critical section.
+                # The child only waits for this lock; it never owns compute yet.
+                thread.start()
+            except BaseException:
+                # Admission stays closed, but a later request may retry transport.
+                self._transport_shutdown_thread = None
+                raise
 
     def server_close(self) -> None:
         self._watchdog_stop.set()
-        try:
-            self.shutdown_components()
-        finally:
-            super().server_close()
+        close_transport = super().server_close
+        _run_best_effort_cleanup((self.shutdown_components, close_transport))
 
-    def shutdown_components(self) -> None:
-        with self._lifecycle_lock:
-            if self._components_shutdown:
-                return
-            if self._components_shutdown_in_progress:
-                return
-            self._components_shutdown_in_progress = True
+    def shutdown_components(
+        self,
+        *,
+        wait_timeout: float = COMPONENT_SHUTDOWN_WAIT_SECONDS,
+    ) -> None:
+        """Run component cleanup once; concurrent callers await the same result."""
+
+        if (
+            isinstance(wait_timeout, bool)
+            or not 0.0 < float(wait_timeout) <= COMPONENT_SHUTDOWN_WAIT_SECONDS
+        ):
+            raise ValueError("component shutdown wait_timeout is outside its bound")
+        caller = get_ident()
+        deadline = monotonic() + float(wait_timeout)
+        owns_cleanup = False
+        must_wait = False
+        # Admission closes before the compute fence. Never hold lifecycle while
+        # acquiring compute: admitted starts briefly take lifecycle while they
+        # already own compute, so reversing that order would deadlock.
+        with self._component_shutdown_condition:
             self._shutdown_requested = True
             self._watchdog_stop.set()
+            if self._component_shutdown_state is _ComponentShutdownState.DONE:
+                failure = self._components_shutdown_error
+            elif self._component_shutdown_state is _ComponentShutdownState.RUNNING:
+                if self._components_shutdown_owner == caller:
+                    return
+                failure = None
+                must_wait = True
+            else:
+                self._component_shutdown_state = _ComponentShutdownState.RUNNING
+                self._components_shutdown_owner = caller
+                failure = None
+                owns_cleanup = True
+
+        if must_wait:
+            with self._component_shutdown_condition:
+                while (
+                    self._component_shutdown_state is not _ComponentShutdownState.DONE
+                ):
+                    remaining = deadline - monotonic()
+                    if remaining <= 0.0:
+                        raise WorkerTerminationError(
+                            "component shutdown did not complete within its wait bound"
+                        )
+                    self._component_shutdown_condition.wait(timeout=remaining)
+                failure = self._components_shutdown_error
+
+        if not owns_cleanup:
+            if failure is not None:
+                raise failure
+            return
+
+        acquired_compute = False
         try:
-            self.manager.shutdown()
-            if self.evolution_manager is not None:
-                shutdown = getattr(self.evolution_manager, "shutdown", None)
-                if callable(shutdown):
-                    shutdown()
-            if self.agent_manager is not None:
-                shutdown = getattr(self.agent_manager, "shutdown", None)
-                if callable(shutdown):
-                    shutdown()
-        except BaseException:
-            with self._lifecycle_lock:
-                self._components_shutdown_in_progress = False
-            raise
-        with self._lifecycle_lock:
-            self._components_shutdown = True
-            self._components_shutdown_in_progress = False
+            remaining = deadline - monotonic()
+            if remaining <= 0.0 or not self._compute_lock.acquire(timeout=remaining):
+                raise WorkerTerminationError(
+                    "component shutdown could not acquire compute within its wait bound"
+                )
+            acquired_compute = True
+            # This acquire/release is a quiescence fence. Admission is closed,
+            # so callbacks may safely re-enter shutdown after it is released.
+            self._compute_lock.release()
+            acquired_compute = False
+            _shutdown_product_components(
+                self.manager,
+                self.evolution_manager,
+                self.agent_manager,
+            )
+        except BaseException as error:
+            failure = error
+        finally:
+            if acquired_compute:
+                self._compute_lock.release()
+            with self._component_shutdown_condition:
+                self._components_shutdown_error = failure
+                self._component_shutdown_state = _ComponentShutdownState.DONE
+                self._components_shutdown_owner = None
+                self._component_shutdown_condition.notify_all()
+        if failure is not None:
+            raise failure
 
 
 class DemoRequestHandler(BaseHTTPRequestHandler):
@@ -2140,6 +2472,8 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
         self._send(HTTPStatus.OK, resolved.read_bytes(), content_type)
 
     def do_POST(self) -> None:  # noqa: N802
+        from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError
+
         if not self._valid_host():
             self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_HOST")
             return
@@ -2899,12 +3233,12 @@ def _build_product_controls(
         )
         agent.workspace_capability_service = workspace_capabilities
         return agent, evolution
-    except BaseException:
-        try:
-            harness.stop()
-        finally:
-            service.stop()
-        raise
+    except BaseException as error:
+        _run_best_effort_cleanup(
+            (harness.stop, service.stop),
+            primary=error,
+        )
+        raise AssertionError("unreachable cleanup path")
 
 
 def _build_local_voice_service(
@@ -2950,8 +3284,363 @@ def _build_local_voice_service(
     )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m cogni_demo.server")
+def _validation_boundary_from_arguments(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> GPUExecutionBoundary | None:
+    """Translate an explicit launch profile into live-validation authority."""
+
+    boundary_values = (
+        args.validation_physical_gpu_index,
+        args.validation_gpu_query_context,
+        args.validation_gpu_uuid,
+        args.expected_source_commit,
+        args.native_snapshot_stage,
+        args.native_source_snapshot_root,
+        args.native_source_snapshot_nonce,
+        args.native_workspace_root,
+        args.native_source_content_digest,
+        args.native_source_identity_digest,
+        args.native_source_file_count,
+        args.native_source_root_device,
+        args.native_source_root_inode,
+        args.native_model_snapshot_root,
+        args.native_model_manifest_sha256,
+        args.native_model_content_digest,
+        args.native_model_identity_digest,
+        args.native_model_file_count,
+        args.native_model_root_device,
+        args.native_model_root_inode,
+        args.native_model_total_bytes,
+    )
+    if args.validation_profile == DESKTOP_VALIDATION_PROFILE:
+        if any(value is not None for value in boundary_values):
+            parser.error(
+                "desktop-ui-only does not accept server GPU boundary arguments"
+            )
+        if not _is_windows_desktop_platform():
+            parser.error(
+                "desktop-ui-only is restricted to the Windows appliance; "
+                "the Linux server requires an explicit GPU5 validation profile"
+            )
+        return None
+
+    if any(value is None for value in boundary_values[:3]):
+        parser.error(
+            "server-gpu5-native requires physical index, query context, and UUID"
+        )
+    if (
+        not isinstance(args.expected_source_commit, str)
+        or _EXPECTED_SOURCE_COMMIT.fullmatch(args.expected_source_commit) is None
+    ):
+        parser.error("server-gpu5-native requires an exact lowercase source commit")
+    if (
+        args.native_snapshot_stage != "sealed"
+        or not isinstance(args.native_source_snapshot_root, str)
+        or not isinstance(args.native_source_snapshot_nonce, str)
+        or re.fullmatch(r"[0-9a-f]{32}", args.native_source_snapshot_nonce) is None
+        or not isinstance(args.native_workspace_root, str)
+        or not isinstance(args.native_source_content_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", args.native_source_content_digest) is None
+        or not isinstance(args.native_source_identity_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", args.native_source_identity_digest) is None
+        or not isinstance(args.native_source_file_count, int)
+        or not 1 <= args.native_source_file_count <= 1_000_000
+        or not isinstance(args.native_source_root_device, int)
+        or not 0 <= args.native_source_root_device <= (2**64) - 1
+        or not isinstance(args.native_source_root_inode, int)
+        or not 1 <= args.native_source_root_inode <= (2**64) - 1
+        or not isinstance(args.native_model_snapshot_root, str)
+        or not isinstance(args.native_model_manifest_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", args.native_model_manifest_sha256) is None
+        or not isinstance(args.native_model_content_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", args.native_model_content_digest) is None
+        or not isinstance(args.native_model_identity_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", args.native_model_identity_digest) is None
+        or not isinstance(args.native_model_file_count, int)
+        or not 1 <= args.native_model_file_count <= 1_000_000
+        or not isinstance(args.native_model_root_device, int)
+        or not 0 <= args.native_model_root_device <= (2**64) - 1
+        or not isinstance(args.native_model_root_inode, int)
+        or not 1 <= args.native_model_root_inode <= (2**64) - 1
+        or not isinstance(args.native_model_total_bytes, int)
+        or not 1 <= args.native_model_total_bytes <= 96 * 1024 * 1024 * 1024
+    ):
+        parser.error("server-gpu5-native requires sealed source/model capabilities")
+    try:
+        boundary = GPUExecutionBoundary(
+            physical_gpu_index=args.validation_physical_gpu_index,
+            gpu_query_context=args.validation_gpu_query_context,
+            gpu_uuid=args.validation_gpu_uuid,
+        )
+        # The product process also owns a resident model service.  Its native
+        # visibility must therefore be fixed before this Python process starts,
+        # not only on the later validation child.
+        boundary.require_native_environment(os.environ)
+        _require_isolated_server_python()
+    except GPUExecutionBoundaryError as error:
+        parser.error(str(error))
+    return boundary
+
+
+def _is_windows_desktop_platform() -> bool:
+    return os.name == "nt"
+
+
+def _require_isolated_server_python() -> None:
+    """Require startup flags that cannot be made effective after import time."""
+
+    if (
+        sys.flags.isolated != 1
+        or sys.flags.dont_write_bytecode != 1
+        or sys.flags.no_user_site != 1
+        or sys.flags.safe_path is not True
+    ):
+        raise GPUExecutionBoundaryError(
+            "server-gpu5-native must start Python with -I -B"
+        )
+
+
+def _preflight_server_gpu_idle(boundary: GPUExecutionBoundary) -> None:
+    """Reprove physical GPU5 idle/no-PID before any CUDA-capable probe."""
+
+    if not isinstance(boundary, GPUExecutionBoundary):
+        raise TypeError("boundary must be GPUExecutionBoundary")
+    from scripts.gpu5_boundary_guard import (
+        GPU5BoundaryError,
+        assert_gpu5_idle,
+        preflight_gpu5,
+    )
+
+    try:
+        snapshot = preflight_gpu5()
+        assert_gpu5_idle(snapshot)
+        if (
+            snapshot.physical_index != boundary.physical_gpu_index
+            or snapshot.uuid != boundary.gpu_uuid
+        ):
+            raise GPU5BoundaryError(
+                "native server idle snapshot returned an invalid GPU5 scope"
+            )
+    except (AttributeError, GPU5BoundaryError, TypeError, ValueError) as error:
+        raise GPUExecutionBoundaryError(
+            "native server requires an idle, process-free physical GPU5"
+        ) from error
+
+
+def _preflight_server_gpu_identity(boundary: GPUExecutionBoundary) -> None:
+    """Run logical identity in a bounded child; the parent never imports torch."""
+
+    if not isinstance(boundary, GPUExecutionBoundary):
+        raise TypeError("boundary must be GPUExecutionBoundary")
+    project_root = Path(__file__).resolve().parents[1]
+    probe = (project_root / "scripts" / "probe_native_gpu5_identity.py").resolve(
+        strict=True
+    )
+    if not probe.is_file() or not probe.is_relative_to(project_root):
+        raise GPUExecutionBoundaryError(
+            "resident model GPU identity probe escaped the source checkout"
+        )
+    executable = _validated_python_invocation_path(sys.executable)
+    command = (
+        executable,
+        "-I",
+        "-B",
+        os.fspath(probe),
+        "--physical-gpu-index",
+        str(boundary.physical_gpu_index),
+        "--gpu-query-context",
+        boundary.gpu_query_context,
+        "--gpu-uuid",
+        boundary.gpu_uuid,
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=os.fspath(project_root),
+            env=_identity_probe_environment(boundary),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            close_fds=True,
+            check=False,
+            timeout=SERVER_GPU_IDENTITY_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GPUExecutionBoundaryError(
+            "resident model GPU identity child did not terminate cleanly"
+        ) from error
+    if completed.returncode != 0:
+        raise GPUExecutionBoundaryError(
+            "resident model GPU identity/logical-device child rejected startup"
+        )
+
+
+def _postflight_server_gpu_absence(boundary: GPUExecutionBoundary) -> None:
+    """Prove the exact physical GPU5 is idle after every product cleanup."""
+
+    from scripts.gpu5_boundary_guard import (
+        GPU5BoundaryError,
+        assert_gpu5_idle,
+        preflight_gpu5,
+    )
+
+    try:
+        snapshot = preflight_gpu5()
+        assert_gpu5_idle(snapshot)
+        if (
+            snapshot.physical_index != boundary.physical_gpu_index
+            or snapshot.uuid != boundary.gpu_uuid
+        ):
+            raise GPU5BoundaryError(
+                "native server postflight returned an invalid GPU5 scope"
+            )
+    except (AttributeError, GPU5BoundaryError, TypeError, ValueError) as error:
+        raise GPUExecutionBoundaryError(
+            "native server could not prove post-cleanup GPU5 absence"
+        ) from error
+
+
+@contextmanager
+def _native_gpu5_server_lifecycle(
+    boundary: GPUExecutionBoundary,
+    expected_source_commit: str,
+    authority: object,
+    *,
+    source_snapshot_root: str,
+    source_snapshot_nonce: str,
+    workspace_root: str,
+    source_content_digest: str,
+    source_identity_digest: str,
+    source_file_count: int,
+    source_root_device: int,
+    source_root_inode: int,
+    model_snapshot_root: str,
+    model_manifest_path: str,
+    model_manifest_sha256: str,
+    model_content_digest: str,
+    model_identity_digest: str,
+    model_file_count: int,
+    model_root_device: int,
+    model_root_inode: int,
+    model_total_bytes: int,
+) -> Iterator[None]:
+    """Consume the pre-import authority and retain poison on uncertainty."""
+
+    if not isinstance(boundary, GPUExecutionBoundary):
+        raise TypeError("boundary must be GPUExecutionBoundary")
+    if (
+        not isinstance(expected_source_commit, str)
+        or _EXPECTED_SOURCE_COMMIT.fullmatch(expected_source_commit) is None
+    ):
+        raise GPUExecutionBoundaryError(
+            "server-gpu5-native requires an exact lowercase source commit"
+        )
+
+    from scripts.gpu5_boundary_guard import (
+        GPU5BoundaryError,
+        NativeGPU5ServerAuthority,
+        verify_native_execution_snapshot,
+    )
+
+    if not isinstance(authority, NativeGPU5ServerAuthority):
+        raise GPUExecutionBoundaryError(
+            "server-gpu5-native requires bootstrap-held GPU5 authority"
+        )
+    try:
+        authority.consume(
+            expected_source_commit=expected_source_commit,
+            physical_gpu_index=boundary.physical_gpu_index,
+            gpu_query_context=boundary.gpu_query_context,
+            gpu_uuid=boundary.gpu_uuid,
+            source_snapshot_root=source_snapshot_root,
+            source_snapshot_nonce=source_snapshot_nonce,
+            workspace_root=workspace_root,
+            source_content_digest=source_content_digest,
+            source_identity_digest=source_identity_digest,
+            source_file_count=source_file_count,
+            source_root_device=source_root_device,
+            source_root_inode=source_root_inode,
+            model_snapshot_root=model_snapshot_root,
+            model_manifest_path=model_manifest_path,
+            model_manifest_sha256=model_manifest_sha256,
+            model_content_digest=model_content_digest,
+            model_identity_digest=model_identity_digest,
+            model_file_count=model_file_count,
+            model_root_device=model_root_device,
+            model_root_inode=model_root_inode,
+            model_total_bytes=model_total_bytes,
+        )
+        execution_snapshot_before = authority.execution_snapshot
+        if (
+            verify_native_execution_snapshot(execution_snapshot_before)
+            != execution_snapshot_before
+        ):
+            raise GPUExecutionBoundaryError(
+                "native server execution snapshot changed after early gate"
+            )
+        _preflight_server_gpu_idle(boundary)
+        authority.mark_launch_attempted()
+        primary: BaseException | None = None
+        try:
+            _preflight_server_gpu_identity(boundary)
+            # The short-lived probe may create a context. Prove it exited and
+            # released the physical device before parent product residency.
+            _preflight_server_gpu_idle(boundary)
+            yield
+        except BaseException as error:
+            primary = error
+
+        postflight_failures: list[BaseException] = []
+        try:
+            _postflight_server_gpu_absence(boundary)
+        except BaseException as error:
+            postflight_failures.append(error)
+        try:
+            execution_snapshot_after = verify_native_execution_snapshot(
+                execution_snapshot_before
+            )
+            if execution_snapshot_after != execution_snapshot_before:
+                raise GPUExecutionBoundaryError(
+                    "native server execution snapshot changed during residency"
+                )
+        except BaseException as error:
+            postflight_failures.append(error)
+
+        # The lifecycle cannot yet distinguish a harmless application error
+        # from a component/worker termination failure.  Releasing on either
+        # would create a late-child GPU acquisition race after an idle sample.
+        # Therefore only a fully normal product return plus both independent
+        # postflight proofs may clear the crash marker. Any primary error stays
+        # fail-closed for explicit operator review.
+        if primary is None and not postflight_failures:
+            authority.mark_safe_to_release()
+        failures = ([primary] if primary is not None else []) + postflight_failures
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup(
+                _NATIVE_GPU5_LIFECYCLE_ERROR_MESSAGE,
+                failures,
+            )
+    except GPU5BoundaryError as error:
+        raise GPUExecutionBoundaryError(
+            "native GPU5 host lease or source boundary rejected startup"
+        ) from error
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    native_gpu5_authority: object | None = None,
+    _native_lifecycle_token: object | None = None,
+) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python scripts/run_cogniboard_server.py",
+        allow_abbrev=False,
+    )
+    arguments = tuple(sys.argv[1:] if argv is None else argv)
     project_root = Path(__file__).resolve().parents[1]
     parser.add_argument(
         "--model",
@@ -2966,15 +3655,124 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--assets", default=str(project_root / "cogni_demo" / "static"))
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--no-browser", action="store_true")
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--validation-profile",
+        choices=(DESKTOP_VALIDATION_PROFILE, SERVER_GPU5_VALIDATION_PROFILE),
+        default=DESKTOP_VALIDATION_PROFILE,
+    )
+    parser.add_argument("--validation-physical-gpu-index", type=int)
+    parser.add_argument(
+        "--validation-gpu-query-context",
+        choices=(SERVER_VALIDATION_GPU_QUERY_CONTEXT,),
+    )
+    parser.add_argument("--validation-gpu-uuid")
+    parser.add_argument("--expected-source-commit")
+    parser.add_argument("--native-snapshot-stage", choices=("sealed",))
+    parser.add_argument("--native-source-snapshot-root")
+    parser.add_argument("--native-source-snapshot-nonce")
+    parser.add_argument("--native-workspace-root")
+    parser.add_argument("--native-source-content-digest")
+    parser.add_argument("--native-source-identity-digest")
+    parser.add_argument("--native-source-file-count", type=int)
+    parser.add_argument("--native-source-root-device", type=int)
+    parser.add_argument("--native-source-root-inode", type=int)
+    parser.add_argument("--native-model-snapshot-root")
+    parser.add_argument("--native-model-manifest-sha256")
+    parser.add_argument("--native-model-content-digest")
+    parser.add_argument("--native-model-identity-digest")
+    parser.add_argument("--native-model-file-count", type=int)
+    parser.add_argument("--native-model-root-device", type=int)
+    parser.add_argument("--native-model-root-inode", type=int)
+    parser.add_argument("--native-model-total-bytes", type=int)
+    args = parser.parse_args(arguments)
+    validation_boundary = _validation_boundary_from_arguments(parser, args)
 
     session_path = default_session_path()
     existing = find_live_session(session_path)
     if existing is not None:
+        if validation_boundary is not None:
+            parser.error(
+                "server-gpu5-native refuses to reuse an existing CogniBoard "
+                "session; stop the existing process before guarded startup"
+            )
         print(f"existing_demo_url=http://127.0.0.1:{existing.port}/", flush=True)
         if not args.no_browser:
             open_graphical_app(existing.bootstrap_url)
         return 0
+
+    if validation_boundary is None:
+        if native_gpu5_authority is not None or _native_lifecycle_token is not None:
+            raise GPUExecutionBoundaryError(
+                "desktop-ui-only rejects native GPU5 server authority"
+            )
+    elif native_gpu5_authority is None:
+        raise GPUExecutionBoundaryError(
+            "server-gpu5-native must start through run_cogniboard_server.py"
+        )
+    elif _native_lifecycle_token is not _NATIVE_GPU5_LIFECYCLE_TOKEN:
+        with _native_gpu5_server_lifecycle(
+            validation_boundary,
+            args.expected_source_commit,
+            native_gpu5_authority,
+            source_snapshot_root=args.native_source_snapshot_root,
+            source_snapshot_nonce=args.native_source_snapshot_nonce,
+            workspace_root=args.native_workspace_root,
+            source_content_digest=args.native_source_content_digest,
+            source_identity_digest=args.native_source_identity_digest,
+            source_file_count=args.native_source_file_count,
+            source_root_device=args.native_source_root_device,
+            source_root_inode=args.native_source_root_inode,
+            model_snapshot_root=args.native_model_snapshot_root,
+            model_manifest_path=args.manifest,
+            model_manifest_sha256=args.native_model_manifest_sha256,
+            model_content_digest=args.native_model_content_digest,
+            model_identity_digest=args.native_model_identity_digest,
+            model_file_count=args.native_model_file_count,
+            model_root_device=args.native_model_root_device,
+            model_root_inode=args.native_model_root_inode,
+            model_total_bytes=args.native_model_total_bytes,
+        ):
+            return main(
+                arguments,
+                native_gpu5_authority=native_gpu5_authority,
+                _native_lifecycle_token=_NATIVE_GPU5_LIFECYCLE_TOKEN,
+            )
+
+    if validation_boundary is not None:
+        from scripts.gpu5_boundary_guard import NativeGPU5ServerAuthority
+
+        if not isinstance(native_gpu5_authority, NativeGPU5ServerAuthority):
+            raise GPUExecutionBoundaryError(
+                "native server lost its execution snapshot authority"
+            )
+        execution_snapshot = native_gpu5_authority.execution_snapshot
+        try:
+            source_root = Path(execution_snapshot.source.root_path).resolve(strict=True)
+            model_root = Path(execution_snapshot.model.root_path).resolve(strict=True)
+            manifest_path = Path(execution_snapshot.manifest_path).resolve(strict=True)
+            workspace_root = Path(execution_snapshot.workspace_root).resolve(
+                strict=True
+            )
+            requested_model = Path(args.model).resolve(strict=True)
+            requested_manifest = Path(args.manifest).resolve(strict=True)
+            requested_assets = Path(args.assets).resolve(strict=True)
+        except OSError as error:
+            raise GPUExecutionBoundaryError(
+                "native execution snapshot paths are unavailable"
+            ) from error
+        if (
+            project_root != source_root
+            or requested_model != model_root
+            or requested_manifest != manifest_path
+            or manifest_path.parent.parent != source_root
+            or requested_assets != source_root / "cogni_demo" / "static"
+            or workspace_root == source_root
+            or source_root.is_relative_to(workspace_root)
+            or workspace_root.is_relative_to(source_root)
+        ):
+            raise GPUExecutionBoundaryError(
+                "native product paths differ from execution snapshot authority"
+            )
 
     # Validate the content-addressed CTS policy in the actual backend process
     # before binding HTTP or publishing session metadata. The native launcher
@@ -2986,11 +3784,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     gpu_lease_manager = GPULeaseManager()
     rhythm = RhythmController()
     manager = JobManager(
-        production_launch_factory(project_root, args.model, args.manifest),
+        production_launch_factory(
+            project_root,
+            args.model,
+            args.manifest,
+            gpu_boundary=validation_boundary,
+        ),
         gpu_lease_manager=gpu_lease_manager,
     )
     agent_manager, evolution_manager = _build_product_controls(
-        project_root,
+        (
+            project_root
+            if validation_boundary is None
+            else Path(native_gpu5_authority.execution_snapshot.workspace_root)
+        ),
         args.model,
         args.manifest,
         manager,
@@ -2998,11 +3805,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         rhythm=rhythm,
     )
     workspace_service = getattr(agent_manager, "workspace_capability_service", None)
-    voice_service = _build_local_voice_service(
-        args.model,
-        args.manifest,
-        agent_manager,
-    )
+    try:
+        voice_service = _build_local_voice_service(
+            args.model,
+            args.manifest,
+            agent_manager,
+        )
+    except BaseException as error:
+        _shutdown_product_components(
+            manager,
+            evolution_manager,
+            agent_manager,
+            primary=error,
+        )
+        raise AssertionError("unreachable cleanup path")
     try:
         server = DemoHTTPServer(
             manager,
@@ -3013,7 +3829,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             voice_service=voice_service,
             port=args.port,
         )
-    except OSError:
+    except OSError as error:
+        if validation_boundary is not None:
+            boundary_error = GPUExecutionBoundaryError(
+                "server-gpu5-native refuses session reuse after a bind conflict"
+            )
+            boundary_error.__cause__ = error
+            _shutdown_product_components(
+                manager,
+                evolution_manager,
+                agent_manager,
+                primary=boundary_error,
+            )
+            raise AssertionError("unreachable cleanup path")
         # A concurrent launcher may bind the fixed port just before publishing
         # its atomic session document. Wait briefly and reuse it; never start a
         # second control plane or CUDA worker.
@@ -3025,21 +3853,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"existing_demo_url=http://127.0.0.1:{existing.port}/",
                     flush=True,
                 )
+                _shutdown_product_components(
+                    manager,
+                    evolution_manager,
+                    agent_manager,
+                )
                 if not args.no_browser:
                     open_graphical_app(existing.bootstrap_url)
-                evolution_manager.shutdown()
-                agent_manager.shutdown()
-                manager.shutdown()
                 return 0
-        evolution_manager.shutdown()
-        agent_manager.shutdown()
-        manager.shutdown()
-        raise
-    except BaseException:
-        evolution_manager.shutdown()
-        agent_manager.shutdown()
-        manager.shutdown()
-        raise
+        _shutdown_product_components(
+            manager,
+            evolution_manager,
+            agent_manager,
+            primary=error,
+        )
+        raise AssertionError("unreachable cleanup path")
+    except BaseException as error:
+        _shutdown_product_components(
+            manager,
+            evolution_manager,
+            agent_manager,
+            primary=error,
+        )
+        raise AssertionError("unreachable cleanup path")
 
     metadata = SessionMetadata(
         os.getpid(),
@@ -3049,19 +3885,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     try:
         write_session_metadata(metadata, session_path)
-    except BaseException:
-        server.server_close()
-        raise
-    print(f"demo_url={server.origin}/", flush=True)
-    if not args.no_browser:
-        open_graphical_app(server.bootstrap_url)
+    except BaseException as error:
+        _run_best_effort_cleanup((server.server_close,), primary=error)
+        raise AssertionError("unreachable cleanup path")
+    cleanup_server = (
+        server.server_close,
+        lambda: remove_session_metadata(session_path, expected=metadata),
+    )
     try:
+        print(f"demo_url={server.origin}/", flush=True)
+        if not args.no_browser:
+            open_graphical_app(server.bootstrap_url)
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        remove_session_metadata(session_path, expected=metadata)
+        _run_best_effort_cleanup(cleanup_server)
+    except BaseException as error:
+        _run_best_effort_cleanup(cleanup_server, primary=error)
+        raise AssertionError("unreachable cleanup path")
+    else:
+        _run_best_effort_cleanup(cleanup_server)
     return 0
 
 
@@ -3071,6 +3913,8 @@ if __name__ == "__main__":
 
 __all__ = [
     "ComputeBusyError",
+    "GPUExecutionBoundary",
+    "GPUExecutionBoundaryError",
     "DemoHTTPServer",
     "DemoServerError",
     "EvolutionController",

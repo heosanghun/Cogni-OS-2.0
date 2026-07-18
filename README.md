@@ -28,7 +28,7 @@ passing component test never upgrades a capability by itself.
 | persistent attachments + PDF extraction | `local_verified_path` | only after explicit RAG/image selection | deployment-specific parser and corpus review |
 | AkasicDB RAG | `local_index_ready` when pinned clone verifies | yes, with bounded source provenance | semantic embedder and independent retrieval-quality benchmark |
 | Gemma image/audio tensor IPC | `bounded_runtime_path` | yes when the verified processor admits the modality | broad multimodal quality and combined-VRAM evidence |
-| local STT/TTS | `measured_smoke` on the development host | yes, after explicit user action | multi-speaker WER, noise, language, latency and accessibility study |
+| local STT/TTS | `historical_dev_host_observation`; current scope unverified | gated until current guarded evidence | GPU5-guarded current-scope run, multi-speaker WER, noise, language, latency and accessibility study |
 | Lens patent/scholarly search | `opt_in_gated` | only after explicit search/index action | token, terms acceptance, allowlist, live validation and distribution attribution review |
 
 The runtime Fact-book is the authority for the live process. Evidence records
@@ -72,28 +72,136 @@ python -m ruff check .
 python -m ruff format --check cogni_agent cogni_core cogni_demo cogni_flow cogni_os scripts tests
 ```
 
-Verify the actual local model and bounded depth-100 runtime:
+Start the ordinary Windows appliance with `Run-CogniOS-Demo.cmd`. Its only
+supported profile is `desktop-ui-only`: conversation and the rest of
+CogniBoard remain
+available, but the live hardware-validation button fails closed before Popen.
+The GPU5-only validator is a server evidence gate, not an implicit desktop
+capability.
 
-```powershell
-python scripts\validate_gemma4_runtime.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
+`Run-CogniOS-CLI.cmd` is a separate Windows CPU/static integrity diagnostic. It
+uses Python isolated mode to validate the machine-readable 170-item master
+acceptance ledger and parse the repository-anchored server bootstrap. It never
+loads the model, probes CUDA, invokes `nvidia-smi`, or claims live hardware
+evidence.
+
+On the designated Linux server, every GPU evidence run goes through the sole
+`gpu5_boundary_guard.py run` entry point.  Direct validator commands are not
+release evidence.  After the clean, exact-commit CPU Exit Gate, Stage G uses:
+
+```bash
+/usr/bin/python3 -I -B \
+  -X pycache_prefix=/home/shoon/.cognios-gpu5-guard/host-never-pycache \
+  scripts/gpu5_boundary_guard.py run \
+  --image cogni-os-dev@sha256:20aaf1d7cde8d6a504ba08f158a34a1907eac9413f3578acc4637f0a1b2ec8ba \
+  --expected-source-commit "$(git rev-parse HEAD)" \
+  --workdir /workspace \
+  --timeout 1800 \
+  --evidence-filename gpu5-runtime-v041.json \
+  -- -I -B /workspace/scripts/validate_gemma4_runtime.py \
+  --model /models/gemma4-e4b \
+  --manifest /workspace/config/gemma4-e4b.manifest.toml \
+  --physical-gpu-index 5 \
+  --gpu-query-context gpu5-container \
   --event-stream
 ```
 
-Run the recommended 20-turn completion stress and the natural Korean gate:
+The product `server-gpu5-native` profile is an operational path only after the
+CPU Exit Gate and Stage G approval.  Before any resident model is constructed,
+it rechecks the exact device identity and single logical-device scope.  Its
+Python process must start with `-I -B`, dangerous Python/loader environment
+variables unset, and the documented native visibility boundary:
 
-```powershell
-python scripts\validate_agent_completion.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --turns 20
-
-python scripts\validate_agent_casual_korean.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --timeout 120
+```bash
+export COGNI_OS_PYTHON=/verified/cognios-venv/bin/python
+export COGNI_OS_MODEL_DIR=/verified/local/gemma4-e4b-it
+./Run-CogniOS-Server-GPU5.sh
 ```
+
+The Linux operator launcher accepts no device selector from the caller. The
+model artifact and a Python 3.11+ environment are external prerequisites. A
+trusted parent process or service manager must start the launcher with the
+documented minimal environment. That is the pre-shebang trust boundary:
+loader variables such as `LD_AUDIT`/`LD_LIBRARY_PATH` and Bash startup hooks
+such as `BASH_ENV` can act before a shell script body can sanitize itself.
+
+As defense in depth, both the shebang and sanitized re-exec use privileged Bash
+mode (`bash -p`) so exported functions cannot shadow `exec`, `exit`, or
+`printf`; security-critical calls also select their Bash builtin explicitly.
+The script immediately re-executes itself through an exact `/usr/bin/env -i`
+environment and verifies that sanitized stage before it runs any repository or
+Python command. Git metadata reads also use a separate fixed environment that
+ignores system and global Git configuration. The
+optional `COGNI_OS_PYTHON` is a bounded absolute invocation path. The launcher
+preserves that path so a verified virtual environment keeps its `sys.prefix`,
+while separately resolving and checking the executable target's ownership and
+mode. The resolved target must be an operator-trusted ELF executable, and an
+exact isolated CPython 3.11+ runtime check requires `-I -B`,
+safe-path/no-user-site flags, the expected resolved `sys.executable`, and the
+live `/proc/self/exe` target. This rejects shell wrappers and accidental
+non-Python ELF executables such as `/usr/bin/true`; it is not cryptographic
+attestation of an arbitrary same-user ELF binary. The operator/service-manager
+trust boundary must protect that runtime. Defending against a malicious
+same-user ELF shim requires a separately committed executable digest or
+equivalent signed provenance.
+
+The final bootstrap is invoked through another exact `/usr/bin/env -i`
+allowlist. Loader, Bash, Git, proxy, credential and unrelated caller variables
+are not inherited. The launcher requires a clean exact 40-hex HEAD, installs
+the pinned UUID visibility environment, and passes that commit to the isolated
+server bootstrap. It performs no GPU query itself; the server acquires the
+shared host lease before its exact-index idle proof and identity check, holds
+it for the resident lifetime, and completes cleanup plus postflight before
+releasing it.
+
+Before the native product imports any repository module, the bootstrap creates
+private, quota-bounded source and model snapshots. Source files are copied from
+the clean expected commit; model files are streamed into separate inodes and
+checked against the closed-world manifest. The prepare process hands the
+sealed re-exec the source/model content digests, identity digests, file counts,
+root device/inode identities, and model byte count. The sealed process fully
+re-inventories those capabilities before acquiring GPU authority. Product
+imports and read-only model access use only the sealed roots; the original
+workspace remains a separate, non-overlapping writable capability for bounded
+outputs and reviewed Self-Harness proposals.
+
+This removes the ordinary verify-then-use window between the mutable checkout
+and resident execution, but it does not turn an unprivileged, same-UID process
+into a cryptographic trust anchor. A malicious process running as the exact
+service UID can change owner-controlled files or forge an unprivileged handoff.
+Production operation with that attacker in scope therefore requires a
+separately installed root-owned or otherwise immutable launcher/guard and
+snapshot handoff, plus a distinct unprivileged runtime UID. The laboratory
+workflow treats the dedicated service UID as trusted and fails closed on
+foreign ownership, symlinks, hard links, or group/world-writable path
+components. No native server or GPU evidence may be claimed when that
+deployment precondition is not satisfied.
+
+`server-gpu5-native`는 기존 CogniBoard 세션이나 포트 bind 경쟁 결과를 재사용하지
+않습니다. 데스크톱 세션을 먼저 종료한 뒤 새 guarded 프로세스로 시작해야 하며,
+그렇지 않으면 프로필·빌드·GPU 증거가 섞이지 않도록 실패 폐쇄합니다.
+
+Omitting or conflicting with any value does not silently fall back to another
+device.  A Linux server also rejects `desktop-ui-only`, because its resident
+conversation model would otherwise bypass the validation-only boundary.
+
+The guard now has two disjoint immutable artifact profiles. `base-canary`
+mounts only the pretrained research checkpoint; `product-e4b-it` mounts only
+the separately manifest-bound seven-file instruction artifact and accepts only
+the exact integrated 20-turn product command. This is implementation
+readiness, not measured evidence: the product Stage G gate remains `NOT RUN`
+until the clean frozen commit passes the CPU Exit Gate and then succeeds through
+the sole guarded GPU5 entry point. A GPU-bearing validator without a matching
+profile and exact argv allowlist is never run on the lab server.
+
+Its `cogni.agent.completion.stress.v2` memory evidence is one post-turn
+point-in-time sample for each expected resident-worker turn. It does not
+measure or certify within-turn peak, sustained usage, or whole-runtime VRAM
+release. Full-runtime peak evidence comes only from
+`validate_gemma4_runtime.py` and its `torch.cuda.max_memory_allocated`
+telemetry. The completion gate requires complete spot-sample coverage and fails
+on any observed sample above 16.7 GiB. Samples at or below that boundary are
+still point observations, not peak-VRAM certification.
 
 The pretrained base checkpoint at `C:\Project\cognios\gemma4-e4b` is retained
 only for explicit research/canary reproduction. It is not accepted as the
@@ -104,8 +212,10 @@ hysteresis mismatch from post-settling PCAS errors:
 
 ```powershell
 python scripts\benchmark_system4.py `
-  --device cuda --iterations 10000 --stress-switch --switch-block 32
+  --device cpu --iterations 10000 --stress-switch --switch-block 32
 ```
+
+This CPU command is a functional benchmark only, not GPU performance evidence.
 
 ## Local workspace, RAG, and multimodal input
 

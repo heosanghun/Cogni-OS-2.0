@@ -47,6 +47,8 @@ def valid_metrics() -> dict:
         "causal_bridge_bias_nonzero": True,
         "causal_bridge_bias_max": 0.04980469,
         "conditioned_generated_tokens": 1,
+        "peak_allocated_vram_gib": 14.5,
+        "peak_reserved_vram_gib": 14.856,
         "peak_vram_gib": 14.856,
         "vram_limit_gib": 16.7,
         "finite": True,
@@ -86,6 +88,21 @@ class TestDemoWorkerProtocol(unittest.TestCase):
         cases.append(bad)
         bad = valid_metrics()
         bad["peak_vram_gib"] = 16.8
+        cases.append(bad)
+        bad = valid_metrics()
+        bad["peak_allocated_vram_gib"] = 15.0
+        bad["peak_reserved_vram_gib"] = 14.9
+        bad["peak_vram_gib"] = 15.0
+        cases.append(bad)
+        bad = valid_metrics()
+        bad["peak_reserved_vram_gib"] = 16.8
+        bad["peak_vram_gib"] = 16.8
+        cases.append(bad)
+        bad = valid_metrics()
+        bad["peak_reserved_vram_gib"] = math.nan
+        cases.append(bad)
+        bad = valid_metrics()
+        bad["peak_vram_gib"] = 14.5
         cases.append(bad)
         bad = valid_metrics()
         bad["causal_bridge_answer_bearing"] = False

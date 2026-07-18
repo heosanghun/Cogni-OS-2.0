@@ -132,40 +132,22 @@ host-filesystem isolation, immutable image와 command digest가 독립 검증되
 
 ## 재현
 
+현재 소스의 비-GPU 계약은 다음 CPU 회귀로 재현한다.
+
 ```powershell
-python scripts\validate_agent_completion.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml
-
-python scripts\validate_agent_casual_korean.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --timeout 120 `
-  --output C:\Project\cognios-evidence\casual-korean-v0.4.0.json
-
-python -m scripts.validate_gemma4_local_voice `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --output C:\Project\cognios-evidence\local-voice-v0.4.0.json
-
-python -m scripts.validate_gemma4_local_image `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --output C:\Project\cognios-evidence\local-image-v0.4.0.json
-
-python scripts\validate_agent_runtime.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --prompt "사용자에게 자연스러운 한국어 한 문장으로 인사하세요." `
-  --max-new-tokens 64
+python -m pytest -q `
+  tests/test_agent_completion_stress.py `
+  tests/test_multimodal_processor.py `
+  tests/test_audio_worker_ipc.py `
+  tests/test_local_voice.py
 ```
 
-`validate_agent_runtime.py`는 채팅 직렬화·공개 응답 채널·종료 토큰·한 턴 품질
-계약과 작업자 정리를 확인하는 저수준 GPU smoke다. 전체 자연 대화 품질의 근거는
-별도의 10턴 casual gate와 20턴 completion stress 결과를 사용한다.
+completion·casual·runtime·voice·image의 직접 모델 실행 명령은 게시하지 않는다.
+현재 E4B-it instruction profile은 GPU5 guard allowlist, 모델 snapshot, 실행 전후
+물리 index/UUID 검사를 모두 결합한 전용 argv가 완성될 때까지 `BLOCKED`다. 서버
+GPU 검증의 단일 실행 지침은 `docs/VALIDATION.md`이며, guard 밖 직접 CUDA 실행은
+현재 scope 증거를 만들 수 없다.
 
-첫 명령은 네 번의 형식 중심 실제 오프라인 대화를 검사한다. 두 번째 명령은 보고된
-협업 대화 원문, 오타, 바꿔 말하기, 후속 질문과 문맥 전환을 포함한 10턴에서
-fallback 0회와 자연스러운 완결성을 검사한다. 어느 명령도 RTX 4090 인증을 대신하지
-않는다. 최신 scoped GPU 관측과 정확한 제한은
+과거 개발 장치의 대화·음성·이미지 결과는 비교용 historical observation일 뿐이다.
+어느 결과도 현재 커밋이나 RTX 4090 인증을 대신하지 않는다. 최신 scoped GPU 관측과 정확한 제한은
 [GEMMA4_VALIDATION.md](GEMMA4_VALIDATION.md)를 참고한다.

@@ -806,7 +806,9 @@ class TestCogniBoardUI(unittest.TestCase):
             'raw.target !== "RTX 4090 24GB"',
             "raw.transition_residual > 0.005",
             "raw.vram_limit_gib > MAX_LIVE_VRAM_LIMIT_GIB",
-            "raw.peak_vram_gib > raw.vram_limit_gib",
+            "raw.peak_reserved_vram_gib > raw.vram_limit_gib",
+            "raw.peak_reserved_vram_gib < raw.peak_allocated_vram_gib",
+            "raw.peak_vram_gib !== Math.max(",
             "resetLiveRuntimePresentation();",
             "setRuntimeStatus(status, state.stage, evidenceVerified)",
             'updateMetrics(liveMetrics, evidenceVerified ? "current" : "prior")',
@@ -988,6 +990,8 @@ assert.deepEqual(toasts, ["error", "success", "error"]);
             "causal_bridge_bias_nonzero": True,
             "causal_bridge_bias_max": 0.04980469,
             "conditioned_generated_tokens": 1,
+            "peak_allocated_vram_gib": 14.5,
+            "peak_reserved_vram_gib": 14.856,
             "peak_vram_gib": 14.856,
             "vram_limit_gib": 16.7,
             "finite": True,
@@ -1008,6 +1012,10 @@ assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, transition_residual: 0.00
 assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, transition_residual: Number.NaN }}), null);
 assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, peak_vram_gib: Number.POSITIVE_INFINITY }}), null);
 assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, peak_vram_gib: 16.8 }}), null);
+assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, peak_allocated_vram_gib: Number.NaN }}), null);
+assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, peak_allocated_vram_gib: 15.0, peak_reserved_vram_gib: 14.9, peak_vram_gib: 15.0 }}), null);
+assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, peak_reserved_vram_gib: 16.8, peak_vram_gib: 16.8 }}), null);
+assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, peak_vram_gib: valid.peak_allocated_vram_gib }}), null);
 assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, reached_depth: 99 }}), null);
 assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, unsafe_silent_fallbacks: 1 }}), null);
 """
@@ -1034,18 +1042,80 @@ assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, unsafe_silent_fallbacks: 
     def test_double_click_and_operator_launchers_have_separate_roles(self) -> None:
         graphical = (ROOT / "Run-CogniOS-Demo.cmd").read_text(encoding="utf-8")
         diagnostic = (ROOT / "Run-CogniOS-CLI.cmd").read_text(encoding="utf-8")
+        server_operator = (ROOT / "Run-CogniOS-Server-GPU5.sh").read_text(
+            encoding="utf-8"
+        )
         native = (ROOT / "launcher" / "CogniBoardLauncher.cs").read_text(
             encoding="utf-8"
         )
         self.assertIn("cogni_demo.server", graphical)
+        self.assertIn("scripts\\run_cogniboard_server.py", graphical)
         self.assertNotIn("validate_gemma4_runtime.py", graphical)
-        self.assertIn("validate_gemma4_runtime.py", diagnostic)
+        self.assertNotIn("validate_gemma4_runtime.py", diagnostic)
+        self.assertIn("validate_master_acceptance_checklist.py", diagnostic)
+        self.assertIn("COGNIBOARD_MASTER_ACCEPTANCE_CHECKLIST_KO.md", diagnostic)
+        self.assertIn("CPU and Static Integrity Diagnostics", diagnostic)
+        self.assertIn("ast.parse", diagnostic)
+        self.assertIn("%PYTHON_ARGS% -I -B -X utf8", diagnostic)
+        for forbidden in (
+            "CUDA_VISIBLE_DEVICES",
+            "NVIDIA_VISIBLE_DEVICES",
+            "nvidia-smi",
+            "server-gpu5-native",
+        ):
+            self.assertNotIn(forbidden, diagnostic)
+        self.assertIn("--validation-profile desktop-ui-only", graphical)
+        for forbidden in (
+            "server-gpu5-native",
+            "COGNI_OS_PHYSICAL_GPU_INDEX",
+            "COGNI_OS_GPU_QUERY_CONTEXT",
+            "COGNI_OS_GPU_UUID",
+            "CUDA_VISIBLE_DEVICES",
+            "NVIDIA_VISIBLE_DEVICES",
+            "VALIDATION_PYTHON_ARGS",
+            "server_gpu5_python_preflight",
+            "--expected-source-commit",
+        ):
+            self.assertNotIn(forbidden, graphical)
+        self.assertIn("torch.cuda.is_available()", graphical)
+        self.assertNotIn("torch.cuda.is_available()", diagnostic)
+        self.assertNotIn("import torch, transformers", diagnostic)
         self.assertIn("HF_HUB_OFFLINE", graphical)
         self.assertIn("HF_HUB_OFFLINE", diagnostic)
-        for launcher in (graphical, diagnostic, native):
+        for launcher in (graphical, native):
             with self.subTest(launcher=launcher[:32]):
                 self.assertIn("gemma4-e4b-it", launcher)
                 self.assertIn("gemma4-e4b-it.manifest.toml", launcher)
+
+        self.assertTrue(server_operator.startswith("#!/usr/bin/bash -p\n"))
+        self.assertIn("builtin exec /usr/bin/env -i", server_operator)
+        self.assertIn("/usr/bin/bash --noprofile --norc -p --", server_operator)
+        self.assertNotIn("/usr/bin/bash -p --noprofile --norc --", server_operator)
+        self.assertIn("operator-trusted ELF executable", server_operator)
+        self.assertIn('os.path.realpath("/proc/self/exe")', server_operator)
+        self.assertIn(
+            'exec /usr/bin/env -i "${PYTHON_ENVIRONMENT[@]}"', server_operator
+        )
+        self.assertIn('"${PYTHON_INVOCATION}" -I -B', server_operator)
+        self.assertIn(
+            'python_input="${COGNI_OS_PYTHON:-/usr/bin/python3}"', server_operator
+        )
+        self.assertIn("readlink -f", server_operator)
+        self.assertIn("PYTHON_RESOLVED_TARGET", server_operator)
+        self.assertIn("PYTHON_SENTINEL_EXPECTED", server_operator)
+        self.assertIn("sanitized_stage_environment_is_exact", server_operator)
+        self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", server_operator)
+        self.assertIn("--validation-profile server-gpu5-native", server_operator)
+        self.assertIn("--validation-physical-gpu-index 5", server_operator)
+        self.assertIn("--validation-gpu-query-context native-host", server_operator)
+        self.assertIn("--expected-source-commit", server_operator)
+        self.assertIn("GPU-84d7eeb0-65e0-a5b1-d7db-d09ef59fe03a", server_operator)
+        self.assertIn('"CUDA_DEVICE_ORDER=PCI_BUS_ID"', server_operator)
+        self.assertIn("status --porcelain=v1 --untracked-files=all", server_operator)
+        self.assertIn("BASH_ENV", server_operator)
+        self.assertNotIn("nvidia-smi", server_operator)
+        self.assertNotIn("/usr/bin/docker", server_operator)
+        self.assertIn("gemma4-e4b-it.manifest.toml", server_operator)
         self.assertIn("cogni_demo.server", native)
         self.assertIn("CreateNoWindow = true", native)
         self.assertIn("HF_HUB_OFFLINE", native)

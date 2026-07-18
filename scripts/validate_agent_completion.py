@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from builtins import BaseExceptionGroup
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -55,8 +57,12 @@ from cogni_agent.response_quality import (  # noqa: E402
 from cogni_agent.tools import WorkspaceToolExecutor  # noqa: E402
 from scripts.gpu5_boundary_guard import (  # noqa: E402
     GPU5BoundaryError,
+    NVIDIA_SMI_EXECUTABLE,
     PROJECT_GPU_UUID,
+    _minimal_host_environment,
+    _validated_executable,
     require_project_gpu_index,
+    validate_guarded_gpu5_identity,
 )
 from cogni_flow.rhythm import RhythmController  # noqa: E402
 from cogni_os.artifacts import verify_artifact_manifest  # noqa: E402
@@ -80,7 +86,8 @@ DEFAULT_TURNS = 20
 RECOMMENDED_STRESS_TURNS = 20
 MAX_STRESS_TURNS = 100
 MAX_INTERACTIVE_TURN_SECONDS = 120.0
-GPU_MEMORY_LIMIT_BYTES = int(16.7 * 1024**3)
+POST_TURN_GPU_MEMORY_SPOT_SAMPLE_THRESHOLD_BYTES = int(16.7 * 1024**3)
+POST_TURN_MEMORY_SAMPLE_SCOPE = "post_turn_spot_sample"
 STRESS_PROMPTS = (
     "온디바이스 AI의 장점 두 가지와 한계 한 가지를 세 문장으로 설명하세요. 같은 문장을 반복하지 마세요.",
     "사용자가 잘못된 사실을 정정했을 때 대화형 AI가 취해야 할 절차를 세 단계로 간결하게 답하세요.",
@@ -189,6 +196,133 @@ class PromptCase:
     required_groups: tuple[tuple[str, ...], ...] = ()
 
 
+PRODUCT_ACCEPTANCE_SUITE = "product-e4b-it-20"
+DEFAULT_COMPLETION_SUITE = "completion-stress"
+PRODUCT_ACCEPTANCE_COVERAGE = frozenset(
+    {
+        "casual_korean",
+        "typo_tolerance",
+        "follow_up_context",
+        "continuation_completion",
+        "repetition_resistance",
+        "truthful_identity",
+        "false_7b_rejection",
+        "role_control_leak_rejection",
+        "cutoff_rejection",
+        "zero_quality_fallback",
+    }
+)
+PRODUCT_CONTINUATION_CASE = "continuation"
+PRODUCT_CONTINUATION_TURN = 9
+PRODUCT_CONTINUATION_FIRST_TOKENS = 96
+PRODUCT_CONTINUATION_TOTAL_TOKENS = 192
+PRODUCT_CONTINUATION_COUNT = 1
+
+
+def _product_acceptance_cases() -> tuple[PromptCase, ...]:
+    """Return the exact, reviewable 20-turn public product conversation suite."""
+
+    prompts = (
+        PromptCase(
+            "product-identity",
+            "안녕하세여! 당신은 어떤 모델이며 저장 파라미터와 effective 파라미터는 각각 몇 개인가요? "
+            "검증된 Runtime Fact-book 수치만 한 번씩 답하세요.",
+            "grounded",
+            (("gemma", "cogni"), ("파라미터", "effective", "저장")),
+        ),
+        PromptCase(
+            "product-self-harness",
+            "자가 거울치료가 무엇인가요? 핵심만 세 문장 이내로 자연스럽게 설명해 주세요.",
+            "grounded",
+            (("자가 거울치료", "self-harness"), ("패치", "검증", "제안", "코드")),
+        ),
+        PromptCase(
+            "product-systems",
+            "Cogni-OS의 CTS, System 1.5, 2.5, 3, 4를 검증 상태와 설계 목표를 구분해 설명하고 "
+            "마지막은 반드시 '이상입니다.'로 끝내세요.",
+            "grounded",
+            DEFAULT_ANCHOR_GROUPS[2],
+        ),
+        PromptCase(
+            "product-grounding-followup",
+            "방금 답변에서 실제 검증과 향후 목표를 구분하는 원칙만 두 문장으로 요약하고 마침표로 끝내세요.",
+            "grounded",
+            DEFAULT_ANCHOR_GROUPS[3],
+        ),
+        PromptCase(
+            "casual-greeting",
+            "안녕하세요! 오늘 저와 어떤 일을 함께 할 수 있나요? 두 문장으로 편안하게 답해주세요.",
+            "generated",
+        ),
+        PromptCase(
+            "typo-tolerance",
+            "온디바이스 AI 장점 두개랑 한계 한개를 세문장으로 알려주세여. 같은 말은 반복하지 마세요.",
+            "generated",
+            STRESS_ANCHOR_GROUPS[0],
+        ),
+        PromptCase(
+            "follow-up-context",
+            "방금 말한 일들 가운데 코드 POC를 만들 때 가장 먼저 할 일을 한 문장으로 골라주세요.",
+            "generated",
+        ),
+        PromptCase(
+            "context-switch",
+            "이제 주제를 바꿀게요. 확인된 사실과 추론을 섞지 않는 원칙을 두 문장으로 설명해 주세요.",
+            "generated",
+            STRESS_ANCHOR_GROUPS[2],
+        ),
+        PromptCase(
+            "continuation",
+            "긴 답변이 중간에 끊기지 않도록 자동 이어쓰기를 실제로 검증합니다. 생성 중단 감지, "
+            "앞부분 중복 방지, "
+            "잘린 문장 복구, 반복 루프 차단, 최종 종료 판정을 각각 원인과 검증 기준까지 "
+            "자세히 분석해 다섯 가지 항목으로 모두 완결하세요.",
+            "generated",
+            STRESS_ANCHOR_GROUPS[3],
+        ),
+        PromptCase(
+            "repetition",
+            "반복 없는 좋은 요약문의 조건을 세 가지 제시하고 각 조건은 서로 다른 내용으로 끝내세요.",
+            "generated",
+            STRESS_ANCHOR_GROUPS[6],
+        ),
+        PromptCase(
+            "safe-correction", STRESS_PROMPTS[1], "generated", STRESS_ANCHOR_GROUPS[1]
+        ),
+        PromptCase(
+            "safe-patching", STRESS_PROMPTS[4], "generated", STRESS_ANCHOR_GROUPS[4]
+        ),
+        PromptCase(
+            "bounded-retry", STRESS_PROMPTS[5], "generated", STRESS_ANCHOR_GROUPS[5]
+        ),
+        PromptCase("privacy", STRESS_PROMPTS[7], "generated", STRESS_ANCHOR_GROUPS[7]),
+        PromptCase(
+            "measurement", STRESS_PROMPTS[8], "generated", STRESS_ANCHOR_GROUPS[8]
+        ),
+        PromptCase(
+            "tool-truth", STRESS_PROMPTS[9], "grounded", STRESS_ANCHOR_GROUPS[9]
+        ),
+        PromptCase(
+            "error-record", STRESS_PROMPTS[10], "generated", STRESS_ANCHOR_GROUPS[10]
+        ),
+        PromptCase(
+            "long-context", STRESS_PROMPTS[11], "generated", STRESS_ANCHOR_GROUPS[11]
+        ),
+        PromptCase(
+            "uncertainty", STRESS_PROMPTS[12], "generated", STRESS_ANCHOR_GROUPS[12]
+        ),
+        PromptCase(
+            "natural-finish", STRESS_PROMPTS[15], "generated", STRESS_ANCHOR_GROUPS[15]
+        ),
+    )
+    if len(prompts) != RECOMMENDED_STRESS_TURNS:
+        raise RuntimeError("product acceptance suite must remain exactly 20 turns")
+    return prompts
+
+
+PRODUCT_ACCEPTANCE_PROMPTS = tuple(case.prompt for case in _product_acceptance_cases())
+
+
 def _bounded_turn_count(value: str) -> int:
     try:
         count = int(value)
@@ -204,7 +338,7 @@ def _bounded_timeout(value: str) -> float:
         timeout = float(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError("timeout must be a number") from error
-    if not 1.0 <= timeout <= MAX_INTERACTIVE_TURN_SECONDS:
+    if not math.isfinite(timeout) or not 1.0 <= timeout <= MAX_INTERACTIVE_TURN_SECONDS:
         raise argparse.ArgumentTypeError(
             f"timeout must be in [1, {MAX_INTERACTIVE_TURN_SECONDS:.0f}] seconds"
         )
@@ -222,6 +356,34 @@ def _bounded_physical_gpu_index(value: str) -> int:
         return require_project_gpu_index(index)
     except GPU5BoundaryError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _is_fatal_control_exception(error: BaseException) -> bool:
+    """Return whether ``error`` must retain control-flow semantics."""
+
+    return not isinstance(error, Exception)
+
+
+def _raise_captured_failures_if_fatal(
+    failures: Sequence[BaseException],
+) -> None:
+    """Re-raise fatal control exceptions after every cleanup/postcheck ran.
+
+    Ordinary exceptions remain part of the validator's machine-readable failure
+    report.  Once a cancellation/exit exception is present, however, returning a
+    status code would swallow the caller's control signal.  Preserve the original
+    object for a single failure and every original object in a group for multiple
+    failures.
+    """
+
+    if not any(_is_fatal_control_exception(error) for error in failures):
+        return
+    if len(failures) == 1:
+        raise failures[0]
+    raise BaseExceptionGroup(
+        "completion validation and cleanup/postcheck failures",
+        list(failures),
+    )
 
 
 def _prompt_cases(turns: int) -> tuple[PromptCase, ...]:
@@ -591,7 +753,7 @@ def _query_nvidia_smi_gpu_memory_bytes(
     try:
         completed = runner(
             [
-                "nvidia-smi",
+                _validated_executable(NVIDIA_SMI_EXECUTABLE),
                 "-i",
                 query_selector,
                 query_argument,
@@ -601,6 +763,7 @@ def _query_nvidia_smi_gpu_memory_bytes(
             text=True,
             timeout=5,
             check=False,
+            env=_minimal_host_environment(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, f"unavailable:{type(error).__name__}"
@@ -651,26 +814,36 @@ def _query_nvidia_smi_gpu_memory_bytes(
 def _sample_worker_memory(
     pid: int | None,
     *,
-    vram_limit_bytes: int,
+    gpu_spot_sample_threshold_bytes: int,
     rss_reader: Any = _read_process_rss_bytes,
     gpu_reader: Any = _query_nvidia_smi_gpu_memory_bytes,
     physical_gpu_index: int | None = None,
     gpu_query_context: str | None = None,
 ) -> dict[str, Any]:
+    """Take one point-in-time sample after a completed conversation turn.
+
+    The caller invokes this once after ``_wait_for_turn``. It is deliberately
+    not continuous telemetry and does not measure a CUDA allocation peak.
+    """
+
     if pid is None:
         return {
-            "worker_rss_bytes": None,
-            "worker_rss_status": "worker_not_started",
-            "worker_gpu_memory_bytes": None,
-            "worker_gpu_memory_status": "worker_not_started",
-            "gpu_memory_within_limit": None,
-            "vram_limit_bytes": int(vram_limit_bytes),
-            "memory_observed": False,
+            "sample_scope": POST_TURN_MEMORY_SAMPLE_SCOPE,
+            "captures_peak": False,
+            "worker_rss_spot_sample_bytes": None,
+            "worker_rss_spot_sample_status": "worker_not_started",
+            "gpu_memory_spot_sample_bytes": None,
+            "gpu_memory_spot_sample_status": "worker_not_started",
+            "gpu_memory_spot_sample_within_threshold": None,
+            "gpu_memory_spot_sample_threshold_bytes": int(
+                gpu_spot_sample_threshold_bytes
+            ),
+            "spot_sample_observed": False,
         }
     try:
         rss_bytes = int(rss_reader(pid))
         rss_status = "measured"
-    except BaseException as error:
+    except Exception as error:
         rss_bytes = None
         rss_status = f"unavailable:{type(error).__name__}"
     try:
@@ -682,18 +855,24 @@ def _sample_worker_memory(
                 physical_gpu_index=physical_gpu_index,
                 gpu_query_context=gpu_query_context,
             )
-    except BaseException as error:
+    except Exception as error:
         gpu_bytes = None
         gpu_status = f"unavailable:{type(error).__name__}"
-    gpu_within = None if gpu_bytes is None else int(gpu_bytes) <= int(vram_limit_bytes)
+    gpu_within = (
+        None
+        if gpu_bytes is None
+        else int(gpu_bytes) <= int(gpu_spot_sample_threshold_bytes)
+    )
     return {
-        "worker_rss_bytes": rss_bytes,
-        "worker_rss_status": rss_status,
-        "worker_gpu_memory_bytes": gpu_bytes,
-        "worker_gpu_memory_status": str(gpu_status),
-        "gpu_memory_within_limit": gpu_within,
-        "vram_limit_bytes": int(vram_limit_bytes),
-        "memory_observed": rss_bytes is not None or gpu_bytes is not None,
+        "sample_scope": POST_TURN_MEMORY_SAMPLE_SCOPE,
+        "captures_peak": False,
+        "worker_rss_spot_sample_bytes": rss_bytes,
+        "worker_rss_spot_sample_status": rss_status,
+        "gpu_memory_spot_sample_bytes": gpu_bytes,
+        "gpu_memory_spot_sample_status": str(gpu_status),
+        "gpu_memory_spot_sample_within_threshold": gpu_within,
+        "gpu_memory_spot_sample_threshold_bytes": int(gpu_spot_sample_threshold_bytes),
+        "spot_sample_observed": rss_bytes is not None or gpu_bytes is not None,
     }
 
 
@@ -811,7 +990,7 @@ def _worker_snapshot(
     *,
     expected_running: bool,
     stable_pid: int | None,
-    vram_limit_bytes: int,
+    gpu_spot_sample_threshold_bytes: int,
     memory_sampler: Any = _sample_worker_memory,
     physical_gpu_index: int | None = None,
     gpu_query_context: str | None = None,
@@ -820,7 +999,7 @@ def _worker_snapshot(
     pid = service.worker_pid
     active_request_id = service.active_request_id
     pid_stable = stable_pid is None or pid == stable_pid
-    memory_kwargs = {"vram_limit_bytes": vram_limit_bytes}
+    memory_kwargs = {"gpu_spot_sample_threshold_bytes": gpu_spot_sample_threshold_bytes}
     if physical_gpu_index is not None:
         memory_kwargs["physical_gpu_index"] = physical_gpu_index
     if gpu_query_context is not None:
@@ -863,6 +1042,9 @@ def _turn_record(
     peer_before_digest: str,
     peer_after_digest: str,
     prior_answer_digests: set[str],
+    new_assistant_count: int,
+    new_user_count: int,
+    observed_user_prompt: str,
     prior_sentence_keys: set[str] | None = None,
     expected_factbook: dict[str, Any] | None = None,
     error: str | None = None,
@@ -901,14 +1083,36 @@ def _turn_record(
     )
     checks.update(
         {
+            "canonical_user_prompt": new_user_count == 1
+            and observed_user_prompt == case.prompt,
+            "exactly_one_assistant": new_assistant_count == 1,
+            "continuation_contract": answer.get("continuations")
+            == (
+                PRODUCT_CONTINUATION_COUNT
+                if case.label == PRODUCT_CONTINUATION_CASE
+                else 0
+            ),
             "grounding_route": route_ok,
             "no_cross_turn_exact_duplicate": not cross_turn_duplicate,
             "no_cross_turn_sentence_echo": not cross_turn_sentence_echo,
             "worker_healthy": bool(worker["healthy"]),
-            "memory_observed_when_required": not worker["expected_running"]
-            or bool(memory["memory_observed"]),
-            "gpu_memory_within_limit_when_observed": memory["gpu_memory_within_limit"]
-            is not False,
+            "post_turn_memory_spot_sample_scope_valid": not worker["expected_running"]
+            or (
+                memory.get("sample_scope") == POST_TURN_MEMORY_SAMPLE_SCOPE
+                and memory.get("captures_peak") is False
+            ),
+            "post_turn_memory_spot_sample_observed_when_required": not worker[
+                "expected_running"
+            ]
+            or bool(memory["spot_sample_observed"]),
+            "post_turn_gpu_memory_spot_sample_observed_when_required": not worker[
+                "expected_running"
+            ]
+            or isinstance(memory.get("gpu_memory_spot_sample_bytes"), int),
+            "post_turn_gpu_memory_spot_sample_within_limit_when_required": not worker[
+                "expected_running"
+            ]
+            or memory.get("gpu_memory_spot_sample_within_threshold") is True,
             "session_isolated": peer_session_id != session_id and peer_unchanged,
             "interactive_latency_within_limit": float(elapsed_seconds)
             <= MAX_INTERACTIVE_TURN_SECONDS,
@@ -922,10 +1126,16 @@ def _turn_record(
         "peer_session_id": peer_session_id,
         "expected_route": case.expected_route,
         "prompt": case.prompt,
+        "observed_user_prompt": observed_user_prompt,
+        "new_user_count": int(new_user_count),
         "answer": text,
         "answer_sha256": answer_digest,
+        "state_status": state.get("status"),
+        "state_stage": state.get("stage"),
+        "answer_truncated": answer.get("truncated"),
         "finish_reason": answer.get("finish_reason"),
         "generation_mode": answer.get("generation_mode"),
+        "new_assistant_count": int(new_assistant_count),
         "continuations": answer.get("continuations"),
         "generated_tokens": generated_tokens,
         "explicit_truncation": _explicitly_truncated(answer, state),
@@ -958,13 +1168,14 @@ def _summarize_turns(
     failures: dict[str, int] = {}
     total_sentences = 0
     duplicate_sentences = 0
-    gpu_samples = 0
-    gpu_over_limit = 0
-    peak_rss = 0
-    peak_gpu = 0
+    gpu_spot_samples = 0
+    gpu_spot_samples_over_threshold = 0
+    maximum_observed_rss_spot_sample = 0
+    maximum_observed_gpu_spot_sample = 0
     worker_expected_turns = 0
-    worker_memory_observed_turns = 0
+    post_turn_memory_spot_sample_observed_turns = 0
     quality_fallback_turns = 0
+    resident_worker_pids: set[int] = set()
     for turn in turns:
         if turn.get("generation_mode") == "quality_fallback":
             quality_fallback_turns += 1
@@ -978,17 +1189,28 @@ def _summarize_turns(
         memory = dict(worker.get("memory", {}))
         if worker.get("expected_running") is True:
             worker_expected_turns += 1
-            if memory.get("memory_observed") is True:
-                worker_memory_observed_turns += 1
-            rss = memory.get("worker_rss_bytes")
-            gpu = memory.get("worker_gpu_memory_bytes")
-            if isinstance(rss, int):
-                peak_rss = max(peak_rss, rss)
-            if isinstance(gpu, int):
-                gpu_samples += 1
-                peak_gpu = max(peak_gpu, gpu)
-                if memory.get("gpu_memory_within_limit") is False:
-                    gpu_over_limit += 1
+            pid = worker.get("pid")
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                resident_worker_pids.add(pid)
+            sample_scope_valid = (
+                memory.get("sample_scope") == POST_TURN_MEMORY_SAMPLE_SCOPE
+                and memory.get("captures_peak") is False
+            )
+            if sample_scope_valid and memory.get("spot_sample_observed") is True:
+                post_turn_memory_spot_sample_observed_turns += 1
+            rss = memory.get("worker_rss_spot_sample_bytes")
+            gpu = memory.get("gpu_memory_spot_sample_bytes")
+            if sample_scope_valid and isinstance(rss, int):
+                maximum_observed_rss_spot_sample = max(
+                    maximum_observed_rss_spot_sample, rss
+                )
+            if sample_scope_valid and isinstance(gpu, int):
+                gpu_spot_samples += 1
+                maximum_observed_gpu_spot_sample = max(
+                    maximum_observed_gpu_spot_sample, gpu
+                )
+                if memory.get("gpu_memory_spot_sample_within_threshold") is False:
+                    gpu_spot_samples_over_threshold += 1
     success_rate = 0.0 if requested_turns <= 0 else passed_turns / int(requested_turns)
     # A bounded safety answer is valid UI behavior, but it is not a completed
     # model answer. Release evidence therefore permits no quality fallback.
@@ -996,11 +1218,11 @@ def _summarize_turns(
     quality_fallback_gate_passed = (
         quality_fallback_turns <= allowed_quality_fallback_turns
     )
-    gpu_memory_gate_passed = (
-        worker_expected_turns > 0
-        and gpu_samples == worker_expected_turns
-        and gpu_over_limit == 0
-        and peak_gpu <= GPU_MEMORY_LIMIT_BYTES
+    post_turn_gpu_memory_spot_sample_coverage_complete = (
+        worker_expected_turns > 0 and gpu_spot_samples == worker_expected_turns
+    )
+    single_resident_worker_scope = (
+        worker_expected_turns > 0 and len(resident_worker_pids) == 1
     )
     return {
         "requested_turns": int(requested_turns),
@@ -1026,32 +1248,67 @@ def _summarize_turns(
             0.0 if total_sentences == 0 else duplicate_sentences / total_sentences
         ),
         "worker_expected_turns": worker_expected_turns,
-        "worker_memory_observed_turns": worker_memory_observed_turns,
-        "worker_memory_coverage_rate": (
+        "resident_worker_pids": sorted(resident_worker_pids),
+        "single_resident_worker_scope": single_resident_worker_scope,
+        "post_turn_memory_spot_sample_observed_turns": (
+            post_turn_memory_spot_sample_observed_turns
+        ),
+        "post_turn_memory_spot_sample_coverage_rate": (
             1.0
             if worker_expected_turns == 0
-            else worker_memory_observed_turns / worker_expected_turns
+            else post_turn_memory_spot_sample_observed_turns / worker_expected_turns
         ),
-        "peak_worker_rss_bytes": peak_rss or None,
-        "gpu_memory_observed_turns": gpu_samples,
-        "gpu_memory_coverage_rate": (
-            0.0 if worker_expected_turns == 0 else gpu_samples / worker_expected_turns
+        "maximum_observed_post_turn_worker_rss_spot_sample_bytes": (
+            maximum_observed_rss_spot_sample or None
         ),
-        "peak_worker_gpu_memory_bytes": peak_gpu or None,
-        "gpu_memory_over_limit_turns": gpu_over_limit,
-        "gpu_memory_verdict": (
+        "post_turn_gpu_memory_spot_sample_observed_turns": gpu_spot_samples,
+        "post_turn_gpu_memory_spot_sample_coverage_rate": (
+            0.0
+            if worker_expected_turns == 0
+            else gpu_spot_samples / worker_expected_turns
+        ),
+        "maximum_observed_post_turn_gpu_memory_spot_sample_bytes": (
+            maximum_observed_gpu_spot_sample or None
+        ),
+        "post_turn_gpu_memory_spot_samples_over_threshold": (
+            gpu_spot_samples_over_threshold
+        ),
+        "post_turn_gpu_memory_spot_sample_coverage_verdict": (
             "unverified"
-            if gpu_samples == 0
-            else ("passed" if gpu_memory_gate_passed else "failed")
+            if gpu_spot_samples == 0
+            else (
+                "complete"
+                if post_turn_gpu_memory_spot_sample_coverage_complete
+                else "incomplete"
+            )
         ),
-        "gpu_memory_gate_passed": gpu_memory_gate_passed,
-        "release_schedule_gate_passed": requested_turns == RECOMMENDED_STRESS_TURNS
+        "post_turn_gpu_memory_spot_sample_threshold_observation": (
+            "unverified"
+            if gpu_spot_samples == 0
+            else (
+                "observed_at_or_below_threshold"
+                if gpu_spot_samples_over_threshold == 0
+                else "observed_above_threshold"
+            )
+        ),
+        "post_turn_gpu_memory_spot_sample_coverage_complete": (
+            post_turn_gpu_memory_spot_sample_coverage_complete
+        ),
+        "post_turn_gpu_memory_spot_sample_threshold_gate_passed": (
+            post_turn_gpu_memory_spot_sample_coverage_complete
+            and gpu_spot_samples_over_threshold == 0
+        ),
+        "recommended_stress_schedule_completed": requested_turns
+        == RECOMMENDED_STRESS_TURNS
         and len(turns) == RECOMMENDED_STRESS_TURNS,
-        "strict_turn_gate_passed": requested_turns == RECOMMENDED_STRESS_TURNS
+        "strict_completion_stress_gate_passed": requested_turns
+        == RECOMMENDED_STRESS_TURNS
         and len(turns) == requested_turns
         and passed_turns == requested_turns
         and quality_fallback_gate_passed
-        and gpu_memory_gate_passed,
+        and single_resident_worker_scope
+        and post_turn_gpu_memory_spot_sample_coverage_complete
+        and gpu_spot_samples_over_threshold == 0,
     }
 
 
@@ -1073,6 +1330,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--physical-gpu-index",
         type=_bounded_physical_gpu_index,
+        required=True,
         help=(
             "required execution selector; this server project accepts physical GPU "
             "5 only and never enumerates other devices"
@@ -1081,6 +1339,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gpu-query-context",
         choices=("native-host", "gpu5-container"),
+        required=True,
         help=(
             "required nvidia-smi selector mode: physical index 5 on the host or "
             "the pinned GPU5 UUID inside Docker's logical cuda:0 namespace"
@@ -1100,6 +1359,17 @@ def build_parser() -> argparse.ArgumentParser:
             f"number of deterministic turns in [1, {MAX_STRESS_TURNS}]; "
             f"use {RECOMMENDED_STRESS_TURNS} for the release stress gate"
         ),
+    )
+    parser.add_argument(
+        "--suite",
+        choices=(DEFAULT_COMPLETION_SUITE, PRODUCT_ACCEPTANCE_SUITE),
+        default=DEFAULT_COMPLETION_SUITE,
+        help="fixed conversation suite; product release requires product-e4b-it-20",
+    )
+    parser.add_argument(
+        "--strict-json",
+        action="store_true",
+        help="emit no progress lines so stdout/stderr capture remains one JSON component",
     )
     return parser
 
@@ -1128,20 +1398,39 @@ def _atomic_external_report(path: str | Path, report: dict[str, Any]) -> Path:
 def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     _offline_environment()
     requested_turns = int(getattr(args, "turns", DEFAULT_TURNS))
+    suite = str(getattr(args, "suite", DEFAULT_COMPLETION_SUITE))
+    strict_json = bool(getattr(args, "strict_json", False))
+    if (
+        suite == PRODUCT_ACCEPTANCE_SUITE
+        and requested_turns != RECOMMENDED_STRESS_TURNS
+    ):
+        raise ValueError("product-e4b-it-20 requires exactly 20 turns")
+    if suite not in {DEFAULT_COMPLETION_SUITE, PRODUCT_ACCEPTANCE_SUITE}:
+        raise ValueError("unknown completion validation suite")
     timeout = float(args.timeout)
     if not 1.0 <= timeout <= MAX_INTERACTIVE_TURN_SECONDS:
         raise ValueError(
             f"timeout must be in [1, {MAX_INTERACTIVE_TURN_SECONDS:.0f}] seconds"
         )
-    cases = _prompt_cases(requested_turns)
-    vram_limit_bytes = GPU_MEMORY_LIMIT_BYTES
+    cases = (
+        _product_acceptance_cases()
+        if suite == PRODUCT_ACCEPTANCE_SUITE
+        else _prompt_cases(requested_turns)
+    )
+    gpu_spot_sample_threshold_bytes = POST_TURN_GPU_MEMORY_SPOT_SAMPLE_THRESHOLD_BYTES
     report: dict[str, Any] = {
-        "schema": "cogni.agent.completion.stress.v1",
+        "schema": "cogni.agent.completion.stress.v2",
         "status": "running",
+        "suite": suite,
         "requested_turns": requested_turns,
         "recommended_stress_turns": RECOMMENDED_STRESS_TURNS,
         "criteria": {
-            "strict_turn_gate": "every requested turn must pass every boolean check",
+            "strict_completion_stress_gate": (
+                "every requested turn must pass every boolean check, including "
+                "declared post-turn GPU spot-sample coverage when a worker is resident, "
+                "and every observed sample must remain at or below the limit; the "
+                "memory component is not a peak-VRAM certification"
+            ),
             "repetition": (
                 "zero repeated sentences, exact cross-turn answers, and substantive "
                 "cross-turn sentence-block reuse"
@@ -1156,10 +1445,26 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "latency": (
                 f"every turn must finish within {MAX_INTERACTIVE_TURN_SECONDS:.0f} seconds"
             ),
-            "memory": (
-                "pinned GPU5 UUID aggregate memory must be observed on every resident "
-                "turn, remain at or below 16.7 GiB, and have zero over-limit samples"
+            "post_turn_memory_spot_samples": (
+                "one point-in-time GPU memory sample after each resident turn must be "
+                "observed; any observed sample above the configured threshold fails "
+                "the completion gate, while samples at or below it still do not certify "
+                "within-turn peak, sustained use, or whole-runtime VRAM release"
             ),
+            "product_acceptance_coverage": (
+                sorted(PRODUCT_ACCEPTANCE_COVERAGE)
+                if suite == PRODUCT_ACCEPTANCE_SUITE
+                else []
+            ),
+        },
+        "memory_evidence_scope": {
+            "kind": POST_TURN_MEMORY_SAMPLE_SCOPE,
+            "one_sample_per_expected_resident_turn": True,
+            "captures_peak": False,
+            "captures_sustained_usage": False,
+            "gpu_memory_spot_sample_threshold_bytes": (gpu_spot_sample_threshold_bytes),
+            "full_runtime_peak_validator": "scripts/validate_gemma4_runtime.py",
+            "full_runtime_peak_metric": "torch.cuda.max_memory_allocated",
         },
         "turns": [],
         "all_checks_passed": False,
@@ -1174,6 +1479,9 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     prior_sentence_keys: set[str] = set()
     stable_worker_pid: int | None = None
     expected_factbook: dict[str, Any] | None = None
+    verified_before = None
+    gpu_identity_before = None
+    captured_failures: list[BaseException] = []
     try:
         physical_gpu_index = require_project_gpu_index(
             getattr(args, "physical_gpu_index", None)
@@ -1183,7 +1491,14 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if gpu_query_context not in {"native-host", "gpu5-container"}:
             raise GPU5BoundaryError("an explicit valid GPU query context is required")
         report["gpu_query_context"] = gpu_query_context
+        gpu_identity_before = validate_guarded_gpu5_identity(
+            physical_gpu_index=physical_gpu_index,
+            gpu_query_context=gpu_query_context,
+            torch_module=torch,
+        )
+        report["gpu_identity_before"] = gpu_identity_before.as_payload()
         verified = verify_artifact_manifest(args.model, args.manifest)
+        verified_before = verified
         report["verified_files"] = len(verified.files)
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for the real-model completion test")
@@ -1249,14 +1564,53 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 for message in before["conversation"]
                 if message.get("role") == "assistant"
             }
+            prior_user_ids = {
+                str(message.get("id"))
+                for message in before["conversation"]
+                if message.get("role") == "user"
+            }
+            original_decode_budget: tuple[int, int, int] | None = None
+            if case.label == PRODUCT_CONTINUATION_CASE:
+                try:
+                    candidate_decode_budget = (
+                        manager.max_new_tokens,
+                        manager.max_total_new_tokens,
+                        manager.max_continuations,
+                    )
+                except AttributeError as error:
+                    raise TypeError(
+                        "continuation probe manager must expose the bounded decode "
+                        "budget interface"
+                    ) from error
+                if any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in candidate_decode_budget
+                ):
+                    raise TypeError(
+                        "continuation probe manager decode budgets must be integers"
+                    )
+                original_decode_budget = candidate_decode_budget
+                manager.max_new_tokens = PRODUCT_CONTINUATION_FIRST_TOKENS
+                manager.max_total_new_tokens = PRODUCT_CONTINUATION_TOTAL_TOKENS
+                manager.max_continuations = PRODUCT_CONTINUATION_COUNT
             started = monotonic()
             turn_error: str | None = None
             try:
-                manager.start_turn(case.prompt, "chat")
-                state = _wait_for_turn(manager, timeout)
-            except BaseException as error:
-                turn_error = f"{type(error).__name__}: {error}"
-                state = manager.snapshot()
+                try:
+                    manager.start_turn(case.prompt, "chat")
+                    state = _wait_for_turn(manager, timeout)
+                except BaseException as error:
+                    if _is_fatal_control_exception(error):
+                        raise
+                    turn_error = f"{type(error).__name__}: {error}"
+                    state = manager.snapshot()
+            finally:
+                if original_decode_budget is not None:
+                    (
+                        manager.max_new_tokens,
+                        manager.max_total_new_tokens,
+                        manager.max_continuations,
+                    ) = original_decode_budget
             if state.get("status") != "succeeded" and turn_error is None:
                 failure = state.get("error") or {}
                 turn_error = (
@@ -1269,10 +1623,25 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 if message.get("role") == "assistant"
                 and str(message.get("id")) not in prior_assistant_ids
             ]
+            users = [
+                message
+                for message in state["conversation"]
+                if message.get("role") == "user"
+                and str(message.get("id")) not in prior_user_ids
+            ]
             answer = assistants[-1] if assistants else {}
-            if not assistants and turn_error is None:
+            observed_user_prompt = str(users[-1].get("content", "")) if users else ""
+            if len(assistants) != 1 and turn_error is None:
                 turn_error = (
-                    "successful agent turn contains no newly owned assistant response"
+                    "successful agent turn must contain exactly one newly owned "
+                    f"assistant response; observed {len(assistants)}"
+                )
+            if (
+                len(users) != 1 or observed_user_prompt != case.prompt
+            ) and turn_error is None:
+                turn_error = (
+                    "successful agent turn must own exactly one canonical user prompt; "
+                    f"observed {len(users)}"
                 )
             expected_worker = (
                 case.expected_route == "generated" or stable_worker_pid is not None
@@ -1281,7 +1650,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 service,
                 expected_running=expected_worker,
                 stable_pid=stable_worker_pid,
-                vram_limit_bytes=vram_limit_bytes,
+                gpu_spot_sample_threshold_bytes=gpu_spot_sample_threshold_bytes,
                 physical_gpu_index=physical_gpu_index,
                 gpu_query_context=gpu_query_context,
             )
@@ -1300,6 +1669,9 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 peer_before_digest=peer_before_digest,
                 peer_after_digest=peer_after_digest,
                 prior_answer_digests=prior_answer_digests,
+                new_assistant_count=len(assistants),
+                new_user_count=len(users),
+                observed_user_prompt=observed_user_prompt,
                 prior_sentence_keys=prior_sentence_keys,
                 expected_factbook=expected_factbook,
                 error=turn_error,
@@ -1312,56 +1684,118 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             report["summary"] = _summarize_turns(report["turns"], requested_turns)
             if getattr(args, "output", None):
                 _atomic_external_report(args.output, report)
-            print(
-                (
-                    f"turn {index + 1}/{requested_turns} "
-                    f"status={'passed' if record['passed'] else 'failed'} "
-                    f"elapsed={record['elapsed_seconds']:.3f}s"
-                ),
-                file=sys.stderr,
-                flush=True,
-            )
+            if not strict_json:
+                print(
+                    (
+                        f"turn {index + 1}/{requested_turns} "
+                        f"status={'passed' if record['passed'] else 'failed'} "
+                        f"elapsed={record['elapsed_seconds']:.3f}s"
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
             if manager.is_active:
                 report["aborted_after_turn"] = index + 1
                 break
     except BaseException as error:
-        report["error"] = f"{type(error).__name__}: {error}"[:512]
+        captured_failures.append(error)
+        if isinstance(error, Exception):
+            report["error"] = f"{type(error).__name__}: {error}"[:512]
     finally:
         report["summary"] = _summarize_turns(report["turns"], requested_turns)
-        try:
-            for manager in managers.values():
+        cleanup_errors: list[BaseException] = []
+        for manager in managers.values():
+            try:
                 manager.shutdown()
-            if not managers and service is not None:
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+                captured_failures.append(cleanup_error)
+        if not managers and service is not None:
+            try:
                 service.stop()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+                captured_failures.append(cleanup_error)
+        if cleanup_errors:
+            report["cleanup_error"] = "; ".join(
+                f"{type(error).__name__}: {error}" for error in cleanup_errors
+            )[:512]
+            report["status"] = "failed"
+            report["all_checks_passed"] = False
+        try:
+            report["worker_cleaned"] = service is None or not service.is_running
         except BaseException as cleanup_error:
+            captured_failures.append(cleanup_error)
+            report["worker_cleaned"] = False
             report["cleanup_error"] = (
                 f"{type(cleanup_error).__name__}: {cleanup_error}"[:512]
             )
-            report["status"] = "failed"
-            report["all_checks_passed"] = False
-        report["worker_cleaned"] = service is None or not service.is_running
-        report["gpu_lease_released"] = leases.active is None
-        report["gpu_lease_history"] = [
-            {
-                "epoch": event.lease.epoch,
-                "purpose": event.lease.purpose,
-                "reason": event.reason,
-            }
-            for event in leases.history
-        ]
+        try:
+            report["gpu_lease_released"] = leases.active is None
+        except BaseException as cleanup_error:
+            captured_failures.append(cleanup_error)
+            report["gpu_lease_released"] = False
+            report["cleanup_error"] = (
+                f"{type(cleanup_error).__name__}: {cleanup_error}"[:512]
+            )
+        try:
+            report["gpu_lease_history"] = [
+                {
+                    "epoch": event.lease.epoch,
+                    "purpose": event.lease.purpose,
+                    "reason": event.reason,
+                }
+                for event in leases.history
+            ]
+        except BaseException as cleanup_error:
+            captured_failures.append(cleanup_error)
+            report["gpu_lease_history"] = []
+            report["cleanup_error"] = (
+                f"{type(cleanup_error).__name__}: {cleanup_error}"[:512]
+            )
         report["cleanup_checks"] = {
             "worker_cleaned": report["worker_cleaned"],
             "gpu_lease_released": report["gpu_lease_released"],
         }
+        if verified_before is not None:
+            try:
+                verified_after = verify_artifact_manifest(args.model, args.manifest)
+                if verified_after != verified_before:
+                    raise RuntimeError("model manifest scope changed during validation")
+                report["verified_files_after"] = len(verified_after.files)
+            except BaseException as verification_error:
+                captured_failures.append(verification_error)
+                report["post_manifest_error"] = (
+                    f"{type(verification_error).__name__}: {verification_error}"[:512]
+                )
+        if gpu_identity_before is not None:
+            try:
+                gpu_identity_after = validate_guarded_gpu5_identity(
+                    physical_gpu_index=physical_gpu_index,
+                    gpu_query_context=gpu_query_context,
+                    torch_module=torch,
+                )
+                if gpu_identity_after != gpu_identity_before:
+                    raise GPU5BoundaryError(
+                        "guarded GPU5 identity changed during completion validation"
+                    )
+                report["gpu_identity_after"] = gpu_identity_after.as_payload()
+            except BaseException as identity_error:
+                captured_failures.append(identity_error)
+                report["post_gpu_identity_error"] = (
+                    f"{type(identity_error).__name__}: {identity_error}"[:512]
+                )
         report["all_checks_passed"] = bool(
-            report["summary"]["strict_turn_gate_passed"]
-            and report["summary"]["gpu_memory_gate_passed"]
+            report["summary"]["strict_completion_stress_gate_passed"]
             and report["worker_cleaned"]
             and report["gpu_lease_released"]
             and "cleanup_error" not in report
+            and "post_manifest_error" not in report
+            and "post_gpu_identity_error" not in report
             and "error" not in report
         )
         report["status"] = "passed" if report["all_checks_passed"] else "failed"
+        _raise_captured_failures_if_fatal(captured_failures)
     return report, 0 if report["all_checks_passed"] else 1
 
 

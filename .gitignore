@@ -8,6 +8,7 @@ build/
 dist/
 work/
 tmp/
+/CogniBoard.exe
 outputs/*.zip
 outputs/*.sha256
 outputs/agent-workspace/attachments/

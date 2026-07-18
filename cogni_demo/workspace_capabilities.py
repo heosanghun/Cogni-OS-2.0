@@ -63,9 +63,13 @@ MAX_INDEXED_TEXT_CHARS = 256_000
 MAX_PDF_PAGES = 128
 MAX_PDF_EXTRACTED_CHARS = MAX_INDEXED_TEXT_CHARS
 MAX_PDF_WORKER_OUTPUT_BYTES = 2 * 1024 * 1024
-PDF_EXTRACT_TIMEOUT_SECONDS = 8.0
 PDF_EXTRACT_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024
 PDF_EXTRACT_CPU_LIMIT_SECONDS = 6
+# The worker's CPU allowance is the parser-abuse boundary.  Keep a separate,
+# bounded wall allowance for interpreter/pypdf cold start and scheduler delay;
+# an 8-second wall cap left only two seconds beyond the CPU cap and flaked when
+# the full Windows suite was under load.
+PDF_EXTRACT_TIMEOUT_SECONDS = float(PDF_EXTRACT_CPU_LIMIT_SECONDS * 3)
 MAX_RAG_CHUNKS_PER_DOCUMENT = 128
 MAX_RAG_QUERY_CHARS = 1_024
 MAX_RAG_RESULTS = 12
@@ -437,7 +441,8 @@ def _run_pdf_extractor_document(content: bytes) -> ExtractedDocument:
                 "PDF_TEXT_EXTRACTION_TIMEOUT", "PDF extraction exceeded its time limit"
             ) from exc
     finally:
-        _close_windows_handle(job_handle)
+        if job_handle:
+            _close_windows_handle(job_handle)
     if len(stdout) > MAX_PDF_WORKER_OUTPUT_BYTES:
         raise WorkspaceCapabilityError(
             "PDF_TEXT_LIMIT", "PDF worker output exceeds its byte limit"

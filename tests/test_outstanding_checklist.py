@@ -1,39 +1,55 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
+
+import pytest
+
 from scripts.render_outstanding_checklist import parse_master, render
+from scripts.validate_master_acceptance_checklist import ChecklistValidationError
 
 
-def test_outstanding_renderer_keeps_only_unchecked_rows() -> None:
-    source = "\n".join(
-        (
-            "| 1 | [x] | done | `COMPLETED` | evidence | keep |",
-            "| 2 | [ ] | partial | `PARTIAL` | evidence | gate |",
-            "| 3 | [ ] | absent | `NOT_IMPLEMENTED` | evidence | gate |",
-            "| 4 | [ ] | external | `EXTERNAL_BLOCKER` | evidence | gate |",
-        )
-    )
-    records = parse_master(source)
+ROOT = Path(__file__).resolve().parents[1]
+MASTER = ROOT / "docs" / "COGNIBOARD_MASTER_ACCEPTANCE_CHECKLIST_KO.md"
+
+
+def test_outstanding_renderer_consumes_only_a_fully_validated_master() -> None:
+    records = parse_master(MASTER)
     result = render(records)
 
-    assert [record.identifier for record in records] == [2, 3, 4]
-    assert "| 1 |" not in result
-    assert "| 2 | [ ] | partial |" in result
-    assert "전체 미완료: **3개**" in result
+    assert len(records) == 170
+    assert [record.identifier for record in records] == list(range(1, 171))
+    assert "전체 미완료: **170개**" in result
+    assert "구현됐으나 승인 증거 미결합: **97개**" in result
+    assert "| 1 | [ ] | Gemma 4 E4B-it 로컬 백본 |" in result
 
 
-def test_outstanding_renderer_rejects_unchecked_completed_row() -> None:
-    source = "| 1 | [ ] | done | `COMPLETED` | evidence | keep |"
+@pytest.mark.parametrize(
+    "source",
+    (
+        "",
+        "| 1 | [ ] | only row | `PARTIAL` | evidence | gate |\n",
+    ),
+)
+def test_outstanding_renderer_rejects_empty_or_one_row_master(source: str) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "master.md"
+        path.write_text(source, encoding="utf-8")
+        with pytest.raises(
+            ChecklistValidationError, match="ID coverage|size is outside policy"
+        ):
+            parse_master(path)
 
-    try:
-        parse_master(source)
-    except ValueError as exc:
-        assert "completed row is unchecked" in str(exc)
-    else:  # pragma: no cover - defensive assertion
-        raise AssertionError("unchecked completed row was accepted")
 
-
-def test_outstanding_renderer_accepts_a_fully_completed_ledger() -> None:
-    records = parse_master("| 1 | [x] | done | `COMPLETED` | evidence | keep |")
-
-    assert records == ()
-    assert "전체 미완료: **0개**" in render(records)
+def test_outstanding_renderer_rejects_duplicate_summary() -> None:
+    text = MASTER.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    marker_index = next(
+        index for index, line in enumerate(lines) if "현재 스냅샷 집계는" in line
+    )
+    marker = "\n".join(lines[marker_index : marker_index + 2])
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "master.md"
+        path.write_text(text + "\n" + marker + "\n", encoding="utf-8")
+        with pytest.raises(ChecklistValidationError, match="exactly one"):
+            parse_master(path)

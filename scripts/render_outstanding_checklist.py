@@ -9,19 +9,23 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-import re
 import sys
 
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.validate_master_acceptance_checklist import validate_checklist  # noqa: E402
+
+
 DEFAULT_SOURCE = ROOT / "docs" / "COGNIBOARD_MASTER_ACCEPTANCE_CHECKLIST_KO.md"
 DEFAULT_OUTPUT = ROOT / "docs" / "COGNIBOARD_OUTSTANDING_IMPLEMENTATION_CHECKLIST_KO.md"
-ROW_RE = re.compile(
-    r"^\|\s*(?P<id>\d+)\s*\|\s*\[(?P<checked>[ x])\]\s*\|"
-    r"\s*(?P<requirement>.*?)\s*\|\s*`(?P<status>[A-Z_]+)`\s*\|"
-    r"\s*(?P<evidence>.*?)\s*\|\s*(?P<gate>.*?)\s*\|$"
+VALID_OUTSTANDING_STATES = (
+    "IMPLEMENTED_UNVERIFIED",
+    "NOT_IMPLEMENTED",
+    "PARTIAL",
+    "EXTERNAL_BLOCKER",
 )
-VALID_OUTSTANDING_STATES = ("NOT_IMPLEMENTED", "PARTIAL", "EXTERNAL_BLOCKER")
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,33 +37,33 @@ class Requirement:
     gate: str
 
 
-def parse_master(source: str) -> tuple[Requirement, ...]:
-    records: list[Requirement] = []
-    for line in source.splitlines():
-        match = ROW_RE.fullmatch(line)
-        if match is None:
-            continue
-        status = match.group("status")
-        checked = match.group("checked")
-        if status == "COMPLETED":
-            if checked != "x":
-                raise ValueError(f"ID {match.group('id')} completed row is unchecked")
-            continue
-        if status not in VALID_OUTSTANDING_STATES or checked != " ":
-            raise ValueError(f"ID {match.group('id')} has an invalid outstanding state")
-        records.append(
-            Requirement(
-                identifier=int(match.group("id")),
-                requirement=match.group("requirement"),
-                status=status,
-                evidence=match.group("evidence"),
-                gate=match.group("gate"),
-            )
+def parse_master(
+    source: str | Path,
+    *,
+    release_attestation: str | Path | None = None,
+    release_attestation_signature: str | Path | None = None,
+    verifier_public_key: str | Path | None = None,
+) -> tuple[Requirement, ...]:
+    """Return outstanding rows only after the full 1..170 ledger gate passes."""
+
+    path = Path(source)
+    report = validate_checklist(
+        path,
+        release_attestation=release_attestation,
+        release_attestation_signature=release_attestation_signature,
+        verifier_public_key=verifier_public_key,
+    )
+    return tuple(
+        Requirement(
+            identifier=record.requirement_id,
+            requirement=record.requirement,
+            status=record.state,
+            evidence=record.evidence,
+            gate=record.completion_condition,
         )
-    identifiers = [record.identifier for record in records]
-    if len(identifiers) != len(set(identifiers)):
-        raise ValueError("master ledger contains duplicate outstanding IDs")
-    return tuple(sorted(records, key=lambda item: item.identifier))
+        for record in report.records
+        if record.state != "COMPLETED"
+    )
 
 
 def render(records: tuple[Requirement, ...]) -> str:
@@ -76,12 +80,14 @@ def render(records: tuple[Requirement, ...]) -> str:
         "## 현재 집계",
         "",
         f"- 전체 미완료: **{len(records)}개**",
+        f"- 구현됐으나 승인 증거 미결합: **{counts['IMPLEMENTED_UNVERIFIED']}개**",
         f"- 코드/제품 경로 미구현: **{counts['NOT_IMPLEMENTED']}개**",
         f"- 부분 구현 또는 검증 잔여: **{counts['PARTIAL']}개**",
         f"- 외부 장치·토큰·아티팩트 차단: **{counts['EXTERNAL_BLOCKER']}개**",
         "",
     ]
     headings = {
+        "IMPLEMENTED_UNVERIFIED": "구현됐으나 승인 증거 미결합",
         "NOT_IMPLEMENTED": "제품 실행 경로 미구현",
         "PARTIAL": "부분 구현·검증 잔여",
         "EXTERNAL_BLOCKER": "외부 입력 없이는 완료 불가능",
@@ -109,6 +115,9 @@ def render(records: tuple[Requirement, ...]) -> str:
             "",
             "- 코드 파일이나 버튼의 존재만으로 완료 처리하지 않습니다.",
             "- 제품 경로 연결, bounded/fail-closed 안전성, 자동 회귀 또는 실측 증거가 모두 있어야 합니다.",
+            "- 구현 경로가 있어도 승인된 verifier의 exact-scope 서명 증거가 없으면 `IMPLEMENTED_UNVERIFIED`로 유지합니다.",
+            "- `config/acceptance-evidence-policy.json`의 ID별 basis·kind·component·raw schema와 source-pinned SHA를 모두 만족해야 합니다.",
+            "- 완료 scope는 source-pinned verifier key의 detached signed release attestation에서만 파생하며, 사용자 입력 digest는 신뢰하지 않습니다.",
             "- RTX 4090과 승인된 Lens 토큰·약관처럼 외부 입력이 필요한 항목은 제공 전까지 차단 상태를 유지합니다.",
             "- 완료된 ID는 이 문서에서 자동으로 사라지고 마스터 원장에만 `[x]`로 남습니다.",
             "",
@@ -122,8 +131,18 @@ def main() -> int:
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--release-attestation")
+    parser.add_argument("--release-attestation-signature")
+    parser.add_argument("--verifier-public-key")
     args = parser.parse_args()
-    rendered = render(parse_master(args.source.read_text(encoding="utf-8")))
+    rendered = render(
+        parse_master(
+            args.source,
+            release_attestation=args.release_attestation,
+            release_attestation_signature=args.release_attestation_signature,
+            verifier_public_key=args.verifier_public_key,
+        )
+    )
     if args.check:
         if (
             not args.output.exists()

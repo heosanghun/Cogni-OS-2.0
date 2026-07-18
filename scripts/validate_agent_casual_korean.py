@@ -45,12 +45,18 @@ from cogni_os.artifacts import verify_artifact_manifest  # noqa: E402
 from cogni_os.factbook import build_runtime_factbook_from_verified  # noqa: E402
 from cogni_os.gpu_lease import GPULeaseManager  # noqa: E402
 from cogni_os.version import __version__  # noqa: E402
+from scripts.gpu5_boundary_guard import (  # noqa: E402
+    GPU5BoundaryError,
+    require_project_gpu_index,
+    validate_guarded_gpu5_identity,
+)
 from scripts.validate_agent_completion import (  # noqa: E402
     _answer_checks,
     _atomic_external_report,
     _expected_factbook_identity,
     _has_conservative_near_duplicate,
     _offline_environment,
+    _raise_captured_failures_if_fatal,
     _sentence_repetition_metrics,
     _wait_for_turn,
 )
@@ -439,6 +445,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument(
+        "--physical-gpu-index",
+        type=int,
+        required=True,
+        help="required physical selector; this project accepts GPU 5 only",
+    )
+    parser.add_argument(
+        "--gpu-query-context",
+        choices=("native-host", "gpu5-container"),
+        required=True,
+    )
+    parser.add_argument(
         "--timeout",
         type=_bounded_timeout,
         default=MAX_CASUAL_TURN_SECONDS,
@@ -494,11 +511,41 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     prior_answer_digests: dict[str, set[str]] = {}
     prior_sentence_keys: dict[str, set[str]] = {}
     expected_factbook: dict[str, Any] | None = None
+    physical_gpu_index: int | None = None
+    gpu_query_context: str | None = None
+    verified_before = None
+    gpu_identity_before = None
+    captured_failures: list[BaseException] = []
     try:
+        physical_gpu_index = require_project_gpu_index(
+            getattr(args, "physical_gpu_index", None)
+        )
+        gpu_query_context = getattr(args, "gpu_query_context", None)
+        if gpu_query_context not in {"native-host", "gpu5-container"}:
+            raise GPU5BoundaryError("an explicit valid GPU query context is required")
+        report["physical_gpu_index"] = physical_gpu_index
+        report["gpu_query_context"] = gpu_query_context
+        gpu_identity_before = validate_guarded_gpu5_identity(
+            physical_gpu_index=physical_gpu_index,
+            gpu_query_context=gpu_query_context,
+            torch_module=torch,
+        )
+        report["gpu_identity_before"] = gpu_identity_before.as_payload()
         verified = verify_artifact_manifest(args.model, args.manifest)
+        verified_before = verified
         report["verified_files"] = len(verified.files)
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for the casual Korean release gate")
+        logical_device_count = int(torch.cuda.device_count())
+        logical_device_index = int(torch.cuda.current_device())
+        if gpu_query_context == "gpu5-container" and (
+            logical_device_count != 1 or logical_device_index != 0
+        ):
+            raise GPU5BoundaryError(
+                "GPU5 container must expose one logical device mapped to cuda:0"
+            )
+        report["logical_cuda_device_count"] = logical_device_count
+        report["logical_cuda_device_index"] = logical_device_index
         report["cuda_device"] = torch.cuda.get_device_name(0)
         factbook = build_runtime_factbook_from_verified(
             verified,
@@ -566,6 +613,11 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 manager.start_turn(case.prompt, "chat")
                 state = _wait_for_turn(manager, timeout)
             except BaseException as caught:
+                # Operator/process control exceptions are never ordinary turn
+                # failures.  Let the outer transaction run its full cleanup
+                # and postcondition checks, then re-raise the original signal.
+                if not isinstance(caught, Exception):
+                    raise
                 error = f"{type(caught).__name__}: {caught}"[:512]
                 try:
                     manager.cancel()
@@ -573,7 +625,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         manager,
                         min(30.0, max(2.0, timeout * 0.25)),
                     )
-                except BaseException:
+                except Exception:
                     state = manager.snapshot()
             elapsed = monotonic() - started
             assistants = [
@@ -636,12 +688,14 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 flush=True,
             )
     except BaseException as error:
+        captured_failures.append(error)
         report["error"] = f"{type(error).__name__}: {error}"[:512]
     finally:
         for manager in managers.values():
             try:
                 manager.shutdown()
             except BaseException as cleanup_error:
+                captured_failures.append(cleanup_error)
                 report.setdefault("cleanup_errors", []).append(
                     f"{type(cleanup_error).__name__}: {cleanup_error}"[:512]
                 )
@@ -649,22 +703,68 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             try:
                 service.stop()
             except BaseException as cleanup_error:
+                captured_failures.append(cleanup_error)
                 report.setdefault("cleanup_errors", []).append(
                     f"{type(cleanup_error).__name__}: {cleanup_error}"[:512]
                 )
         report["summary"] = _casual_summary(
             report["turns"], latency_limit_seconds=timeout
         )
-        report["worker_cleaned"] = service is None or not service.is_running
-        report["gpu_lease_released"] = leases.active is None
+        try:
+            report["worker_cleaned"] = service is None or not service.is_running
+        except BaseException as cleanup_error:
+            captured_failures.append(cleanup_error)
+            report["worker_cleaned"] = False
+            report.setdefault("cleanup_errors", []).append(
+                f"{type(cleanup_error).__name__}: {cleanup_error}"[:512]
+            )
+        try:
+            report["gpu_lease_released"] = leases.active is None
+        except BaseException as cleanup_error:
+            captured_failures.append(cleanup_error)
+            report["gpu_lease_released"] = False
+            report.setdefault("cleanup_errors", []).append(
+                f"{type(cleanup_error).__name__}: {cleanup_error}"[:512]
+            )
+        if verified_before is not None:
+            try:
+                verified_after = verify_artifact_manifest(args.model, args.manifest)
+                if verified_after != verified_before:
+                    raise RuntimeError("model manifest scope changed during validation")
+                report["verified_files_after"] = len(verified_after.files)
+            except BaseException as verification_error:
+                captured_failures.append(verification_error)
+                report["post_manifest_error"] = (
+                    f"{type(verification_error).__name__}: {verification_error}"[:512]
+                )
+        if gpu_identity_before is not None:
+            try:
+                gpu_identity_after = validate_guarded_gpu5_identity(
+                    physical_gpu_index=physical_gpu_index,
+                    gpu_query_context=gpu_query_context,
+                    torch_module=torch,
+                )
+                if gpu_identity_after != gpu_identity_before:
+                    raise GPU5BoundaryError(
+                        "guarded GPU5 identity changed during casual validation"
+                    )
+                report["gpu_identity_after"] = gpu_identity_after.as_payload()
+            except BaseException as identity_error:
+                captured_failures.append(identity_error)
+                report["post_gpu_identity_error"] = (
+                    f"{type(identity_error).__name__}: {identity_error}"[:512]
+                )
         report["all_checks_passed"] = bool(
             report["summary"]["strict_casual_gate_passed"]
             and report["worker_cleaned"]
             and report["gpu_lease_released"]
             and "error" not in report
             and not report.get("cleanup_errors")
+            and "post_manifest_error" not in report
+            and "post_gpu_identity_error" not in report
         )
         report["status"] = "passed" if report["all_checks_passed"] else "failed"
+        _raise_captured_failures_if_fatal(captured_failures)
     return report, 0 if report["all_checks_passed"] else 1
 
 

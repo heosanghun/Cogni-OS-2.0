@@ -269,6 +269,10 @@ class TestMaliciousPdfCorpus(unittest.TestCase):
             payload["pdf_cpu_limit_seconds"], PDF_EXTRACT_CPU_LIMIT_SECONDS
         )
         self.assertEqual(
+            PDF_EXTRACT_TIMEOUT_SECONDS,
+            PDF_EXTRACT_CPU_LIMIT_SECONDS * 3,
+        )
+        self.assertEqual(
             payload["pdf_memory_limit_bytes"], PDF_EXTRACT_MEMORY_LIMIT_BYTES
         )
         self.assertEqual(pdf_extract_worker.MAX_INPUT_BYTES, MAX_ATTACHMENT_BYTES)

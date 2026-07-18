@@ -1,39 +1,34 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 chcp 65001 >nul
-title Cogni-OS 2.0 Genesis CLI Diagnostics
+title Cogni-OS 2.0 CPU and Static Integrity Diagnostics
 
 for %%I in ("%~dp0.") do set "LAUNCHER_DIR=%%~fI"
 set "PROJECT_ROOT="
 set "PYTHON_EXE="
 set "PYTHON_ARGS="
-set "DEMO_EXIT_CODE=1"
 set "EXIT_CODE=1"
 
-if exist "%LAUNCHER_DIR%\scripts\validate_gemma4_runtime.py" (
+if exist "%LAUNCHER_DIR%\scripts\validate_master_acceptance_checklist.py" (
     set "PROJECT_ROOT=%LAUNCHER_DIR%"
 )
 if defined PROJECT_ROOT goto root_ready
 
 for %%I in ("%LAUNCHER_DIR%\..") do set "PARENT_DIR=%%~fI"
-if exist "%PARENT_DIR%\scripts\validate_gemma4_runtime.py" (
+if exist "%PARENT_DIR%\scripts\validate_master_acceptance_checklist.py" (
     set "PROJECT_ROOT=%PARENT_DIR%"
 )
 if defined PROJECT_ROOT goto root_ready
 goto fail_project
 
 :root_ready
-set "DEMO_SCRIPT=%PROJECT_ROOT%\scripts\validate_gemma4_runtime.py"
-set "MANIFEST=%PROJECT_ROOT%\config\gemma4-e4b-it.manifest.toml"
-if defined COGNI_OS_MODEL_DIR (
-    set "MODEL_DIR=%COGNI_OS_MODEL_DIR%"
-) else (
-    set "MODEL_DIR=C:\Project\cognios\gemma4-e4b-it"
-)
+set "CHECKLIST_VALIDATOR=%PROJECT_ROOT%\scripts\validate_master_acceptance_checklist.py"
+set "CHECKLIST=%PROJECT_ROOT%\docs\COGNIBOARD_MASTER_ACCEPTANCE_CHECKLIST_KO.md"
+set "SERVER_BOOTSTRAP=%PROJECT_ROOT%\scripts\run_cogniboard_server.py"
 
-if not exist "%DEMO_SCRIPT%" goto fail_project
-if not exist "%MANIFEST%" goto fail_manifest
-if not exist "%MODEL_DIR%\" goto fail_model
+if not exist "%CHECKLIST_VALIDATOR%" goto fail_project
+if not exist "%CHECKLIST%" goto fail_checklist
+if not exist "%SERVER_BOOTSTRAP%" goto fail_bootstrap
 
 if defined COGNI_OS_PYTHON (
     set "PYTHON_EXE=%COGNI_OS_PYTHON%"
@@ -60,45 +55,39 @@ set "HF_HUB_DISABLE_TELEMETRY=1"
 set "TRANSFORMERS_OFFLINE=1"
 set "HF_DATASETS_OFFLINE=1"
 set "WANDB_MODE=offline"
-set "TOKENIZERS_PARALLELISM=false"
+set "PYTHONDONTWRITEBYTECODE=1"
 set "PYTHONUTF8=1"
 
-"%PYTHON_EXE%" %PYTHON_ARGS% -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+"%PYTHON_EXE%" %PYTHON_ARGS% -I -B -X utf8 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
 if errorlevel 1 goto fail_python
 
-"%PYTHON_EXE%" %PYTHON_ARGS% -c "import torch, transformers; raise SystemExit(0 if torch.cuda.is_available() else 1)" >nul 2>&1
-if errorlevel 1 goto fail_python_runtime
-
 echo ============================================================
-echo   Cogni-OS 2.0 Genesis - CLI Diagnostics
+echo   Cogni-OS 2.0 - CPU and Static Integrity Diagnostics
 echo ============================================================
 echo Project : "%PROJECT_ROOT%"
-echo Model   : "%MODEL_DIR%"
-echo VRAM cap: 16.7 GiB
 echo.
-echo Loading the local model and running CTS depth 100...
-echo This can take about one minute. Keep this window open.
+echo [1/2] Validating the machine-readable 170-item acceptance ledger...
+
+"%PYTHON_EXE%" %PYTHON_ARGS% -I -B -X utf8 "%CHECKLIST_VALIDATOR%" "%CHECKLIST%" --json
+if errorlevel 1 goto fail_checklist_validation
+
 echo.
-
-pushd "%PROJECT_ROOT%" >nul
-if errorlevel 1 goto fail_workdir
-
-"%PYTHON_EXE%" %PYTHON_ARGS% "%DEMO_SCRIPT%" --model "%MODEL_DIR%" --manifest "%MANIFEST%" --vram-limit-gib 16.7
-set "DEMO_EXIT_CODE=%ERRORLEVEL%"
-popd
-
-if not "%DEMO_EXIT_CODE%"=="0" goto fail_demo
+echo [2/2] Parsing the isolated server bootstrap with the Python AST...
+set "COGNI_BOOTSTRAP_PATH=%SERVER_BOOTSTRAP%"
+"%PYTHON_EXE%" %PYTHON_ARGS% -I -B -X utf8 -c "import ast, os; from pathlib import Path; p=Path(os.environ['COGNI_BOOTSTRAP_PATH']); s=p.read_text(encoding='utf-8', errors='strict'); ast.parse(s, filename=str(p)); required=('Path(__file__).resolve().parents[1]', 'sys.path.insert(0, str(_PROJECT_ROOT))'); raise SystemExit(0 if all(item in s for item in required) else 1)"
+if errorlevel 1 goto fail_bootstrap_validation
 
 echo.
 echo ============================================================
-echo [SUCCESS] Depth-100 Cogni-OS demo completed successfully.
+echo [SUCCESS] CPU and static integrity diagnostics passed.
+echo This command does not perform live hardware validation.
 echo ============================================================
 set "EXIT_CODE=0"
 goto finish
 
 :fail_project
 echo.
-echo [ERROR] Cogni-OS project files were not found.
+echo [ERROR] Cogni-OS project integrity files were not found.
 echo Keep this launcher in the project root or its outputs folder.
 set "EXIT_CODE=2"
 goto finish
@@ -110,39 +99,28 @@ echo Install the project environment or set COGNI_OS_PYTHON.
 set "EXIT_CODE=3"
 goto finish
 
-:fail_python_runtime
+:fail_checklist
 echo.
-echo [ERROR] CUDA-enabled PyTorch and Transformers are required.
-echo Confirm that the selected Python can access the NVIDIA GPU.
-set "EXIT_CODE=3"
-goto finish
-
-:fail_model
-echo.
-echo [ERROR] Local Gemma model directory not found:
-echo "%MODEL_DIR%"
-echo Set COGNI_OS_MODEL_DIR to use a different local model path.
+echo [ERROR] The master acceptance checklist was not found.
 set "EXIT_CODE=4"
 goto finish
 
-:fail_manifest
+:fail_bootstrap
 echo.
-echo [ERROR] Model manifest not found:
-echo "%MANIFEST%"
+echo [ERROR] The isolated CogniBoard server bootstrap was not found.
 set "EXIT_CODE=5"
 goto finish
 
-:fail_workdir
+:fail_checklist_validation
 echo.
-echo [ERROR] Could not enter the project directory:
-echo "%PROJECT_ROOT%"
+echo [FAILED] The master acceptance checklist integrity contract failed.
 set "EXIT_CODE=6"
 goto finish
 
-:fail_demo
+:fail_bootstrap_validation
 echo.
-echo [FAILED] Cogni-OS demo exited with code %DEMO_EXIT_CODE%.
-set "EXIT_CODE=%DEMO_EXIT_CODE%"
+echo [FAILED] The isolated server bootstrap integrity contract failed.
+set "EXIT_CODE=7"
 goto finish
 
 :finish

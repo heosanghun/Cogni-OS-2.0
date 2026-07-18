@@ -400,9 +400,16 @@ function normalizedLiveRuntimeMetrics(raw) {
     !finiteNumber(raw.vram_limit_gib)
     || raw.vram_limit_gib <= 0
     || raw.vram_limit_gib > MAX_LIVE_VRAM_LIMIT_GIB
+    || !finiteNumber(raw.peak_allocated_vram_gib)
+    || raw.peak_allocated_vram_gib < 0
+    || !finiteNumber(raw.peak_reserved_vram_gib)
+    || raw.peak_reserved_vram_gib < raw.peak_allocated_vram_gib
+    || raw.peak_reserved_vram_gib > raw.vram_limit_gib
     || !finiteNumber(raw.peak_vram_gib)
-    || raw.peak_vram_gib < 0
-    || raw.peak_vram_gib > raw.vram_limit_gib
+    || raw.peak_vram_gib !== Math.max(
+      raw.peak_allocated_vram_gib,
+      raw.peak_reserved_vram_gib,
+    )
   ) return null;
   return Object.freeze({ ...raw, device, model_class: modelClass });
 }
@@ -2445,10 +2452,16 @@ function updateMetrics(metrics = null, evidenceScope = "unverified") {
   });
 
   const vram = metrics.peak_vram_gib;
+  const allocatedVram = metrics.peak_allocated_vram_gib;
+  const reservedVram = metrics.peak_reserved_vram_gib;
   const limit = metrics.vram_limit_gib;
   setText("#metric-vram", vram.toFixed(4));
   setText("#telemetry-vram", vram.toFixed(4));
   setText("#ledger-vram", `Peak VRAM ${vram.toFixed(4)} GiB`);
+  $("#ledger-vram")?.setAttribute(
+    "title",
+    `Peak allocated ${allocatedVram.toFixed(4)} GiB; peak reserved ${reservedVram.toFixed(4)} GiB`,
+  );
   const meterLabel = `VRAM 사용량 ${vram.toFixed(4)} GiB, 상한 ${limit.toFixed(1)} GiB`;
   for (const selector of ["#vram-meter", "#telemetry-vram-fill"]) {
     const meter = $(selector);

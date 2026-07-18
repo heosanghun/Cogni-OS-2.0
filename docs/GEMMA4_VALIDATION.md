@@ -16,16 +16,44 @@ artifact inventory.
 
 ## Reproduction
 
-```powershell
-python scripts\validate_gemma4_runtime.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
+```bash
+/usr/bin/python3 -I -B \
+  -X pycache_prefix=/home/shoon/.cognios-gpu5-guard/host-never-pycache \
+  scripts/gpu5_boundary_guard.py run \
+  --image cogni-os-dev@sha256:20aaf1d7cde8d6a504ba08f158a34a1907eac9413f3578acc4637f0a1b2ec8ba \
+  --expected-source-commit "$(git rev-parse HEAD)" \
+  --workdir /workspace \
+  --timeout 1800 \
+  --evidence-filename gpu5-base-canary-v041.json \
+  -- -I -B /workspace/scripts/validate_gemma4_runtime.py \
+  --model /models/gemma4-e4b \
+  --manifest /workspace/config/gemma4-e4b.manifest.toml \
+  --physical-gpu-index 5 \
+  --gpu-query-context gpu5-container \
   --event-stream
 ```
 
-The command is local-only and validates finite tensors, the CTS/DEQ safety
-contract, causal conditioning telemetry and the 16.7 GiB allocated-memory
-postcondition.
+This is the sole Stage G GPU evidence entry point after the clean exact-commit
+CPU Exit Gate.  It snapshots the named commit, uses the pinned image and UUID
+container selector, and validates finite tensors, the CTS/DEQ safety contract,
+causal conditioning telemetry and the 16.7 GiB allocated-memory postcondition.
+The ordinary Windows CogniBoard launch supports only `desktop-ui-only`; callers
+cannot select the native GPU server profile, and it does not claim this server
+evidence capability.
+
+Every `run` command is additionally blocked before Docker and before the first
+GPU query unless the laboratory scheduler has issued
+`/run/cognios-lab-scheduler/gpu5-reservation.json`. The artifact must be a
+root-owned, non-symlink, read-only regular file with the closed schema
+`cogni.lab.gpu5.reservation.v1`. It binds status `reserved`, physical index 5,
+the pinned GPU5 UUID, the exact source commit, the launching effective UID, a
+bounded reservation identifier, and an unexpired window of at most 24 hours.
+The remaining window must cover the configured run timeout plus five minutes
+for fail-closed cleanup. A project-local lock cannot exclude unrelated
+laboratory jobs, so it is not a substitute for this scheduler reservation.
+Until the external scheduler creates that artifact, Stage G is
+`EXTERNAL_BLOCKER / NOT RUN`; operators must not hand-create or weaken the
+reservation file to make a test pass.
 
 ## Latest scoped canary observation
 
@@ -73,12 +101,55 @@ Product conversation validation uses only the exact pinned instruction-tuned
 checkpoint and its seven-file manifest. The pretrained base artifact above is
 not an accepted public conversation checkpoint.
 
-```powershell
-python scripts\validate_agent_completion.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --turns 20
+The historical Windows command is not a release command. It can select the
+desktop's default CUDA device and therefore must not be used on the laboratory
+server. Stage G now has two immutable artifact profiles: `base-canary` retains
+the pretrained six-file research checkpoint, while `product-e4b-it` seals the
+distinct seven-file instruction checkpoint at `/models/gemma4-e4b-it`. The
+profile is bound into the Docker labels, source/model execution scope, result
+and evidence. Cross-profile model, manifest and validator combinations fail
+before GPU preflight. This implementation has not been run on the laboratory
+GPU in this change, so its current evidence status is `NOT RUN`, not `PASS`.
+Stage G product-completion gate is `EXTERNAL_BLOCKER / NOT RUN` until the lab
+scheduler reserves physical GPU 5, the exact command below finishes inside that
+reservation, and its standalone JSON component passes the guard.
+
+The sole product release command is the integrated 20-turn acceptance suite:
+
+```bash
+/usr/bin/python3 -I -B \
+  -X pycache_prefix=/home/shoon/.cognios-gpu5-guard/host-never-pycache \
+  scripts/gpu5_boundary_guard.py run \
+  --image cogni-os-dev@sha256:20aaf1d7cde8d6a504ba08f158a34a1907eac9413f3578acc4637f0a1b2ec8ba \
+  --expected-source-commit "$(git rev-parse HEAD)" \
+  --validation-artifact-profile product-e4b-it \
+  --workdir /workspace \
+  --timeout 3600 \
+  --evidence-filename gpu5-product-e4b-it-20.json \
+  -- -I -B /workspace/scripts/validate_agent_completion.py \
+  --model /models/gemma4-e4b-it \
+  --manifest /workspace/config/gemma4-e4b-it.manifest.toml \
+  --physical-gpu-index 5 \
+  --gpu-query-context gpu5-container \
+  --turns 20 \
+  --suite product-e4b-it-20 \
+  --strict-json
 ```
+
+The release guard accepts exactly 20 turns and one standalone strict UTF-8 JSON
+component. It rejects progress-text/JSON mixtures, duplicate object keys and
+non-finite values. The guard independently recomputes the fixed case order,
+the canonical prompt text at every index, Fact-book/model routes, A/B session
+isolation, answer digests, raw Korean completion, repetition, role/control-token
+leakage, topic anchors, exact quality-check schema, one resident PID, post-turn
+GPU samples, model-manifest binding, GPU5 identity before/after and worker/lease
+cleanup before it releases the host GPU5 lease. Each user turn must own exactly
+one new assistant message. Turn 9 is a deliberate low-first-budget continuation
+probe and must use exactly one bounded continuation; every other turn must use
+zero. In particular, the identity turn must contain exactly one occurrence of
+the manifest-bound `gemma4-e4b-it` label, build `0.4.0`, effective parameter
+count `4,506,496,490` and stored parameter count `7,996,157,418`; a self-asserted
+summary cannot substitute for those raw turn records.
 
 The recommended release run executes 20 offline turns and checks clean terminal
 reasons,
@@ -86,31 +157,53 @@ no truncation, no public role/control markers, no repetitive output, truthful
 identity grounding and worker cleanup. It is release regression evidence, not
 a substitute for independently reviewed task-quality evaluation.
 
-Natural Korean conversation is a separate mandatory gate:
+The completion report schema is `cogni.agent.completion.stress.v2`. Its memory
+coverage consists of exactly one point-in-time sample after each turn for which
+the resident worker is expected. The maximum of those samples is still not a
+runtime peak: this validator does not certify within-turn peaks, sustained
+usage, or whole-runtime VRAM release. Peak VRAM evidence belongs to
+`validate_gemma4_runtime.py`, which records
+`torch.cuda.max_memory_allocated` telemetry. The strict completion stress gate
+requires complete post-turn coverage and fails if any observed sample exceeds
+16.7 GiB. A non-exceeding spot sample remains a point observation and cannot
+promote the separate peak-VRAM gate.
 
-```powershell
-python scripts\validate_agent_casual_korean.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --timeout 120 `
-  --output C:\Project\cognios-evidence\casual-korean-v0.3.2.json
-```
+Natural Korean conversation is part of the only executable product Stage G
+path: the integrated exact-20 suite above.  The standalone 10-turn
+`validate_agent_casual_korean.py` harness remains source-level diagnostic code
+and is deliberately rejected by guarded `run`; `docker-argv` inspection does
+not execute it and cannot create evidence.  This distinction prevents a
+smaller diagnostic corpus from being presented as product release evidence.
 
-This reproduces the reported two-turn collaboration conversation verbatim and
-adds independent greetings, paraphrases, typos, follow-ups, a context switch,
-and formal regressions. Release requires zero quality fallbacks, exactly one
-assistant message per user turn, natural Korean completion, no loops, and a
-bounded per-turn latency. See [CASUAL_KOREAN_VALIDATION.md](CASUAL_KOREAN_VALIDATION.md).
+The standalone harness still enforces explicit physical index 5 and query
+context, pre-access guarded identity, and manifest plus identity postchecks for
+future guarded integration.  Its scenarios reproduce the reported two-turn
+collaboration conversation and cover greetings, paraphrases, typos, follow-ups,
+context switching, and formal regressions.  Those behavioral categories are
+included in the executable exact-20 product suite, which additionally requires
+zero quality fallbacks, one assistant message per user turn, natural Korean
+completion, no loops, and bounded per-turn latency.  See
+[CASUAL_KOREAN_VALIDATION.md](CASUAL_KOREAN_VALIDATION.md).
 
 ## Experimental decoder-DEQ smoke
 
 This section intentionally retains the pretrained base checkpoint to reproduce
 the historical research canary. It is not a product conversation command.
 
-```powershell
-python scripts\validate_gemma4_deq.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
+```bash
+/usr/bin/python3 -I -B \
+  -X pycache_prefix=/home/shoon/.cognios-gpu5-guard/host-never-pycache \
+  scripts/gpu5_boundary_guard.py run \
+  --image cogni-os-dev@sha256:20aaf1d7cde8d6a504ba08f158a34a1907eac9413f3578acc4637f0a1b2ec8ba \
+  --expected-source-commit "$(git rev-parse HEAD)" \
+  --workdir /workspace \
+  --timeout 1800 \
+  --evidence-filename gpu5-deq-experimental-v041.jsonl \
+  -- -I -B /workspace/scripts/validate_gemma4_deq.py \
+  --model /models/gemma4-e4b \
+  --manifest /workspace/config/gemma4-e4b.manifest.toml \
+  --physical-gpu-index 5 \
+  --gpu-query-context gpu5-container \
   --allow-uncertified-experimental
 ```
 

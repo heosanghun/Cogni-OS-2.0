@@ -29,14 +29,9 @@ configuration, device scope에 묶여야 한다.
 | TTS voice | `Microsoft Heami Desktop`, `ko-KR` |
 | STT/TTS application external calls | `0 / 0` |
 
-재현 명령:
-
-```powershell
-python -m scripts.validate_gemma4_local_voice `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --output C:\Project\cognios-evidence\local-voice-v0.4.0.json
-```
+이 명령은 현재 배포하지 않는다. 기록은 개발 호스트의 historical observation이며,
+voice validator가 E4B-it 전용 GPU5 guard allowlist와 실행 전후 identity 계약에
+들어오기 전까지 current-scope 재현은 `BLOCKED`다.
 
 이 결과는 단일 synthetic TTS phrase의 pipeline smoke다. multi-speaker WER,
 noise robustness, far-field microphone, multilingual speech, streaming latency,
@@ -58,14 +53,9 @@ image route에 전달했다. 보존된 raw JSON은
 | finish / generation mode | `stop` / `cogni_core` |
 | application external calls | `0` |
 
-재현 명령:
-
-```powershell
-python -m scripts.validate_gemma4_local_image `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --output C:\Project\cognios-evidence\local-image-v0.4.0.json
-```
+이 명령은 현재 배포하지 않는다. 기록은 개발 호스트의 historical observation이며,
+image validator가 E4B-it 전용 GPU5 guard allowlist와 실행 전후 identity 계약에
+들어오기 전까지 current-scope 재현은 `BLOCKED`다.
 
 이 결과는 고정된 blue-square 한 장에 대한 smoke다. general visual reasoning,
 OCR, document image understanding, adversarial image safety 또는 combined

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+import scripts.validate_agent_casual_korean as casual
+from scripts.gpu5_boundary_guard import GPU5BoundaryError, require_project_gpu_index
 from scripts.validate_agent_casual_korean import (
     CASUAL_CASES,
     REQUIRED_CASUAL_CHECKS,
@@ -273,12 +277,165 @@ class TestCasualKoreanReleaseGate(unittest.TestCase):
         self.assertFalse(failed["strict_casual_gate_passed"])
 
     def test_cli_uses_bounded_release_latency_default(self) -> None:
-        args = build_parser().parse_args(["--model", "m", "--manifest", "x"])
+        required = [
+            "--model",
+            "m",
+            "--manifest",
+            "x",
+            "--physical-gpu-index",
+            "5",
+            "--gpu-query-context",
+            "gpu5-container",
+        ]
+        args = build_parser().parse_args(required)
         self.assertEqual(args.timeout, 120.0)
         with self.assertRaises(SystemExit):
-            build_parser().parse_args(
-                ["--model", "m", "--manifest", "x", "--timeout", "120.001"]
-            )
+            build_parser().parse_args([*required, "--timeout", "120.001"])
+
+    def test_cli_and_execution_contract_reject_non5_or_missing_selector(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["--model", "m", "--manifest", "x"])
+        for rejected in (0, 1, 2, 3, 4, 6, 7):
+            with self.subTest(rejected=rejected), self.assertRaises(GPU5BoundaryError):
+                require_project_gpu_index(rejected)
+
+    def test_identity_precheck_runs_before_manifest_or_model_access(self) -> None:
+        args = SimpleNamespace(
+            model="m",
+            manifest="x",
+            physical_gpu_index=5,
+            gpu_query_context="gpu5-container",
+            timeout=120.0,
+            output=None,
+        )
+        identity = Mock(side_effect=GPU5BoundaryError("identity rejected"))
+        manifest = Mock()
+        model = Mock()
+        with (
+            patch.object(casual, "validate_guarded_gpu5_identity", identity),
+            patch.object(casual, "verify_artifact_manifest", manifest),
+            patch.object(casual.ModelService, "for_local_gemma", model),
+        ):
+            report, code = casual.execute(args)
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "failed")
+        identity.assert_called_once()
+        manifest.assert_not_called()
+        model.assert_not_called()
+
+    def test_primary_failure_still_runs_manifest_and_gpu_postchecks(self) -> None:
+        args = SimpleNamespace(
+            model="m",
+            manifest="x",
+            physical_gpu_index=5,
+            gpu_query_context="gpu5-container",
+            timeout=120.0,
+            output=None,
+        )
+        identity_value = SimpleNamespace(
+            as_payload=lambda: {
+                "physical_index": 5,
+                "uuid": "gpu5",
+                "logical_device_count": 1,
+                "logical_device_index": 0,
+            }
+        )
+        verified = SimpleNamespace(files=())
+        identity = Mock(side_effect=[identity_value, identity_value])
+        manifest = Mock(side_effect=[verified, verified])
+        torch_cuda = SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 1,
+            current_device=lambda: 0,
+            get_device_name=lambda _index: "GPU5",
+        )
+        with (
+            patch.object(casual, "validate_guarded_gpu5_identity", identity),
+            patch.object(casual, "verify_artifact_manifest", manifest),
+            patch.object(casual.torch, "cuda", torch_cuda),
+            patch.object(
+                casual,
+                "build_runtime_factbook_from_verified",
+                side_effect=RuntimeError("primary"),
+            ),
+        ):
+            report, code = casual.execute(args)
+        self.assertEqual(code, 1)
+        self.assertEqual(identity.call_count, 2)
+        self.assertEqual(manifest.call_count, 2)
+        self.assertEqual(report["verified_files_after"], 0)
+        self.assertIn("gpu_identity_after", report)
+
+    def test_turn_keyboard_interrupt_is_re_raised_after_cleanup(self) -> None:
+        args = SimpleNamespace(
+            model="m",
+            manifest="x",
+            physical_gpu_index=5,
+            gpu_query_context="gpu5-container",
+            timeout=120.0,
+            output=None,
+        )
+        identity_value = SimpleNamespace(
+            as_payload=lambda: {
+                "physical_index": 5,
+                "uuid": "gpu5",
+                "logical_device_count": 1,
+                "logical_device_index": 0,
+            }
+        )
+        verified = SimpleNamespace(files=())
+        factbook = SimpleNamespace(
+            model=SimpleNamespace(manifest_sha256="f" * 64),
+            as_payload=lambda: {},
+        )
+        service = SimpleNamespace(is_running=False, stop=Mock())
+        shutdown = Mock()
+
+        class InterruptingManager:
+            session_id = "casual-interrupt"
+            is_active = False
+
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def snapshot(self) -> dict[str, object]:
+                return {"status": "idle", "conversation": []}
+
+            def start_turn(self, *_args, **_kwargs) -> None:
+                raise KeyboardInterrupt("operator stop")
+
+            def shutdown(self) -> None:
+                shutdown()
+
+        torch_cuda = SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 1,
+            current_device=lambda: 0,
+            get_device_name=lambda _index: "GPU5",
+        )
+        with (
+            patch.object(
+                casual,
+                "validate_guarded_gpu5_identity",
+                side_effect=[identity_value, identity_value],
+            ),
+            patch.object(
+                casual,
+                "verify_artifact_manifest",
+                side_effect=[verified, verified],
+            ),
+            patch.object(casual.torch, "cuda", torch_cuda),
+            patch.object(
+                casual, "build_runtime_factbook_from_verified", return_value=factbook
+            ),
+            patch.object(casual, "_expected_factbook_identity", return_value={}),
+            patch.object(casual, "RuntimeFactGrounder", return_value=Mock()),
+            patch.object(casual.ModelService, "for_local_gemma", return_value=service),
+            patch.object(casual, "AgentManager", InterruptingManager),
+            self.assertRaisesRegex(KeyboardInterrupt, "operator stop"),
+        ):
+            casual.execute(args)
+        shutdown.assert_called_once_with()
 
 
 if __name__ == "__main__":

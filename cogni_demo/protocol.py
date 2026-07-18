@@ -142,6 +142,8 @@ _REQUIRED_METRICS: dict[str, str] = {
     "causal_bridge_bias_nonzero": "bool",
     "causal_bridge_bias_max": "number",
     "conditioned_generated_tokens": "int",
+    "peak_allocated_vram_gib": "number",
+    "peak_reserved_vram_gib": "number",
     "peak_vram_gib": "number",
     "vram_limit_gib": "number",
     "finite": "bool",
@@ -237,8 +239,15 @@ def validate_terminal_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
     if normalized["conditioned_generated_tokens"] != 1:
         raise ProtocolError("causal bridge validation must decode exactly one token")
     limit = normalized["vram_limit_gib"]
+    peak_allocated = normalized["peak_allocated_vram_gib"]
+    peak_reserved = normalized["peak_reserved_vram_gib"]
     peak = normalized["peak_vram_gib"]
-    if not 0 < limit <= ABSOLUTE_VRAM_LIMIT_GIB or not 0 <= peak <= limit:
+    if not 0 < limit <= ABSOLUTE_VRAM_LIMIT_GIB:
+        raise ProtocolError("VRAM limit crossed the absolute safety limit")
+    if not (
+        0 <= peak_allocated <= peak_reserved <= limit
+        and peak == max(peak_allocated, peak_reserved)
+    ):
         raise ProtocolError("VRAM telemetry crossed the absolute safety limit")
     return normalized
 

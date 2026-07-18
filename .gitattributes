@@ -1,7 +1,14 @@
-*.cmd text eol=crlf
+# GPU5 evidence hashes the exact worktree bytes against the committed Git blob.
+# Keep launcher bytes opaque so checkout/archive materialisation cannot rewrite
+# LF to CRLF and silently move the measured source outside the signed scope.
+*.cmd -text
 # This checkpoint is content-addressed at runtime.  Treat it as an opaque
 # artifact so Windows archive/export never rewrites LF to CRLF.
 /cogni_core/cts_policy_checkpoint.json -text
+# Publication admits this policy by an exact source-pinned byte digest.
+/config/release-toolchain-policy.json -text
+/config/release-verifier-policy.json -text
+/config/acceptance-evidence-policy.json -text
 *.exe export-ignore
 *.whl export-ignore
 *.zip export-ignore

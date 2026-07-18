@@ -16,8 +16,8 @@
 ## 필수 증거
 
 - 전체 pytest/ruff/format/Node 문법 결과
-- `scripts/validate_agent_casual_korean.py`의 10/10 실GPU JSON
-- `scripts/validate_agent_completion.py --turns 20`의 실GPU JSON
+- 당시 10/10 casual 실GPU JSON(현재 scope에서는 historical/unverified)
+- 당시 20-turn completion 실GPU JSON(현재 scope에서는 historical/unverified)
 - 현재 프로세스의 UI/API smoke와 버전·Fact-book 일치
 - 동결 commit에서 생성한 EXE, wheel, source ZIP, manual PDF와 `SHA256SUMS.txt`
 

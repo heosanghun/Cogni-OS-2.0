@@ -3,15 +3,35 @@ from __future__ import annotations
 import os
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from scripts.gpu5_boundary_guard import PROJECT_GPU_UUID
+from scripts.gpu5_boundary_guard import (
+    NVIDIA_SMI_EXECUTABLE,
+    PROJECT_GPU_UUID,
+    _MINIMAL_HOST_ENVIRONMENT,
+    _PRODUCT_BUILD_VERSION,
+    _PRODUCT_EFFECTIVE_PARAMETERS,
+    _PRODUCT_ACCEPTANCE_PROMPTS as GUARDED_PRODUCT_ACCEPTANCE_PROMPTS,
+    _PRODUCT_REQUIRED_TURN_CHECKS,
+    _PRODUCT_STORED_PARAMETERS,
+)
+from cogni_os.version import __version__
 from scripts.validate_agent_completion import (
     DEFAULT_PROMPTS,
+    POST_TURN_MEMORY_SAMPLE_SCOPE,
+    PRODUCT_ACCEPTANCE_COVERAGE,
+    PRODUCT_ACCEPTANCE_PROMPTS,
+    PRODUCT_ACCEPTANCE_SUITE,
+    PRODUCT_CONTINUATION_COUNT,
+    PRODUCT_CONTINUATION_FIRST_TOKENS,
+    PRODUCT_CONTINUATION_TOTAL_TOKENS,
+    PRODUCT_CONTINUATION_TURN,
     PromptCase,
     _answer_checks,
     _expected_factbook_identity,
     _korean_completion_metrics,
     _prompt_cases,
+    _product_acceptance_cases,
     _query_nvidia_smi_gpu_memory_bytes,
     _read_process_rss_bytes,
     _sample_worker_memory,
@@ -35,17 +55,19 @@ def _healthy_worker(*, gpu_bytes: int | None = 800) -> dict[str, object]:
         "active_request_id": None,
         "healthy": True,
         "memory": {
-            "worker_rss_bytes": 500,
-            "worker_rss_status": "measured",
-            "worker_gpu_memory_bytes": gpu_bytes,
-            "worker_gpu_memory_status": (
+            "sample_scope": POST_TURN_MEMORY_SAMPLE_SCOPE,
+            "captures_peak": False,
+            "worker_rss_spot_sample_bytes": 500,
+            "worker_rss_spot_sample_status": "measured",
+            "gpu_memory_spot_sample_bytes": gpu_bytes,
+            "gpu_memory_spot_sample_status": (
                 "measured" if gpu_bytes is not None else "driver_unreported"
             ),
-            "gpu_memory_within_limit": (
+            "gpu_memory_spot_sample_within_threshold": (
                 None if gpu_bytes is None else gpu_bytes <= 1_000
             ),
-            "vram_limit_bytes": 1_000,
-            "memory_observed": True,
+            "gpu_memory_spot_sample_threshold_bytes": 1_000,
+            "spot_sample_observed": True,
         },
     }
 
@@ -71,25 +93,168 @@ def _complete_answer(
 
 
 class TestAgentCompletionStressValidation(unittest.TestCase):
+    def test_product_acceptance_suite_is_exactly_20_and_covers_public_failures(self):
+        cases = _product_acceptance_cases()
+        self.assertEqual(len(cases), 20)
+        self.assertEqual(len({case.label for case in cases}), 20)
+        self.assertEqual(
+            PRODUCT_ACCEPTANCE_COVERAGE,
+            {
+                "casual_korean",
+                "typo_tolerance",
+                "follow_up_context",
+                "continuation_completion",
+                "repetition_resistance",
+                "truthful_identity",
+                "false_7b_rejection",
+                "role_control_leak_rejection",
+                "cutoff_rejection",
+                "zero_quality_fallback",
+            },
+        )
+        prompts = "\n".join(case.prompt for case in cases)
+        self.assertIn("안녕하세여", prompts)
+        self.assertIn("방금", prompts)
+        self.assertIn("끊기지", prompts)
+        self.assertIn("반복", prompts)
+        self.assertIn("파라미터", prompts)
+        self.assertEqual(
+            PRODUCT_ACCEPTANCE_PROMPTS, tuple(case.prompt for case in cases)
+        )
+        self.assertEqual(PRODUCT_ACCEPTANCE_PROMPTS, GUARDED_PRODUCT_ACCEPTANCE_PROMPTS)
+        self.assertEqual(PRODUCT_CONTINUATION_TURN, 9)
+        self.assertEqual(PRODUCT_CONTINUATION_COUNT, 1)
+        self.assertEqual(PRODUCT_CONTINUATION_FIRST_TOKENS, 96)
+        self.assertEqual(PRODUCT_CONTINUATION_TOTAL_TOKENS, 192)
+
+    def test_product_guard_check_contract_matches_the_turn_record_schema(self):
+        record = _turn_record(
+            turn_number=1,
+            case=PromptCase("schema", "검증을 설명하세요.", "generated"),
+            session_id="completion-a",
+            peer_session_id="completion-b",
+            state=_complete_state(),
+            answer={**_complete_answer(), "generation_mode": "cogni_core"},
+            elapsed_seconds=1.0,
+            worker=_healthy_worker(),
+            peer_before_digest="a" * 64,
+            peer_after_digest="a" * 64,
+            prior_answer_digests=set(),
+            new_assistant_count=1,
+            new_user_count=1,
+            observed_user_prompt="검증을 설명하세요.",
+        )
+
+        self.assertEqual(set(record["checks"]), _PRODUCT_REQUIRED_TURN_CHECKS)
+
+    def test_turn_record_requires_one_new_assistant_and_exact_continuation_probe(self):
+        ordinary = _turn_record(
+            turn_number=1,
+            case=PromptCase("ordinary", "검증을 설명하세요.", "generated"),
+            session_id="completion-a",
+            peer_session_id="completion-b",
+            state=_complete_state(),
+            answer={**_complete_answer(), "generation_mode": "cogni_core"},
+            elapsed_seconds=1.0,
+            worker=_healthy_worker(),
+            peer_before_digest="a" * 64,
+            peer_after_digest="a" * 64,
+            prior_answer_digests=set(),
+            new_assistant_count=2,
+            new_user_count=1,
+            observed_user_prompt="검증을 설명하세요.",
+        )
+        self.assertFalse(ordinary["checks"]["exactly_one_assistant"])
+        self.assertFalse(ordinary["passed"])
+
+        probe = _turn_record(
+            turn_number=PRODUCT_CONTINUATION_TURN,
+            case=PromptCase("continuation", "자세히 분석하세요.", "generated"),
+            session_id="completion-b",
+            peer_session_id="completion-a",
+            state=_complete_state(),
+            answer={
+                **_complete_answer(),
+                "generation_mode": "cogni_core",
+                "continuations": PRODUCT_CONTINUATION_COUNT,
+            },
+            elapsed_seconds=1.0,
+            worker=_healthy_worker(),
+            peer_before_digest="a" * 64,
+            peer_after_digest="a" * 64,
+            prior_answer_digests=set(),
+            new_assistant_count=1,
+            new_user_count=1,
+            observed_user_prompt="자세히 분석하세요.",
+        )
+        self.assertTrue(probe["checks"]["exactly_one_assistant"])
+        self.assertTrue(probe["checks"]["continuation_contract"])
+
+    def test_product_guard_identity_constants_match_the_release_factbook(self):
+        self.assertEqual(_PRODUCT_BUILD_VERSION, __version__)
+        self.assertEqual(_PRODUCT_EFFECTIVE_PARAMETERS, 4_506_496_490)
+        self.assertEqual(_PRODUCT_STORED_PARAMETERS, 7_996_157_418)
+
+    def test_product_suite_parser_requires_exact_turn_count_at_execution(self):
+        parser = build_parser()
+        required = [
+            "--model",
+            "m",
+            "--manifest",
+            "x",
+            "--physical-gpu-index",
+            "5",
+            "--gpu-query-context",
+            "gpu5-container",
+            "--suite",
+            PRODUCT_ACCEPTANCE_SUITE,
+            "--strict-json",
+        ]
+        accepted = parser.parse_args(required)
+        self.assertEqual(accepted.turns, 20)
+        self.assertTrue(accepted.strict_json)
+        rejected = parser.parse_args([*required, "--turns", "19"])
+        with self.assertRaisesRegex(ValueError, "exactly 20"):
+            execute(rejected)
+
     def test_release_defaults_to_twenty_turns_and_120_second_ceiling(self):
         parser = build_parser()
-        default = parser.parse_args(["--model", "m", "--manifest", "x"])
-        stress = parser.parse_args(["--model", "m", "--manifest", "x", "--turns", "20"])
+        required = [
+            "--model",
+            "m",
+            "--manifest",
+            "x",
+            "--physical-gpu-index",
+            "5",
+            "--gpu-query-context",
+            "gpu5-container",
+        ]
+        default = parser.parse_args(required)
+        stress = parser.parse_args([*required, "--turns", "20"])
         self.assertEqual(default.turns, 20)
-        self.assertIsNone(default.physical_gpu_index)
+        self.assertEqual(default.physical_gpu_index, 5)
+        self.assertEqual(default.gpu_query_context, "gpu5-container")
         self.assertEqual(default.timeout, 120.0)
         self.assertEqual(stress.turns, 20)
+        for missing in (
+            [
+                "--model",
+                "m",
+                "--manifest",
+                "x",
+                "--gpu-query-context",
+                "gpu5-container",
+            ],
+            ["--model", "m", "--manifest", "x", "--physical-gpu-index", "5"],
+        ):
+            with self.subTest(missing=missing), self.assertRaises(SystemExit):
+                parser.parse_args(missing)
         for value in ("0", "101", "not-a-number"):
             with self.subTest(value=value), self.assertRaises(SystemExit):
-                parser.parse_args(["--model", "m", "--manifest", "x", "--turns", value])
-        with self.assertRaises(SystemExit):
-            parser.parse_args(
-                ["--model", "m", "--manifest", "x", "--timeout", "120.001"]
-            )
-        selected = parser.parse_args(
-            ["--model", "m", "--manifest", "x", "--physical-gpu-index", "5"]
-        )
-        self.assertEqual(selected.physical_gpu_index, 5)
+                parser.parse_args([*required, "--turns", value])
+        for value in ("120.001", "nan", "inf", "-inf"):
+            with self.subTest(timeout=value), self.assertRaises(SystemExit):
+                parser.parse_args([*required, "--timeout", value])
         for value in ("0", "4", "6", "7", "not-a-number"):
             with self.subTest(gpu=value), self.assertRaises(SystemExit):
                 parser.parse_args(
@@ -100,6 +265,8 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
                         "x",
                         "--physical-gpu-index",
                         value,
+                        "--gpu-query-context",
+                        "gpu5-container",
                     ]
                 )
 
@@ -114,8 +281,8 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
             for _ in range(4)
         ]
         summary = _summarize_turns(diagnostic, 4)
-        self.assertFalse(summary["release_schedule_gate_passed"])
-        self.assertFalse(summary["strict_turn_gate_passed"])
+        self.assertFalse(summary["recommended_stress_schedule_completed"])
+        self.assertFalse(summary["strict_completion_stress_gate_passed"])
 
     def test_twenty_turn_schedule_keeps_original_four_and_is_deterministic(self):
         first = _prompt_cases(20)
@@ -362,14 +529,14 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         one_fallback[0]["generation_mode"] = "quality_fallback"
         rejected_once = _summarize_turns(one_fallback, 20)
         self.assertFalse(rejected_once["quality_fallback_gate_passed"])
-        self.assertFalse(rejected_once["strict_turn_gate_passed"])
+        self.assertFalse(rejected_once["strict_completion_stress_gate_passed"])
         self.assertEqual(rejected_once["content_answer_rate"], 0.95)
 
         two_fallbacks = [dict(item) for item in one_fallback]
         two_fallbacks[1]["generation_mode"] = "quality_fallback"
         rejected_twice = _summarize_turns(two_fallbacks, 20)
         self.assertFalse(rejected_twice["quality_fallback_gate_passed"])
-        self.assertFalse(rejected_twice["strict_turn_gate_passed"])
+        self.assertFalse(rejected_twice["strict_completion_stress_gate_passed"])
 
         incomplete = _korean_completion_metrics("이는 내가.")
         self.assertFalse(incomplete["complete"])
@@ -417,17 +584,22 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
                 stderr="",
             )
 
-        measured = _query_nvidia_smi_gpu_memory_bytes(
-            77,
-            physical_gpu_index=5,
-            gpu_query_context="native-host",
-            runner=runner,
-        )
+        with patch(
+            "scripts.validate_agent_completion._validated_executable",
+            return_value=str(NVIDIA_SMI_EXECUTABLE),
+        ):
+            measured = _query_nvidia_smi_gpu_memory_bytes(
+                77,
+                physical_gpu_index=5,
+                gpu_query_context="native-host",
+                runner=runner,
+            )
         self.assertEqual(measured, (900 * 1024**2, "measured"))
-        self.assertEqual(calls[0][0][:3], ("nvidia-smi", "-i", "5"))
+        self.assertEqual(calls[0][0][:3], (str(NVIDIA_SMI_EXECUTABLE), "-i", "5"))
         self.assertNotIn("6", calls[0][0][:3])
         self.assertNotIn("7", calls[0][0][:3])
         self.assertEqual(calls[0][1]["timeout"], 5)
+        self.assertEqual(calls[0][1]["env"], _MINIMAL_HOST_ENVIRONMENT)
 
         def wrong_uuid(argv, **kwargs):
             return SimpleNamespace(
@@ -436,15 +608,19 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
                 stderr="",
             )
 
-        self.assertEqual(
-            _query_nvidia_smi_gpu_memory_bytes(
-                77,
-                physical_gpu_index=5,
-                gpu_query_context="native-host",
-                runner=wrong_uuid,
-            ),
-            (None, "gpu_uuid_mismatch"),
-        )
+        with patch(
+            "scripts.validate_agent_completion._validated_executable",
+            return_value=str(NVIDIA_SMI_EXECUTABLE),
+        ):
+            self.assertEqual(
+                _query_nvidia_smi_gpu_memory_bytes(
+                    77,
+                    physical_gpu_index=5,
+                    gpu_query_context="native-host",
+                    runner=wrong_uuid,
+                ),
+                (None, "gpu_uuid_mismatch"),
+            )
 
     def test_container_gpu_memory_query_uses_uuid_aggregate_not_worker_pid(self):
         calls = []
@@ -457,16 +633,24 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
                 stderr="",
             )
 
-        measured = _query_nvidia_smi_gpu_memory_bytes(
-            999999,
-            physical_gpu_index=5,
-            gpu_query_context="gpu5-container",
-            runner=runner,
-        )
+        with patch(
+            "scripts.validate_agent_completion._validated_executable",
+            return_value=str(NVIDIA_SMI_EXECUTABLE),
+        ):
+            measured = _query_nvidia_smi_gpu_memory_bytes(
+                999999,
+                physical_gpu_index=5,
+                gpu_query_context="gpu5-container",
+                runner=runner,
+            )
         self.assertEqual(measured, (900 * 1024**2, "measured_aggregate"))
-        self.assertEqual(calls[0][0][:3], ("nvidia-smi", "-i", PROJECT_GPU_UUID))
+        self.assertEqual(
+            calls[0][0][:3],
+            (str(NVIDIA_SMI_EXECUTABLE), "-i", PROJECT_GPU_UUID),
+        )
         self.assertIn("--query-gpu=uuid,memory.used", calls[0][0])
         self.assertFalse(any("query-compute-apps" in token for token in calls[0][0]))
+        self.assertEqual(calls[0][1]["env"], _MINIMAL_HOST_ENVIRONMENT)
 
         def forbidden_runner(*args, **kwargs):
             raise AssertionError("invalid context must not run nvidia-smi")
@@ -508,25 +692,70 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
         self.assertIn("GPU5BoundaryError", report["error"])
         self.assertNotIn("verified_files", report)
 
+    def test_execute_preserves_primary_error_and_post_identity_error(self):
+        identity_before = SimpleNamespace(as_payload=lambda: {"uuid": "GPU5-before"})
+        identity_after = SimpleNamespace(as_payload=lambda: {"uuid": "GPU5-after"})
+        verified = SimpleNamespace(files=())
+        args = SimpleNamespace(
+            model="model",
+            manifest="manifest",
+            timeout=120.0,
+            turns=1,
+            output=None,
+            physical_gpu_index=5,
+            gpu_query_context="gpu5-container",
+        )
+        with (
+            patch(
+                "scripts.validate_agent_completion.validate_guarded_gpu5_identity",
+                side_effect=(identity_before, identity_after),
+            ) as identity_check,
+            patch(
+                "scripts.validate_agent_completion.verify_artifact_manifest",
+                side_effect=(verified, verified),
+            ) as manifest_check,
+            patch(
+                "scripts.validate_agent_completion.torch.cuda.is_available",
+                return_value=False,
+            ),
+        ):
+            report, code = execute(args)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(report["schema"], "cogni.agent.completion.stress.v2")
+        self.assertEqual(
+            report["memory_evidence_scope"]["kind"],
+            POST_TURN_MEMORY_SAMPLE_SCOPE,
+        )
+        self.assertIs(report["memory_evidence_scope"]["captures_peak"], False)
+        self.assertIn("CUDA is required", report["error"])
+        self.assertIn("identity changed", report["post_gpu_identity_error"])
+        self.assertEqual(identity_check.call_count, 2)
+        self.assertEqual(manifest_check.call_count, 2)
+
     def test_memory_sampler_keeps_gpu_unverified_separate_from_rss(self):
         observed = _sample_worker_memory(
             77,
-            vram_limit_bytes=1_000,
+            gpu_spot_sample_threshold_bytes=1_000,
             rss_reader=lambda _pid: 500,
             gpu_reader=lambda _pid: (900, "measured"),
         )
-        self.assertTrue(observed["memory_observed"])
-        self.assertTrue(observed["gpu_memory_within_limit"])
+        self.assertEqual(observed["sample_scope"], POST_TURN_MEMORY_SAMPLE_SCOPE)
+        self.assertIs(observed["captures_peak"], False)
+        self.assertTrue(observed["spot_sample_observed"])
+        self.assertTrue(observed["gpu_memory_spot_sample_within_threshold"])
 
         driver_hidden = _sample_worker_memory(
             77,
-            vram_limit_bytes=1_000,
+            gpu_spot_sample_threshold_bytes=1_000,
             rss_reader=lambda _pid: 500,
             gpu_reader=lambda _pid: (None, "driver_unreported"),
         )
-        self.assertTrue(driver_hidden["memory_observed"])
-        self.assertIsNone(driver_hidden["gpu_memory_within_limit"])
-        self.assertEqual(driver_hidden["worker_gpu_memory_status"], "driver_unreported")
+        self.assertTrue(driver_hidden["spot_sample_observed"])
+        self.assertIsNone(driver_hidden["gpu_memory_spot_sample_within_threshold"])
+        self.assertEqual(
+            driver_hidden["gpu_memory_spot_sample_status"], "driver_unreported"
+        )
 
     def test_current_process_rss_is_observable_without_optional_packages(self):
         self.assertGreater(_read_process_rss_bytes(os.getpid()), 0)
@@ -538,16 +767,16 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
             active_request_id=None,
         )
 
-        def sampler(pid, *, vram_limit_bytes):
+        def sampler(pid, *, gpu_spot_sample_threshold_bytes):
             self.assertEqual(pid, 81)
-            self.assertEqual(vram_limit_bytes, 1_000)
+            self.assertEqual(gpu_spot_sample_threshold_bytes, 1_000)
             return _healthy_worker()["memory"]
 
         healthy = _worker_snapshot(
             service,
             expected_running=True,
             stable_pid=81,
-            vram_limit_bytes=1_000,
+            gpu_spot_sample_threshold_bytes=1_000,
             memory_sampler=sampler,
         )
         self.assertTrue(healthy["healthy"])
@@ -557,7 +786,7 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
             service,
             expected_running=True,
             stable_pid=81,
-            vram_limit_bytes=1_000,
+            gpu_spot_sample_threshold_bytes=1_000,
             memory_sampler=sampler,
         )
         self.assertFalse(busy["healthy"])
@@ -577,6 +806,9 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
             peer_before_digest="a" * 64,
             peer_after_digest="a" * 64,
             prior_answer_digests=set(),
+            new_assistant_count=1,
+            new_user_count=1,
+            observed_user_prompt=case.prompt,
         )
         self.assertTrue(first["passed"])
 
@@ -592,6 +824,9 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
             peer_before_digest="a" * 64,
             peer_after_digest="b" * 64,
             prior_answer_digests={first["answer_sha256"]},
+            new_assistant_count=1,
+            new_user_count=1,
+            observed_user_prompt=case.prompt,
         )
         self.assertFalse(second["passed"])
         self.assertFalse(second["checks"]["no_cross_turn_exact_duplicate"])
@@ -599,11 +834,14 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
 
         summary = _summarize_turns([first, second], 2)
         self.assertEqual(summary["turn_success_rate"], 0.5)
-        self.assertFalse(summary["strict_turn_gate_passed"])
-        self.assertFalse(summary["gpu_memory_gate_passed"])
-        self.assertEqual(summary["gpu_memory_verdict"], "failed")
+        self.assertFalse(summary["strict_completion_stress_gate_passed"])
+        self.assertFalse(summary["post_turn_gpu_memory_spot_sample_coverage_complete"])
+        self.assertEqual(
+            summary["post_turn_gpu_memory_spot_sample_coverage_verdict"],
+            "incomplete",
+        )
 
-    def test_release_gate_requires_full_gpu_memory_coverage(self):
+    def test_completion_gate_requires_full_post_turn_gpu_spot_sample_coverage(self):
         base = {
             "passed": True,
             "checks": {},
@@ -612,27 +850,114 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
             "generation_mode": "cogni_core",
         }
         complete = _summarize_turns([dict(base) for _ in range(20)], 20)
-        self.assertTrue(complete["gpu_memory_gate_passed"])
-        self.assertEqual(complete["gpu_memory_coverage_rate"], 1.0)
-        self.assertEqual(complete["gpu_memory_verdict"], "passed")
-        self.assertTrue(complete["strict_turn_gate_passed"])
+        self.assertTrue(complete["post_turn_gpu_memory_spot_sample_coverage_complete"])
+        self.assertEqual(
+            complete["post_turn_gpu_memory_spot_sample_coverage_rate"], 1.0
+        )
+        self.assertEqual(
+            complete["post_turn_gpu_memory_spot_sample_coverage_verdict"],
+            "complete",
+        )
+        self.assertTrue(complete["strict_completion_stress_gate_passed"])
+        self.assertTrue(
+            complete["post_turn_gpu_memory_spot_sample_threshold_gate_passed"]
+        )
+        self.assertNotIn("peak_worker_gpu_memory_bytes", complete)
+        self.assertEqual(
+            complete["maximum_observed_post_turn_gpu_memory_spot_sample_bytes"],
+            800,
+        )
+        self.assertEqual(complete["resident_worker_pids"], [1234])
+        self.assertTrue(complete["single_resident_worker_scope"])
+
+        second_worker = _healthy_worker()
+        second_worker["pid"] = 4321
+        second_worker["stable_pid_before_turn"] = 4321
+        mixed_workers = [dict(base) for _ in range(20)]
+        mixed_workers[-1] = {**base, "worker": second_worker}
+        mixed_summary = _summarize_turns(mixed_workers, 20)
+        self.assertEqual(mixed_summary["resident_worker_pids"], [1234, 4321])
+        self.assertFalse(mixed_summary["single_resident_worker_scope"])
+        self.assertFalse(mixed_summary["strict_completion_stress_gate_passed"])
+
+        legacy_worker = _healthy_worker()
+        legacy_worker["memory"].pop("sample_scope")
+        legacy = _summarize_turns(
+            [{**base, "worker": legacy_worker} for _ in range(20)], 20
+        )
+        self.assertFalse(legacy["post_turn_gpu_memory_spot_sample_coverage_complete"])
+
+        over_threshold = _summarize_turns(
+            [{**base, "worker": _healthy_worker(gpu_bytes=1_200)} for _ in range(20)],
+            20,
+        )
+        self.assertTrue(
+            over_threshold["post_turn_gpu_memory_spot_sample_coverage_complete"]
+        )
+        self.assertFalse(over_threshold["strict_completion_stress_gate_passed"])
+        self.assertFalse(
+            over_threshold["post_turn_gpu_memory_spot_sample_threshold_gate_passed"]
+        )
+        self.assertEqual(
+            over_threshold["post_turn_gpu_memory_spot_sample_threshold_observation"],
+            "observed_above_threshold",
+        )
 
         missing = [dict(base) for _ in range(20)]
         missing[-1] = {**base, "worker": _healthy_worker(gpu_bytes=None)}
         incomplete = _summarize_turns(missing, 20)
-        self.assertFalse(incomplete["gpu_memory_gate_passed"])
-        self.assertEqual(incomplete["gpu_memory_verdict"], "failed")
-        self.assertFalse(incomplete["strict_turn_gate_passed"])
+        self.assertFalse(
+            incomplete["post_turn_gpu_memory_spot_sample_coverage_complete"]
+        )
+        self.assertEqual(
+            incomplete["post_turn_gpu_memory_spot_sample_coverage_verdict"],
+            "incomplete",
+        )
+        self.assertFalse(incomplete["strict_completion_stress_gate_passed"])
 
         missing_resident = {**base, "worker": _healthy_worker(gpu_bytes=None)}
         nonresident = {**base, "worker": _healthy_worker()}
         nonresident["worker"]["expected_running"] = False
         uncompensated = _summarize_turns([missing_resident, nonresident], 2)
         self.assertEqual(uncompensated["worker_expected_turns"], 1)
-        self.assertEqual(uncompensated["gpu_memory_observed_turns"], 0)
-        self.assertEqual(uncompensated["gpu_memory_coverage_rate"], 0.0)
-        self.assertFalse(uncompensated["gpu_memory_gate_passed"])
-        self.assertEqual(uncompensated["gpu_memory_verdict"], "unverified")
+        self.assertEqual(
+            uncompensated["post_turn_gpu_memory_spot_sample_observed_turns"], 0
+        )
+        self.assertEqual(
+            uncompensated["post_turn_gpu_memory_spot_sample_coverage_rate"], 0.0
+        )
+        self.assertFalse(
+            uncompensated["post_turn_gpu_memory_spot_sample_coverage_complete"]
+        )
+        self.assertEqual(
+            uncompensated["post_turn_gpu_memory_spot_sample_coverage_verdict"],
+            "unverified",
+        )
+
+    def test_turn_record_rejects_observed_gpu_memory_above_limit(self):
+        record = _turn_record(
+            turn_number=1,
+            case=PromptCase("stress-vram", "간결하게 답하세요.", "generated"),
+            session_id="completion-a",
+            peer_session_id="completion-b",
+            state=_complete_state(),
+            answer=_complete_answer(),
+            elapsed_seconds=1.0,
+            worker=_healthy_worker(gpu_bytes=1_200),
+            peer_before_digest="a" * 64,
+            peer_after_digest="a" * 64,
+            prior_answer_digests=set(),
+            new_assistant_count=1,
+            new_user_count=1,
+            observed_user_prompt="간결하게 답하세요.",
+        )
+
+        self.assertFalse(record["passed"])
+        self.assertFalse(
+            record["checks"][
+                "post_turn_gpu_memory_spot_sample_within_limit_when_required"
+            ]
+        )
 
     def test_turn_record_rejects_substantive_cross_turn_sentence_echo(self):
         prior = (
@@ -652,6 +977,9 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
             peer_before_digest="a" * 64,
             peer_after_digest="a" * 64,
             prior_answer_digests=set(),
+            new_assistant_count=1,
+            new_user_count=1,
+            observed_user_prompt="다른 원칙을 답하세요.",
             prior_sentence_keys=set(_substantive_sentence_keys(prior)),
         )
         self.assertFalse(record["passed"])
@@ -671,6 +999,9 @@ class TestAgentCompletionStressValidation(unittest.TestCase):
             peer_before_digest="a" * 64,
             peer_after_digest="a" * 64,
             prior_answer_digests=set(),
+            new_assistant_count=1,
+            new_user_count=1,
+            observed_user_prompt="간결하게 답하세요.",
         )
         self.assertFalse(record["passed"])
         self.assertFalse(record["checks"]["interactive_latency_within_limit"])

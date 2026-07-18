@@ -18,8 +18,12 @@ Public claims use four evidence classes:
 An evidence record is valid only while all cited content-addressed records are
 present and match the current model, code, config and device digests. The JSON
 contract is [`config/evidence.schema.json`](../config/evidence.schema.json).
-Runtime evidence and last-known-good snapshots are stored outside the source
-tree; generated local `.cogni_state` data is not a release artifact.
+Raw runtime guard evidence, raw logs and last-known-good snapshots are stored
+outside the source tree in owner-only storage; generated local `.cogni_state`
+data is not a release artifact. After independent review, an immutable,
+content-addressed release summary may be committed under
+`release/evidence/v0.4.1` only when it cites the exact external raw-evidence
+digest and source scope. Raw guard evidence and raw logs are never committed.
 
 The UI starts with runtime evidence marked `UNVERIFIED` and no copied metric
 values. Only a successful validation run in the current process and current
@@ -38,13 +42,16 @@ The retained current-scope evidence has the following status:
 | integrated Gemma/DEQ/CTS GPU runtime measurement | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
 | final System 4 stress measurement | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
 | natural Korean 10-turn release gate | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
-| local Korean TTS → Gemma STT smoke | `PASS (one synthetic phrase; development host)` |
-| deterministic image-understanding smoke | `PASS (one fixed PNG; development host)` |
+| local Korean TTS → Gemma STT smoke | `HISTORICAL DEV-HOST OBSERVATION; CURRENT SCOPE UNVERIFIED` |
+| deterministic image-understanding smoke | `HISTORICAL DEV-HOST OBSERVATION; CURRENT SCOPE UNVERIFIED` |
 | live Lens patent/scholarly query | `NOT RUN (user token and terms acceptance not bundled)` |
 | final release bytes and `SHA256SUMS.txt` | `PASS` only after regeneration from the frozen v0.4.0 commit |
 
-These passes are scoped to the retained source/model/config/device evidence.
-They do not certify the target RTX 4090, code signing, or a standalone installer.
+Only records that validate against the evidence schema and bind the exact
+source/model/config/device and raw-evidence digests can be called current-scope
+passes. The retained voice and image JSON files predate that contract and are
+historical observations only; they do not certify the target RTX 4090, code
+signing, or a standalone installer.
 
 The older JSON records under `release/evidence/` remain historical comparison
 material. They cannot authorize the changed v0.4.0 source scope. Final v0.4.0
@@ -61,6 +68,19 @@ python -m ruff check .
 python -m ruff format --check cogni_agent cogni_core cogni_demo cogni_flow cogni_os scripts tests
 python -m pytest -q
 ```
+
+The double-click launchers have intentionally separate roles:
+
+- `Run-CogniOS-Demo.cmd` starts only the ordinary Windows
+  `desktop-ui-only` appliance. A caller cannot switch it to the native GPU
+  server profile.
+- `Run-CogniOS-CLI.cmd` runs only the CPU/static integrity diagnostic: Python
+  3.11 isolated mode, the 170-item acceptance-ledger validator, and an AST
+  integrity check of the repository-anchored bootstrap. It does not load a
+  model, probe CUDA, invoke `nvidia-smi`, or produce live hardware evidence.
+- `Run-CogniOS-Server-GPU5.sh` is the Linux native product-server operator
+  launcher. It accepts the model location only through `COGNI_OS_MODEL_DIR` and
+  delegates all GPU access to the server after the shared lease is acquired.
 
 The exact number of collected tests is intentionally not a release contract:
 new security cases change it. A release candidate must retain the complete raw
@@ -132,20 +152,12 @@ python -m pytest -q `
   tests/test_proposal_review.py
 ```
 
-Run actual local voice and image forwards serially so two validators do not
-compete for the single GPU lease:
-
-```powershell
-python -m scripts.validate_gemma4_local_voice `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --output C:\Project\cognios-evidence\local-voice-v0.4.0.json
-
-python -m scripts.validate_gemma4_local_image `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
-  --output C:\Project\cognios-evidence\local-image-v0.4.0.json
-```
+The historical direct voice and image commands are intentionally not published:
+both can select a default CUDA device and neither validator is in the sole GPU5
+guard allowlist. They must not run on the laboratory server. Current-scope GPU
+evidence remains blocked until each validator has an exact guarded argv,
+identity-before-load and identity-after-shutdown checks, and a manifest-bound
+instruction-profile mount.
 
 The 2026-07-16 development-host voice smoke synthesized
 `안녕하세요. 코그니보드 로컬 음성 검증입니다.` with Microsoft Heami Desktop
@@ -176,32 +188,119 @@ gates require the exact pinned Gemma 4 E4B-it artifact and its seven-file
 manifest. The pretrained base checkpoint is retained only for the explicitly
 uncertified research/canary decoder-DEQ smoke:
 
-```powershell
-python scripts\validate_gemma4.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml
+The GPU-bearing gates below are server operations.  After the clean exact-commit
+CPU Exit Gate, the only Stage G GPU entry point is
+`gpu5_boundary_guard.py run`; direct native validator commands cannot create
+release evidence.  The Windows appliance starts as `desktop-ui-only`; it
+preserves the UI and conversation path but cannot silently turn an unbounded
+desktop device into server evidence.
 
-# Research/canary only; never a public conversation checkpoint.
-python scripts\validate_gemma4_deq.py `
-  --model C:\Project\cognios\gemma4-e4b `
-  --manifest config\gemma4-e4b.manifest.toml `
-  --allow-uncertified-experimental
-
-python scripts\validate_gemma4_runtime.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml `
+```bash
+/usr/bin/python3 -I -B \
+  -X pycache_prefix=/home/shoon/.cognios-gpu5-guard/host-never-pycache \
+  scripts/gpu5_boundary_guard.py run \
+  --image cogni-os-dev@sha256:20aaf1d7cde8d6a504ba08f158a34a1907eac9413f3578acc4637f0a1b2ec8ba \
+  --expected-source-commit "$(git rev-parse HEAD)" \
+  --validation-artifact-profile base-canary \
+  --workdir /workspace \
+  --timeout 1800 \
+  --evidence-filename gpu5-runtime-v041.json \
+  -- -I -B /workspace/scripts/validate_gemma4_runtime.py \
+  --model /models/gemma4-e4b \
+  --manifest /workspace/config/gemma4-e4b.manifest.toml \
+  --physical-gpu-index 5 \
+  --gpu-query-context gpu5-container \
   --event-stream
-
-python scripts\validate_agent_completion.py `
-  --model C:\Project\cognios\gemma4-e4b-it `
-  --manifest config\gemma4-e4b-it.manifest.toml
 ```
 
-The second command is explicitly an **uncertified convergence smoke test**.
-It is not proof that the whole Gemma decoder has global Lipschitz constant
-below 0.95. Production use without the experimental flag requires an
+The completion and DEQ validators use the same guard with distinct evidence
+filenames and their allowlisted container commands.  An uncertified DEQ smoke
+test is never release evidence.  Production DEQ evidence requires an
 independently derived decoder-delta certificate and fails before execution
-when it is missing or unsafe.
+when provenance is missing or unsafe.
+
+The command above is the preserved `base-canary` research/runtime path. Product
+conversation evidence selects the immutable `product-e4b-it` profile and cannot
+reuse the base model, manifest or validators:
+
+```bash
+/usr/bin/python3 -I -B \
+  -X pycache_prefix=/home/shoon/.cognios-gpu5-guard/host-never-pycache \
+  scripts/gpu5_boundary_guard.py run \
+  --image cogni-os-dev@sha256:20aaf1d7cde8d6a504ba08f158a34a1907eac9413f3578acc4637f0a1b2ec8ba \
+  --expected-source-commit "$(git rev-parse HEAD)" \
+  --validation-artifact-profile product-e4b-it \
+  --workdir /workspace \
+  --timeout 3600 \
+  --evidence-filename gpu5-product-e4b-it-20.json \
+  -- -I -B /workspace/scripts/validate_agent_completion.py \
+  --model /models/gemma4-e4b-it \
+  --manifest /workspace/config/gemma4-e4b-it.manifest.toml \
+  --physical-gpu-index 5 \
+  --gpu-query-context gpu5-container \
+  --turns 20 \
+  --suite product-e4b-it-20 \
+  --strict-json
+```
+
+The product release command is one ModelService/lease and exactly 20 turns. Its
+fixed cases cover casual Korean, typo tolerance, follow-up context, continuation
+completion, repetition resistance, exact Fact-book identity, false-7B, public
+role/control-marker and cutoff rejection, and zero quality fallback. The guard
+requires a single passed `cogni.agent.completion.stress.v2` JSON component and
+independently recomputes its fixed turn order/routes, exact quality-check keys,
+answer digests, A/B isolation, one resident PID, all 16 required GPU spot
+samples, seven-file manifest binding, GPU5 identities and cleanup. The first
+turn must expose `gemma4-e4b-it`, effective `4,506,496,490` and stored
+`7,996,157,418` parameters; an empty turn list or self-authored PASS summary is
+rejected.
+Implementation alone does not create evidence: this route remains `NOT RUN`
+until the exact command succeeds on idle physical GPU5 and independent review
+accepts the retained component.
+
+The operational resident server is started separately from Stage G evidence:
+
+```bash
+export COGNI_OS_PYTHON=/verified/cognios-venv/bin/python
+export COGNI_OS_MODEL_DIR=/verified/local/gemma4-e4b-it
+./Run-CogniOS-Server-GPU5.sh
+```
+
+The verified Gemma 4 E4B-it artifact and a Python 3.11+ environment are external
+prerequisites. A trusted parent process or service manager must provide the
+documented minimal environment before the launcher is loaded. This is the
+pre-shebang trust boundary because loader variables (`LD_AUDIT`,
+`LD_LIBRARY_PATH`) and Bash startup hooks (`BASH_ENV`) can act before the shell
+script body runs.
+
+The shebang and sanitized re-exec use `bash -p`, and security-critical
+`exec`/`exit`/`printf` calls select their Bash builtins explicitly, so exported
+functions cannot shadow them. The launcher then immediately re-executes itself
+through an exact `/usr/bin/env -i` environment and verifies that sanitized
+stage. Git,
+`readlink`, the interpreter sentinel and the final Python bootstrap each run
+with a purpose-specific exact environment; loader, Bash, Git configuration,
+proxy, credential and unrelated caller variables are not inherited.
+`COGNI_OS_PYTHON`, when set, is a bounded absolute invocation path. The
+launcher preserves that path so a verified virtual environment retains its
+`sys.prefix`, while separately resolving the executable target for ownership
+and mode checks. The resolved target must be an operator-trusted ELF
+executable. An exact isolated CPython 3.11+ runtime check requires `-I -B`,
+safe-path/no-user-site flags, the expected resolved `sys.executable`, and live
+`/proc/self/exe`; shell wrappers and accidental non-Python executables are
+rejected. This is not cryptographic attestation of an arbitrary same-user ELF
+binary. Such a threat requires a committed executable digest or equivalent
+signed provenance at the operator/service-manager trust boundary. Without an
+override the launcher checks `/usr/bin/python3` and fails closed when it is
+unsuitable.
+
+The launcher requires a clean lowercase 40-hex HEAD, installs the pinned GPU5
+UUID visibility environment, and invokes the selected interpreter with
+`-I -B` plus `--expected-source-commit`. It never calls `nvidia-smi` itself.
+The server owns the shared cross-process lease, exact-index
+idle/foreign-PID proof, identity check, resident lifetime, cleanup, and
+postflight; a failed safety postcheck poisons the lease instead of silently
+releasing it.
 
 The integrated runtime gate must:
 
@@ -241,13 +340,23 @@ control-token leakage, no repetitive loop, no false model identity, clean
 worker shutdown and bounded stream completion. The retained
 `phase11_gemma_20turn_cognicore_release_final_v6_20260712.json` passed 20/20
 turns with zero quality fallbacks, zero repeated sentences and zero substantive
-cross-turn sentence reuse. Worker-memory coverage was 100%; 15 turns used
+cross-turn sentence reuse. Worker post-turn spot-sample coverage was 100%; 15 turns used
 Cogni-Core generation, whose max and p95 latency were both 78.516 seconds, and
 every turn stayed within 180 seconds. Worker cleanup and GPU-lease release were
 both true. Per-process GPU memory was not reported by the driver, so that
 conversation-specific metric remains `unverified`; it is not inferred from the
 separate integrated-runtime peak measurement. This automated pass does not
 replace the independent external human-labelled 20-turn acceptance study.
+
+Completion evidence uses the
+`cogni.agent.completion.stress.v2` schema. It requires one declared post-turn
+spot sample per expected resident-worker turn, but it never labels the maximum
+of those samples as a peak and does not certify sustained usage or whole-runtime
+VRAM release. Full-runtime peak certification is owned by
+`validate_gemma4_runtime.py` and its `torch.cuda.max_memory_allocated`
+telemetry. The strict completion stress gate requires complete spot-sample
+coverage and rejects any observed value above 16.7 GiB. Values at or below the
+boundary remain point observations and cannot satisfy the separate peak gate.
 
 See [GEMMA4_VALIDATION.md](GEMMA4_VALIDATION.md) for the latest scoped canary
 record and its limitations.
@@ -256,11 +365,16 @@ record and its limitations.
 
 ```powershell
 python scripts\benchmark_system4.py `
-  --device cuda `
+  --device cpu `
   --iterations 10000 `
   --stress-switch `
   --switch-block 32
 ```
+
+This CPU run verifies software invariants only. A System 4 CUDA run is
+`NOT RUN / BLOCKED` on the lab server until the benchmark has an exact GPU5
+guard allowlist and before/after identity contract. Direct `--device cuda`
+execution is prohibited.
 
 Record warm-path p50/p95/p99/max latency, convergence and finite rates,
 operator norm, spectral radius, switch count, instantaneous mismatch,

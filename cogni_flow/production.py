@@ -1491,6 +1491,12 @@ class ProductionSelfHarness:
             return ()
         return self.evaluation_ledger.records()
 
+    @property
+    def active_source_surface_sha256(self) -> str:
+        """Return the bounded digest of the currently active mutable surface."""
+
+        return self._source_surface_digest()
+
     def promote_approved_once(
         self,
         evaluation_id: str,

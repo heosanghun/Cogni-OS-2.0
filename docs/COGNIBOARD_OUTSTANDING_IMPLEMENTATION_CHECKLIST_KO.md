@@ -7,8 +7,8 @@
 
 - 전체 미완료: **170개**
 - 구현됐으나 승인 증거 미결합: **103개**
-- 코드/제품 경로 미구현: **5개**
-- 부분 구현 또는 검증 잔여: **57개**
+- 코드/제품 경로 미구현: **4개**
+- 부분 구현 또는 검증 잔여: **58개**
 - 외부 장치·토큰·아티팩트 차단: **5개**
 
 ## 구현됐으나 승인 증거 미결합
@@ -123,7 +123,7 @@
 
 | ID | 체크 | 요구사항 | 현재 근거 | 완료 승격 조건 |
 |---:|:---:|---|---|---|
-| 75 | [ ] | UI가 아닌 실제 자가수정 E2E | 기본 UI는 proposal-only; 내부 ATTESTED 평가·승격·signed committed rollback 단위 경로는 있으나 한 production boundary의 전체 E2E 없음 | 실패 재현→patch→독립 격리검증→외부 승인→승격→signed committed rollback E2E |
+| 75 | [ ] | UI가 아닌 실제 자가수정 E2E | 기본 UI는 proposal-only; detached external runner statement import와 운영자 전용 K≥3 후보→immutable regression→외부 승인→승격→health→별도 signed rollback append-only evidence chain/validator 구현 | 독립 평가자가 서명한 실제 production runner statement와 current production boundary의 원시 전체 E2E evidence; UI/자동 승격은 계속 금지 |
 | 85 | [ ] | 비디오 processor 연결 | video token/config 표시는 실행 권한이 아님 | frame/sampling/time/VRAM 상한과 실제 추론 |
 | 100 | [ ] | 검증된 로컬 semantic embedder | 현재 검색은 안정적 lexical projection | 모델 artifact/manifest, 품질·VRAM·라이선스 검증 |
 | 116 | [ ] | 안전한 unload/load 전환 | 단일 worker lifecycle만 존재 | lease drain→unload→memory check→load→rollback E2E |

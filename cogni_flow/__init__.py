@@ -19,6 +19,24 @@ _EXPORTS = {
     "Ed25519ApprovalVerifier": ("approval", "Ed25519ApprovalVerifier"),
     "HumanApprovalV1": ("approval", "HumanApprovalV1"),
     "RollbackAuthorizationV1": ("approval", "RollbackAuthorizationV1"),
+    "ExternallyAttestedLinuxOciRunner": (
+        "runner_attestation",
+        "ExternallyAttestedLinuxOciRunner",
+    ),
+    "RunnerAttestationImportLedger": (
+        "runner_attestation",
+        "RunnerAttestationImportLedger",
+    ),
+    "load_externally_attested_runner": (
+        "runner_attestation",
+        "load_externally_attested_runner",
+    ),
+    "OperatorSelfHarnessE2E": ("self_harness_e2e", "OperatorSelfHarnessE2E"),
+    "SelfHarnessE2ELedger": ("self_harness_e2e", "SelfHarnessE2ELedger"),
+    "validate_self_harness_e2e": (
+        "self_harness_e2e",
+        "validate_self_harness_e2e",
+    ),
     "SafeProjectSnapshotBuilder": ("snapshot", "SafeProjectSnapshotBuilder"),
     "SnapshotBoundaryError": ("snapshot", "SnapshotBoundaryError"),
     "SnapshotEvidence": ("snapshot", "SnapshotEvidence"),

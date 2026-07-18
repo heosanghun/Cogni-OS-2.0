@@ -336,8 +336,8 @@ class TestMasterAcceptanceChecklist(unittest.TestCase):
                 "COMPLETED": 0,
                 "EXTERNAL_BLOCKER": 5,
                 "IMPLEMENTED_UNVERIFIED": 103,
-                "NOT_IMPLEMENTED": 5,
-                "PARTIAL": 57,
+                "NOT_IMPLEMENTED": 4,
+                "PARTIAL": 58,
             },
         )
         self.assertEqual(report.as_payload()["incomplete_count"], 170)

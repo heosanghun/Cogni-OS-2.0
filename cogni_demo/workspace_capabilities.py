@@ -25,7 +25,6 @@ from binascii import Error as Base64Error
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
-from importlib.util import module_from_spec, spec_from_file_location
 import json
 from math import isfinite, sqrt
 import os
@@ -94,13 +93,13 @@ AKASICDB_REPOSITORY = "https://github.com/heosanghun/AkasicDB.git"
 AKASICDB_AUDITED_REVISION = "a6c8e8ebd487e7cb86079f9804a66aaf0914d1dc"
 AKASICDB_AUDITED_DIGESTS: dict[str, str] = {
     "akasic/storage/graph_store.py": (
-        "fad8977c1be2269f78670e8a9d9b41e0ae6751cc3b874d5f82f95ff639f21ce4"
+        "c8a2fbcf00df462c8b14ead6a46904e7e44094a04aa5646380371fd835a143d3"
     ),
     "akasic/storage/relational_store.py": (
-        "1a66bb519244cbfc759848fbcac7d4584dce60c746ae0971372f4929f832daf3"
+        "b079dd712aa1391f0ca48e17b07465aa3722ad42b73592b2e45a6b29dbc8c12e"
     ),
     "akasic/storage/vector_store.py": (
-        "2fbba721966fc0ad90b3a9b315e16b04d5f798e12ab66f5c1b60fcf2934ef939"
+        "29e5f7ef1766e5aba605b26cdd7e4e3689e5b7e567607a5f901ab5d5596c313c"
     ),
 }
 
@@ -1770,17 +1769,46 @@ def _safe_clone_head(root: Path) -> str | None:
     return None
 
 
-def _load_verified_class(path: Path, class_name: str, digest: str) -> type[Any]:
-    _require_sha256(digest, "audited module digest")
-    module_name = f"_cogni_akasic_{path.stem}_{digest[:12]}"
-    spec = spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise WorkspaceCapabilityError(
-            "AKASICDB_IMPORT_FAILED", f"cannot load audited module: {path.name}"
-        )
-    module: ModuleType = module_from_spec(spec)
+def _canonical_audited_python_source(source: bytes) -> bytes:
+    """Admit exactly one consistent LF or CRLF representation.
+
+    Git stores the audited modules with LF, while a Windows checkout may
+    materialize the same blobs with CRLF.  Canonicalization is deliberately
+    limited to that single reversible representation difference: mixed line
+    endings, lone CR bytes, invalid UTF-8, and content changes fail closed.
+    """
+
+    if not isinstance(source, bytes) or not source:
+        raise ValueError("audited Python source must be non-empty bytes")
+    if b"\r" in source:
+        without_crlf = source.replace(b"\r\n", b"")
+        if b"\r" in without_crlf or b"\n" in without_crlf:
+            raise ValueError("audited Python source has mixed line endings")
+        canonical = source.replace(b"\r\n", b"\n")
+    else:
+        canonical = source
     try:
-        spec.loader.exec_module(module)
+        canonical.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("audited Python source is not UTF-8") from exc
+    return canonical
+
+
+def _load_verified_class(
+    path: Path, class_name: str, digest: str, source: bytes
+) -> type[Any]:
+    _require_sha256(digest, "audited module digest")
+    if sha256(source).hexdigest() != digest:
+        raise WorkspaceCapabilityError(
+            "AKASICDB_DIGEST_MISMATCH", f"audited module changed: {path.name}"
+        )
+    module_name = f"_cogni_akasic_{path.stem}_{digest[:12]}"
+    module = ModuleType(module_name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    try:
+        code = compile(source, str(path), "exec", dont_inherit=True)
+        exec(code, module.__dict__)
     except Exception as exc:
         raise WorkspaceCapabilityError(
             "AKASICDB_IMPORT_FAILED", f"audited module failed: {path.name}"
@@ -1931,7 +1959,7 @@ class AkasicDBAdapter:
                 "AKASICDB_REVISION_MISMATCH",
                 "AkasicDB clone is not at the audited revision",
             )
-        verified_paths: dict[str, Path] = {}
+        verified_modules: dict[str, tuple[Path, bytes]] = {}
         for relative, expected in AKASICDB_AUDITED_DIGESTS.items():
             try:
                 _require_sha256(expected, f"AkasicDB digest for {relative}")
@@ -1950,28 +1978,47 @@ class AkasicDBAdapter:
                 candidate.is_symlink()
                 or not resolved.is_relative_to(root)
                 or not resolved.is_file()
-                or _sha256_file(resolved) != expected
             ):
                 raise WorkspaceCapabilityError(
                     "AKASICDB_DIGEST_MISMATCH",
                     f"AkasicDB audited file mismatch: {relative}",
                 )
-            verified_paths[relative] = resolved
+            try:
+                source = _canonical_audited_python_source(resolved.read_bytes())
+            except (OSError, ValueError) as exc:
+                raise WorkspaceCapabilityError(
+                    "AKASICDB_DIGEST_MISMATCH",
+                    f"AkasicDB audited file mismatch: {relative}",
+                ) from exc
+            if sha256(source).hexdigest() != expected:
+                raise WorkspaceCapabilityError(
+                    "AKASICDB_DIGEST_MISMATCH",
+                    f"AkasicDB audited file mismatch: {relative}",
+                )
+            verified_modules[relative] = (resolved, source)
 
+        graph_path, graph_source = verified_modules["akasic/storage/graph_store.py"]
         graph_type = _load_verified_class(
-            verified_paths["akasic/storage/graph_store.py"],
+            graph_path,
             "GraphStore",
             AKASICDB_AUDITED_DIGESTS["akasic/storage/graph_store.py"],
+            graph_source,
         )
+        relational_path, relational_source = verified_modules[
+            "akasic/storage/relational_store.py"
+        ]
         relational_type = _load_verified_class(
-            verified_paths["akasic/storage/relational_store.py"],
+            relational_path,
             "RelationalStore",
             AKASICDB_AUDITED_DIGESTS["akasic/storage/relational_store.py"],
+            relational_source,
         )
+        vector_path, vector_source = verified_modules["akasic/storage/vector_store.py"]
         vector_type = _load_verified_class(
-            verified_paths["akasic/storage/vector_store.py"],
+            vector_path,
             "VectorStore",
             AKASICDB_AUDITED_DIGESTS["akasic/storage/vector_store.py"],
+            vector_source,
         )
         self.root = root
         self.revision = revision

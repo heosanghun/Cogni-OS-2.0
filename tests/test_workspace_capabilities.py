@@ -218,10 +218,59 @@ class TestWorkspaceCapabilities(unittest.TestCase):
     def test_pinned_relational_digest_and_all_digests_are_sha256(self) -> None:
         self.assertEqual(
             AKASICDB_AUDITED_DIGESTS["akasic/storage/relational_store.py"],
-            "1a66bb519244cbfc759848fbcac7d4584dce60c746ae0971372f4929f832daf3",
+            "b079dd712aa1391f0ca48e17b07465aa3722ad42b73592b2e45a6b29dbc8c12e",
         )
         for digest in AKASICDB_AUDITED_DIGESTS.values():
             self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+    def test_audited_akasic_modules_accept_only_consistent_lf_or_crlf(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lf_clone = root / "lf"
+            crlf_clone = root / "crlf"
+            lf_clone.mkdir()
+            crlf_clone.mkdir()
+            canonical_digests = _write_clone(lf_clone)
+            _write_clone(crlf_clone)
+            for relative in canonical_digests:
+                target = crlf_clone / relative
+                target.write_bytes(target.read_bytes().replace(b"\n", b"\r\n"))
+            with patch.dict(
+                AKASICDB_AUDITED_DIGESTS,
+                canonical_digests,
+                clear=True,
+            ):
+                self.assertIsInstance(AkasicDBAdapter(lf_clone), AkasicDBAdapter)
+                self.assertIsInstance(AkasicDBAdapter(crlf_clone), AkasicDBAdapter)
+
+    def test_audited_akasic_modules_reject_content_and_line_ending_tamper(
+        self,
+    ) -> None:
+        for tamper in ("content", "mixed", "lone_cr"):
+            with (
+                self.subTest(tamper=tamper),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                clone = Path(temporary) / "AkasicDB"
+                clone.mkdir()
+                canonical_digests = _write_clone(clone)
+                target = clone / "akasic/storage/graph_store.py"
+                source = target.read_bytes()
+                if tamper == "content":
+                    source = source.replace(b"GraphStore", b"GraphSt0re", 1)
+                elif tamper == "mixed":
+                    source = source.replace(b"\n", b"\r\n", 1)
+                else:
+                    source = source.replace(b"\n", b"\r", 1)
+                target.write_bytes(source)
+                with patch.dict(
+                    AKASICDB_AUDITED_DIGESTS,
+                    canonical_digests,
+                    clear=True,
+                ):
+                    with self.assertRaises(WorkspaceCapabilityError) as captured:
+                        AkasicDBAdapter(clone)
+                self.assertEqual(captured.exception.code, "AKASICDB_DIGEST_MISMATCH")
 
     def test_model_metadata_rejects_non_sha256_digests(self) -> None:
         with self.assertRaisesRegex(ValueError, "manifest_sha256"):

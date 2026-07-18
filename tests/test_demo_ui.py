@@ -992,6 +992,17 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertEqual(
             lens_flow.count("await refreshWorkspaceCapabilityDisclosure()"), 1
         )
+        request_start = script.index(
+            "async function requestLatestWorkspaceCapabilities"
+        )
+        request_end = script.index(
+            "async function refreshWorkspaceCapabilityDisclosure", request_start
+        )
+        request_flow = script[request_start:request_end]
+        self.assertEqual(request_flow.count('api("/api/workspace/capabilities"'), 1)
+        self.assertIn("ui.workspaceCapabilityAbortController?.abort()", request_flow)
+        self.assertIn("requestId !== ui.workspaceCapabilityRequestId", request_flow)
+
         refresh_start = script.index(
             "async function refreshWorkspaceCapabilityDisclosure"
         )
@@ -999,7 +1010,8 @@ class TestCogniBoardUI(unittest.TestCase):
             "function updateWorkspaceControlStates", refresh_start
         )
         refresh_flow = script[refresh_start:refresh_end]
-        self.assertEqual(refresh_flow.count('api("/api/workspace/capabilities")'), 1)
+        self.assertEqual(refresh_flow.count("requestLatestWorkspaceCapabilities()"), 1)
+        self.assertNotIn('api("/api/workspace/capabilities"', refresh_flow)
         self.assertIn('updateExternalCallDisclosure("", null)', refresh_flow)
         self.assertIn("revokeWorkspaceCapabilities();", refresh_flow)
 
@@ -1015,6 +1027,76 @@ class TestCogniBoardUI(unittest.TestCase):
             'trapFocusWithin(event, $(".proposal-review-dialog", proposalLayer))',
             script,
         )
+
+    def test_workspace_capability_refresh_is_latest_request_wins(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is not installed in this Python test environment")
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        start = script.index("async function requestLatestWorkspaceCapabilities")
+        end = (
+            script.index(
+                "\n}\n\nasync function refreshWorkspaceCapabilityDisclosure", start
+            )
+            + 2
+        )
+        request_latest = script[start:end]
+        probe = (
+            r"""
+const assert = require("node:assert/strict");
+const ui = {
+  workspaceCapabilityRequestId: 0,
+  workspaceCapabilityAbortController: null,
+};
+const pending = [];
+const applied = [];
+function api(path, options) {
+  assert.equal(path, "/api/workspace/capabilities");
+  return new Promise((resolve) => pending.push({ resolve, signal: options.signal }));
+}
+function applyWorkspaceCapabilities(payload) {
+  applied.push(payload.version);
+  return true;
+}
+"""
+            + request_latest
+            + r"""
+
+(async () => {
+  const older = requestLatestWorkspaceCapabilities();
+  const newer = requestLatestWorkspaceCapabilities();
+  assert.equal(pending.length, 2);
+  assert.equal(pending[0].signal.aborted, true);
+  assert.equal(pending[1].signal.aborted, false);
+
+  pending[1].resolve({ version: "new" });
+  const newerResult = await newer;
+  pending[0].resolve({ version: "old" });
+  const olderResult = await older;
+
+  assert.deepEqual(applied, ["new"]);
+  assert.deepEqual(
+    { latest: newerResult.latest, applied: newerResult.applied },
+    { latest: true, applied: true },
+  );
+  assert.deepEqual(
+    { latest: olderResult.latest, applied: olderResult.applied },
+    { latest: false, applied: false },
+  );
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        )
+        completed = subprocess.run(
+            [node, "-e", probe],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_validation_ready_and_evidence_transitions_fail_closed(self) -> None:
         node = shutil.which("node")

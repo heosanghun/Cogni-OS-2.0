@@ -1272,7 +1272,7 @@ def _profile_checks(
         client.set_window_rect(width, height)
         geometry = client.execute(
             """
-            const composer = document.querySelector('.agent-composer');
+            const composer = document.querySelector('.chat-composer');
             const input = document.querySelector('#agent-input');
             const rect = composer?.getBoundingClientRect();
             return {

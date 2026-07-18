@@ -46,6 +46,9 @@ const RAG_SOURCE_EXACT_KEYS = Object.freeze([
 const VOICE_SAMPLE_RATE = 16000;
 const VOICE_MAX_SECONDS = 30;
 const VOICE_MAX_SOURCE_RATE = 192000;
+const VOICE_MAX_RECORDED_BYTES = 4 * 1024 * 1024;
+const VOICE_RECORDER_STOP_TIMEOUT_MS = 5000;
+const VOICE_DECODE_TIMEOUT_MS = 5000;
 const MAX_TTS_TEXT_CHARS = 2000;
 const MAX_TTS_WAV_BYTES = 8 * 1024 * 1024;
 const MAX_TTS_BASE64_CHARS = Math.ceil(MAX_TTS_WAV_BYTES / 3) * 4;
@@ -279,6 +282,8 @@ const ui = {
   runtimeExecutionModules: Object.create(null),
   workspaceCapabilities: null,
   workspaceCapabilitiesLoaded: false,
+  workspaceCapabilityRequestId: 0,
+  workspaceCapabilityAbortController: null,
   workspaceRequestPending: false,
   workspaceAttachments: [],
   selectedImageAttachmentId: "",
@@ -1241,6 +1246,9 @@ function browserMicrophoneSupport() {
   if (!navigator.mediaDevices?.getUserMedia) {
     return { ready: false, reason: "이 브라우저는 getUserMedia를 지원하지 않습니다." };
   }
+  if (typeof window.MediaRecorder !== "function") {
+    return { ready: false, reason: "이 브라우저는 MediaRecorder를 지원하지 않습니다." };
+  }
   if (!AudioContextClass) {
     return { ready: false, reason: "이 브라우저는 AudioContext를 지원하지 않습니다." };
   }
@@ -1441,17 +1449,46 @@ function applyWorkspaceCapabilities(capabilities) {
   return true;
 }
 
-async function refreshWorkspaceCapabilityDisclosure() {
+async function requestLatestWorkspaceCapabilities() {
+  ui.workspaceCapabilityAbortController?.abort();
+  const requestId = ui.workspaceCapabilityRequestId + 1;
+  const controller = new AbortController();
+  ui.workspaceCapabilityRequestId = requestId;
+  ui.workspaceCapabilityAbortController = controller;
   try {
-    const capabilities = await api("/api/workspace/capabilities");
-    return applyWorkspaceCapabilities(capabilities) === true;
-  } catch (_) {
+    const capabilities = await api("/api/workspace/capabilities", {
+      signal: controller.signal,
+    });
+    if (requestId !== ui.workspaceCapabilityRequestId) {
+      return { latest: false, applied: false, requestId };
+    }
+    return {
+      latest: true,
+      applied: applyWorkspaceCapabilities(capabilities) === true,
+      requestId,
+    };
+  } catch (error) {
+    const latest = requestId === ui.workspaceCapabilityRequestId
+      && !controller.signal.aborted;
+    return { latest, applied: false, requestId, error };
+  } finally {
+    if (requestId === ui.workspaceCapabilityRequestId) {
+      ui.workspaceCapabilityAbortController = null;
+    }
+  }
+}
+
+async function refreshWorkspaceCapabilityDisclosure() {
+  const result = await requestLatestWorkspaceCapabilities();
+  if (!result.latest) return false;
+  if (!result.applied) {
     revokeWorkspaceCapabilities();
     updateExternalCallDisclosure("", null);
     setText("#agent-web-status", "미검증");
     updateWorkspaceControlStates();
     return false;
   }
+  return true;
 }
 
 function updateWorkspaceControlStates() {
@@ -1613,12 +1650,11 @@ function updateWorkspaceControlStates() {
 }
 
 async function loadWorkspaceCapabilities() {
-  try {
-    const capabilities = await api("/api/workspace/capabilities");
-    const applied = applyWorkspaceCapabilities(capabilities);
+  const result = await requestLatestWorkspaceCapabilities();
+  if (!result.latest) return;
+  if (result.applied) {
     if (
-      applied
-      && ui.imageAttestationPending
+      ui.imageAttestationPending
       && ["succeeded", "cancelled", "failed"].includes(ui.agentStatus)
       && !ui.imageAttestationSettling
     ) {
@@ -1643,7 +1679,7 @@ async function loadWorkspaceCapabilities() {
     } catch (_) {
       showToast("로컬 첨부 목록을 불러오지 못했습니다.", "warning");
     }
-  } catch (_) {
+  } else {
     revokeWorkspaceCapabilities();
     setText("#agent-attachment-status", "사용 불가");
     setText("#agent-rag-status", "사용 불가");
@@ -2398,15 +2434,14 @@ function releaseVoiceSession(session) {
   if (!session) return;
   clearTimeout(session.limitTimer);
   clearInterval(session.elapsedTimer);
-  if (session.processor) {
-    session.processor.onaudioprocess = null;
-    try { session.processor.disconnect(); } catch (_) { /* already disconnected */ }
-  }
-  if (session.source) {
-    try { session.source.disconnect(); } catch (_) { /* already disconnected */ }
-  }
-  if (session.sink) {
-    try { session.sink.disconnect(); } catch (_) { /* already disconnected */ }
+  session.stopCleanup?.();
+  session.stopCleanup = null;
+  if (session.recorder) {
+    session.recorder.ondataavailable = null;
+    session.recorder.onerror = null;
+    if (session.recorder.state !== "inactive") {
+      try { session.recorder.stop(); } catch (_) { /* already stopped */ }
+    }
   }
   if (session.stream) {
     session.stream.getTracks().forEach((track) => track.stop());
@@ -2414,19 +2449,6 @@ function releaseVoiceSession(session) {
   if (session.context && session.context.state !== "closed") {
     session.context.close().catch(() => {});
   }
-}
-
-function flattenVoiceChunks(chunks, frameCount) {
-  const output = new Float32Array(frameCount);
-  let offset = 0;
-  chunks.forEach((chunk) => {
-    const remaining = output.length - offset;
-    if (remaining <= 0) return;
-    const bounded = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
-    output.set(bounded, offset);
-    offset += bounded.length;
-  });
-  return output;
 }
 
 function resampleVoiceSamples(source, sourceRate) {
@@ -2501,6 +2523,98 @@ function insertVoiceTranscript(transcript) {
   return true;
 }
 
+function preferredVoiceRecorderMimeType() {
+  const candidates = [
+    "audio/ogg;codecs=opus",
+    "audio/webm;codecs=opus",
+    "audio/ogg",
+    "audio/webm",
+  ];
+  if (typeof window.MediaRecorder?.isTypeSupported !== "function") return "";
+  return candidates.find((candidate) => window.MediaRecorder.isTypeSupported(candidate)) || "";
+}
+
+function stopVoiceRecorder(session) {
+  const recorder = session?.recorder;
+  if (!recorder || recorder.state === "inactive") {
+    return Promise.reject(new Error("VOICE_RECORDER_NOT_ACTIVE"));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeoutId = 0;
+    const cleanup = () => {
+      if (timeoutId) window.clearTimeout(timeoutId);
+      recorder.removeEventListener("stop", onStop);
+      recorder.removeEventListener("error", onError);
+      if (session.stopCleanup === cleanup) session.stopCleanup = null;
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onStop = () => finish(resolve);
+    const onError = (event) => finish(
+      reject,
+      event?.error instanceof Error ? event.error : new Error("VOICE_RECORDER_FAILED"),
+    );
+    session.stopCleanup = cleanup;
+    recorder.addEventListener("stop", onStop, { once: true });
+    recorder.addEventListener("error", onError, { once: true });
+    timeoutId = window.setTimeout(
+      () => finish(reject, new Error("VOICE_RECORDER_STOP_TIMEOUT")),
+      VOICE_RECORDER_STOP_TIMEOUT_MS,
+    );
+    try {
+      recorder.stop();
+    } catch (error) {
+      finish(reject, error);
+    }
+  });
+}
+
+async function decodeVoiceRecording(blob) {
+  if (!(blob instanceof Blob) || blob.size < 1) throw new Error("VOICE_WAV_INVALID");
+  if (blob.size > VOICE_MAX_RECORDED_BYTES) throw new Error("VOICE_AUDIO_TOO_LARGE");
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) throw new Error("VOICE_WAV_FORMAT_INVALID");
+  const context = new AudioContextClass({ sampleRate: VOICE_SAMPLE_RATE });
+  let timeoutId = 0;
+  try {
+    const encoded = await blob.arrayBuffer();
+    const decoded = await Promise.race([
+      context.decodeAudioData(encoded.slice(0)),
+      new Promise((_, reject) => {
+        timeoutId = window.setTimeout(
+          () => reject(new Error("VOICE_AUDIO_DECODE_TIMEOUT")),
+          VOICE_DECODE_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    const sourceRate = decoded?.sampleRate;
+    if (
+      !decoded
+      || decoded.numberOfChannels < 1
+      || !Number.isFinite(sourceRate)
+      || sourceRate < VOICE_SAMPLE_RATE
+      || sourceRate > VOICE_MAX_SOURCE_RATE
+    ) {
+      throw new Error("VOICE_WAV_FORMAT_INVALID");
+    }
+    const maxFrames = Math.floor(sourceRate * VOICE_MAX_SECONDS);
+    const channel = decoded.getChannelData(0);
+    if (!(channel instanceof Float32Array) || !channel.length) throw new Error("VOICE_WAV_INVALID");
+    return {
+      samples: new Float32Array(channel.subarray(0, Math.min(channel.length, maxFrames))),
+      sourceRate,
+    };
+  } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+    if (context.state !== "closed") context.close().catch(() => {});
+  }
+}
+
 async function startVoiceCapture() {
   if (
     ui.voiceCaptureState !== "idle"
@@ -2517,7 +2631,12 @@ async function startVoiceCapture() {
     showToast(copy, "warning");
     return;
   }
-  const session = { cancelled: false, chunks: [], frameCount: 0 };
+  const session = {
+    cancelled: false,
+    encodedChunks: [],
+    encodedBytes: 0,
+    recorderError: null,
+  };
   ui.voiceSession = session;
   setVoiceCaptureState("requesting", "버튼을 누른 이 요청에서만 Windows 마이크 권한을 확인합니다.");
   try {
@@ -2534,34 +2653,29 @@ async function startVoiceCapture() {
       releaseVoiceSession(session);
       return;
     }
-    session.context = new AudioContextClass({ sampleRate: VOICE_SAMPLE_RATE });
-    await session.context.resume();
-    session.sourceRate = session.context.sampleRate;
-    if (
-      !Number.isFinite(session.sourceRate)
-      || session.sourceRate < VOICE_SAMPLE_RATE
-      || session.sourceRate > VOICE_MAX_SOURCE_RATE
-    ) {
-      throw new Error("VOICE_WAV_FORMAT_INVALID");
-    }
-    session.maxSourceFrames = Math.floor(session.sourceRate * VOICE_MAX_SECONDS);
-    session.source = session.context.createMediaStreamSource(session.stream);
-    session.processor = session.context.createScriptProcessor(4096, 1, 1);
-    session.sink = session.context.createGain();
-    session.sink.gain.value = 0;
-    session.processor.onaudioprocess = (event) => {
-      if (ui.voiceSession !== session || ui.voiceCaptureState !== "recording") return;
-      const channel = event.inputBuffer.getChannelData(0);
-      const remaining = session.maxSourceFrames - session.frameCount;
-      if (remaining <= 0) return;
-      const chunk = new Float32Array(channel.subarray(0, Math.min(channel.length, remaining)));
-      session.chunks.push(chunk);
-      session.frameCount += chunk.length;
-      if (session.frameCount >= session.maxSourceFrames) setTimeout(stopVoiceCapture, 0);
+    const mimeType = preferredVoiceRecorderMimeType();
+    const recorderOptions = mimeType ? { mimeType, audioBitsPerSecond: 64000 } : undefined;
+    session.recorder = recorderOptions
+      ? new window.MediaRecorder(session.stream, recorderOptions)
+      : new window.MediaRecorder(session.stream);
+    session.recorder.ondataavailable = (event) => {
+      if (session.cancelled || ui.voiceSession !== session || !(event.data instanceof Blob)) return;
+      if (event.data.size < 1) return;
+      session.encodedBytes += event.data.size;
+      if (session.encodedBytes > VOICE_MAX_RECORDED_BYTES) {
+        session.recorderError = new Error("VOICE_AUDIO_TOO_LARGE");
+        if (ui.voiceCaptureState === "recording") setTimeout(stopVoiceCapture, 0);
+        return;
+      }
+      session.encodedChunks.push(event.data);
     };
-    session.source.connect(session.processor);
-    session.processor.connect(session.sink);
-    session.sink.connect(session.context.destination);
+    session.recorder.onerror = (event) => {
+      session.recorderError = event?.error instanceof Error
+        ? event.error
+        : new Error("VOICE_RECORDER_FAILED");
+      if (ui.voiceCaptureState === "recording") setTimeout(stopVoiceCapture, 0);
+    };
+    session.recorder.start(100);
     session.startedAt = performance.now();
     session.limitTimer = setTimeout(stopVoiceCapture, VOICE_MAX_SECONDS * 1000);
     session.elapsedTimer = setInterval(() => {
@@ -2586,11 +2700,15 @@ async function stopVoiceCapture() {
   const session = ui.voiceSession;
   if (!session || ui.voiceCaptureState !== "recording") return;
   setVoiceCaptureState("encoding", "메모리 안에서 16kHz 모노 PCM WAV로 변환합니다.");
-  const samples = flattenVoiceChunks(session.chunks, session.frameCount);
-  releaseVoiceSession(session);
-  session.chunks = [];
   try {
-    const resampled = resampleVoiceSamples(samples, session.sourceRate);
+    await stopVoiceRecorder(session);
+    if (session.recorderError) throw session.recorderError;
+    const mimeType = session.recorder?.mimeType || session.encodedChunks[0]?.type || "";
+    const recorded = new Blob(session.encodedChunks, mimeType ? { type: mimeType } : undefined);
+    session.encodedChunks = [];
+    releaseVoiceSession(session);
+    const decoded = await decodeVoiceRecording(recorded);
+    const resampled = resampleVoiceSamples(decoded.samples, decoded.sourceRate);
     const wav = encodeVoiceWav(resampled);
     const audioWavBase64 = voiceBytesToBase64(wav);
     session.abortController = new AbortController();
@@ -2615,6 +2733,8 @@ async function stopVoiceCapture() {
     setVoiceCaptureState("idle", copy);
     showToast(copy, code === "LOCAL_STT_ARTIFACT_REQUIRED" ? "warning" : "error");
   } finally {
+    releaseVoiceSession(session);
+    session.encodedChunks = [];
     if (ui.voiceSession === session) ui.voiceSession = null;
     updateWorkspaceControlStates();
   }

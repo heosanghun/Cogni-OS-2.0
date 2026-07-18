@@ -315,6 +315,16 @@ class TestW3CWebDriverClient(unittest.TestCase):
 
 
 class TestBrowserFixtureServer(unittest.TestCase):
+    def test_viewport_probe_targets_the_product_composer_dom_contract(self) -> None:
+        html = (ASSETS / "index.html").read_text(encoding="utf-8")
+        validator = (ROOT / "scripts" / "validate_cogniboard_browser_e2e.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('class="chat-composer"', html)
+        self.assertIn("document.querySelector('.chat-composer')", validator)
+        self.assertNotIn("document.querySelector('.agent-composer')", validator)
+
     def test_authenticates_and_serves_exact_production_static_assets(self) -> None:
         with _fixture(enabled=False) as server:
             self.assertEqual(server.server_address[0], "127.0.0.1")

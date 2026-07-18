@@ -259,6 +259,48 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn('"로컬 저장·모델 미전달"', script)
         self.assertIn("selector.replaceChildren(fragment)", script)
 
+    def test_workspace_controls_fail_closed_on_executable_capability_not_inventory(
+        self,
+    ) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("ragAnswerIntegrationReady: false", script)
+        self.assertIn("rag.answer_integration === true", script)
+        self.assertIn("|| !ui.ragAnswerIntegrationReady", script)
+        self.assertIn("&& ui.ragAnswerIntegrationReady", script)
+        self.assertIn('return "인덱스 전용"', script)
+
+        controls_start = script.index("function updateWorkspaceControlStates")
+        controls_end = script.index("async function loadWorkspaceCapabilities")
+        controls = script[controls_start:controls_end]
+        self.assertIn("|| !ui.voiceTranscriptionReady", controls)
+        self.assertIn(
+            'const selectableCount = Number(modelSelector.dataset.selectableCount || "0")',
+            controls,
+        )
+        self.assertIn("selectableCount < 2", controls)
+        self.assertNotIn("verifiedCount < 2", controls)
+
+        voice_start = script.index("async function startVoiceCapture")
+        voice_end = script.index("function stopVoiceCapture", voice_start)
+        self.assertIn("|| !ui.voiceTranscriptionReady", script[voice_start:voice_end])
+
+        revoke_start = script.index("function revokeWorkspaceCapabilities")
+        revoke_end = script.index("function applyWorkspaceCapabilities", revoke_start)
+        revoke = script[revoke_start:revoke_end]
+        for contract in (
+            "ui.workspaceCapabilitiesLoaded = false",
+            "ui.ragBackendReady = false",
+            "ui.ragAnswerIntegrationReady = false",
+            "ui.ragEnabled = false",
+            "ui.imageModelIntegrationReady = false",
+            "ui.lensConnectorReady = false",
+            "ui.voiceTranscriptionReady = false",
+            "ui.voiceSynthesisReady = false",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, revoke)
+
     def test_runtime_authority_is_factbook_driven_and_fails_closed(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
         script = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -862,7 +904,7 @@ class TestCogniBoardUI(unittest.TestCase):
         refresh_flow = script[refresh_start:refresh_end]
         self.assertEqual(refresh_flow.count('api("/api/workspace/capabilities")'), 1)
         self.assertIn('updateExternalCallDisclosure("", null)', refresh_flow)
-        self.assertIn("ui.lensConnectorReady = false", refresh_flow)
+        self.assertIn("revokeWorkspaceCapabilities();", refresh_flow)
 
         self.assertIn("function syncModalBackgroundBlock()", script)
         self.assertIn("shell.inert = modalOpen", script)

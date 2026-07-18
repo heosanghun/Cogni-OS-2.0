@@ -283,6 +283,7 @@ const ui = {
   imageModelIntegrationReady: false,
   indexedAttachmentIds: new Set(),
   ragBackendReady: false,
+  ragAnswerIntegrationReady: false,
   ragDocumentCount: 0,
   ragEnabled: false,
   modelSelectionPending: false,
@@ -1058,6 +1059,14 @@ function renderWorkspaceModels(models) {
   );
 }
 
+function workspaceRagStatusLabel() {
+  const indexedDocuments = Math.max(ui.indexedAttachmentIds.size, ui.ragDocumentCount);
+  if (!ui.ragBackendReady) return "미연결";
+  if (!ui.ragAnswerIntegrationReady) return "인덱스 전용";
+  if (ui.ragEnabled) return "사용 중";
+  return indexedDocuments > 0 ? "사용 가능" : "문서 필요";
+}
+
 function updateExternalCallDisclosure(mode, externalCalls) {
   const validMode = mode === "air_gapped" || mode === "online_opt_in";
   const validCalls = Number.isInteger(externalCalls) && externalCalls >= 0;
@@ -1094,9 +1103,23 @@ function updateExternalCallDisclosure(mode, externalCalls) {
   });
 }
 
+function revokeWorkspaceCapabilities() {
+  ui.workspaceCapabilities = null;
+  ui.workspaceCapabilitiesLoaded = false;
+  ui.ragBackendReady = false;
+  ui.ragAnswerIntegrationReady = false;
+  ui.ragEnabled = false;
+  ui.imageModelIntegrationReady = false;
+  ui.selectedImageAttachmentId = "";
+  ui.lensConnectorReady = false;
+  ui.voiceTransportReady = false;
+  ui.voiceTranscriptionReady = false;
+  ui.voiceSynthesisReady = false;
+}
+
 function applyWorkspaceCapabilities(capabilities) {
   if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
-    ui.lensConnectorReady = false;
+    revokeWorkspaceCapabilities();
     updateExternalCallDisclosure("", null);
     setText("#agent-web-status", "미검증");
     updateWorkspaceControlStates();
@@ -1111,10 +1134,15 @@ function applyWorkspaceCapabilities(capabilities) {
   const web = capabilities.web_search || {};
   const lens = web.official_lens_connector || {};
   ui.ragBackendReady = rag.state === "local_index_ready";
+  ui.ragAnswerIntegrationReady = ui.ragBackendReady
+    && rag.answer_integration === true;
   ui.imageModelIntegrationReady = attachments.image_to_model_integration === true;
   if (!ui.imageModelIntegrationReady) ui.selectedImageAttachmentId = "";
   ui.ragDocumentCount = Number.isInteger(rag.documents) ? Math.max(0, rag.documents) : 0;
-  if (!ui.ragBackendReady || (!ui.ragDocumentCount && !ui.indexedAttachmentIds.size)) {
+  if (
+    !ui.ragAnswerIntegrationReady
+    || (!ui.ragDocumentCount && !ui.indexedAttachmentIds.size)
+  ) {
     ui.ragEnabled = false;
   }
   ui.voiceTransportReady = microphone.capture_state === "browser_get_user_media"
@@ -1136,16 +1164,7 @@ function applyWorkspaceCapabilities(capabilities) {
       : "백엔드가 로컬 첨부 기능을 활성화하지 않았습니다.";
   }
   setText("#agent-attachment-status", attachments.state === "enabled" ? "로컬" : "사용 불가");
-  setText(
-    "#agent-rag-status",
-    !ui.ragBackendReady
-      ? "미연결"
-      : ui.ragEnabled
-        ? "사용 중"
-        : ui.ragDocumentCount || ui.indexedAttachmentIds.size
-          ? "사용 가능"
-          : "문서 필요",
-  );
+  setText("#agent-rag-status", workspaceRagStatusLabel());
   const networkMode = web.mode === "air_gapped" || web.mode === "online_opt_in" ? web.mode : "";
   const externalCalls = Number.isInteger(lens.external_calls) && lens.external_calls >= 0
     ? lens.external_calls
@@ -1193,7 +1212,7 @@ function applyWorkspaceCapabilities(capabilities) {
   setText(
     "#agent-microphone-status",
     MICROPHONE_CAPTURE_UI_IMPLEMENTED && ui.voiceTransportReady
-      ? ui.voiceTranscriptionReady ? "로컬 STT" : "녹음 가능·STT 필요"
+      ? ui.voiceTranscriptionReady ? "로컬 STT" : "STT 필요"
       : "미연결",
   );
   const microphoneButton = $('[data-action="workspace-microphone"]');
@@ -1202,7 +1221,7 @@ function applyWorkspaceCapabilities(capabilities) {
     microphoneButton.setAttribute(
       "aria-label",
       captureReady
-        ? ui.voiceTranscriptionReady ? "로컬 음성 입력 시작" : "로컬 녹음 검증 시작, STT 모델 필요"
+        ? ui.voiceTranscriptionReady ? "로컬 음성 입력 시작" : "음성 입력 사용 불가: 검증된 로컬 STT 모델 필요"
         : "음성 입력, 로컬 캡처 파이프라인 미연결",
     );
     microphoneButton.title = captureReady
@@ -1226,7 +1245,7 @@ async function refreshWorkspaceCapabilityDisclosure() {
     const capabilities = await api("/api/workspace/capabilities");
     return applyWorkspaceCapabilities(capabilities) === true;
   } catch (_) {
-    ui.lensConnectorReady = false;
+    revokeWorkspaceCapabilities();
     updateExternalCallDisclosure("", null);
     setText("#agent-web-status", "미검증");
     updateWorkspaceControlStates();
@@ -1252,17 +1271,21 @@ function updateWorkspaceControlStates() {
   if (attachmentButton) attachmentButton.disabled = unavailable || !attachmentReady;
   if (attachmentInput) attachmentInput.disabled = unavailable || !attachmentReady;
   const indexedDocuments = Math.max(ui.indexedAttachmentIds.size, ui.ragDocumentCount);
+  setText("#agent-rag-status", workspaceRagStatusLabel());
   const ragButton = $('[data-action="workspace-rag-toggle"]');
   if (ragButton) {
     ragButton.disabled = unavailable
       || ui.agentMode !== "chat"
       || !ui.ragBackendReady
+      || !ui.ragAnswerIntegrationReady
       || indexedDocuments < 1;
     ragButton.setAttribute("aria-pressed", String(ui.ragEnabled));
     ragButton.setAttribute(
       "aria-label",
       !ui.ragBackendReady
         ? "로컬 RAG, AkasicDB 미연결"
+        : !ui.ragAnswerIntegrationReady
+          ? "로컬 RAG, 인덱스 준비·답변 연결 미검증"
         : indexedDocuments < 1
           ? "로컬 RAG, 인덱싱된 문서 필요"
           : ui.ragEnabled
@@ -1271,6 +1294,8 @@ function updateWorkspaceControlStates() {
     );
     ragButton.title = !ui.ragBackendReady
       ? "감사된 로컬 AkasicDB가 준비되지 않았습니다."
+      : !ui.ragAnswerIntegrationReady
+        ? "로컬 검색 인덱스는 준비됐지만 Agent 답변 연결은 검증되지 않았습니다."
       : indexedDocuments < 1
         ? "UTF-8 텍스트 파일을 첨부하면 로컬 인덱싱을 시도합니다."
         : "현재 대화에 로컬 AkasicDB 검색을 적용합니다.";
@@ -1303,6 +1328,7 @@ function updateWorkspaceControlStates() {
         || !MICROPHONE_CAPTURE_UI_IMPLEMENTED
         || microphone.capture_state !== "browser_get_user_media"
         || microphone.transport_state !== "authenticated_loopback_ready"
+        || !ui.voiceTranscriptionReady
         || ["requesting", "encoding", "uploading"].includes(ui.voiceCaptureState);
   }
   const voiceStop = $('[data-action="workspace-voice-stop"]');
@@ -1358,8 +1384,8 @@ function updateWorkspaceControlStates() {
   }
   const modelSelector = $("#agent-model-selector");
   if (modelSelector) {
-    const verifiedCount = Number(modelSelector.dataset.verifiedCount || "0");
-    modelSelector.disabled = unavailable || ui.modelSelectionPending || verifiedCount < 2;
+    const selectableCount = Number(modelSelector.dataset.selectableCount || "0");
+    modelSelector.disabled = unavailable || ui.modelSelectionPending || selectableCount < 2;
   }
   $$('.attachment-remove').forEach((button) => {
     button.disabled = unavailable || ui.workspaceRequestPending;
@@ -1404,16 +1430,13 @@ async function loadWorkspaceCapabilities() {
       showToast("로컬 첨부 목록을 불러오지 못했습니다.", "warning");
     }
   } catch (_) {
-    ui.workspaceCapabilitiesLoaded = false;
-    ui.voiceTransportReady = false;
-    ui.voiceTranscriptionReady = false;
+    revokeWorkspaceCapabilities();
     setText("#agent-attachment-status", "사용 불가");
     setText("#agent-rag-status", "사용 불가");
     setText("#agent-web-status", "오프라인");
     setText("#agent-microphone-status", "미연결");
     setText("#agent-model-status", "확인 실패");
     updateExternalCallDisclosure("", null);
-    ui.lensConnectorReady = false;
     updateWorkspaceControlStates();
   }
 }
@@ -1808,7 +1831,12 @@ async function reindexWorkspaceAttachments() {
 
 function toggleWorkspaceRag() {
   const indexedDocuments = Math.max(ui.indexedAttachmentIds.size, ui.ragDocumentCount);
-  if (ui.agentMode !== "chat" || !ui.ragBackendReady || indexedDocuments < 1) return;
+  if (
+    ui.agentMode !== "chat"
+    || !ui.ragBackendReady
+    || !ui.ragAnswerIntegrationReady
+    || indexedDocuments < 1
+  ) return;
   ui.ragEnabled = !ui.ragEnabled;
   if (ui.ragEnabled) ui.selectedImageAttachmentId = "";
   setText("#agent-rag-status", ui.ragEnabled ? "사용 중" : "사용 가능");
@@ -2234,7 +2262,11 @@ function insertVoiceTranscript(transcript) {
 }
 
 async function startVoiceCapture() {
-  if (ui.voiceCaptureState !== "idle" || !ui.voiceTransportReady) return;
+  if (
+    ui.voiceCaptureState !== "idle"
+    || !ui.voiceTransportReady
+    || !ui.voiceTranscriptionReady
+  ) return;
   if (ui.voicePlaybackState !== "idle") stopVoicePlayback();
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
   if (!navigator.mediaDevices?.getUserMedia || !AudioContextClass) {
@@ -3289,7 +3321,8 @@ async function sendAgentMessage() {
     const requestBody = {
       message,
       mode: ui.agentMode,
-      rag: ui.agentMode === "chat" && ui.ragEnabled,
+      rag: ui.agentMode === "chat" && ui.ragEnabled
+        && ui.ragAnswerIntegrationReady,
     };
     if (
       ui.agentMode === "chat"

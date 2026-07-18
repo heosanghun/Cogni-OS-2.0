@@ -1,17 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from hashlib import sha256
 from io import BytesIO
 import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from PIL import Image
 import torch
 from torch import nn
 
-from cogni_agent.model_service import ModelService, RequestLimitError
+from cogni_agent.model_service import (
+    ModelRuntimeIdentity,
+    ModelService,
+    RequestLimitError,
+    WorkerAuthorityError,
+)
 from cogni_agent.multimodal import VerifiedGemma4MultimodalProcessor
 from cogni_agent.protocol import (
     HARD_MAX_IMAGE_TENSOR_BYTES,
@@ -213,18 +220,88 @@ class TestResidentImageGeneration(unittest.TestCase):
         processor = object.__new__(VerifiedGemma4MultimodalProcessor)
         processor.processor = _Processor()
         service._multimodal_processor = processor
+        identity = ModelRuntimeIdentity(
+            service_nonce="1" * 32,
+            worker_incarnation=1,
+            worker_pid=4321,
+            lease_epoch=0,
+            lease_deadline_ns=0,
+            artifact_digest="a" * 64,
+            model_root="model",
+            manifest_path="manifest",
+            processor_root="model",
+            processor_manifest_path="manifest",
+        )
+        image = _png()
         try:
-            result = service.generate(
-                "이미지를 설명하세요.",
-                image_content=_png(),
-                max_new_tokens=1,
-                decode_mode="strict",
-            )
+            with (
+                patch.object(
+                    service, "_runtime_identity_locked", return_value=identity
+                ),
+                patch.object(service, "runtime_identity", return_value=identity),
+            ):
+                result = service.generate(
+                    "이미지를 설명하세요.",
+                    image_content=image,
+                    max_new_tokens=1,
+                    decode_mode="strict",
+                )
         finally:
             service.stop()
 
         self.assertEqual(result.token_ids.tolist(), [42])
         self.assertEqual(result.text, "42")
+        self.assertEqual(result.media_sha256, sha256(image).hexdigest())
+        self.assertEqual(result.runtime_identity, identity)
+
+    def test_image_terminal_publication_rejects_successor_worker_identity(self) -> None:
+        service = ModelService(
+            _Tokenizer(),
+            _ImageFactory(os.getpid()),
+            max_input_tokens=32,
+            max_new_tokens=4,
+            startup_timeout=20.0,
+            request_timeout=20.0,
+            multimodal_processor_config=(Path(__file__), Path(__file__)),
+        )
+        processor = object.__new__(VerifiedGemma4MultimodalProcessor)
+        processor.processor = _Processor()
+        service._multimodal_processor = processor
+        request_identity = ModelRuntimeIdentity(
+            service_nonce="1" * 32,
+            worker_incarnation=1,
+            worker_pid=4321,
+            lease_epoch=7,
+            lease_deadline_ns=99,
+            artifact_digest="a" * 64,
+            model_root="model",
+            manifest_path="manifest",
+            processor_root="model",
+            processor_manifest_path="manifest",
+        )
+        successor_identity = replace(request_identity, worker_incarnation=2)
+        try:
+            with (
+                patch.object(
+                    service,
+                    "_runtime_identity_locked",
+                    return_value=request_identity,
+                ),
+                patch.object(
+                    service,
+                    "runtime_identity",
+                    return_value=successor_identity,
+                ),
+            ):
+                with self.assertRaisesRegex(WorkerAuthorityError, "identity changed"):
+                    service.generate(
+                        "이미지를 설명하세요.",
+                        image_content=_png(),
+                        max_new_tokens=1,
+                        decode_mode="strict",
+                    )
+        finally:
+            service.stop()
 
     def test_image_request_without_verified_processor_fails_before_model_start(
         self,

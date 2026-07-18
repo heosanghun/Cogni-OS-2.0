@@ -271,6 +271,8 @@ class GenerationChunk:
     cancelled: bool = False
     finish_reason: str | None = None
     generation_mode: str = "cogni_core"
+    media_sha256: str | None = None
+    runtime_identity: ModelRuntimeIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -280,6 +282,8 @@ class GenerationResult:
     text: str
     finish_reason: str
     generation_mode: str = "cogni_core"
+    media_sha256: str | None = None
+    runtime_identity: ModelRuntimeIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2160,55 +2164,58 @@ class ModelService:
         """
 
         with self._state_lock:
-            process = self._process
-            ready = self._ready_event
-            factory = self.model_factory
-            processor = self._multimodal_processor_config
+            return self._runtime_identity_locked()
+
+    def _runtime_identity_locked(self) -> ModelRuntimeIdentity | None:
+        """Return exact worker identity while ``_state_lock`` is held."""
+
+        process = self._process
+        ready = self._ready_event
+        factory = self.model_factory
+        processor = self._multimodal_processor_config
+        if (
+            type(factory) is not LocalGemmaModelFactory
+            or factory.manifest_path is None
+            or self.artifact_digest is None
+            or factory.artifact_digest != self.artifact_digest
+            or not isinstance(processor, tuple)
+            or len(processor) != 2
+            or process is None
+            or ready is None
+            or not ready.is_set()
+            or self._worker_incarnation < 1
+        ):
+            return None
+        try:
+            factory_root = Path(factory.model_path)
+            factory_manifest = Path(factory.manifest_path)
+            processor_root, processor_manifest = processor
             if (
-                type(factory) is not LocalGemmaModelFactory
-                or factory.manifest_path is None
-                or self.artifact_digest is None
-                or factory.artifact_digest != self.artifact_digest
-                or not isinstance(processor, tuple)
-                or len(processor) != 2
-                or process is None
-                or ready is None
-                or not ready.is_set()
-                or self._worker_incarnation < 1
+                processor_root != factory_root
+                or processor_manifest != factory_manifest
+                or _sha256_file(factory_manifest) != self.artifact_digest
             ):
                 return None
-            try:
-                factory_root = Path(factory.model_path)
-                factory_manifest = Path(factory.manifest_path)
-                processor_root, processor_manifest = processor
-                if (
-                    processor_root != factory_root
-                    or processor_manifest != factory_manifest
-                    or _sha256_file(factory_manifest) != self.artifact_digest
-                ):
-                    return None
-                if not process.is_alive() or process.pid is None:
-                    return None
-                self._validate_running_gpu_lease()
-            except BaseException:
+            if not process.is_alive() or process.pid is None:
                 return None
-            lease = self._gpu_lease
-            lease_epoch = 0 if lease is None else int(lease.epoch)
-            lease_deadline_ns = (
-                0 if lease is None else int(lease.deadline * 1_000_000_000)
-            )
-            return ModelRuntimeIdentity(
-                service_nonce=self._service_nonce,
-                worker_incarnation=self._worker_incarnation,
-                worker_pid=int(process.pid),
-                lease_epoch=lease_epoch,
-                lease_deadline_ns=lease_deadline_ns,
-                artifact_digest=self.artifact_digest,
-                model_root=str(factory_root),
-                manifest_path=str(factory_manifest),
-                processor_root=str(processor_root),
-                processor_manifest_path=str(processor_manifest),
-            )
+            self._validate_running_gpu_lease()
+        except BaseException:
+            return None
+        lease = self._gpu_lease
+        lease_epoch = 0 if lease is None else int(lease.epoch)
+        lease_deadline_ns = 0 if lease is None else int(lease.deadline * 1_000_000_000)
+        return ModelRuntimeIdentity(
+            service_nonce=self._service_nonce,
+            worker_incarnation=self._worker_incarnation,
+            worker_pid=int(process.pid),
+            lease_epoch=lease_epoch,
+            lease_deadline_ns=lease_deadline_ns,
+            artifact_digest=self.artifact_digest,
+            model_root=str(factory_root),
+            manifest_path=str(factory_manifest),
+            processor_root=str(processor_root),
+            processor_manifest_path=str(processor_manifest),
+        )
 
     @staticmethod
     def _bounded_gpu_label(value: object, field: str) -> str:
@@ -2565,6 +2572,7 @@ class ModelService:
         observed_total = 0
         buffered_tokens: list[Tensor] = []
         authority: _RequestAuthority | None = None
+        request_runtime_identity: ModelRuntimeIdentity | None = None
         try:
             if monotonic() >= total_deadline:
                 deadline_exceeded = True
@@ -2599,6 +2607,12 @@ class ModelService:
             )
             with self._state_lock:
                 self._validate_running_gpu_lease()
+                if image_content is not None:
+                    request_runtime_identity = self._runtime_identity_locked()
+                    if request_runtime_identity is None:
+                        raise WorkerAuthorityError(
+                            "image request lacks a live runtime identity"
+                        )
                 request_id = self._next_request_id
                 self._next_request_id += 1
                 self._active_request_id = request_id
@@ -2735,6 +2749,25 @@ class ModelService:
                             raise WorkerExecutionError(
                                 "atomic token buffer disagrees with worker total"
                             )
+                        terminal_media_sha256: str | None = None
+                        terminal_runtime_identity: ModelRuntimeIdentity | None = None
+                        if image_content is not None:
+                            if media_digest is None:
+                                raise WorkerAuthorityError(
+                                    "image request lacks a media digest"
+                                )
+                            terminal_runtime_identity = self.runtime_identity()
+                            if (
+                                terminal_runtime_identity is None
+                                or terminal_runtime_identity != request_runtime_identity
+                            ):
+                                raise WorkerAuthorityError(
+                                    "image worker identity changed before terminal publication"
+                                )
+                            # ``authority.validate_frame`` above proves that the
+                            # terminal frame belongs to the session digest that
+                            # was cryptographically bound to this exact image.
+                            terminal_media_sha256 = media_digest
                         completed = True
                         # Atomic publication: no STATUS_OK token crosses this
                         # boundary until the worker's terminal frame confirms
@@ -2747,6 +2780,8 @@ class ModelService:
                             cancelled=False,
                             finish_reason=finish_reason,
                             generation_mode="cogni_core",
+                            media_sha256=terminal_media_sha256,
+                            runtime_identity=terminal_runtime_identity,
                         )
                         return
                     # The timeout measures worker silence. Intermediate frames
@@ -2832,6 +2867,8 @@ class ModelService:
         cancelled = False
         finish_reason: str | None = None
         generation_mode = "cogni_core"
+        media_sha256: str | None = None
+        runtime_identity: ModelRuntimeIdentity | None = None
         for chunk in self.iter_generate_tokens(
             prompt,
             image_content=image_content,
@@ -2851,6 +2888,8 @@ class ModelService:
             if chunk.final:
                 finish_reason = chunk.finish_reason
                 generation_mode = chunk.generation_mode
+                media_sha256 = chunk.media_sha256
+                runtime_identity = chunk.runtime_identity
         tokens = torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.int64)
         if tokens.numel() > self.max_new_tokens:
             raise WorkerExecutionError("worker exceeded the aggregate token budget")
@@ -2871,6 +2910,8 @@ class ModelService:
             text,
             finish_reason,
             generation_mode,
+            media_sha256,
+            runtime_identity,
         )
 
     def cancel(self, request_id: int | None = None) -> bool:

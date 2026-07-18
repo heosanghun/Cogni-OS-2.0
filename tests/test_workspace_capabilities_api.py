@@ -7,12 +7,14 @@ import json
 from pathlib import Path
 import tempfile
 from threading import Thread
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from cogni_demo.server import (
     DemoHTTPServer,
     DemoRequestHandler,
+    ImageModelUnavailableError,
     MAX_AGENT_CHAT_REQUEST_BODY_BYTES,
     MAX_INDEXED_TEXT_CHARS,
     MAX_REQUEST_BODY_BYTES,
@@ -64,7 +66,7 @@ class _ImageProbe:
 
 @dataclass(frozen=True)
 class _RuntimeIdentity:
-    service_nonce: str = "service-a"
+    service_nonce: str = "1" * 32
     worker_incarnation: int = 1
     worker_pid: int = 4321
     lease_epoch: int = 7
@@ -84,6 +86,28 @@ class _RuntimeService:
         return self.identity
 
 
+def _terminal_image_evidence(
+    identity: _RuntimeIdentity,
+    image_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "image_sha256": image_sha256,
+        "runtime_identity": {
+            "service_nonce": identity.service_nonce,
+            "worker_incarnation": identity.worker_incarnation,
+            "worker_pid": identity.worker_pid,
+            "lease_epoch": identity.lease_epoch,
+            "lease_deadline_ns": identity.lease_deadline_ns,
+            "artifact_digest": identity.artifact_digest,
+            "model_root": identity.model_root,
+            "manifest_path": identity.manifest_path,
+            "processor_root": identity.processor_root,
+            "processor_manifest_path": identity.processor_manifest_path,
+        },
+    }
+
+
 class _Agent:
     def __init__(self) -> None:
         self.availability_check = None
@@ -92,6 +116,7 @@ class _Agent:
         self.messages: list[str] = []
         self.retrieval_requested = False
         self.shutdown_called = False
+        self.reset_calls = 0
 
     @property
     def is_active(self) -> bool:
@@ -117,6 +142,9 @@ class _Agent:
 
     def stop_model(self):
         return None
+
+    def reset(self):
+        self.reset_calls += 1
 
     def shutdown(self):
         self.shutdown_called = True
@@ -739,6 +767,12 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
                 return_value=("turn-image-probe", True),
             ) as start_probe,
         ):
+            capability_status, capability = self._get("/api/workspace/capabilities")
+            self.assertEqual(capability_status, 200)
+            self.assertEqual(
+                capability["attachments"]["image_selection"],
+                "explicit_single_next_turn",
+            )
             status, payload = self._post(
                 "/api/agent/chat",
                 {
@@ -767,6 +801,7 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
             "generation_mode": "cogni_core_image",
             "truncated": False,
             "generated_tokens": 3,
+            "image_attestation": _terminal_image_evidence(identity, probe.image_sha256),
         }
         with patch.object(
             self.server,
@@ -816,6 +851,124 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
             self.assertFalse(failed["runtime_ready"])
             self.assertIsNone(failed["attestation_id"])
 
+    def test_image_attestation_rejects_terminal_and_worker_mismatches(self) -> None:
+        identity = _RuntimeIdentity()
+        service = _RuntimeService(identity)
+        probe = _ImageProbe("turn-image", "b" * 64, "2026-07-19T00:00:00+00:00")
+        completion = {
+            "state": "complete",
+            "finish_reason": "stop",
+            "generation_mode": "cogni_core_image",
+            "truncated": False,
+            "generated_tokens": 3,
+            "image_attestation": _terminal_image_evidence(identity, probe.image_sha256),
+        }
+        cases = (
+            (
+                "length",
+                {**completion, "finish_reason": "length"},
+                "succeeded",
+                probe.turn_id,
+            ),
+            (
+                "truncated",
+                {**completion, "truncated": True},
+                "succeeded",
+                probe.turn_id,
+            ),
+            (
+                "zero_tokens",
+                {**completion, "generated_tokens": 0},
+                "succeeded",
+                probe.turn_id,
+            ),
+            ("cancelled", completion, "cancelled", probe.turn_id),
+            ("failed", completion, "failed", probe.turn_id),
+            ("other_turn", completion, "succeeded", "turn-other"),
+            (
+                "digest_mismatch",
+                {
+                    **completion,
+                    "image_attestation": _terminal_image_evidence(identity, "c" * 64),
+                },
+                "succeeded",
+                probe.turn_id,
+            ),
+        )
+        with patch.object(
+            self.server,
+            "_configured_image_model_service",
+            return_value=service,
+        ):
+            for name, candidate, status, turn_id in cases:
+                with self.subTest(case=name):
+                    self.server._image_attestation = None
+                    self.server._image_attestation_probe = probe
+                    self.server._finish_first_image_attestation(
+                        probe,
+                        {
+                            "turn_id": turn_id,
+                            "status": status,
+                            "completion": candidate,
+                        },
+                    )
+                    self.assertIsNone(self.server._image_attestation)
+                    self.assertIsNone(self.server._image_attestation_probe)
+
+            for successor in (
+                _RuntimeIdentity(worker_incarnation=2),
+                _RuntimeIdentity(lease_epoch=8),
+            ):
+                with self.subTest(successor=successor):
+                    self.server._image_attestation = None
+                    self.server._image_attestation_probe = probe
+                    service.identity = successor
+                    self.server._finish_first_image_attestation(
+                        probe,
+                        {
+                            "turn_id": probe.turn_id,
+                            "status": "succeeded",
+                            "completion": completion,
+                        },
+                    )
+                    self.assertIsNone(self.server._image_attestation)
+                    self.assertIsNone(self.server._image_attestation_probe)
+
+    def test_image_probe_reset_fence_and_watcher_start_failure_fail_closed(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self.server._image_attestation_watch_seconds(
+                SimpleNamespace(
+                    max_decode_seconds=120.0,
+                    model_service=SimpleNamespace(startup_timeout=180.0),
+                )
+            ),
+            330.0,
+        )
+        probe = _ImageProbe("turn-image", "b" * 64, "2026-07-19T00:00:00+00:00")
+        self.server._image_attestation_probe = probe
+        status, payload = self._post("/api/agent/reset", {})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"]["code"], "COMPUTE_BUSY")
+        self.assertEqual(self.agent.reset_calls, 0)
+        self.server._image_attestation_probe = None
+
+        with (
+            patch.object(
+                self.server,
+                "image_to_model_integration_status",
+                return_value=_configured_unverified_image_status(),
+            ),
+            patch("cogni_demo.server.Thread.start", side_effect=RuntimeError("boom")),
+        ):
+            with self.assertRaisesRegex(
+                ImageModelUnavailableError, "watcher could not start"
+            ):
+                self.server.start_image_agent_turn("describe", b"image")
+        self.assertIsNone(self.server._image_attestation_probe)
+        self.assertIsNone(self.server._image_attestation_thread)
+
     def test_image_chat_rejects_invalid_id_media_rag_task_and_unverified_runtime(
         self,
     ) -> None:
@@ -852,14 +1005,22 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
                 "capability_payload",
                 return_value=text_only_capability,
             ),
+            patch.object(self.server, "start_image_agent_turn") as start_image,
         ):
             status, capability = self._get("/api/workspace/capabilities")
+            post_status, post_payload = self._post(
+                "/api/agent/chat",
+                {"message": "x", "image_attachment_id": "a" * 24},
+            )
         self.assertEqual(status, 200)
         self.assertFalse(capability["attachments"]["image_to_model_integration"])
         self.assertEqual(
             capability["attachments"]["image_capability"]["state"],
             "selected_checkpoint_not_supported",
         )
+        self.assertEqual(post_status, 503)
+        self.assertEqual(post_payload["error"]["code"], "IMAGE_MODEL_UNAVAILABLE")
+        start_image.assert_not_called()
 
         misleading_discovered_capability = {
             "schema_version": 1,

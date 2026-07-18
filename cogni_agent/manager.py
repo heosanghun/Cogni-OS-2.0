@@ -25,6 +25,7 @@ from .conversation_fastpath import ConversationFastPath
 from .fact_grounding import RuntimeFactGrounder
 from .model_service import (
     GenerationCancelled,
+    ModelRuntimeIdentity,
     ModelServiceError,
     truncate_repeated_tokens,
 )
@@ -1202,6 +1203,13 @@ class AgentManager:
             if evidence
             else "cogni_core"
         )
+        expected_image_sha256 = (
+            hashlib.sha256(image_content).hexdigest()
+            if image_content is not None
+            else None
+        )
+        image_terminal_identity: ModelRuntimeIdentity | None = None
+        image_terminal_attestation: dict[str, Any] | None = None
         message_id = self._append_message(
             "assistant",
             "",
@@ -1373,6 +1381,34 @@ class AgentManager:
                         raise ModelServiceError(
                             "worker returned an unattested generation mode"
                         )
+                    if expected_image_sha256 is not None:
+                        chunk_media_sha256 = getattr(chunk, "media_sha256", None)
+                        chunk_runtime_identity = getattr(
+                            chunk, "runtime_identity", None
+                        )
+                        if chunk_media_sha256 != expected_image_sha256:
+                            raise ModelServiceError(
+                                "image terminal digest did not match admitted bytes"
+                            )
+                        if not isinstance(chunk_runtime_identity, ModelRuntimeIdentity):
+                            raise ModelServiceError(
+                                "image terminal response lacked runtime identity"
+                            )
+                        if (
+                            image_terminal_identity is not None
+                            and chunk_runtime_identity != image_terminal_identity
+                        ):
+                            raise ModelServiceError(
+                                "image worker identity changed across generation attempts"
+                            )
+                        image_terminal_identity = chunk_runtime_identity
+                        image_terminal_attestation = {
+                            "schema_version": 1,
+                            "image_sha256": expected_image_sha256,
+                            "runtime_identity": self._runtime_identity_payload(
+                                chunk_runtime_identity
+                            ),
+                        }
 
             total_generated += request_generated
             finish_reason = (
@@ -1890,6 +1926,16 @@ class AgentManager:
         published_sources = (
             evidence_sources if generation_mode == "cogni_core_rag" else ()
         )
+        published_image_attestation = (
+            image_terminal_attestation
+            if generation_mode == "cogni_core_image"
+            else None
+        )
+        if (
+            generation_mode == "cogni_core_image"
+            and published_image_attestation is None
+        ):
+            raise ModelServiceError("image completion lacked terminal worker evidence")
         self.conversations.commit_assistant_turn(
             self.session_id, user_sequence, response
         )
@@ -1914,6 +1960,7 @@ class AgentManager:
                 generated_tokens=total_generated,
                 generation_mode=generation_mode,
                 sources=published_sources,
+                image_attestation=published_image_attestation,
             )
             self._core = self._core_state()
         return "succeeded", final_stage, 100
@@ -3321,6 +3368,53 @@ class AgentManager:
         return False
 
     @staticmethod
+    def _runtime_identity_payload(
+        identity: ModelRuntimeIdentity,
+    ) -> dict[str, object]:
+        if not isinstance(identity, ModelRuntimeIdentity):
+            raise ModelServiceError("runtime identity has an invalid type")
+        service_nonce = identity.service_nonce.strip().lower()
+        artifact_digest = identity.artifact_digest.strip().lower()
+        if len(service_nonce) != 32 or any(
+            character not in "0123456789abcdef" for character in service_nonce
+        ):
+            raise ModelServiceError("runtime identity service nonce is invalid")
+        if len(artifact_digest) != 64 or any(
+            character not in "0123456789abcdef" for character in artifact_digest
+        ):
+            raise ModelServiceError("runtime identity artifact digest is invalid")
+        integer_fields = {
+            "worker_incarnation": identity.worker_incarnation,
+            "worker_pid": identity.worker_pid,
+            "lease_epoch": identity.lease_epoch,
+            "lease_deadline_ns": identity.lease_deadline_ns,
+        }
+        if any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < (1 if name in {"worker_incarnation", "worker_pid"} else 0)
+            for name, value in integer_fields.items()
+        ):
+            raise ModelServiceError("runtime identity counters are invalid")
+        path_fields = {
+            "model_root": identity.model_root,
+            "manifest_path": identity.manifest_path,
+            "processor_root": identity.processor_root,
+            "processor_manifest_path": identity.processor_manifest_path,
+        }
+        if any(
+            not isinstance(value, str) or not 1 <= len(value) <= 4_096
+            for value in path_fields.values()
+        ):
+            raise ModelServiceError("runtime identity paths are invalid")
+        return {
+            "service_nonce": service_nonce,
+            **integer_fields,
+            "artifact_digest": artifact_digest,
+            **path_fields,
+        }
+
+    @staticmethod
     def _completion_state(
         *,
         state: str = "idle",
@@ -3330,6 +3424,7 @@ class AgentManager:
         generated_tokens: int = 0,
         generation_mode: str | None = None,
         sources: tuple[dict[str, Any], ...] = (),
+        image_attestation: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if generation_mode not in {
             None,
@@ -3351,6 +3446,7 @@ class AgentManager:
             "generation_mode": generation_mode,
             "rag_used": bool(sources),
             "sources": deepcopy(list(sources)),
+            "image_attestation": deepcopy(image_attestation),
         }
 
     def _core_state(self, active: tuple[str, ...] = ()) -> dict[str, Any]:

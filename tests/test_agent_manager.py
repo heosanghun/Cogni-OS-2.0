@@ -23,7 +23,11 @@ from cogni_agent.manager import (
     safe_quality_fallback,
 )
 from cogni_agent.fact_grounding import RuntimeFactGrounder
-from cogni_agent.model_service import GenerationChunk, ModelServiceError
+from cogni_agent.model_service import (
+    GenerationChunk,
+    ModelRuntimeIdentity,
+    ModelServiceError,
+)
 from cogni_agent.multimodal import MAX_IMAGE_BYTES
 from cogni_agent.response_quality import compile_response_intent
 from cogni_agent.tools import ToolResult, WorkspaceToolExecutor
@@ -131,6 +135,18 @@ class _ImageScriptedService(_ScriptedService):
     def __init__(self, plans):
         super().__init__(plans)
         self.images = []
+        self.runtime_identity = ModelRuntimeIdentity(
+            service_nonce="1" * 32,
+            worker_incarnation=1,
+            worker_pid=4321,
+            lease_epoch=7,
+            lease_deadline_ns=99,
+            artifact_digest="a" * 64,
+            model_root="model",
+            manifest_path="manifest",
+            processor_root="model",
+            processor_manifest_path="manifest",
+        )
 
     def iter_generate_tokens(
         self,
@@ -145,7 +161,7 @@ class _ImageScriptedService(_ScriptedService):
         sampling_seed=None,
     ):
         self.images.append(image_content)
-        yield from super().iter_generate_tokens(
+        for chunk in super().iter_generate_tokens(
             prompt,
             max_new_tokens=max_new_tokens,
             stop_token_ids=stop_token_ids,
@@ -153,7 +169,11 @@ class _ImageScriptedService(_ScriptedService):
             timeout=timeout,
             total_timeout=total_timeout,
             sampling_seed=sampling_seed,
-        )
+        ):
+            if chunk.final:
+                chunk.media_sha256 = sha256(image_content).hexdigest()
+                chunk.runtime_identity = self.runtime_identity
+            yield chunk
 
 
 class _VariadicImageClaimService(_ScriptedService):
@@ -348,6 +368,16 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(state["status"], "succeeded")
         self.assertEqual(answer["generation_mode"], "cogni_core_image")
         self.assertEqual(state["completion"]["generation_mode"], "cogni_core_image")
+        self.assertEqual(
+            state["completion"]["image_attestation"]["image_sha256"],
+            sha256(image).hexdigest(),
+        )
+        self.assertEqual(
+            state["completion"]["image_attestation"]["runtime_identity"][
+                "worker_incarnation"
+            ],
+            1,
+        )
         self.assertEqual(
             state["last_finished_turn"],
             {

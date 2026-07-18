@@ -110,6 +110,8 @@ DEFAULT_PORT = 8765
 DEFAULT_WATCHDOG_SECONDS = 60.0
 COMPONENT_SHUTDOWN_WAIT_SECONDS = 45.0
 SERVER_GPU_IDENTITY_PROBE_TIMEOUT_SECONDS = 45.0
+MAX_IMAGE_ATTESTATION_WATCH_SECONDS = 360.0
+IMAGE_ATTESTATION_WATCH_MARGIN_SECONDS = 30.0
 MAX_SESSION_BYTES = 4096
 SESSION_VERSION = 1
 SERVICE_MARKER = "cogniboard"
@@ -2118,6 +2120,94 @@ class DemoHTTPServer(ThreadingHTTPServer):
         except (AttributeError, ImportError, OSError, TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _selected_checkpoint_advertises_image(payload: object) -> bool:
+        """Accept image admission only for the one selected image checkpoint."""
+
+        if not isinstance(payload, dict):
+            return False
+        models = payload.get("models")
+        items = models.get("items") if isinstance(models, dict) else None
+        if not isinstance(items, list):
+            return False
+        selected = [
+            item
+            for item in items
+            if isinstance(item, dict) and item.get("selected") is True
+        ]
+        if len(selected) != 1:
+            return False
+        modalities = selected[0].get("checkpoint_modalities")
+        return isinstance(modalities, list) and "image" in modalities
+
+    def selected_checkpoint_advertises_image(self) -> bool:
+        """Re-read selected checkpoint authority at the image admission edge."""
+
+        workspace = self.workspace_service
+        if workspace is None:
+            return False
+        try:
+            payload = workspace.capability_payload()
+        except (
+            AttributeError,
+            OSError,
+            TypeError,
+            ValueError,
+            WorkspaceCapabilityError,
+        ):
+            return False
+        return self._selected_checkpoint_advertises_image(payload)
+
+    @staticmethod
+    def _runtime_identity_payload(identity: object) -> dict[str, object] | None:
+        """Serialize one exact worker identity with fail-closed bounds."""
+
+        names = (
+            "service_nonce",
+            "worker_incarnation",
+            "worker_pid",
+            "lease_epoch",
+            "lease_deadline_ns",
+            "artifact_digest",
+            "model_root",
+            "manifest_path",
+            "processor_root",
+            "processor_manifest_path",
+        )
+        try:
+            payload = {name: getattr(identity, name) for name in names}
+        except (AttributeError, TypeError):
+            return None
+        service_nonce = payload["service_nonce"]
+        artifact_digest = payload["artifact_digest"]
+        if (
+            not isinstance(service_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{32}", service_nonce) is None
+            or not isinstance(artifact_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", artifact_digest) is None
+        ):
+            return None
+        for name in (
+            "worker_incarnation",
+            "worker_pid",
+            "lease_epoch",
+            "lease_deadline_ns",
+        ):
+            value = payload[name]
+            minimum = 1 if name in {"worker_incarnation", "worker_pid"} else 0
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                return None
+        for name in (
+            "model_root",
+            "manifest_path",
+            "processor_root",
+            "processor_manifest_path",
+        ):
+            value = payload[name]
+            if not isinstance(value, str) or not 1 <= len(value) <= 4_096:
+                return None
+        return payload
+
     def image_to_model_integration_status(self) -> dict[str, object]:
         """Separate image configuration from processor and inference proof.
 
@@ -2266,6 +2356,13 @@ class DemoHTTPServer(ThreadingHTTPServer):
             effective_retrieval = retrieval_requested or bool(evidence)
             if effective_retrieval and image_content is not None:
                 raise ValueError("retrieval and image content are mutually exclusive")
+            if (
+                image_content is not None
+                and not self.selected_checkpoint_advertises_image()
+            ):
+                raise ImageModelUnavailableError(
+                    "selected checkpoint does not advertise image input"
+                )
             if evidence:
                 # Product callers may bypass the HTTP adapter.  Do not let
                 # unprovenanced generic AgentManager evidence acquire the
@@ -2338,17 +2435,27 @@ class DemoHTTPServer(ThreadingHTTPServer):
             )
             with self._image_attestation_lock:
                 self._image_attestation_thread = thread
-            thread.start()
+            try:
+                thread.start()
+            except BaseException as exc:
+                # The image turn has already been admitted, so it cannot be
+                # rolled back here.  Remove the unpublished probe fence so a
+                # failed watcher launch cannot block all later compute forever;
+                # this turn remains unverified and cannot mint an attestation.
+                with self._image_attestation_lock:
+                    if self._image_attestation_probe == probe:
+                        self._image_attestation_probe = None
+                        self._image_attestation_thread = None
+                raise ImageModelUnavailableError(
+                    "image attestation watcher could not start"
+                ) from exc
             return turn_id, True
 
     def _watch_first_image_attestation(self, probe: _ImageAttestationProbe) -> None:
         """Publish only after the exact image turn reaches a trusted terminal state."""
 
         agent = self.agent_manager
-        deadline = monotonic() + min(
-            180.0,
-            max(30.0, float(getattr(agent, "max_decode_seconds", 120.0)) + 30.0),
-        )
+        deadline = monotonic() + self._image_attestation_watch_seconds(agent)
         finished: dict[str, object] | None = None
         try:
             while monotonic() < deadline:
@@ -2369,6 +2476,23 @@ class DemoHTTPServer(ThreadingHTTPServer):
         with self._compute_lock:
             self._finish_first_image_attestation(probe, finished)
 
+    @staticmethod
+    def _image_attestation_watch_seconds(agent: object) -> float:
+        """Cover cold startup plus bounded decode under a server watchdog cap."""
+
+        startup_seconds = float(
+            getattr(getattr(agent, "model_service", None), "startup_timeout", 180.0)
+        )
+        decode_seconds = float(getattr(agent, "max_decode_seconds", 120.0))
+        if not isfinite(startup_seconds) or startup_seconds <= 0:
+            startup_seconds = 180.0
+        if not isfinite(decode_seconds) or decode_seconds <= 0:
+            decode_seconds = 120.0
+        return min(
+            MAX_IMAGE_ATTESTATION_WATCH_SECONDS,
+            startup_seconds + decode_seconds + IMAGE_ATTESTATION_WATCH_MARGIN_SECONDS,
+        )
+
     def _finish_first_image_attestation(
         self,
         probe: _ImageAttestationProbe,
@@ -2378,6 +2502,44 @@ class DemoHTTPServer(ThreadingHTTPServer):
             if self._image_attestation_probe != probe:
                 return
         completion = finished.get("completion") if isinstance(finished, dict) else None
+        terminal_evidence = (
+            completion.get("image_attestation")
+            if isinstance(completion, dict)
+            else None
+        )
+        terminal_identity_payload = (
+            terminal_evidence.get("runtime_identity")
+            if isinstance(terminal_evidence, dict)
+            else None
+        )
+        terminal_image_sha256 = (
+            terminal_evidence.get("image_sha256")
+            if isinstance(terminal_evidence, dict)
+            else None
+        )
+        evidence_schema_valid = bool(
+            isinstance(terminal_evidence, dict)
+            and set(terminal_evidence)
+            == {"schema_version", "image_sha256", "runtime_identity"}
+            and terminal_evidence.get("schema_version") == 1
+            and terminal_image_sha256 == probe.image_sha256
+            and isinstance(terminal_image_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", terminal_image_sha256) is not None
+            and isinstance(terminal_identity_payload, dict)
+            and set(terminal_identity_payload)
+            == {
+                "service_nonce",
+                "worker_incarnation",
+                "worker_pid",
+                "lease_epoch",
+                "lease_deadline_ns",
+                "artifact_digest",
+                "model_root",
+                "manifest_path",
+                "processor_root",
+                "processor_manifest_path",
+            }
+        )
         successful = bool(
             isinstance(finished, dict)
             and finished.get("turn_id") == probe.turn_id
@@ -2390,6 +2552,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
             and isinstance(completion.get("generated_tokens"), int)
             and not isinstance(completion.get("generated_tokens"), bool)
             and completion["generated_tokens"] > 0
+            and evidence_schema_valid
         )
         service = self._configured_image_model_service() if successful else None
         identity = None
@@ -2398,31 +2561,21 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 identity = service.runtime_identity()
             except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
                 identity = None
+        current_identity_payload = self._runtime_identity_payload(identity)
         attestation: _CurrentProcessImageAttestation | None = None
-        if identity is not None:
+        if (
+            identity is not None
+            and current_identity_payload is not None
+            and terminal_identity_payload == current_identity_payload
+        ):
             recorded_at = datetime.now(timezone.utc).isoformat()
-            identity_payload = {
-                name: getattr(identity, name, None)
-                for name in (
-                    "service_nonce",
-                    "worker_incarnation",
-                    "worker_pid",
-                    "lease_epoch",
-                    "lease_deadline_ns",
-                    "artifact_digest",
-                    "model_root",
-                    "manifest_path",
-                    "processor_root",
-                    "processor_manifest_path",
-                )
-            }
             payload = {
                 "schema_version": 1,
                 "process_nonce": self._image_process_nonce,
                 "turn_id": probe.turn_id,
-                "image_sha256": probe.image_sha256,
+                "image_sha256": terminal_image_sha256,
                 "recorded_at": recorded_at,
-                "runtime_identity": identity_payload,
+                "runtime_identity": current_identity_payload,
                 "generation_mode": "cogni_core_image",
                 "finish_reason": "stop",
             }
@@ -2439,7 +2592,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 ).hexdigest(),
                 process_nonce=self._image_process_nonce,
                 turn_id=probe.turn_id,
-                image_sha256=probe.image_sha256,
+                image_sha256=terminal_image_sha256,
                 recorded_at=recorded_at,
                 runtime_identity=identity,
             )
@@ -2519,6 +2672,17 @@ class DemoHTTPServer(ThreadingHTTPServer):
     def _image_probe_active(self) -> bool:
         with self._image_attestation_lock:
             return self._image_attestation_probe is not None
+
+    def reset_agent_conversation(self) -> dict[str, object]:
+        """Reset only after the first-image watcher releases its exact turn."""
+
+        with self._compute_lock:
+            if self.agent_manager is None:
+                raise RuntimeError("agent manager is unavailable")
+            if self._image_probe_active():
+                raise ComputeBusyError("image attestation is still in progress")
+            self.agent_manager.reset()
+            return self.agent_manager.snapshot()
 
     def _validation_compute_available(self) -> bool:
         return (
@@ -2754,10 +2918,8 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 else []
             )
             selected_model = selected_items[0] if len(selected_items) == 1 else None
-            checkpoint_image = bool(
-                isinstance(selected_model, dict)
-                and isinstance(selected_model.get("checkpoint_modalities"), list)
-                and "image" in selected_model["checkpoint_modalities"]
+            checkpoint_image = self.server._selected_checkpoint_advertises_image(
+                payload
             )
             image_capability = self.server.image_to_model_integration_status()
             if not checkpoint_image:
@@ -2768,15 +2930,26 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                     "processor_probed": False,
                     "model_inference_attested": False,
                     "runtime_ready": False,
+                    "first_use_attestation_allowed": False,
+                    "attestation_id": None,
+                    "attested_at": None,
                     "disabled_reason": "SELECTED_MODEL_IMAGE_NOT_ADVERTISED",
                 }
             image_integration = bool(image_capability.get("runtime_ready") is True)
+            image_first_use = bool(
+                checkpoint_image
+                and image_capability.get("state") == "configured_unverified"
+                and image_capability.get("configured") is True
+                and image_capability.get("first_use_attestation_allowed") is True
+            )
             attachment_capability = payload.get("attachments")
             if isinstance(attachment_capability, dict):
                 attachment_capability["image_to_model_integration"] = image_integration
                 attachment_capability["image_capability"] = image_capability
                 attachment_capability["image_selection"] = (
-                    "explicit_single_next_turn" if image_integration else "disabled"
+                    "explicit_single_next_turn"
+                    if image_integration or image_first_use
+                    else "disabled"
                 )
             if isinstance(models, dict):
                 models["image_to_model_integration"] = image_integration
@@ -3071,6 +3244,12 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                         HTTPStatus.SERVICE_UNAVAILABLE, "WORKSPACE_UNAVAILABLE"
                     )
                     return
+                if not self.server.selected_checkpoint_advertises_image():
+                    self._json_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "IMAGE_MODEL_UNAVAILABLE",
+                    )
+                    return
                 image_status = self.server.image_to_model_integration_status()
                 image_ready = self.server.image_to_model_integration_ready()
                 image_attestation_probe = bool(
@@ -3185,11 +3364,14 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AGENT_UNAVAILABLE")
                 return
             try:
-                self.server.agent_manager.reset()
+                state = self.server.reset_agent_conversation()
+            except ComputeBusyError:
+                self._json_error(HTTPStatus.CONFLICT, "COMPUTE_BUSY")
+                return
             except AgentBusyError:
                 self._json_error(HTTPStatus.CONFLICT, "AGENT_BUSY")
                 return
-            self._json(HTTPStatus.OK, self.server.agent_manager.snapshot())
+            self._json(HTTPStatus.OK, state)
             return
         if parsed.path == "/api/evolution/run":
             if self.server.evolution_manager is None:

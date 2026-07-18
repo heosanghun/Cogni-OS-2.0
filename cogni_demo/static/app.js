@@ -285,6 +285,7 @@ const ui = {
   imageModelIntegrationReady: false,
   imageModelFirstUseReady: false,
   imageAttestationPending: false,
+  imageAttestationSettling: false,
   indexedAttachmentIds: new Set(),
   ragBackendReady: false,
   ragAnswerIntegrationReady: false,
@@ -1221,6 +1222,7 @@ function revokeWorkspaceCapabilities() {
   ui.imageModelIntegrationReady = false;
   ui.imageModelFirstUseReady = false;
   ui.imageAttestationPending = false;
+  ui.imageAttestationSettling = false;
   ui.selectedImageAttachmentId = "";
   ui.lensConnectorReady = false;
   ui.voiceTransportReady = false;
@@ -1270,9 +1272,18 @@ function applyWorkspaceCapabilities(capabilities) {
     && rag.answer_integration === true
     && rag.answer_integration_schema === "cogni.agent.retrieval-evidence.v1";
   const imageCapability = attachments.image_capability || {};
+  const serverImageAttestationPending = imageCapability.state === "first_image_attestation_in_progress";
   ui.imageModelIntegrationReady = attachments.image_to_model_integration === true
     && imageCapability.runtime_ready === true
     && imageCapability.model_inference_attested === true;
+  if (serverImageAttestationPending) {
+    ui.imageAttestationPending = true;
+  } else if (ui.imageModelIntegrationReady || ui.imageAttestationSettling) {
+    // A settling refresh is the only configured-unverified response allowed to
+    // clear a locally admitted probe. This prevents an older in-flight GET
+    // from erasing the POST result before the server publishes pending state.
+    ui.imageAttestationPending = false;
+  }
   ui.imageModelFirstUseReady = attachments.state === "enabled"
     && imageCapability.state === "configured_unverified"
     && imageCapability.configured === true
@@ -1604,7 +1615,15 @@ function updateWorkspaceControlStates() {
 async function loadWorkspaceCapabilities() {
   try {
     const capabilities = await api("/api/workspace/capabilities");
-    applyWorkspaceCapabilities(capabilities);
+    const applied = applyWorkspaceCapabilities(capabilities);
+    if (
+      applied
+      && ui.imageAttestationPending
+      && ["succeeded", "cancelled", "failed"].includes(ui.agentStatus)
+      && !ui.imageAttestationSettling
+    ) {
+      void settleFirstImageAttestation();
+    }
     try {
       const inventory = await api("/api/workspace/attachments");
       ui.workspaceAttachments = Array.isArray(inventory?.items)
@@ -1637,20 +1656,26 @@ async function loadWorkspaceCapabilities() {
 }
 
 async function settleFirstImageAttestation() {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await refreshWorkspaceCapabilityDisclosure();
-    const imageCapability = ui.workspaceCapabilities?.attachments?.image_capability || {};
-    if (ui.imageModelIntegrationReady) {
-      showToast("현재 로컬 모델의 이미지 전처리·추론 경로가 검증되었습니다.", "success");
-      return;
+  if (ui.imageAttestationSettling) return;
+  ui.imageAttestationSettling = true;
+  try {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await refreshWorkspaceCapabilityDisclosure();
+      const imageCapability = ui.workspaceCapabilities?.attachments?.image_capability || {};
+      if (ui.imageModelIntegrationReady) {
+        showToast("현재 로컬 모델의 이미지 전처리·추론 경로가 검증되었습니다.", "success");
+        return;
+      }
+      if (imageCapability.state !== "first_image_attestation_in_progress") {
+        showToast("첫 이미지 검증을 통과하지 못했습니다. 이미지 기능은 미검증 상태로 유지됩니다.", "warning");
+        return;
+      }
     }
-    if (imageCapability.state !== "first_image_attestation_in_progress") {
-      showToast("첫 이미지 검증을 통과하지 못했습니다. 이미지 기능은 미검증 상태로 유지됩니다.", "warning");
-      return;
-    }
+    showToast("이미지 검증 결과를 확인하지 못해 기능을 활성화하지 않았습니다.", "warning");
+  } finally {
+    ui.imageAttestationSettling = false;
   }
-  showToast("이미지 검증 결과를 확인하지 못해 기능을 활성화하지 않았습니다.", "warning");
 }
 
 async function indexWorkspaceAttachment(attachment) {
@@ -3499,8 +3524,8 @@ function updateAgentState(state) {
   if (
     ui.imageAttestationPending
     && ["succeeded", "cancelled", "failed"].includes(ui.agentStatus)
+    && !ui.imageAttestationSettling
   ) {
-    ui.imageAttestationPending = false;
     ui.imageModelFirstUseReady = false;
     void settleFirstImageAttestation();
   }

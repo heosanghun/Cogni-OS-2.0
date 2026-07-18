@@ -216,6 +216,8 @@ PC의 RTX 5090 Laptop 결과를 RTX 4090 인증으로 바꾸어 말하지 않는
 Evidence Ledger의 `PASS`, `PENDING`, `RESEARCH`를 구분한다. 특허·ISO·조달 계획은
 기술 PASS가 아니다.
 
+<!-- PDF_PAGE_BREAK -->
+
 ## 5. 첨부 파일 운영
 
 ### 5.1 지원 범위와 한도
@@ -565,6 +567,8 @@ proposal-only Self-Harness를 설명한다.
 - “Lens 웹 전체를 자유롭게 검색” — 공식 고정 API 두 경로만 허용
 - “Self-Harness가 소스를 자동 수정·승격” — 현재 읽기 전용 제안만 허용
 - “AGI·무한 진화 완성” — 검증되지 않은 주장
+
+<!-- PDF_PAGE_BREAK -->
 
 ## 17. 완료 판정
 

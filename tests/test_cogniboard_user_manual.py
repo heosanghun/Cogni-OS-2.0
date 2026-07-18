@@ -7,6 +7,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MANUAL = ROOT / "docs" / "COGNIBOARD_USER_MANUAL_PLAYBOOK_KO.md"
+PDF_BUILDER = ROOT / "scripts" / "build_cogniboard_manual_pdf.py"
 
 
 class TestCogniBoardUserManual(unittest.TestCase):
@@ -58,6 +59,13 @@ class TestCogniBoardUserManual(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.text)
+
+    def test_print_layout_keeps_code_and_major_sections_together(self) -> None:
+        self.assertEqual(self.text.count("<!-- PDF_PAGE_BREAK -->"), 2)
+        builder = PDF_BUILDER.read_text(encoding="utf-8")
+        self.assertIn('line == "<!-- PDF_PAGE_BREAK -->"', builder)
+        self.assertIn("KeepTogether", builder)
+        self.assertIn('Preformatted("\\n".join(block)', builder)
 
 
 if __name__ == "__main__":

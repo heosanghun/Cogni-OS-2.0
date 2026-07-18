@@ -20,6 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     CondPageBreak,
     Flowable,
+    KeepTogether,
     LongTable,
     PageBreak,
     Paragraph,
@@ -420,6 +421,11 @@ def markdown_story(path: Path, styles: dict[str, ParagraphStyle]):
             flush_paragraph()
             index += 1
             continue
+        if line == "<!-- PDF_PAGE_BREAK -->":
+            flush_paragraph()
+            story.append(PageBreak())
+            index += 1
+            continue
         if line.startswith("```"):
             flush_paragraph()
             language = line[3:].strip()
@@ -433,7 +439,11 @@ def markdown_story(path: Path, styles: dict[str, ParagraphStyle]):
                     [Spacer(1, 3 * mm), ArchitectureDiagram(), Spacer(1, 4 * mm)]
                 )
             else:
-                story.append(Preformatted("\n".join(block), styles["code"]))
+                # Command examples are intentionally short. Keeping each one intact
+                # avoids stranding a continuation fragment at the top of a page.
+                story.append(
+                    KeepTogether([Preformatted("\n".join(block), styles["code"])])
+                )
             index += 1
             continue
         if line.startswith("|") and index + 1 < len(lines):

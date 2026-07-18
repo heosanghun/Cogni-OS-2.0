@@ -20,10 +20,12 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from .harness import SandboxResult
-from .production import RunnerAttestation, command_sha256
+
+if TYPE_CHECKING:
+    from .production import RunnerAttestation
 
 
 _EVIDENCE_SCHEMA = "cogni.kernel-sandbox-evidence.v1"
@@ -187,6 +189,11 @@ class LinuxOciSandboxRunner:
     def isolation_attestation(self) -> RunnerAttestation:
         """Return evidence for the existing production attestation gate."""
 
+        # Keep the host runner lightweight: importing production eagerly would
+        # import the local-model stack (including torch) even for a standalone
+        # kernel-boundary validation.
+        from .production import RunnerAttestation
+
         return RunnerAttestation(
             version=1,
             runner_id=self.evidence.runner_id,
@@ -203,7 +210,7 @@ class LinuxOciSandboxRunner:
     ) -> SandboxResult:
         """Run an exact command and reap the entire container on every exit."""
 
-        digest = command_sha256(command)
+        digest = _command_sha256(command)
         if digest not in self.evidence.allowed_command_sha256:
             raise KernelSandboxError("candidate command is not evidence-allowlisted")
         _require_regular_nofollow(self._engine, "container engine")
@@ -401,7 +408,7 @@ def build_kernel_sandbox_evidence_payload(
         "engine_sha256": engine_sha256,
         "daemon_socket": daemon_socket,
         "image_reference": image_reference,
-        "allowed_command_sha256": [command_sha256(item) for item in commands],
+        "allowed_command_sha256": [_command_sha256(item) for item in commands],
         "runtime": "runc",
         "network_mode": "none",
         "read_only_rootfs": True,
@@ -434,6 +441,24 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> None:
             os.killpg(process.pid, signal.SIGKILL)
         except OSError:
             process.kill()
+
+
+def _command_sha256(command: tuple[str, ...]) -> str:
+    if (
+        not isinstance(command, tuple)
+        or not command
+        or len(command) > 64
+        or any(
+            not isinstance(item, str) or not item or len(item) > 4096 or "\x00" in item
+            for item in command
+        )
+    ):
+        raise KernelSandboxError("candidate command is not a bounded argv tuple")
+    payload = b"".join(
+        len(item.encode("utf-8")).to_bytes(4, "big") + item.encode("utf-8")
+        for item in command
+    )
+    return sha256(payload).hexdigest()
 
 
 def _require_regular_nofollow(path: Path, label: str) -> None:

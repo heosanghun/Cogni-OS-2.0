@@ -48,12 +48,8 @@ class TestVoiceUIContract(unittest.TestCase):
         stop_start = script.index("async function stopVoiceCapture")
         stop_end = script.index("function cancelVoiceCapture", stop_start)
         stop_flow = script[stop_start:stop_end]
-        response_index = stop_flow.index(
-            'await api("/api/workspace/voice/transcribe"'
-        )
-        refresh_index = stop_flow.index(
-            "await refreshWorkspaceCapabilityDisclosure()"
-        )
+        response_index = stop_flow.index('await api("/api/workspace/voice/transcribe"')
+        refresh_index = stop_flow.index("await refreshWorkspaceCapabilityDisclosure()")
         ready_index = stop_flow.index("!ui.voiceTranscriptionReady", refresh_index)
         insert_index = stop_flow.index("insertVoiceTranscript", ready_index)
         self.assertLess(response_index, refresh_index)

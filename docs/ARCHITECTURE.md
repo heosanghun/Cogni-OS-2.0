@@ -181,15 +181,20 @@ flowchart LR
   bounded.
 - PDF extraction is local and bounded by file bytes, page count, and extracted
   characters. Encrypted, malformed, oversized, or textless PDFs fail closed.
-  Page-level provenance and a parser timeout/adversarial PDF certification are
-  not yet complete.
+  Physical-page provenance, normalized page-relative character offsets, parser
+  timeout/reap behavior, and a generated adversarial corpus are implemented and
+  covered by CPU tests. They remain `IMPLEMENTED_UNVERIFIED` until exact-scope
+  release evidence is independently attested.
 - The AkasicDB adapter pins the audited upstream revision and invokes its
   GraphStore, RelationalStore, and VectorStore interfaces. The stores are
   process-memory and are rebuilt from the persistent catalog.
 - Current retrieval is a stable SHA-256 lexical sketch with lexical overlap
   enforcement. It must not be described as a verified semantic embedder.
-- Evidence currently identifies file, chunk, and score. Sentence-to-page or
-  sentence-to-source navigation remains incomplete.
+- Evidence identifies file, chunk, score, physical PDF page, normalized
+  page-relative offsets, and excerpt digest. Inline sentence citations and the
+  source list open an independent read-only drawer. The schema explicitly calls
+  its text a normalized extracted excerpt; it is never presented as raw PDF or
+  attachment bytes.
 
 ## Official Lens.org connector
 

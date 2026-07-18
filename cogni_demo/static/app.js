@@ -28,6 +28,7 @@ const RAG_SOURCE_OFFSET_BASES = new Set([
   "normalized_document_text_v1",
   "normalized_pdf_page_text_v1",
 ]);
+const RAG_SOURCE_REPRESENTATION = "normalized_extracted_excerpt_v1";
 const RAG_SOURCE_EXACT_KEYS = Object.freeze([
   "schema_version",
   "attachment_id",
@@ -35,6 +36,7 @@ const RAG_SOURCE_EXACT_KEYS = Object.freeze([
   "name",
   "media_type",
   "text",
+  "representation",
   "page_number",
   "char_start",
   "char_end",
@@ -97,9 +99,9 @@ const API_ERROR_COPY = {
   PDF_TEXT_EXTRACTION_UNAVAILABLE: "로컬 PDF 추출기(pypdf)가 설치되지 않았습니다.",
   PDF_TEXT_LIMIT: "PDF에서 추출된 텍스트가 안전 처리 한도를 초과했습니다.",
   RAG_REINDEX_FAILED: "로컬 RAG 재색인을 완료하지 못했습니다.",
-  RAG_SOURCE_INTEGRITY_FAILED: "근거 원문 SHA-256 무결성 검증에 실패해 발췌를 표시하지 않았습니다.",
-  RAG_SOURCE_NOT_FOUND: "선택한 로컬 RAG 근거 원문을 찾을 수 없습니다.",
-  RAG_SOURCE_UNAVAILABLE: "선택한 로컬 RAG 근거 원문을 안전하게 불러올 수 없습니다.",
+  RAG_SOURCE_INTEGRITY_FAILED: "정규화 추출 발췌의 SHA-256 무결성 검증에 실패해 표시하지 않았습니다.",
+  RAG_SOURCE_NOT_FOUND: "선택한 로컬 RAG 정규화 추출 발췌를 찾을 수 없습니다.",
+  RAG_SOURCE_UNAVAILABLE: "선택한 로컬 RAG 정규화 추출 발췌를 안전하게 불러올 수 없습니다.",
   MODEL_NOT_VERIFIED: "검증된 로컬 모델만 선택할 수 있습니다.",
   MODEL_SWITCH_UNAVAILABLE: "모델은 검증되었지만 안전한 전환 기능은 아직 활성화되지 않았습니다.",
   LOCAL_AUDIO_PREPROCESS_FAILED: "검증된 로컬 Gemma 오디오 전처리에 실패했습니다.",
@@ -530,7 +532,7 @@ function configureRagEvidenceButton(button, source) {
   button.dataset.chunkIndex = String(source.chunkIndex);
   button.dataset.sourceTitle = source.title;
   button.dataset.sourceScore = source.score === null ? "" : String(source.score);
-  button.setAttribute("aria-label", `근거 ${source.number} 원문 열기: ${source.title}`);
+  button.setAttribute("aria-label", `근거 ${source.number} 정규화 추출 발췌 열기: ${source.title}`);
   button.setAttribute("aria-haspopup", "dialog");
   button.setAttribute("aria-controls", "evidence-drawer-layer");
   return true;
@@ -619,7 +621,7 @@ function normalizedExactRagSource(payload, requestedSource) {
   if (
     payloadKeys.length !== RAG_SOURCE_EXACT_KEYS.length
     || payloadKeys.some((key, index) => key !== RAG_SOURCE_EXACT_KEYS[index])
-    || payload.schema_version !== 1
+    || payload.schema_version !== 2
     || payload.attachment_id !== requestedSource.attachmentId
     || payload.chunk_index !== requestedSource.chunkIndex
     || typeof payload.name !== "string"
@@ -635,6 +637,7 @@ function normalizedExactRagSource(payload, requestedSource) {
     || typeof payload.text !== "string"
     || !payload.text
     || Array.from(payload.text).length > MAX_RAG_SOURCE_TEXT_CHARS
+    || payload.representation !== RAG_SOURCE_REPRESENTATION
     || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(payload.text)
     || !Number.isInteger(payload.char_start)
     || payload.char_start < 0
@@ -668,6 +671,7 @@ function normalizedExactRagSource(payload, requestedSource) {
     name,
     mediaType: payload.media_type,
     text: payload.text,
+    representation: payload.representation,
     pageNumber,
     charStart: payload.char_start,
     charEnd: payload.char_end,
@@ -824,8 +828,8 @@ async function openRagEvidenceSource(source, returnFocus) {
   excerpt.textContent = "";
   excerpt.hidden = true;
   empty.hidden = false;
-  empty.textContent = "근거 위치와 SHA-256 무결성을 확인하고 있습니다.";
-  setText("#evidence-drawer-title", `근거 ${source.number} 원문 확인 중`);
+  empty.textContent = "정규화 추출 위치와 SHA-256 무결성을 확인하고 있습니다.";
+  setText("#evidence-drawer-title", `근거 ${source.number} 추출 발췌 확인 중`);
   setText(
     "#evidence-drawer-location",
     `attachment_id ${source.attachmentId} · chunk ${source.chunkIndex}`,
@@ -835,7 +839,8 @@ async function openRagEvidenceSource(source, returnFocus) {
     source.score === null ? "검색 점수 미제공" : source.score.toFixed(4),
   );
   setText("#evidence-drawer-digest", "검증 중");
-  setEvidenceDrawerState("loading", "정확한 로컬 원문을 불러오고 있습니다.");
+  setText("#evidence-drawer-representation", "정규화 추출 발췌 · 원본 첨부 바이트 아님");
+  setEvidenceDrawerState("loading", "정확한 로컬 정규화 추출 발췌를 불러오고 있습니다.");
   layer.hidden = false;
   drawer.focus();
   syncModalBackgroundBlock();
@@ -850,8 +855,8 @@ async function openRagEvidenceSource(source, returnFocus) {
     const exactSource = normalizedExactRagSource(payload, source);
     setText("#evidence-drawer-title", exactSource.name);
     const pageLocation = exactSource.pageNumber === null
-      ? "문서 단위"
-      : `PDF ${exactSource.pageNumber}쪽`;
+      ? "정규화 문서 텍스트"
+      : `PDF 물리 ${exactSource.pageNumber}쪽의 정규화 추출 텍스트`;
     setText(
       "#evidence-drawer-location",
       `${pageLocation} · 문자 ${exactSource.charStart}–${exactSource.charEnd} · ${exactSource.offsetBasis}`,
@@ -862,23 +867,25 @@ async function openRagEvidenceSource(source, returnFocus) {
       throw ragSourceError("RAG_SOURCE_INTEGRITY_FAILED");
     }
     setText("#evidence-drawer-digest", exactSource.excerptSha256);
+    setText("#evidence-drawer-representation", "정규화 추출 발췌 · 원본 첨부 바이트 아님");
     excerpt.textContent = exactSource.text;
     excerpt.hidden = false;
     empty.hidden = true;
     setEvidenceDrawerState(
       "ready",
-      `원문 SHA-256 확인 완료 · ${exactSource.mediaType}`,
+      `정규화 추출 발췌 SHA-256 확인 완료 · ${exactSource.mediaType}`,
     );
   } catch (error) {
     if (requestId !== ui.evidenceDrawerRequestId) return;
     excerpt.textContent = "";
     excerpt.hidden = true;
     empty.hidden = false;
-    empty.textContent = "무결성이 확인되지 않아 원문 발췌를 표시하지 않았습니다.";
+    empty.textContent = "무결성이 확인되지 않아 정규화 추출 발췌를 표시하지 않았습니다.";
     setText("#evidence-drawer-digest", "검증 실패");
+    setText("#evidence-drawer-representation", "검증 실패");
     setEvidenceDrawerState(
       "error",
-      describeApiError(error, "선택한 근거 원문을 안전하게 불러올 수 없습니다."),
+      describeApiError(error, "선택한 정규화 추출 근거를 안전하게 불러올 수 없습니다."),
     );
   } finally {
     if (requestId === ui.evidenceDrawerRequestId) {
@@ -2960,7 +2967,7 @@ function renderAgentConversation(messages = []) {
         title.className = "chat-source-button";
         if (!configureRagEvidenceButton(title, source)) {
           title.disabled = true;
-          title.setAttribute("aria-label", `근거 ${source.number} 원문 위치 미제공`);
+          title.setAttribute("aria-label", `근거 ${source.number} 출처 위치 미제공`);
         }
         title.textContent = `[근거 ${source.number}] ${source.title}`;
         const provenance = [];

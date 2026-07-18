@@ -174,12 +174,13 @@ class _Workspace:
             return self.source_payload
         text = "검증된 로컬 검색 근거"
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "attachment_id": attachment_id,
             "chunk_index": chunk_index,
             "name": "paper.md",
             "media_type": "text/markdown",
             "text": text,
+            "representation": "normalized_extracted_excerpt_v1",
             "page_number": None,
             "char_start": 4,
             "char_end": 4 + len(text),
@@ -337,6 +338,7 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
                 "name",
                 "media_type",
                 "text",
+                "representation",
                 "page_number",
                 "char_start",
                 "char_end",
@@ -344,8 +346,10 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
                 "excerpt_sha256",
             },
         )
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["attachment_id"], attachment_id)
         self.assertEqual(payload["chunk_index"], 0)
+        self.assertEqual(payload["representation"], "normalized_extracted_excerpt_v1")
         self.assertEqual(
             payload["excerpt_sha256"], sha256(payload["text"].encode()).hexdigest()
         )
@@ -413,6 +417,8 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
 
         malformed_payloads = (
             {**valid, "schema_version": True},
+            {**valid, "schema_version": 1},
+            {**valid, "representation": "raw_pdf_bytes"},
             {**valid, "chunk_index": False},
             {**valid, "char_start": False},
             {**valid, "char_end": True},

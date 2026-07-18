@@ -490,6 +490,10 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 self.assertEqual(source["chunk_index"], 0)
                 self.assertEqual(source["page_number"], 1)
                 self.assertEqual(source["offset_basis"], "normalized_pdf_page_text_v1")
+                self.assertEqual(
+                    source["representation"],
+                    "normalized_extracted_excerpt_v1",
+                )
                 extracted = capabilities._extract_pdf_document(pdf_content)
                 normalized_page = capabilities._normalize_index_source(
                     extracted.pages[0].text
@@ -506,6 +510,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 exact = service.preview_rag_source(
                     admitted["attachment_id"], source["chunk_index"]
                 )
+                self.assertEqual(exact["schema_version"], 2)
                 self.assertEqual(
                     set(exact),
                     {
@@ -515,6 +520,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                         "name",
                         "media_type",
                         "text",
+                        "representation",
                         "page_number",
                         "char_start",
                         "char_end",
@@ -528,6 +534,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     "name",
                     "media_type",
                     "text",
+                    "representation",
                     "page_number",
                     "char_start",
                     "char_end",
@@ -610,12 +617,14 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     exact = selected.preview_rag_source(
                         admitted["attachment_id"], source["chunk_index"]
                     )
+                    self.assertEqual(exact["schema_version"], 2)
                     for key in (
                         "attachment_id",
                         "chunk_index",
                         "name",
                         "media_type",
                         "text",
+                        "representation",
                         "page_number",
                         "char_start",
                         "char_end",
@@ -1152,6 +1161,10 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 self.assertGreater(source["score"], 0)
                 self.assertIsNone(source["page_number"])
                 self.assertEqual(source["offset_basis"], "normalized_document_text_v1")
+                self.assertEqual(
+                    source["representation"],
+                    "normalized_extracted_excerpt_v1",
+                )
                 normalized = capabilities._normalize_index_source(
                     "평형 탐색과 텐서 검색을 결합합니다."
                 )

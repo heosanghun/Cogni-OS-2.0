@@ -440,6 +440,7 @@ class TestCogniBoardUI(unittest.TestCase):
             "evidence-drawer-title",
             "evidence-drawer-status",
             "evidence-drawer-location",
+            "evidence-drawer-representation",
             "evidence-drawer-score",
             "evidence-drawer-digest",
             "evidence-drawer-excerpt",
@@ -468,12 +469,13 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn('aria-controls", "evidence-drawer-layer"', script)
 
         for contract_check in (
-            "payload.schema_version !== 1",
+            "payload.schema_version !== 2",
             "payload.attachment_id !== requestedSource.attachmentId",
             "payload.chunk_index !== requestedSource.chunkIndex",
             'typeof payload.name !== "string"',
             'typeof payload.media_type !== "string"',
             'typeof payload.text !== "string"',
+            "payload.representation !== RAG_SOURCE_REPRESENTATION",
             "!Number.isInteger(payload.char_start)",
             "!Number.isInteger(payload.char_end)",
             "!RAG_SOURCE_OFFSET_BASES.has(payload.offset_basis)",
@@ -498,6 +500,7 @@ class TestCogniBoardUI(unittest.TestCase):
                 "name",
                 "media_type",
                 "text",
+                "representation",
                 "page_number",
                 "char_start",
                 "char_end",
@@ -529,6 +532,19 @@ class TestCogniBoardUI(unittest.TestCase):
             self.assertNotRegex(script, forbidden_alias_pattern)
         self.assertIn("source.chunkIndex > 127", script)
         self.assertIn('source.score === null ? "검색 점수 미제공"', script)
+        self.assertIn(
+            'const RAG_SOURCE_REPRESENTATION = "normalized_extracted_excerpt_v1"',
+            script,
+        )
+        self.assertIn("NORMALIZED EXTRACTED EVIDENCE", html)
+        self.assertIn("정규화 추출 발췌 · 원본 첨부 바이트 아님", html)
+        self.assertIn(
+            "PDF 물리 ${exactSource.pageNumber}쪽의 정규화 추출 텍스트", script
+        )
+        self.assertNotIn("EXACT LOCAL SOURCE", html)
+        self.assertNotIn(">근거 원문<", html)
+        self.assertNotIn(">원문 SHA-256<", html)
+        self.assertNotIn(">검증된 원문 발췌<", html)
 
         digest_start = script.index("const actualDigest = await sha256HexUtf8")
         digest_compare = script.index(

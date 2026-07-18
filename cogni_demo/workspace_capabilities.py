@@ -77,6 +77,7 @@ MAX_RAG_RESULTS = 12
 RAG_VECTOR_DIMENSIONS = 256
 RAG_CHUNK_CHARS = 1_600
 RAG_CHUNK_OVERLAP_CHARS = 200
+RAG_EXCERPT_REPRESENTATION = "normalized_extracted_excerpt_v1"
 MAX_WEB_ALLOWLIST_HOSTS = 32
 MAX_LOCAL_MODEL_REGISTRY_ENTRIES = 64
 MAX_LOCAL_MODEL_CANDIDATES = 16
@@ -249,6 +250,9 @@ class IndexedChunk:
         return {
             "chunk_index": self.chunk_index,
             "text": self.text,
+            # This is normalized parser/decoder output, never the attachment's
+            # raw bytes. Keep the semantic label inside the integrity authority.
+            "representation": RAG_EXCERPT_REPRESENTATION,
             "page_number": self.page_number,
             "char_start": self.char_start,
             "char_end": self.char_end,
@@ -2055,6 +2059,7 @@ class AkasicDBAdapter:
                         "media_type": media_type,
                         "chunk_index": chunk.chunk_index,
                         "chunk": chunk.text,
+                        "representation": RAG_EXCERPT_REPRESENTATION,
                         "page_number": chunk.page_number,
                         "char_start": chunk.char_start,
                         "char_end": chunk.char_end,
@@ -2112,6 +2117,7 @@ class AkasicDBAdapter:
                 "the indexed source record could not be verified",
             )
         text = record.get("chunk")
+        representation = record.get("representation")
         page_number = record.get("page_number")
         char_start = record.get("char_start")
         char_end = record.get("char_end")
@@ -2134,6 +2140,7 @@ class AkasicDBAdapter:
             or not isinstance(text, str)
             or not 1 <= len(text) <= RAG_CHUNK_CHARS
             or _normalize_index_source(text) != text
+            or representation != RAG_EXCERPT_REPRESENTATION
             or not isinstance(char_start, int)
             or isinstance(char_start, bool)
             or char_start < 0
@@ -2156,6 +2163,7 @@ class AkasicDBAdapter:
             "name": record["name"],
             "media_type": record["media_type"],
             "text": text,
+            "representation": representation,
             "page_number": page_number,
             "char_start": char_start,
             "char_end": char_end,
@@ -2212,6 +2220,7 @@ class AkasicDBAdapter:
                         "media_type": record.get("media_type"),
                         "chunk_index": record.get("chunk_index"),
                         "text": chunk_text,
+                        "representation": record.get("representation"),
                         "page_number": record.get("page_number"),
                         "char_start": record.get("char_start"),
                         "char_end": record.get("char_end"),
@@ -3613,7 +3622,7 @@ class WorkspaceCapabilityService:
                     "RAG_SOURCE_INTEGRITY_FAILED",
                     "the indexed source no longer matches the admitted attachment",
                 )
-            return {"schema_version": 1, **snapshot.as_payload()}
+            return {"schema_version": 2, **snapshot.as_payload()}
 
     def search_lens(
         self,
@@ -3701,6 +3710,7 @@ __all__ = [
     "MAX_PDF_EXTRACTED_CHARS",
     "MAX_PDF_PAGES",
     "MAX_RAG_RESULTS",
+    "RAG_EXCERPT_REPRESENTATION",
     "LocalModelDiscoveryRejection",
     "LocalModelDiscoveryResult",
     "VerifiedModelMetadata",

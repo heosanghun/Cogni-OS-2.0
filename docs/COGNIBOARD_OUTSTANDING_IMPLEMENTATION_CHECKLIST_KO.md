@@ -6,9 +6,9 @@
 ## 현재 집계
 
 - 전체 미완료: **170개**
-- 구현됐으나 승인 증거 미결합: **98개**
+- 구현됐으나 승인 증거 미결합: **101개**
 - 코드/제품 경로 미구현: **8개**
-- 부분 구현 또는 검증 잔여: **59개**
+- 부분 구현 또는 검증 잔여: **56개**
 - 외부 장치·토큰·아티팩트 차단: **5개**
 
 ## 구현됐으나 승인 증거 미결합
@@ -57,6 +57,7 @@
 | 74 | [ ] | 증거·후보 이력 영속 저장 | `cogni_flow/logdb.py`, proposal persistence tests | scope/content digest 검증 유지 |
 | 76 | [ ] | `+` 파일/이미지 첨부 UI·API | `cogni_demo/static/index.html`, `app.js`, `/api/workspace/attachments/add`, API/UI tests | 최신 bundle에 포함하여 E2E smoke |
 | 77 | [ ] | TXT/MD/CSV/JSON 수신·UTF-8 검증 | `cogni_demo/workspace_capabilities.py`, `tests/test_workspace_capabilities.py` | parser/크기/깊이 상한 유지 |
+| 78 | [ ] | PDF 텍스트 추출·색인 | `cogni_demo/pdf_extract_worker.py`, `cogni_demo/workspace_capabilities.py`, `tests/test_pdf_malicious_corpus.py`; Windows Job Object/POSIX rlimit의 256MiB·CPU 6초·wall 18초 격리 worker, 128쪽/256,000자 상한, 물리 page·정규화 offset·excerpt digest, encrypted/truncated/textless/page-limit/control-character corpus와 timeout kill/reap·host-path redaction 회귀 | exact-commit CPU attestation과 승인된 독립 evidence 결합 |
 | 79 | [ ] | PNG/JPG/JPEG/WEBP 수신·서명 검증 | workspace capability MIME/signature gate와 tests | 수신 완료를 vision inference로 표시하지 않기 |
 | 80 | [ ] | 첨부 목록·삭제·재색인 | 영속 목록, delete/reindex API·UI와 `tests/test_workspace_capabilities.py`, `tests/test_workspace_capabilities_api.py`, UI contract tests | 삭제·재색인 API/UI와 인증·입력 상한 회귀 유지 |
 | 81 | [ ] | 파일/총량/개수/JSON 깊이 제한 | workspace capability constants와 boundary tests | 재시작 후 quota 우회 불가 유지 |
@@ -74,6 +75,7 @@
 | 98 | [ ] | 영속 provenance catalog | atomic `attachment-catalog.v1.json`, content digest·media·index state, restart/tamper/symlink/quota tests | catalog schema·atomic replace·blob digest·host-path 비노출 유지 |
 | 99 | [ ] | 삭제 시 검색 index·blob 제거 | 성공 응답 전 검증 blob 물리 삭제, catalog/index commit, 실패 시 blob·catalog·RAG rollback; unlink/catalog fault injection과 stale retrieval 0 tests | 성공은 `deleted=true`와 `blob_deleted=true`가 모두 충족될 때만 표시하는 계약 유지 |
 | 101 | [ ] | RAG on/off toggle | `static/index.html`, `app.js`, chat `rag` API flag, UI/API tests | 상태와 backend capability 일치 유지 |
+| 102 | [ ] | 답변 provenance drawer | 문장 내 `[근거 N]`과 source list가 인증된 exact-source API 및 독립 drawer를 열고 file/chunk/score·PDF 물리 page·정규화 offset·excerpt digest를 표시; schema v2의 `normalized_extracted_excerpt_v1`로 원본 bytes/summary와 구분, `tests/test_demo_ui.py`, `tests/test_workspace_capabilities_api.py` | exact-commit CPU/UI attestation과 승인된 독립 evidence 결합 |
 | 106 | [ ] | 음성→입력창 전사 | `/api/workspace/voice/transcribe` 결과를 자동 전송 없이 편집 가능한 composer에 넣는 `app.js`, voice API/UI contract tests | transcript 편집과 명시적 전송 분리 유지 |
 | 109 | [ ] | 선택적 로컬 TTS | Windows System.Speech 고정 runner, 실제 Microsoft Heami ko-KR WAV smoke, 인증 API와 play/stop/object-URL cleanup tests | 설치 voice probe·사용자 실행·stop·크기/시간 상한과 외부 호출 0 유지 |
 | 110 | [ ] | 음성 미지원 이유 명시 | capability payload와 disabled microphone tooltip/status | 지원 전까지 enabled 표시 금지 |
@@ -88,6 +90,7 @@
 | 130 | [ ] | 입력창 sticky/항상 접근 가능 | composer CSS/HTML과 `tests/test_demo_ui.py` | resize/zoom에서 가림 없음 확인 |
 | 131 | [ ] | 불필요한 스크롤 최소화 | workspace grid/viewport CSS | 장문은 대화 pane만 스크롤 유지 |
 | 132 | [ ] | 첨부·RAG·모델·웹·음성을 composer에 배치 | `static/index.html`, `app.js`, UI tests | 미구현 기능은 disabled 상태 유지 |
+| 133 | [ ] | 근거 provenance drawer | 문장 citation·source list에서 file/chunk/page/정규화 offset으로 이동하는 read-only 독립 drawer와 O(1) immutable source snapshot, SHA-256 browser 재검증·focus trap/return·stale request 취소·fail-closed schema tests 구현 | exact-commit CPU/UI attestation과 승인된 독립 evidence 결합 |
 | 134 | [ ] | READY/THINKING/STREAMING/FAILED/COMPLETE 상태 | `app.js`, agent API/UI tests | backend terminal state와 일치 유지 |
 | 135 | [ ] | 생성 취소 | cancel API/UI, conversation transaction tests | cancel 후 worker drain/새 요청 정상 |
 | 136 | [ ] | 새 대화 | new conversation UI/API tests | pending turn 중 안전 처리 유지 |
@@ -160,12 +163,10 @@
 | 63 | [ ] | 적용 전 회귀 테스트 | 후보 평가/negative archive는 구현 | source patch 격리 실행과 전체 gate 연결 |
 | 64 | [ ] | 취소·timeout·rollback | IPC/task deadline·취소·candidate rollback tests | 실제 source/bundle 변경의 byte-identical rollback |
 | 70 | [ ] | 후보 회귀·보안 테스트 | sealed evaluator/negative archive 단위 경로 | 실제 patch sandbox에서 전체 회귀·fault injection |
-| 78 | [ ] | PDF 텍스트 추출·색인 | 로컬 `pypdf` strict 추출을 Windows Job Object/POSIX rlimit의 256MiB·CPU 6초·wall 8초 격리 worker에서 실행; 128쪽/문자 상한·preview·AkasicDB 색인·재색인과 tests 구현 | PDF page 번호 provenance와 악성 PDF corpus 추가 |
 | 82 | [ ] | Gemma4Processor 이미지 tensor화 | `cogni_agent/multimodal.py`와 processor tests는 구현; v0.4.0 image JSON은 historical | current manifest-bound E4B-it guard run과 pixel/byte/tensor·finite 증거 |
 | 83 | [ ] | 이미지 tensor를 모델 입력에 연결 | 고정 CPU tensor IPC와 worker/model/manager/server tests는 구현; 과거 blue-square smoke는 current scope 아님 | current exact commit image inference와 ID 86 VRAM gate |
 | 84 | [ ] | 로컬 audio processor 연결 | audio chat-template·고정 CPU tensor IPC·worker/service tests는 구현; 과거 STT smoke는 current scope 아님 | current exact commit E4B-it guard에서 16 kHz mono·finite/shape 검증 |
 | 86 | [ ] | 멀티모달 VRAM 경계 검증 | 이미지와 오디오 actual-model smoke는 PASS이나 증거 JSON에 peak allocated/reserved VRAM은 없음 | image/audio 조합을 current commit에서 16.7 GiB/finite/latency로 실측 |
-| 102 | [ ] | 답변 provenance drawer | 파일명·chunk·score 근거 표시와 첨부 preview 경로 | 문장별 클릭, PDF page/원문 위치 navigation, raw/summary 구분 |
 | 103 | [ ] | 마이크 입력 | 브라우저 `getUserMedia`→16 kHz mono WAV→인증 loopback STT 경로와 UI/API contract tests | 실제 Windows 마이크 장치에서 권한·녹음·전사 브라우저 E2E |
 | 104 | [ ] | Windows 마이크 권한 처리 | 클릭 시에만 권한 요청하고 오류/취소 cleanup UI 경로 구현 | 권한 거부·철회·장치 없음·장치 전환을 실제 브라우저에서 검증 |
 | 105 | [ ] | 로컬 STT | 로컬 voice/API tests와 Gemma audio 경로는 구현; v0.4.0 TTS→STT JSON은 historical | current E4B-it GPU5 guard smoke와 다화자·잡음 품질 gate |
@@ -177,7 +178,6 @@
 | 119 | [ ] | 사용자 명시적 online 전환 | 권한/allowlist 정책은 구현, 실제 executor 없음 | 세션 opt-in UI·감사 로그·즉시 revoke E2E |
 | 124 | [ ] | Lens ID/DOI/특허 링크 인용 | Lens ID·identifier normalization과 `https://lens.org/<검증 ID>` allowlist, UI link/API tests | 실제 특허·학술 응답에서 DOI/특허 ID/링크 attribution E2E와 provenance drawer 연결 |
 | 125 | [ ] | Lens 결과→AkasicDB 색인 | `LensAkasicBridge`, normalized provenance 문서와 `/search-and-index` mocked E2E tests | 승인 token 실응답의 영속 graph/index·재시작·삭제 provenance E2E |
-| 133 | [ ] | 근거 provenance drawer | 메시지별 RAG source 표시만 구현 | 독립 drawer, 문장↔원문 위치 navigation |
 | 137 | [ ] | 반응형 layout | breakpoint CSS와 1080p QA | 1366×768, 1920×1080, 4K, 125–200% zoom 시각/키보드 QA |
 | 139 | [ ] | 접근성 | ARIA/label/live region/disabled reason 일부 구현 | 키보드-only, focus order, screen-reader, contrast 감사 |
 | 151 | [ ] | 현재 scope 실제 GPU 증거 | v0.4.0 commit·RTX 5090 JSON은 historical; GPU5 guard와 evidence schema는 구현 | current exact commit·E4B-it·GPU5 source/model/config/device digest 결합 |

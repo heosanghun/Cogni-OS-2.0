@@ -177,6 +177,7 @@ _RAG_SOURCE_RESPONSE_KEYS = frozenset(
         "name",
         "media_type",
         "text",
+        "representation",
         "page_number",
         "char_start",
         "char_end",
@@ -187,6 +188,7 @@ _RAG_SOURCE_RESPONSE_KEYS = frozenset(
 _RAG_SOURCE_OFFSET_BASES = frozenset(
     {"normalized_document_text_v1", "normalized_pdf_page_text_v1"}
 )
+_RAG_SOURCE_REPRESENTATION = "normalized_extracted_excerpt_v1"
 _RAG_SOURCE_MEDIA_TYPES = frozenset(
     {
         "application/json",
@@ -313,6 +315,7 @@ def _rag_source_payload_is_valid(
     name = payload.get("name")
     media_type = payload.get("media_type")
     text = payload.get("text")
+    representation = payload.get("representation")
     page_number = payload.get("page_number")
     char_start = payload.get("char_start")
     char_end = payload.get("char_end")
@@ -321,7 +324,7 @@ def _rag_source_payload_is_valid(
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version != 1
+        or schema_version != 2
         or payload.get("attachment_id") != attachment_id
         or not isinstance(payload_chunk_index, int)
         or isinstance(payload_chunk_index, bool)
@@ -339,6 +342,7 @@ def _rag_source_payload_is_valid(
         or not isinstance(text, str)
         or not 1 <= len(text) <= MAX_RAG_EVIDENCE_CHUNK_CHARS
         or not text.strip()
+        or representation != _RAG_SOURCE_REPRESENTATION
         or any(
             (ord(character) < 32 and character not in "\t\r\n")
             or 127 <= ord(character) <= 159

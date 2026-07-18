@@ -343,16 +343,35 @@ class TestTrustedMetadataPrimitives(unittest.TestCase):
 
     def test_product_manifest_is_exactly_seven_it_files_not_base_six(self) -> None:
         repository = Path(guard.__file__).resolve().parents[1]
-        with (
-            patch.object(guard, "_effective_uid", return_value=0),
-            patch.object(guard, "_group_or_world_writable", return_value=False),
-        ):
-            product_entries, product_identity = guard._strict_model_manifest_entries(
-                repository / "config/gemma4-e4b-it.manifest.toml"
+        source_manifest = repository / "config/gemma4-e4b-it.manifest.toml"
+        source_base_manifest = repository / "config/gemma4-e4b.manifest.toml"
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = Path(temporary) / source_manifest.name
+            base_manifest_path = Path(temporary) / source_base_manifest.name
+            # Git may materialize CRLF in a Windows worktree.  The production
+            # Linux parser intentionally accepts canonical LF only, so this
+            # content-focused test uses those exact canonical bytes instead of
+            # accidentally testing checkout newline policy or host ownership.
+            manifest_path.write_bytes(
+                source_manifest.read_bytes().replace(b"\r\n", b"\n")
             )
-            base_entries, base_identity = guard._strict_model_manifest_entries(
-                repository / "config/gemma4-e4b.manifest.toml"
+            base_manifest_path.write_bytes(
+                source_base_manifest.read_bytes().replace(b"\r\n", b"\n")
             )
+            with (
+                patch.object(
+                    guard,
+                    "_effective_uid",
+                    return_value=manifest_path.stat().st_uid,
+                ),
+                patch.object(guard, "_group_or_world_writable", return_value=False),
+            ):
+                product_entries, product_identity = (
+                    guard._strict_model_manifest_entries(manifest_path)
+                )
+                base_entries, base_identity = guard._strict_model_manifest_entries(
+                    base_manifest_path
+                )
 
         self.assertEqual(len(product_entries), 7)
         self.assertEqual(len(base_entries), 6)

@@ -1696,7 +1696,7 @@ def _run_git(
 def _hash_regular_file(
     path: Path, *, expected_root: Path
 ) -> tuple[str, tuple[int, ...]]:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -1752,7 +1752,7 @@ def _strict_model_manifest_entries(
 ) -> tuple[tuple[tuple[str, str], ...], ArtifactIdentity | None]:
     """Parse the pinned minimal ``[files]`` grammar without importing TOML code."""
 
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -2340,7 +2340,7 @@ def _hash_git_worktree_file(
     expected_root: Path,
     object_format: str,
 ) -> tuple[str, str, tuple[int, ...], str]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -4953,7 +4953,7 @@ def _require_external_gpu5_scheduler_reservation(
         raise GPU5BoundaryError(
             "GPU5 scheduler reservation must be a non-symlink canonical file"
         )
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is None:
         raise GPU5BoundaryError("GPU5 scheduler reservation requires O_NOFOLLOW")

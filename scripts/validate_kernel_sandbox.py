@@ -42,15 +42,34 @@ def main() -> int:
             root = Path(tmp)
             project = root / "project"
             project.mkdir(mode=0o755)
+            project.chmod(0o777)
+            writable_probe = project / "writable-probe.txt"
+            writable_probe.write_bytes(b"original")
+            writable_probe.chmod(0o666)
             (project / "check.py").write_text(
                 "import os\n"
                 "from pathlib import Path\n"
                 "import socket\n"
+                "assert os.geteuid() == 65534\n"
+                "status = {}\n"
+                "for line in Path('/proc/self/status').read_text().splitlines():\n"
+                "    if ':' in line:\n"
+                "        key, value = line.split(':', 1)\n"
+                "        status[key] = value.strip()\n"
+                "assert int(status['CapEff'], 16) == 0\n"
+                "assert status['NoNewPrivs'] == '1'\n"
                 "assert os.environ.get('NVIDIA_VISIBLE_DEVICES') == 'void'\n"
                 "assert os.environ.get('CUDA_VISIBLE_DEVICES') == ''\n"
                 "assert os.environ.get('HIP_VISIBLE_DEVICES') == ''\n"
                 "assert os.environ.get('ROCR_VISIBLE_DEVICES') == ''\n"
-                "for target in (Path('/project/candidate-write'), Path('/root-write')):\n"
+                "mount_options = {}\n"
+                "for line in Path('/proc/self/mountinfo').read_text().splitlines():\n"
+                "    fields = line.split(' ')\n"
+                "    mount_options[fields[4]] = set(fields[5].split(','))\n"
+                "assert 'ro' in mount_options['/']\n"
+                "assert 'ro' in mount_options['/project']\n"
+                "assert Path('/project/writable-probe.txt').read_bytes() == b'original'\n"
+                "for target in (Path('/project/candidate-write'), Path('/project/writable-probe.txt')):\n"
                 "    try:\n"
                 "        target.write_text('forbidden', encoding='ascii')\n"
                 "    except OSError:\n"
@@ -58,6 +77,7 @@ def main() -> int:
                 "    else:\n"
                 "        raise AssertionError(f'writable boundary: {target}')\n"
                 f"assert not Path('/tmp/{canary_name}').exists()\n"
+                "assert {name for _, name in socket.if_nameindex()} <= {'lo'}\n"
                 "probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
                 "probe.settimeout(1.0)\n"
                 "try:\n"
@@ -79,6 +99,7 @@ def main() -> int:
             )
             for path in project.iterdir():
                 path.chmod(0o644)
+            writable_probe.chmod(0o666)
             evidence_bytes = build_kernel_sandbox_evidence_payload(
                 runner_id="cogni-linux-oci-v1",
                 engine_path=str(engine),
@@ -99,23 +120,36 @@ def main() -> int:
             if not safe.passed or "KERNEL_SANDBOX_BOUNDARIES=PASS" not in safe.output:
                 raise RuntimeError(f"sandbox boundary validation failed: {safe}")
             timeout = runner.run(project, TIMEOUT_COMMAND, 2)
-            if timeout.passed or timeout.returncode != 124:
+            if (
+                timeout.passed
+                or timeout.returncode != 124
+                or getattr(timeout, "cleanup_verified", False) is not True
+            ):
                 raise RuntimeError(f"sandbox timeout validation failed: {timeout}")
+            if getattr(safe, "cleanup_verified", False) is not True:
+                raise RuntimeError("successful sandbox cleanup was not verified")
+            runner.verify_container_absent(safe.container_name)
+            runner.verify_container_absent(timeout.container_name)
             if not host_canary.is_file() or host_canary.read_bytes() != b"host-only":
                 raise RuntimeError("host canary changed during sandbox execution")
+            if writable_probe.read_bytes() != b"original":
+                raise RuntimeError("read-only project probe changed on the host")
             report = {
-                "schema": "cogni.kernel-sandbox-validation.v1",
+                "schema": "cogni.kernel-sandbox-integration-smoke.v1",
                 "status": "PASS",
+                "assurance": "implementation_integration_smoke_only",
+                "production_attestation": False,
                 "evidence_sha256": sha256(evidence_bytes).hexdigest(),
                 "engine_sha256": engine_sha256,
                 "image_reference": args.image,
-                "network": "none",
-                "project_mount": "read_only",
-                "rootfs": "read_only",
-                "non_root_uid": 65534,
+                "network_request": "none",
+                "network_smoke": "only_loopback_observed",
+                "project_mount_smoke": "read_only",
+                "rootfs_mount_smoke": "read_only",
+                "observed_non_root_uid": 65534,
                 "timeout_returncode": timeout.returncode,
-                "gpu_query_count": 0,
-                "gpu_use_count": 0,
+                "container_cleanup_verified": True,
+                "gpu_measurement": "not_performed",
             }
             print(json.dumps(report, ensure_ascii=False, sort_keys=True))
             return 0

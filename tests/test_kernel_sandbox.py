@@ -3,10 +3,14 @@ from __future__ import annotations
 from hashlib import sha256
 import json
 from pathlib import Path
+from types import SimpleNamespace
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import cogni_flow.kernel_sandbox as kernel_sandbox
 from cogni_flow.kernel_sandbox import (
     KernelSandboxError,
     LinuxOciSandboxRunner,
@@ -70,6 +74,15 @@ class TestKernelSandboxEvidence(unittest.TestCase):
         with self.assertRaisesRegex(KernelSandboxError, "read_only_project"):
             parse_kernel_sandbox_evidence(json.dumps(data).encode())
 
+    def test_parser_rejects_duplicate_json_keys(self):
+        raw = evidence_payload().decode("ascii")
+        duplicate = raw.replace(
+            '"schema":', '"schema":"attacker-selected","schema":', 1
+        ).encode("ascii")
+
+        with self.assertRaisesRegex(KernelSandboxError, "duplicate key: schema"):
+            parse_kernel_sandbox_evidence(duplicate)
+
     def test_parser_rejects_unpinned_image_and_network(self):
         data = json.loads(evidence_payload())
         data["image_reference"] = "cogni-os-dev:latest"
@@ -106,6 +119,130 @@ class TestKernelSandboxEvidence(unittest.TestCase):
         original = evidence_payload()
         changed = evidence_payload(max_pids=65)
         self.assertNotEqual(sha256(original).digest(), sha256(changed).digest())
+
+    def test_configuration_never_self_attests_production_isolation(self):
+        runner = object.__new__(LinuxOciSandboxRunner)
+        runner.evidence = parse_kernel_sandbox_evidence(evidence_payload())
+        runner._evidence_sha256 = sha256(evidence_payload()).hexdigest()
+
+        attestation = runner.isolation_attestation()
+
+        self.assertFalse(runner.kernel_isolated)
+        self.assertTrue(runner.integration_smoke_only)
+        self.assertFalse(attestation.kernel_boundary)
+        self.assertFalse(attestation.network_isolated)
+        self.assertFalse(attestation.host_filesystem_isolated)
+        self.assertFalse(attestation.ephemeral_workspace)
+
+    def test_argv_hardens_image_execution_and_resource_bounds(self):
+        runner = object.__new__(LinuxOciSandboxRunner)
+        runner.evidence = parse_kernel_sandbox_evidence(evidence_payload())
+        runner._engine = Path("/usr/bin/docker")
+        name = "cogni-candidate-" + "c" * 32
+
+        argv = runner._build_argv(
+            Path("/tmp/project"),
+            COMMANDS[0],
+            Path("/tmp/container.cid"),
+            container_name=name,
+        )
+
+        self.assertIn("--no-healthcheck", argv)
+        self.assertEqual(argv[argv.index("--log-driver") + 1], "none")
+        self.assertEqual(argv[argv.index("--memory-swap") + 1], str(512 * 1024 * 1024))
+        self.assertEqual(argv[argv.index("--name") + 1], name)
+        self.assertEqual(argv[argv.index("--entrypoint") + 1], "python")
+        image_index = argv.index(IMAGE)
+        self.assertEqual(argv[image_index + 1 :], ("-I", "/project/check.py"))
+
+
+class TestKernelSandboxCleanup(unittest.TestCase):
+    def setUp(self):
+        self.runner = object.__new__(LinuxOciSandboxRunner)
+        self.runner.evidence = SimpleNamespace(daemon_socket="/var/run/docker.sock")
+        self.name = "cogni-candidate-" + "d" * 32
+        self.not_found = f"Error response from daemon: No such container: {self.name}"
+
+    def test_missing_cidfile_never_verifies_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cidfile = Path(tmp) / "missing.cid"
+            responses = [
+                (1, self.not_found),
+                (1, f"Error: No such object: {self.name}"),
+                (1, f"Error: No such object: {self.name}"),
+            ]
+            with (
+                patch.object(self.runner, "_docker_control", side_effect=responses),
+                patch.object(kernel_sandbox.time, "sleep"),
+            ):
+                error = self.runner._force_remove(
+                    cidfile, container_name=self.name, env={}
+                )
+
+        self.assertEqual(error, "container cleanup unverified: cidfile is missing")
+
+    def test_ambiguous_inspect_failure_is_not_absence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cidfile = Path(tmp) / "container.cid"
+            cidfile.write_text("a" * 64, encoding="ascii")
+            with patch.object(
+                self.runner,
+                "_docker_control",
+                side_effect=[
+                    (1, self.not_found),
+                    (1, "Cannot connect to the Docker daemon"),
+                ],
+            ):
+                error = self.runner._force_remove(
+                    cidfile, container_name=self.name, env={}
+                )
+
+        self.assertIn("survivor check ambiguous", error)
+
+    def test_exact_not_found_for_name_and_cid_verifies_cleanup(self):
+        container_id = "a" * 64
+        absent_name = f"Error: No such object: {self.name}"
+        absent_id = f"Error: No such object: {container_id}"
+        with tempfile.TemporaryDirectory() as tmp:
+            cidfile = Path(tmp) / "container.cid"
+            cidfile.write_text(container_id, encoding="ascii")
+            responses = [
+                (1, self.not_found),
+                (1, absent_name),
+                (1, absent_id),
+                (1, absent_name),
+                (1, absent_id),
+            ]
+            with (
+                patch.object(self.runner, "_docker_control", side_effect=responses),
+                patch.object(kernel_sandbox.time, "sleep"),
+            ):
+                error = self.runner._force_remove(
+                    cidfile, container_name=self.name, env={}
+                )
+
+        self.assertIsNone(error)
+
+
+class TestBoundedOutput(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux pipe selector only")
+    def test_output_is_hard_bounded_and_process_is_stopped(self):
+        process = subprocess.Popen(
+            (sys.executable, "-c", "print('x' * 100000)"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+        output, timed_out, output_limited = kernel_sandbox._collect_bounded_output(
+            process, timeout_seconds=10, maximum_bytes=4_096
+        )
+
+        self.assertEqual(len(output), 4_096)
+        self.assertFalse(timed_out)
+        self.assertTrue(output_limited)
+        self.assertIsNotNone(process.returncode)
 
 
 class TestKernelSandboxLinuxHostValidation(unittest.TestCase):

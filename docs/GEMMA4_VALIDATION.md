@@ -147,7 +147,7 @@ cleanup before it releases the host GPU5 lease. Each user turn must own exactly
 one new assistant message. Turn 9 is a deliberate low-first-budget continuation
 probe and must use exactly one bounded continuation; every other turn must use
 zero. In particular, the identity turn must contain exactly one occurrence of
-the manifest-bound `gemma4-e4b-it` label, build `0.4.0`, effective parameter
+the manifest-bound `gemma4-e4b-it` label, build `0.4.1`, effective parameter
 count `4,506,496,490` and stored parameter count `7,996,157,418`; a self-asserted
 summary cannot substitute for those raw turn records.
 

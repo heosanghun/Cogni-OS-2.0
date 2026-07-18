@@ -2,6 +2,9 @@
 # Keep launcher bytes opaque so checkout/archive materialisation cannot rewrite
 # LF to CRLF and silently move the measured source outside the signed scope.
 *.cmd -text
+# CMD files intentionally retain CRLF bytes; keep all other whitespace checks
+# while teaching plain `git diff --check` that the terminal CR is structural.
+*.cmd whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 # This checkpoint is content-addressed at runtime.  Treat it as an opaque
 # artifact so Windows archive/export never rewrites LF to CRLF.
 /cogni_core/cts_policy_checkpoint.json -text

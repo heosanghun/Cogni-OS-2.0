@@ -15,7 +15,7 @@ class TestCogniBoardUserManual(unittest.TestCase):
         cls.text = MANUAL.read_text(encoding="utf-8")
 
     def test_manual_targets_v040_and_documents_all_six_pages(self) -> None:
-        self.assertIn("문서 기준 버전: 0.4.0", self.text)
+        self.assertIn("문서 기준 버전: 0.4.1", self.text)
         for title in (
             "AI 워크스페이스",
             "미션 컨트롤",

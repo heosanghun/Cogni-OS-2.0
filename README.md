@@ -1,7 +1,7 @@
-# Cogni-OS 2.0 Genesis — v0.4.0
+# Cogni-OS 2.0 Genesis — v0.4.1
 
 Cogni-OS 2.0 is an offline-by-default, bounded research runtime for a verified local
-dense Gemma 4 E4B-it artifact. Version 0.4.0 adds a persistent local document
+dense Gemma 4 E4B-it artifact. Version 0.4.1 adds a persistent local document
 workspace, provenance-bearing AkasicDB RAG, bounded Gemma image/audio routes,
 local speech input/output, and an explicitly opt-in Lens patent/scholarly API
 connector to the existing conversation, Cogni-Core, typed-task, and
@@ -13,7 +13,7 @@ passing component test never upgrades a capability by itself.
 
 ## Product authority at a glance
 
-| Capability | v0.4.0 state | May affect the answer? | What is still required |
+| Capability | v0.4.1 state | May affect the answer? | What is still required |
 |---|---|---:|---|
 | verified local Gemma 4 E4B-it | `authoritative` | yes | exact pinned instruction-tuned artifact and seven-file manifest |
 | bounded conversation fast path | `product_ux` | yes, narrow social turns only | must never intercept general knowledge/code/format requests |
@@ -256,11 +256,11 @@ the release process has no distributable user token or terms acceptance.
 
 ## Windows launcher
 
-Build the v0.4.0 launcher from the exact source tree:
+Build the v0.4.1 launcher from the exact source tree:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_windows_launcher.ps1 `
-  -OutputPath release\CogniBoard-v0.4.0.exe
+  -OutputPath release\CogniBoard-v0.4.1.exe
 ```
 
 The launcher is a console-free bootstrapper, not a standalone model bundle. It
@@ -269,12 +269,14 @@ model plus manifest. The binary is not code-signed in this research release.
 The frozen release builder records that unsigned state and emits
 `SBOM.cdx.json`, `THIRD_PARTY_NOTICES.md`, `BUILD_MANIFEST.txt`, and
 `SHA256SUMS.txt`; these inventories do not replace independent license review.
-Do not use older release assets as v0.4.0 evidence.
+Do not use older release assets as v0.4.1 evidence.
 
 Korean operator documentation: [`docs/COGNIBOARD_USER_MANUAL_PLAYBOOK_KO.md`](docs/COGNIBOARD_USER_MANUAL_PLAYBOOK_KO.md).
 
-The v0.4.0 validation addendum is
-[`release/COGNI_OS_0.4.0_VALIDATION_ADDENDUM_KO.md`](release/COGNI_OS_0.4.0_VALIDATION_ADDENDUM_KO.md).
+The v0.4.1 release notes and validation addendum are
+[`release/COGNI_OS_0.4.1_RELEASE_NOTES_KO.md`](release/COGNI_OS_0.4.1_RELEASE_NOTES_KO.md)
+and
+[`release/COGNI_OS_0.4.1_VALIDATION_ADDENDUM_KO.md`](release/COGNI_OS_0.4.1_VALIDATION_ADDENDUM_KO.md).
 
 ## Runtime boundaries
 
@@ -287,7 +289,7 @@ The v0.4.0 validation addendum is
   never passed to a shell.
 - AFlow can only create a bounded research archive.
 - Self-Harness stores inert proposals and exposes a read-only diff review; it
-  cannot approve, execute, install, promote, or roll back source in v0.4.0.
+  cannot approve, execute, install, promote, or roll back source in v0.4.1.
 - The graphical server is loopback-only, uses per-session authentication and
   local allowlisted assets, and has no CDN or analytics dependency.
 

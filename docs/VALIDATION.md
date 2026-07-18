@@ -1,4 +1,4 @@
-# Cogni-OS 2.0 v0.4.0 Validation Gates
+# Cogni-OS 2.0 v0.4.1 Validation Gates
 
 ## Evidence rule
 
@@ -37,15 +37,15 @@ The retained current-scope evidence has the following status:
 
 | Gate | Status |
 |---|---|
-| full source regression (`ruff`, format, `pytest`, Node syntax) | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
-| automated 20-turn local completion run | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
-| integrated Gemma/DEQ/CTS GPU runtime measurement | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
-| final System 4 stress measurement | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
-| natural Korean 10-turn release gate | `REQUIRED AFTER v0.4.0 SOURCE FREEZE` |
+| full source regression (`ruff`, format, `pytest`, Node syntax) | `REQUIRED AFTER v0.4.1 SOURCE FREEZE` |
+| automated 20-turn local completion run | `REQUIRED AFTER v0.4.1 SOURCE FREEZE` |
+| integrated Gemma/DEQ/CTS GPU runtime measurement | `REQUIRED AFTER v0.4.1 SOURCE FREEZE` |
+| final System 4 stress measurement | `REQUIRED AFTER v0.4.1 SOURCE FREEZE` |
+| natural Korean 10-turn release gate | `REQUIRED AFTER v0.4.1 SOURCE FREEZE` |
 | local Korean TTS → Gemma STT smoke | `HISTORICAL DEV-HOST OBSERVATION; CURRENT SCOPE UNVERIFIED` |
 | deterministic image-understanding smoke | `HISTORICAL DEV-HOST OBSERVATION; CURRENT SCOPE UNVERIFIED` |
 | live Lens patent/scholarly query | `NOT RUN (user token and terms acceptance not bundled)` |
-| final release bytes and `SHA256SUMS.txt` | `PASS` only after regeneration from the frozen v0.4.0 commit |
+| final release bytes and `SHA256SUMS.txt` | `PASS` only after regeneration from the frozen v0.4.1 commit |
 
 Only records that validate against the evidence schema and bind the exact
 source/model/config/device and raw-evidence digests can be called current-scope
@@ -54,7 +54,7 @@ historical observations only; they do not certify the target RTX 4090, code
 signing, or a standalone installer.
 
 The older JSON records under `release/evidence/` remain historical comparison
-material. They cannot authorize the changed v0.4.0 source scope. Final v0.4.0
+material. They cannot authorize the changed v0.4.1 source scope. Final v0.4.1
 records and release bytes must be regenerated from one frozen commit; release
 byte identity is recorded separately in `release/SHA256SUMS.txt`, which is
 excluded from source archives.
@@ -85,12 +85,12 @@ The double-click launchers have intentionally separate roles:
 The exact number of collected tests is intentionally not a release contract:
 new security cases change it. A release candidate must retain the complete raw
 command output, source commit/tree digest, Python/PyTorch versions and skipped
-test reasons. No historical fixed count is accepted as v0.4.0 evidence.
+test reasons. No historical fixed count is accepted as v0.4.1 evidence.
 
 The previous retained v0.3.2 run passed Ruff and format checks plus Node syntax
 check, with 709 passed, 3 skipped, 3 deprecation warnings and 565 subtests in
 112.44 seconds. Those counts describe only that historical snapshot and do not
-pass the v0.4.0 release gate.
+pass the v0.4.1 release gate.
 
 The suite covers the following Phase 1–11 invariants:
 
@@ -174,7 +174,7 @@ path. The model returned `중앙의 큰 도형은 파란색 정사각형입니�
 `finish_reason=stop`, `generation_mode=cogni_core`, both concept gates true,
 and zero external calls. This one fixed case does not establish general visual
 reasoning or combined image-plus-depth-100 VRAM conformance. Video has no
-validation route in v0.4.0.
+validation route in v0.4.1.
 
 Lens tests use an injected fake transport and prove only local policy/schema
 invariants. A live request is permitted only when online opt-in, exact

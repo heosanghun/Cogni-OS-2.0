@@ -1,13 +1,13 @@
-# CogniBoard v0.4.0 AI 워크스페이스 사용 안내
+# CogniBoard v0.4.1 AI 워크스페이스 사용 안내
 
 ## 실행
 
-최종 검증 후 생성된 `release\CogniBoard-v0.4.0.exe`를 더블클릭한다. 개발 소스에서
+최종 검증 후 생성된 `release\CogniBoard-v0.4.1.exe`를 더블클릭한다. 개발 소스에서
 직접 빌드하려면 다음 명령을 사용한다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_windows_launcher.ps1 `
-  -OutputPath release\CogniBoard-v0.4.0.exe
+  -OutputPath release\CogniBoard-v0.4.1.exe
 ```
 
 launcher는 standalone model bundle이 아니라 console-free bootstrapper다. 동일
@@ -83,7 +83,7 @@ $env:COGNI_OS_LENS_TERMS_ACCEPTED = '1'
 ```
 
 토큰이나 약관 동의를 배포물에 포함하지 않는다. 결과는 Lens provenance를 유지하며
-사용자가 선택한 경우에만 AkasicDB에 색인된다. v0.4.0 배포 검증은 실제 사용자
+사용자가 선택한 경우에만 AkasicDB에 색인된다. v0.4.1 배포 검증은 실제 사용자
 토큰으로 live Lens 검색을 수행했다고 주장하지 않는다. 공개 배포 전 Lens 이용약관,
 attribution, 승인된 logo 자산 사용 조건을 운영자가 별도로 확인해야 한다.
 
@@ -124,7 +124,7 @@ output-only `/save`다.
 evidence, expected behavior, risk, reproduction test와 rollback trigger를 가진다.
 거부된 후보는 negative archive에 남는다.
 
-v0.4.0 지원 profile은 `proposal_only`다. source는 실행·덮어쓰기·승격되지 않는다.
+v0.4.1 지원 profile은 `proposal_only`다. source는 실행·덮어쓰기·승격되지 않는다.
 UI의 제안 diff는 읽기 전용이며 승인·적용·promotion·rollback 버튼을 제공하지 않는다.
 야간 주기 전후 source digest가 달라지면 safe mode로 진입한다. 별도 kernel, network/
 host-filesystem isolation, immutable image와 command digest가 독립 검증되는 Phase 12

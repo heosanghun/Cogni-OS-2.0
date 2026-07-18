@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.1 — 2026-07-18
+
+### Evidence-first server execution
+
+- added an exact-commit GPU5 guard that admits only physical GPU 5 and rejects
+  GPU 0-4 and GPU 6-7 without enumerating or touching them;
+- required a root-owned, time-bounded laboratory scheduler reservation before
+  Docker startup or the first GPU identity query;
+- bound source, model, configuration, device and completion evidence to one
+  immutable scope while keeping raw evidence outside the repository;
+- separated CPU/static validation, GPU5 runtime validation, acceptance and
+  release publication so that an earlier gate cannot authorize a later one.
+
+### Completion and publication integrity
+
+- strengthened natural-conversation completion, continuation budgets,
+  repetition detection and fail-closed answer publication;
+- added a 170-row conservative acceptance ledger and detached evidence policy;
+- hardened artifact-only release assembly while keeping verified publication
+  blocked until an independently protected toolchain and signed evidence bundle
+  are available;
+- aligned product, UI, launcher, manual and guard metadata at v0.4.1 while
+  retaining every v0.4.0 measurement as historical evidence only.
+
 ## 0.4.0 — 2026-07-16
 
 ### Persistent local knowledge workspace

@@ -60,7 +60,7 @@ def _valid_product_acceptance_payload() -> dict[str, object]:
     }
     threshold = int(16.7 * 1024**3)
     answers = (
-        "Cogni-OS 0.4.0에서 실행되는 gemma4-e4b-it 모델이며, effective 파라미터는 "
+        "Cogni-OS 0.4.1에서 실행되는 gemma4-e4b-it 모델이며, effective 파라미터는 "
         "4,506,496,490개이고 저장 파라미터는 7,996,157,418개입니다.",
         "자가 거울치료는 실패 로그에서 코드 패치 후보를 만들고, 격리 검증을 통과한 제안만 "
         "승격하는 절차입니다.",
@@ -235,7 +235,7 @@ def _valid_product_acceptance_payload() -> dict[str, object]:
         "gpu_identity_after": dict(identity),
         "factbook": {
             "schema_version": 1,
-            "build_version": "0.4.0",
+            "build_version": "0.4.1",
             "device": "Test GPU5",
             "target_device": "RTX 4090 24GB",
             "model": {

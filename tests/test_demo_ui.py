@@ -1163,7 +1163,7 @@ assert.equal(normalizedLiveRuntimeMetrics({{ ...valid, unsafe_silent_fallbacks: 
             env=environment,
             timeout=30,
         ).stdout.strip()
-        self.assertEqual(version, "0.4.0.0")
+        self.assertEqual(version, "0.4.1.0")
 
 
 if __name__ == "__main__":

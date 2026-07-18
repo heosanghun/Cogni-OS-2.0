@@ -1,9 +1,9 @@
-# Cogni-OS 2.0 v0.4.0 Working-Tree Architecture
+# Cogni-OS 2.0 v0.4.1 Working-Tree Architecture
 
 ## Scope and evidence boundary
 
-This document describes the **v0.4.0 integration working tree**. It is not a
-claim that a v0.4.0 executable or release bundle has been published. The
+This document describes the **v0.4.1 integration working tree**. It is not a
+claim that a v0.4.1 executable or release bundle has been published. The
 packaged application, README, and runtime version remain separate release
 evidence until they are rebuilt from one frozen commit and smoke-tested.
 
@@ -280,7 +280,7 @@ an exclusive evolution window.
 - Self-Harness records evidence and may construct inert proposals after the
   required causal support. Current review is read-only.
 
-There is no v0.4.0 source-patch approval/apply/promotion path. Attested sandbox
+There is no v0.4.1 source-patch approval/apply/promotion path. Attested sandbox
 execution, independent approval, byte-identical rollback, and safe promotion
 remain outside this working-tree capability and must not be presented as
 automatic self-modification.

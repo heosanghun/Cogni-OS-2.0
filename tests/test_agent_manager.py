@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from threading import Event
@@ -18,6 +19,7 @@ from cogni_agent.manager import (
     SAFE_QUALITY_FALLBACK,
     AgentBusyError,
     AgentManager,
+    AgentTurnStartError,
     RetrievalEvidence,
     RetrievalProvenance,
     safe_quality_fallback,
@@ -135,6 +137,7 @@ class _ImageScriptedService(_ScriptedService):
     def __init__(self, plans):
         super().__init__(plans)
         self.images = []
+        self.expected_runtime_identities = []
         self.runtime_identity = ModelRuntimeIdentity(
             service_nonce="1" * 32,
             worker_incarnation=1,
@@ -153,6 +156,7 @@ class _ImageScriptedService(_ScriptedService):
         prompt,
         *,
         image_content=None,
+        expected_runtime_identity=None,
         max_new_tokens,
         stop_token_ids=None,
         decode_mode="conversation",
@@ -161,6 +165,7 @@ class _ImageScriptedService(_ScriptedService):
         sampling_seed=None,
     ):
         self.images.append(image_content)
+        self.expected_runtime_identities.append(expected_runtime_identity)
         for chunk in super().iter_generate_tokens(
             prompt,
             max_new_tokens=max_new_tokens,
@@ -174,6 +179,74 @@ class _ImageScriptedService(_ScriptedService):
                 chunk.media_sha256 = sha256(image_content).hexdigest()
                 chunk.runtime_identity = self.runtime_identity
             yield chunk
+
+
+class _RotatingImageScriptedService(_ImageScriptedService):
+    def __init__(self, plans, identities):
+        super().__init__(plans)
+        self.identities = list(identities)
+
+    def iter_generate_tokens(
+        self,
+        prompt,
+        *,
+        image_content=None,
+        expected_runtime_identity=None,
+        max_new_tokens,
+        stop_token_ids=None,
+        decode_mode="conversation",
+        timeout=None,
+        total_timeout=None,
+        sampling_seed=None,
+    ):
+        self.runtime_identity = self.identities.pop(0)
+        yield from super().iter_generate_tokens(
+            prompt,
+            image_content=image_content,
+            expected_runtime_identity=expected_runtime_identity,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+            decode_mode=decode_mode,
+            timeout=timeout,
+            total_timeout=total_timeout,
+            sampling_seed=sampling_seed,
+        )
+
+
+class _BlockingSecondImageScriptedService(_RotatingImageScriptedService):
+    def __init__(self, plans, identities, second_entered: Event, release: Event):
+        super().__init__(plans, identities)
+        self.second_entered = second_entered
+        self.release = release
+
+    def iter_generate_tokens(
+        self,
+        prompt,
+        *,
+        image_content=None,
+        expected_runtime_identity=None,
+        max_new_tokens,
+        stop_token_ids=None,
+        decode_mode="conversation",
+        timeout=None,
+        total_timeout=None,
+        sampling_seed=None,
+    ):
+        if len(self.expected_runtime_identities) == 1:
+            self.second_entered.set()
+            if not self.release.wait(2):
+                raise TimeoutError("second image attempt test release timed out")
+        yield from super().iter_generate_tokens(
+            prompt,
+            image_content=image_content,
+            expected_runtime_identity=expected_runtime_identity,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+            decode_mode=decode_mode,
+            timeout=timeout,
+            total_timeout=total_timeout,
+            sampling_seed=sampling_seed,
+        )
 
 
 class _VariadicImageClaimService(_ScriptedService):
@@ -390,6 +463,137 @@ class TestAgentManager(unittest.TestCase):
         self.assertEqual(len(service.images), 1)
         self.assertIs(service.images[0], image)
         self.assertNotIn("image_content", state["conversation"][0])
+
+    def test_ready_image_turn_pins_exact_admitted_runtime_identity(self) -> None:
+        image = b"immutable-image"
+        service = _ImageScriptedService(
+            [("사진 속 파란 원은 중앙에 선명하게 배치되어 있습니다.", "stop")]
+        )
+        manager = self.manager(service)
+
+        manager.start_turn(
+            "사진 속 파란 원을 자연스럽게 설명해 주세요.",
+            image_content=image,
+            expected_image_runtime_identity=service.runtime_identity,
+        )
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(
+            service.expected_runtime_identities,
+            [service.runtime_identity],
+        )
+
+    def test_ready_image_turn_rejects_successor_before_answer_publication(
+        self,
+    ) -> None:
+        image = b"immutable-image"
+        service = _ImageScriptedService(
+            [("이 문장은 런타임 신원이 바뀌면 공개되면 안 됩니다.", "stop")]
+        )
+        admitted = service.runtime_identity
+        service.runtime_identity = replace(admitted, worker_incarnation=2)
+        manager = self.manager(service)
+
+        manager.start_turn(
+            "이미지를 설명해 주세요.",
+            image_content=image,
+            expected_image_runtime_identity=admitted,
+        )
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["completion"]["state"], "failed")
+        self.assertEqual(
+            service.expected_runtime_identities,
+            [admitted],
+        )
+        self.assertFalse(
+            any(item.get("role") == "assistant" for item in state["conversation"])
+        )
+        self.assertNotIn(
+            "이 문장은 런타임 신원이 바뀌면 공개되면 안 됩니다.",
+            str(state["conversation"]),
+        )
+
+    def test_image_repair_attempt_does_not_publish_first_worker_candidate(
+        self,
+    ) -> None:
+        question = "이미지의 파란 원을 자연스럽게 설명해 주세요."
+        image = b"immutable-image"
+        admitted = _ImageScriptedService([]).runtime_identity
+        successor = replace(admitted, lease_epoch=admitted.lease_epoch + 1)
+        second_entered = Event()
+        release = Event()
+        service = _BlockingSecondImageScriptedService(
+            [
+                (question + "\n[턴 종료]", "stop"),
+                (
+                    "두 번째 작업자의 문장은 절대로 공개되면 안 됩니다.",
+                    "stop",
+                ),
+            ],
+            [admitted, successor],
+            second_entered,
+            release,
+        )
+        manager = self.manager(service, max_generation_attempts=2)
+
+        try:
+            manager.start_turn(
+                question,
+                image_content=image,
+                expected_image_runtime_identity=admitted,
+            )
+            self.assertTrue(second_entered.wait(2))
+            in_flight = manager.snapshot()
+            in_flight_assistant = [
+                item
+                for item in in_flight["conversation"]
+                if item.get("role") == "assistant"
+            ]
+            self.assertEqual(len(in_flight_assistant), 1)
+            self.assertEqual(in_flight_assistant[0]["content"], "")
+        finally:
+            release.set()
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(len(service.images), 2)
+        self.assertFalse(
+            any(item.get("role") == "assistant" for item in state["conversation"])
+        )
+        serialized = str(state["conversation"])
+        self.assertNotIn(question + "\n[턴 종료]", serialized)
+        self.assertNotIn("두 번째 작업자의 문장", serialized)
+
+    def test_turn_thread_start_failure_rolls_back_pending_state(self) -> None:
+        manager = self.manager()
+
+        with patch(
+            "cogni_agent.manager.Thread.start",
+            side_effect=RuntimeError("thread unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                AgentTurnStartError,
+                "could not start",
+            ):
+                manager.start_turn("시작 실패를 안전하게 복구해 주세요.")
+
+        state = manager.snapshot()
+        self.assertEqual(state["status"], "ready")
+        self.assertEqual(state["stage"], "ready")
+        self.assertIsNone(state["active_turn"])
+        self.assertIsNone(state["error"])
+        self.assertEqual(state["completion"]["state"], "idle")
+        self.assertEqual(state["conversation"], [])
+        self.assertEqual(
+            manager.conversations.snapshot(manager.session_id).as_messages(),
+            (),
+        )
+
+        manager.start_turn("간단히 인사해 주세요.")
+        self.assertEqual(_wait(manager)["status"], "succeeded")
 
     def test_same_image_content_is_used_for_every_bounded_generation_attempt(
         self,

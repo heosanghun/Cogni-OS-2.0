@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from cogni_agent.manager import AgentTurnStartError
 from cogni_demo.server import (
     DemoHTTPServer,
     DemoRequestHandler,
@@ -113,10 +114,12 @@ class _Agent:
         self.availability_check = None
         self.evidence: tuple[object, ...] = ()
         self.image_content: bytes | None = None
+        self.expected_image_runtime_identity: object | None = None
         self.messages: list[str] = []
         self.retrieval_requested = False
         self.shutdown_called = False
         self.reset_calls = 0
+        self.cancel_calls = 0
 
     @property
     def is_active(self) -> bool:
@@ -129,13 +132,18 @@ class _Agent:
         *,
         evidence=(),
         image_content=None,
+        expected_image_runtime_identity=None,
         retrieval_requested=False,
     ):
         self.messages.append(_message)
         self.evidence = tuple(evidence)
         self.image_content = image_content
+        self.expected_image_runtime_identity = expected_image_runtime_identity
         self.retrieval_requested = retrieval_requested
         return "turn-rag"
+
+    def cancel(self):
+        self.cancel_calls += 1
 
     def snapshot(self):
         return {"status": "ready", "seq": 1, "conversation": []}
@@ -711,6 +719,11 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
             patch.object(
                 self.server, "image_to_model_integration_ready", return_value=True
             ),
+            patch.object(
+                self.server,
+                "_attested_image_runtime_identity",
+                return_value=_RuntimeIdentity(),
+            ),
         ):
             status, capability = self._get("/api/workspace/capabilities")
             self.assertEqual(status, 200)
@@ -744,6 +757,10 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         self.assertTrue(payload["image_input_admitted"])
         self.assertEqual(payload["image_media_type"], "image/png")
         self.assertEqual(self.agent.image_content, b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(
+            self.agent.expected_image_runtime_identity,
+            _RuntimeIdentity(),
+        )
         encoded = json.dumps(payload)
         self.assertNotIn("89504e47", encoded.casefold())
         self.assertNotIn("C:\\", encoded)
@@ -968,6 +985,56 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
                 self.server.start_image_agent_turn("describe", b"image")
         self.assertIsNone(self.server._image_attestation_probe)
         self.assertIsNone(self.server._image_attestation_thread)
+        self.assertEqual(self.agent.cancel_calls, 1)
+
+    def test_public_image_start_requires_ready_exact_attestation(self) -> None:
+        image = b"immutable-image"
+
+        with patch.object(
+            self.server,
+            "_attested_image_runtime_identity",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(
+                ImageModelUnavailableError,
+                "attestation is not ready",
+            ):
+                self.server.start_agent_turn(
+                    "이미지를 설명해 주세요.",
+                    "chat",
+                    image_content=image,
+                )
+        self.assertIsNone(self.agent.image_content)
+
+        admitted = _RuntimeIdentity()
+        with patch.object(
+            self.server,
+            "_attested_image_runtime_identity",
+            return_value=admitted,
+        ):
+            turn_id = self.server.start_agent_turn(
+                "이미지를 설명해 주세요.",
+                "chat",
+                image_content=image,
+            )
+
+        self.assertEqual(turn_id, "turn-rag")
+        self.assertIs(self.agent.expected_image_runtime_identity, admitted)
+        self.assertIs(self.agent.image_content, image)
+
+    def test_agent_thread_start_failure_has_controlled_http_error(self) -> None:
+        with patch.object(
+            self.server,
+            "start_agent_turn",
+            side_effect=AgentTurnStartError("thread unavailable"),
+        ):
+            status, payload = self._post(
+                "/api/agent/chat",
+                {"message": "안전하게 시작해 주세요.", "mode": "chat"},
+            )
+
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"]["code"], "AGENT_UNAVAILABLE")
 
     def test_image_chat_rejects_invalid_id_media_rag_task_and_unverified_runtime(
         self,

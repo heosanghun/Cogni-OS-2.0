@@ -646,6 +646,10 @@ class AgentBusyError(RuntimeError):
     pass
 
 
+class AgentTurnStartError(RuntimeError):
+    """Raised after a turn admission is rolled back before its thread starts."""
+
+
 class NoActiveAgentTurnError(RuntimeError):
     pass
 
@@ -661,6 +665,7 @@ class GenerationBackend(Protocol):
         prompt: str,
         *,
         image_content: bytes | None = None,
+        expected_runtime_identity: ModelRuntimeIdentity | None = None,
         max_new_tokens: int,
         decode_mode: str = "conversation",
         sampling_seed: int | None = None,
@@ -860,6 +865,7 @@ class AgentManager:
         *,
         evidence: tuple[RetrievalEvidence, ...] = (),
         image_content: bytes | None = None,
+        expected_image_runtime_identity: ModelRuntimeIdentity | None = None,
         retrieval_requested: bool = False,
     ) -> str:
         text = self._validate_message(message)
@@ -869,6 +875,14 @@ class AgentManager:
             raise TypeError("retrieval_requested must be a bool")
         bounded_evidence = self._validate_retrieval_evidence(evidence)
         bounded_image = self._validate_image_content(image_content)
+        if expected_image_runtime_identity is not None and not isinstance(
+            expected_image_runtime_identity, ModelRuntimeIdentity
+        ):
+            raise TypeError(
+                "expected_image_runtime_identity must be a ModelRuntimeIdentity or None"
+            )
+        if expected_image_runtime_identity is not None and bounded_image is None:
+            raise ValueError("expected image runtime identity requires image content")
         retrieval_requested = retrieval_requested or bool(bounded_evidence)
         if mode == "task" and retrieval_requested:
             raise ValueError("retrieval evidence is available only in chat mode")
@@ -882,6 +896,15 @@ class AgentManager:
         ):
             raise ModelServiceError(
                 "model backend does not explicitly support image content"
+            )
+        if (
+            expected_image_runtime_identity is not None
+            and not self._backend_explicitly_supports_parameter(
+                "expected_runtime_identity"
+            )
+        ):
+            raise ModelServiceError(
+                "model backend does not explicitly support admitted runtime identity"
             )
         with self._condition:
             if self._status in ACTIVE_AGENT_STATUSES:
@@ -900,7 +923,7 @@ class AgentManager:
             self._cancel_event = Event()
             self._error = None
             self._completion = self._completion_state(state="pending")
-            self._append_message("user", text)
+            user_message_id = self._append_message("user", text)
             self._transition_locked("starting", "accepted", 0)
             thread = Thread(
                 target=self._run_turn,
@@ -912,13 +935,30 @@ class AgentManager:
                     resume_truncated,
                     bounded_evidence,
                     bounded_image,
+                    expected_image_runtime_identity,
                     retrieval_requested,
                 ),
                 name=f"cogni-agent-{turn_id[:8]}",
                 daemon=True,
             )
             self._thread = thread
-            thread.start()
+            try:
+                thread.start()
+            except BaseException as exc:
+                self.conversations.abort_user_turn(self.session_id, user_sequence)
+                if self._messages and self._messages[-1].get("id") == user_message_id:
+                    self._messages.pop()
+                self._active_turn = None
+                self._active_user_sequence = None
+                self._thread = None
+                self._cancel_event = Event()
+                self._error = None
+                self._completion = self._completion_state()
+                self._core = self._core_state()
+                self._transition_locked("ready", "ready", 100)
+                raise AgentTurnStartError(
+                    "agent worker thread could not start"
+                ) from exc
             return turn_id
 
     def cancel(self) -> None:
@@ -967,6 +1007,7 @@ class AgentManager:
         resume_truncated: bool,
         evidence: tuple[RetrievalEvidence, ...],
         image_content: bytes | None,
+        expected_image_runtime_identity: ModelRuntimeIdentity | None,
         retrieval_requested: bool,
     ) -> None:
         try:
@@ -981,6 +1022,9 @@ class AgentManager:
                         resume_truncated=resume_truncated,
                         evidence=evidence,
                         image_content=image_content,
+                        expected_image_runtime_identity=(
+                            expected_image_runtime_identity
+                        ),
                         retrieval_requested=retrieval_requested,
                     )
             if finish is not None:
@@ -1032,6 +1076,7 @@ class AgentManager:
         resume_truncated: bool,
         evidence: tuple[RetrievalEvidence, ...],
         image_content: bytes | None,
+        expected_image_runtime_identity: ModelRuntimeIdentity | None,
         retrieval_requested: bool,
     ) -> TurnFinish | None:
         if retrieval_requested and not evidence:
@@ -1290,6 +1335,7 @@ class AgentManager:
                 prompt,
                 request_budget,
                 image_content=image_content,
+                expected_image_runtime_identity=(expected_image_runtime_identity),
                 decode_mode=decode_mode,
                 timeout_seconds=max(0.01, decode_deadline - monotonic()),
                 sampling_seed=self._sampling_seed(
@@ -1318,62 +1364,6 @@ class AgentManager:
                 if chunk.token_ids.numel():
                     request_tokens.append(chunk.token_ids)
                     received_tokens += int(chunk.token_ids.numel())
-                render_due = bool(request_tokens) and (
-                    chunk.final
-                    or received_tokens - rendered_tokens >= STREAM_RENDER_TOKEN_INTERVAL
-                    or monotonic() - rendered_at >= STREAM_RENDER_SECONDS
-                )
-                if render_due:
-                    decoded, token_repetition = self._decode(request_tokens)
-                    if continuations == 0:
-                        decoded, _user_echo = self._strip_leading_user_echo(
-                            decoded, message
-                        )
-                    segment, segment_role_boundary = self._clean_model_text(decoded)
-                    role_boundary = role_boundary or segment_role_boundary
-                    repetition_boundary = repetition_boundary or token_repetition
-                    merged = self._merge_response(response_before_request, segment)
-                    merged, segment_repetition = self._trim_repeated_text(merged)
-                    repetition_boundary = repetition_boundary or segment_repetition
-                    response, clipped = self._clip_response(merged)
-                    char_truncated = char_truncated or clipped
-                    quality = inspect_response(response, final=False)
-                    if quality.should_stop_generation:
-                        cut = quality.recommended_cut_index
-                        if cut is not None:
-                            response = response[:cut].rstrip()
-                        quality_boundary = True
-                    made_progress = made_progress or response != response_before_request
-                    with self._condition:
-                        self._update_message(
-                            message_id,
-                            "" if evidence else response,
-                            streaming=True,
-                            finish_reason=None,
-                            continuations=continuations,
-                            truncated=False,
-                            generated_tokens=total_generated + request_generated,
-                        )
-                        self._completion = self._completion_state(
-                            state="streaming",
-                            continuations=continuations,
-                            generated_tokens=total_generated + request_generated,
-                        )
-                        self._transition_locked(
-                            "generating",
-                            "continuing" if continuations else "decode",
-                            min(
-                                95,
-                                55
-                                + int(
-                                    (total_generated + request_generated)
-                                    * 40
-                                    / budget.total
-                                ),
-                            ),
-                        )
-                    rendered_tokens = received_tokens
-                    rendered_at = monotonic()
                 if chunk.final:
                     request_reason = self._chunk_finish_reason(chunk)
                     chunk_mode = getattr(chunk, "generation_mode", "cogni_core")
@@ -1395,6 +1385,14 @@ class AgentManager:
                                 "image terminal response lacked runtime identity"
                             )
                         if (
+                            expected_image_runtime_identity is not None
+                            and chunk_runtime_identity
+                            != expected_image_runtime_identity
+                        ):
+                            raise ModelServiceError(
+                                "image terminal identity did not match admitted runtime"
+                            )
+                        if (
                             image_terminal_identity is not None
                             and chunk_runtime_identity != image_terminal_identity
                         ):
@@ -1409,7 +1407,71 @@ class AgentManager:
                                 chunk_runtime_identity
                             ),
                         }
-
+                decode_due = bool(request_tokens) and (
+                    chunk.final
+                    or image_content is None
+                    and (
+                        received_tokens - rendered_tokens
+                        >= STREAM_RENDER_TOKEN_INTERVAL
+                        or monotonic() - rendered_at >= STREAM_RENDER_SECONDS
+                    )
+                )
+                if decode_due:
+                    decoded, token_repetition = self._decode(request_tokens)
+                    if continuations == 0:
+                        decoded, _user_echo = self._strip_leading_user_echo(
+                            decoded, message
+                        )
+                    segment, segment_role_boundary = self._clean_model_text(decoded)
+                    role_boundary = role_boundary or segment_role_boundary
+                    repetition_boundary = repetition_boundary or token_repetition
+                    merged = self._merge_response(response_before_request, segment)
+                    merged, segment_repetition = self._trim_repeated_text(merged)
+                    repetition_boundary = repetition_boundary or segment_repetition
+                    response, clipped = self._clip_response(merged)
+                    char_truncated = char_truncated or clipped
+                    quality = inspect_response(response, final=False)
+                    if quality.should_stop_generation:
+                        cut = quality.recommended_cut_index
+                        if cut is not None:
+                            response = response[:cut].rstrip()
+                        quality_boundary = True
+                    made_progress = made_progress or response != response_before_request
+                    # Image candidates remain private across every bounded
+                    # quality repair/continuation attempt.  Only the final
+                    # update below may publish image-derived text after all
+                    # runtime identity checks and quality gates pass.
+                    if image_content is None:
+                        with self._condition:
+                            self._update_message(
+                                message_id,
+                                "" if evidence else response,
+                                streaming=True,
+                                finish_reason=None,
+                                continuations=continuations,
+                                truncated=False,
+                                generated_tokens=total_generated + request_generated,
+                            )
+                            self._completion = self._completion_state(
+                                state="streaming",
+                                continuations=continuations,
+                                generated_tokens=total_generated + request_generated,
+                            )
+                            self._transition_locked(
+                                "generating",
+                                "continuing" if continuations else "decode",
+                                min(
+                                    95,
+                                    55
+                                    + int(
+                                        (total_generated + request_generated)
+                                        * 40
+                                        / budget.total
+                                    ),
+                                ),
+                            )
+                    rendered_tokens = received_tokens
+                    rendered_at = monotonic()
             total_generated += request_generated
             finish_reason = (
                 "stop"
@@ -2619,6 +2681,7 @@ class AgentManager:
         max_new_tokens: int,
         *,
         image_content: bytes | None = None,
+        expected_image_runtime_identity: ModelRuntimeIdentity | None = None,
         decode_mode: str,
         timeout_seconds: float,
         sampling_seed: int,
@@ -2648,6 +2711,16 @@ class AgentManager:
                     "model backend does not explicitly support image content"
                 )
             kwargs["image_content"] = image_content
+        if expected_image_runtime_identity is not None:
+            identity_parameter = parameters.get("expected_runtime_identity")
+            if identity_parameter is None or identity_parameter.kind not in {
+                Parameter.POSITIONAL_OR_KEYWORD,
+                Parameter.KEYWORD_ONLY,
+            }:
+                raise ModelServiceError(
+                    "model backend does not explicitly support admitted runtime identity"
+                )
+            kwargs["expected_runtime_identity"] = expected_image_runtime_identity
         if supported("stop_token_ids"):
             kwargs["stop_token_ids"] = self._response_stop_ids
         if supported("conversation_id"):
@@ -3706,11 +3779,14 @@ class AgentManager:
         return image_content
 
     def _backend_explicitly_supports_image_content(self) -> bool:
+        return self._backend_explicitly_supports_parameter("image_content")
+
+    def _backend_explicitly_supports_parameter(self, name: str) -> bool:
         try:
             parameters = signature(self.model_service.iter_generate_tokens).parameters
         except (TypeError, ValueError):
             return False
-        parameter = parameters.get("image_content")
+        parameter = parameters.get(name)
         return parameter is not None and parameter.kind in {
             Parameter.POSITIONAL_OR_KEYWORD,
             Parameter.KEYWORD_ONLY,
@@ -3721,6 +3797,7 @@ __all__ = [
     "ACTIVE_AGENT_STATUSES",
     "AgentBusyError",
     "AgentManager",
+    "AgentTurnStartError",
     "NoActiveAgentTurnError",
     "RetrievalEvidence",
     "SYSTEM_PROMPT",

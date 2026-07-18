@@ -2080,6 +2080,31 @@ class DemoHTTPServer(ThreadingHTTPServer):
 
         return bool(self.image_to_model_integration_status()["runtime_ready"])
 
+    def _attested_image_runtime_identity(self) -> object | None:
+        """Capture the exact live identity authorized by the current attestation."""
+
+        service = self._configured_image_model_service()
+        if service is None:
+            return None
+        with self._image_attestation_lock:
+            attestation = self._image_attestation
+        if attestation is None:
+            return None
+        try:
+            identity = service.runtime_identity()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            identity = None
+        with self._image_attestation_lock:
+            ready = bool(
+                self._image_attestation is attestation
+                and identity is not None
+                and attestation.process_nonce == self._image_process_nonce
+                and attestation.runtime_identity == identity
+            )
+            if not ready and self._image_attestation is attestation:
+                self._image_attestation = None
+        return identity if ready else None
+
     def _configured_image_model_service(self) -> object | None:
         """Return only the exact production image pipeline service."""
 
@@ -2363,6 +2388,15 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 raise ImageModelUnavailableError(
                     "selected checkpoint does not advertise image input"
                 )
+            expected_image_runtime_identity = None
+            if image_content is not None:
+                expected_image_runtime_identity = (
+                    self._attested_image_runtime_identity()
+                )
+                if expected_image_runtime_identity is None:
+                    raise ImageModelUnavailableError(
+                        "image runtime attestation is not ready"
+                    )
             if evidence:
                 # Product callers may bypass the HTTP adapter.  Do not let
                 # unprovenanced generic AgentManager evidence acquire the
@@ -2386,8 +2420,22 @@ class DemoHTTPServer(ThreadingHTTPServer):
                     mode,
                     evidence=evidence,
                     image_content=image_content,
+                    expected_image_runtime_identity=(expected_image_runtime_identity),
                 )
             return self.agent_manager.start_turn(message, mode)
+
+    def _start_first_use_image_turn_locked(
+        self,
+        message: str,
+        image_content: bytes,
+    ) -> str:
+        """Start only the private configured-unverified attestation turn."""
+
+        return self.agent_manager.start_turn(
+            message,
+            "chat",
+            image_content=image_content,
+        )
 
     def start_image_agent_turn(
         self,
@@ -2399,6 +2447,19 @@ class DemoHTTPServer(ThreadingHTTPServer):
         if type(image_content) is not bytes or not image_content:
             raise ValueError("image_content must be non-empty immutable bytes")
         with self._compute_lock:
+            self._require_admission_open()
+            if self.agent_manager is None:
+                raise RuntimeError("agent manager is unavailable")
+            if (
+                self.manager.is_active
+                or self._evolution_active()
+                or self._image_probe_active()
+            ):
+                raise ComputeBusyError("validation or evolution owns local compute")
+            if not self.selected_checkpoint_advertises_image():
+                raise ImageModelUnavailableError(
+                    "selected checkpoint does not advertise image input"
+                )
             status = self.image_to_model_integration_status()
             if status.get("runtime_ready") is True:
                 return (
@@ -2415,10 +2476,9 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 raise ImageModelUnavailableError(
                     "image model is not configured for first-use attestation"
                 )
-            turn_id = self.start_agent_turn(
+            turn_id = self._start_first_use_image_turn_locked(
                 message,
-                "chat",
-                image_content=image_content,
+                image_content,
             )
             probe = _ImageAttestationProbe(
                 turn_id=turn_id,
@@ -2446,6 +2506,10 @@ class DemoHTTPServer(ThreadingHTTPServer):
                     if self._image_attestation_probe == probe:
                         self._image_attestation_probe = None
                         self._image_attestation_thread = None
+                try:
+                    self.agent_manager.cancel()
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
                 raise ImageModelUnavailableError(
                     "image attestation watcher could not start"
                 ) from exc
@@ -3080,7 +3144,11 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
         self._send(HTTPStatus.OK, resolved.read_bytes(), content_type)
 
     def do_POST(self) -> None:  # noqa: N802
-        from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError
+        from cogni_agent.manager import (
+            AgentBusyError,
+            AgentTurnStartError,
+            NoActiveAgentTurnError,
+        )
 
         if not self._valid_host():
             self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_HOST")
@@ -3312,6 +3380,9 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                         evidence=evidence,
                         retrieval_requested=rag_requested,
                     )
+            except AgentTurnStartError:
+                self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AGENT_UNAVAILABLE")
+                return
             except (AgentBusyError, ComputeBusyError):
                 self._json_error(HTTPStatus.CONFLICT, "COMPUTE_BUSY")
                 return

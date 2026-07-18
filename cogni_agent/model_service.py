@@ -2505,6 +2505,7 @@ class ModelService:
         prompt: str,
         *,
         image_content: bytes | None = None,
+        expected_runtime_identity: ModelRuntimeIdentity | None = None,
         audio_wav_content: bytes | None = None,
         max_new_tokens: int | None = None,
         stop_token_ids: Tensor | None = None,
@@ -2514,6 +2515,16 @@ class ModelService:
         decode_mode: str = "conversation",
         sampling_seed: int | None = None,
     ) -> Iterator[GenerationChunk]:
+        if expected_runtime_identity is not None and not isinstance(
+            expected_runtime_identity, ModelRuntimeIdentity
+        ):
+            raise TypeError(
+                "expected_runtime_identity must be a ModelRuntimeIdentity or None"
+            )
+        if expected_runtime_identity is not None and image_content is None:
+            raise RequestLimitError(
+                "expected runtime identity is valid only for an image request"
+            )
         decode_mode_code = _decode_mode_code(decode_mode)
         requested_seed = _validated_sampling_seed(sampling_seed)
         wait_seconds = self.request_timeout if timeout is None else float(timeout)
@@ -2612,6 +2623,13 @@ class ModelService:
                     if request_runtime_identity is None:
                         raise WorkerAuthorityError(
                             "image request lacks a live runtime identity"
+                        )
+                    if (
+                        expected_runtime_identity is not None
+                        and request_runtime_identity != expected_runtime_identity
+                    ):
+                        raise WorkerAuthorityError(
+                            "image worker identity did not match the admitted runtime"
                         )
                 request_id = self._next_request_id
                 self._next_request_id += 1
@@ -2760,6 +2778,11 @@ class ModelService:
                             if (
                                 terminal_runtime_identity is None
                                 or terminal_runtime_identity != request_runtime_identity
+                                or (
+                                    expected_runtime_identity is not None
+                                    and terminal_runtime_identity
+                                    != expected_runtime_identity
+                                )
                             ):
                                 raise WorkerAuthorityError(
                                     "image worker identity changed before terminal publication"
@@ -2853,6 +2876,7 @@ class ModelService:
         prompt: str,
         *,
         image_content: bytes | None = None,
+        expected_runtime_identity: ModelRuntimeIdentity | None = None,
         audio_wav_content: bytes | None = None,
         max_new_tokens: int | None = None,
         stop_token_ids: Tensor | None = None,
@@ -2872,6 +2896,7 @@ class ModelService:
         for chunk in self.iter_generate_tokens(
             prompt,
             image_content=image_content,
+            expected_runtime_identity=expected_runtime_identity,
             audio_wav_content=audio_wav_content,
             max_new_tokens=max_new_tokens,
             stop_token_ids=stop_token_ids,

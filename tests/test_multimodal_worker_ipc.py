@@ -243,6 +243,7 @@ class TestResidentImageGeneration(unittest.TestCase):
                 result = service.generate(
                     "이미지를 설명하세요.",
                     image_content=image,
+                    expected_runtime_identity=identity,
                     max_new_tokens=1,
                     decode_mode="strict",
                 )
@@ -253,6 +254,68 @@ class TestResidentImageGeneration(unittest.TestCase):
         self.assertEqual(result.text, "42")
         self.assertEqual(result.media_sha256, sha256(image).hexdigest())
         self.assertEqual(result.runtime_identity, identity)
+
+    def test_ready_image_admission_rejects_stable_successor_worker_identity(
+        self,
+    ) -> None:
+        service = ModelService(
+            _Tokenizer(),
+            _ImageFactory(os.getpid()),
+            max_input_tokens=32,
+            max_new_tokens=4,
+            startup_timeout=20.0,
+            request_timeout=20.0,
+            multimodal_processor_config=(Path(__file__), Path(__file__)),
+        )
+        processor = object.__new__(VerifiedGemma4MultimodalProcessor)
+        processor.processor = _Processor()
+        service._multimodal_processor = processor
+        admitted = ModelRuntimeIdentity(
+            service_nonce="1" * 32,
+            worker_incarnation=1,
+            worker_pid=4321,
+            lease_epoch=7,
+            lease_deadline_ns=99,
+            artifact_digest="a" * 64,
+            model_root="model",
+            manifest_path="manifest",
+            processor_root="model",
+            processor_manifest_path="manifest",
+        )
+        try:
+            service.start()
+            for successor in (
+                replace(admitted, worker_incarnation=2),
+                replace(admitted, lease_epoch=8),
+            ):
+                with (
+                    self.subTest(successor=successor),
+                    (
+                        patch.object(
+                            service,
+                            "_runtime_identity_locked",
+                            return_value=successor,
+                        )
+                    ),
+                    patch.object(
+                        service,
+                        "runtime_identity",
+                        return_value=successor,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        WorkerAuthorityError,
+                        "admitted runtime",
+                    ):
+                        service.generate(
+                            "이미지를 설명하세요.",
+                            image_content=_png(),
+                            expected_runtime_identity=admitted,
+                            max_new_tokens=1,
+                            decode_mode="strict",
+                        )
+        finally:
+            service.stop()
 
     def test_image_terminal_publication_rejects_successor_worker_identity(self) -> None:
         service = ModelService(

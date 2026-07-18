@@ -43,7 +43,8 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _RUNNER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _CONTAINER_NAME = re.compile(r"^cogni-candidate-[0-9a-f]{32}$")
 _NO_SUCH_CONTAINER = re.compile(
-    r"(?im)^Error(?: response from daemon)?: No such (?:object|container): [^\r\n]+$"
+    r"Error(?: response from daemon)?: No such (?:object|container): [^\r\n]+",
+    re.IGNORECASE,
 )
 _EVIDENCE_FIELDS = {
     "schema",
@@ -666,7 +667,12 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, ob
 
 
 def _is_exact_not_found(detail: str) -> bool:
-    return _NO_SUCH_CONTAINER.fullmatch(detail.strip()) is not None
+    lines = detail.strip().splitlines()
+    if lines[:1] == ["[]"]:
+        lines = lines[1:]
+    if len(lines) != 1:
+        return False
+    return _NO_SUCH_CONTAINER.fullmatch(lines[0]) is not None
 
 
 def _path_identity(path: Path) -> tuple[int, int, int, int, int]:

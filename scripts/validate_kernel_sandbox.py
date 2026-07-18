@@ -28,11 +28,18 @@ def _arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _canonical_daemon_socket(value: str) -> Path:
+    """Resolve the operator socket alias before strict runner validation."""
+
+    return Path(value).resolve(strict=True)
+
+
 def main() -> int:
     args = _arguments()
     if not sys.platform.startswith("linux"):
         raise SystemExit("kernel sandbox validation requires Linux")
     engine = Path(args.engine).resolve(strict=True)
+    daemon_socket = _canonical_daemon_socket(args.socket)
     engine_sha256 = sha256(engine.read_bytes()).hexdigest()
     canary_name = f"cogni-host-canary-{token_hex(12)}"
     host_canary = Path("/tmp") / canary_name
@@ -104,7 +111,7 @@ def main() -> int:
                 runner_id="cogni-linux-oci-v1",
                 engine_path=str(engine),
                 engine_sha256=engine_sha256,
-                daemon_socket=args.socket,
+                daemon_socket=str(daemon_socket),
                 image_reference=args.image,
                 commands=(SAFE_COMMAND, TIMEOUT_COMMAND),
                 max_memory_bytes=1024 * 1024 * 1024,

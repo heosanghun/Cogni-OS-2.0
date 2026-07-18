@@ -18,6 +18,7 @@ from cogni_flow.kernel_sandbox import (
     parse_kernel_sandbox_evidence,
 )
 from cogni_flow.production import command_sha256
+from scripts.validate_kernel_sandbox import _canonical_daemon_socket
 
 
 ENGINE_DIGEST = "a" * 64
@@ -208,10 +209,10 @@ class TestKernelSandboxCleanup(unittest.TestCase):
             cidfile.write_text(container_id, encoding="ascii")
             responses = [
                 (1, self.not_found),
-                (1, absent_name),
-                (1, absent_id),
-                (1, absent_name),
-                (1, absent_id),
+                (1, f"[]\n{absent_name}"),
+                (1, f"[]\n{absent_id}"),
+                (1, f"[]\n{absent_name}"),
+                (1, f"[]\n{absent_id}"),
             ]
             with (
                 patch.object(self.runner, "_docker_control", side_effect=responses),
@@ -222,6 +223,41 @@ class TestKernelSandboxCleanup(unittest.TestCase):
                 )
 
         self.assertIsNone(error)
+
+
+class TestDockerNotFoundParsing(unittest.TestCase):
+    def test_accepts_optional_empty_inspect_json_line(self):
+        name = "cogni-candidate-" + "e" * 32
+        error = f"Error response from daemon: No such container: {name}"
+
+        self.assertTrue(kernel_sandbox._is_exact_not_found(error))
+        self.assertTrue(kernel_sandbox._is_exact_not_found(f"[]\n{error}"))
+        self.assertTrue(kernel_sandbox._is_exact_not_found(f"[]\r\n{error}"))
+
+    def test_rejects_extra_or_other_daemon_output(self):
+        name = "cogni-candidate-" + "e" * 32
+        error = f"Error response from daemon: No such container: {name}"
+        rejected = (
+            f"{{}}\n{error}",
+            f"[]\n[]\n{error}",
+            f"[]\n{error}\nwarning: daemon restarted",
+            "[]\nCannot connect to the Docker daemon",
+            f"container list follows\n{error}",
+        )
+
+        for detail in rejected:
+            with self.subTest(detail=detail):
+                self.assertFalse(kernel_sandbox._is_exact_not_found(detail))
+
+
+class TestValidatorSocketCanonicalization(unittest.TestCase):
+    def test_operator_socket_is_resolved_strictly_before_evidence(self):
+        canonical = Path("/run/docker.sock")
+        with patch.object(Path, "resolve", return_value=canonical) as resolve:
+            result = _canonical_daemon_socket("/var/run/docker.sock")
+
+        self.assertEqual(result, canonical)
+        resolve.assert_called_once_with(strict=True)
 
 
 class TestBoundedOutput(unittest.TestCase):

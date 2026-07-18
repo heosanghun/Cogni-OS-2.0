@@ -7,6 +7,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import stat
 from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
@@ -505,6 +506,8 @@ class TestExecutableAndCleanupBoundary(unittest.TestCase):
             root = Path(temporary)
             executable = root / "driver.exe"
             executable.write_bytes(b"exact executable bytes")
+            if os.name == "posix":
+                executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
             identity = inspect_executable(executable, label="driver")
             self.assertEqual(identity.path, str(executable.resolve()))
             self.assertEqual(len(identity.sha256), 64)

@@ -1691,12 +1691,21 @@ class TaskPlanExecutor:
         deadline = monotonic() + timeout_seconds
         timed_out = False
         resource_violation: str | None = None
+        measurement_error: TaskExecutionError | None = None
         while process.poll() is None:
             if overflow.is_set() or monotonic() >= deadline:
                 timed_out = monotonic() >= deadline
                 process.kill()
                 break
-            used_cpu, used_ram = self._process_usage(process)
+            try:
+                used_cpu, used_ram = self._process_usage(process)
+            except TaskExecutionError as exc:
+                # A live child may not outlast a failed budget measurement. Defer
+                # the original fail-closed error until the process, pipes, and
+                # drain threads have been deterministically reclaimed below.
+                measurement_error = exc
+                process.kill()
+                break
             if used_cpu > cpu_seconds:
                 resource_violation = "subprocess exceeded its CPU budget"
                 process.kill()
@@ -1722,6 +1731,8 @@ class TaskPlanExecutor:
             raise TaskExecutionError("subprocess exceeded its wall-clock timeout")
         if resource_violation is not None:
             raise TaskExecutionError(resource_violation)
+        if measurement_error is not None:
+            raise measurement_error
         return output, returncode
 
     @staticmethod
@@ -1784,14 +1795,21 @@ class TaskPlanExecutor:
 
         proc = Path("/proc") / str(process.pid)
         try:
-            fields = (proc / "stat").read_text(encoding="ascii").split()
+            raw_stat = (proc / "stat").read_text(encoding="ascii")
+            comm_end = raw_stat.rfind(")")
+            if comm_end < 0:
+                raise ValueError("process stat command field is malformed")
+            # Fields after comm start at field 3 (state). Reading CPU ticks and
+            # resident pages from this one kernel snapshot avoids a TOCTOU race
+            # between separate stat/status reads when the child becomes a zombie.
+            fields = raw_stat[comm_end + 1 :].split()
             ticks_per_second = os.sysconf("SC_CLK_TCK")
-            cpu = (int(fields[13]) + int(fields[14])) / float(ticks_per_second)
-            status = (proc / "status").read_text(encoding="ascii")
-            match = re.search(r"^VmRSS:\s+(\d+)\s+kB$", status, re.MULTILINE)
-            if match is None:
-                raise ValueError("VmRSS missing")
-            return cpu, int(match.group(1)) * 1024
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            cpu = (int(fields[11]) + int(fields[12])) / float(ticks_per_second)
+            resident_pages = int(fields[21])
+            if ticks_per_second <= 0 or page_size <= 0 or resident_pages < 0:
+                raise ValueError("invalid process accounting value")
+            return cpu, resident_pages * page_size
         except (OSError, ValueError, IndexError) as exc:
             raise TaskExecutionError("cannot enforce child CPU/RAM budget") from exc
 

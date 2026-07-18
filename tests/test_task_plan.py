@@ -387,6 +387,61 @@ class TestCapabilityAndVerification(TaskPlanFixture):
 
 
 class TestFixedSubprocessAndT2Staging(TaskPlanFixture):
+    @staticmethod
+    def _linux_stat(*, state: str, user: int, system: int, rss: int) -> str:
+        tail = [state] + ["0"] * 10
+        tail.extend((str(user), str(system)))
+        tail.extend(["0"] * 8)
+        tail.append(str(rss))
+        return "4321 (python worker) " + " ".join(tail)
+
+    @unittest.skipIf(os.name == "nt", "Linux /proc semantics")
+    def test_atomic_zombie_stat_keeps_final_cpu_and_zero_ram(self) -> None:
+        process = type("ExitedProcess", (), {"pid": 4321})()
+        stat = self._linux_stat(state="Z", user=25, system=5, rss=0)
+        with (
+            patch.object(Path, "read_text", return_value=stat),
+            patch(
+                "cogni_flow.task_plan.os.sysconf",
+                side_effect=lambda name: {
+                    "SC_CLK_TCK": 100,
+                    "SC_PAGE_SIZE": 4096,
+                }[name],
+            ),
+        ):
+            cpu, ram = self.executor._process_usage(process)  # type: ignore[arg-type]
+        self.assertAlmostEqual(cpu, 0.3)
+        self.assertEqual(ram, 0)
+
+    @unittest.skipIf(os.name == "nt", "Linux /proc semantics")
+    def test_atomic_live_stat_reports_resident_pages(self) -> None:
+        process = type("LiveProcess", (), {"pid": 4321})()
+        stat = self._linux_stat(state="R", user=5, system=5, rss=7)
+        with (
+            patch.object(Path, "read_text", return_value=stat),
+            patch(
+                "cogni_flow.task_plan.os.sysconf",
+                side_effect=lambda name: {
+                    "SC_CLK_TCK": 100,
+                    "SC_PAGE_SIZE": 4096,
+                }[name],
+            ),
+        ):
+            cpu, ram = self.executor._process_usage(process)  # type: ignore[arg-type]
+        self.assertAlmostEqual(cpu, 0.1)
+        self.assertEqual(ram, 7 * 4096)
+
+    @unittest.skipIf(os.name == "nt", "Linux /proc semantics")
+    def test_malformed_atomic_stat_still_fails_closed(self) -> None:
+        process = type("MalformedProcess", (), {"pid": 4321})()
+        with (
+            patch.object(Path, "read_text", return_value="4321 malformed"),
+            self.assertRaisesRegex(
+                TaskExecutionError, "cannot enforce child CPU/RAM budget"
+            ),
+        ):
+            self.executor._process_usage(process)  # type: ignore[arg-type]
+
     def test_fixed_pytest_argv_runs_without_shell(self) -> None:
         target = self.root / "tests" / "test_fixed.py"
         target.write_text(
@@ -478,6 +533,44 @@ class TestFixedSubprocessAndT2Staging(TaskPlanFixture):
             with self.subTest(name=name):
                 with self.assertRaisesRegex(TaskExecutionError, message):
                     self.execute(selected)
+
+    def test_measurement_failure_kills_and_reaps_the_child(self) -> None:
+        relative = "tests/test_measurement.py"
+        (self.root / relative).write_text(
+            "import time\ndef test_wait():\n    time.sleep(5)\n", encoding="utf-8"
+        )
+        selected = plan(
+            6180,
+            TaskAction(
+                "pytest-measurement",
+                TaskActionKind.RUN_TEST,
+                path=relative,
+                argv=(sys.executable, "-m", "pytest", relative, "-q"),
+            ),
+            risk=RiskTier.T1,
+            verifier=VerifierKind.PYTEST_PASS,
+            selected_budget=budget(timeout=10.0),
+        )
+        spawned = []
+        real_popen = __import__("subprocess").Popen
+
+        def recording_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        with (
+            patch("cogni_flow.task_plan.subprocess.Popen", side_effect=recording_popen),
+            patch.object(
+                TaskPlanExecutor,
+                "_process_usage",
+                side_effect=TaskExecutionError("cannot measure child"),
+            ),
+            self.assertRaisesRegex(TaskExecutionError, "cannot measure child"),
+        ):
+            self.execute(selected)
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].poll())
 
     def test_t2_stages_inert_self_harness_proposal_without_source_mutation(
         self,

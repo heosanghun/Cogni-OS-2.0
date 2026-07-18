@@ -59,6 +59,26 @@ class TestOperatorSelfHarnessE2E(unittest.TestCase):
             raise AssertionError("fixture did not produce a candidate evaluation")
         return service.candidate_evaluations[-1]
 
+    @staticmethod
+    def _rechain(directory, events, mutate, *, run_id=None):
+        ledger = SelfHarnessE2ELedger(directory)
+        previous = "0" * 64
+        selected_run_id = events[0].run_id if run_id is None else run_id
+        for index, original in enumerate(events):
+            payload = dict(original.payload)
+            mutate(index, payload)
+            event = SelfHarnessE2EEventV1.create(
+                run_id=selected_run_id,
+                sequence=original.sequence,
+                stage=original.stage,
+                previous_event_sha256=previous,
+                created_ns=original.created_ns,
+                payload=payload,
+            )
+            ledger.append(event)
+            previous = event.event_sha256
+        return ledger, selected_run_id
+
     def test_full_signed_promotion_and_byte_identical_rollback_chain(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -238,6 +258,113 @@ class TestOperatorSelfHarnessE2E(unittest.TestCase):
             )
             with self.assertRaises(SelfHarnessE2EError):
                 SelfHarnessE2ELedger(tampered_dir).events(prepared.run_id)
+
+    def test_recomputed_cross_field_tamper_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture, clock, private, verifier, service = self._build(root)
+            with service:
+                evaluation = self._evaluation(fixture, service, clock)
+                ledger = SelfHarnessE2ELedger(root / ".operator-e2e")
+                operator = OperatorSelfHarnessE2E(service, ledger)
+                prepared = operator.prepare(
+                    evaluation.evaluation_id,
+                    run_nonce="operator_e2e_cross_field_nonce_012345",
+                )
+                operator.promote(
+                    prepared.run_id,
+                    _signed_approval(private, verifier, evaluation),
+                )
+                record = service.journal.records()[-1]
+                operator.rollback(
+                    prepared.run_id,
+                    _signed_rollback(private, verifier, service, record),
+                )
+                events = ledger.events(prepared.run_id)
+
+            def replace_first(field, value):
+                def mutate(index, payload):
+                    if index == 0:
+                        payload[field] = value
+
+                return mutate
+
+            def replace_nested(index_to_change, field, value):
+                def mutate(index, payload):
+                    if index == index_to_change:
+                        record_payload = dict(payload["journal_record"])
+                        record_payload[field] = value
+                        payload["journal_record"] = record_payload
+
+                return mutate
+
+            original_mode = events[2].payload["journal_record"]["file_mode"]
+            changed_mode = 0 if original_mode != 0 else 1
+            cases = (
+                (replace_first("target_before_sha256", "f" * 64), None),
+                (replace_first("regression_result_sha256", "e" * 64), None),
+                (
+                    replace_first(
+                        "candidate_proposal_ids",
+                        ["1" * 64, "2" * 64, "3" * 64],
+                    ),
+                    None,
+                ),
+                (
+                    replace_first(
+                        "candidate_replacement_sha256",
+                        ["4" * 64, "5" * 64, "6" * 64],
+                    ),
+                    None,
+                ),
+                (replace_nested(1, "status", "rolled_back"), None),
+                (replace_nested(2, "file_mode", changed_mode), None),
+                (
+                    lambda index, payload: (
+                        payload.__setitem__("health_returncode", 99)
+                        if index == 1
+                        else None
+                    ),
+                    None,
+                ),
+                (lambda _index, _payload: None, "1" * 32),
+            )
+            for index, (mutate, run_id) in enumerate(cases):
+                with self.subTest(case=index):
+                    altered, altered_run_id = self._rechain(
+                        root / f".altered-{index}",
+                        events,
+                        mutate,
+                        run_id=run_id,
+                    )
+                    with self.assertRaises(SelfHarnessE2EError):
+                        validate_self_harness_e2e(altered, altered_run_id, verifier)
+
+    def test_new_run_is_rejected_before_crossing_hard_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture, clock, _, _, service = self._build(root)
+            with service:
+                evaluation = self._evaluation(fixture, service, clock)
+                source = SelfHarnessE2ELedger(root / ".source")
+                first = OperatorSelfHarnessE2E(service, source).prepare(
+                    evaluation.evaluation_id,
+                    run_nonce="operator_e2e_bound_first_nonce_0123456",
+                )
+
+            bounded = SelfHarnessE2ELedger(root / ".bounded", max_runs=1)
+            bounded.append(first)
+            second = SelfHarnessE2EEventV1.create(
+                run_id="1" * 32,
+                sequence=1,
+                stage="evaluation_ready",
+                previous_event_sha256="0" * 64,
+                created_ns=first.created_ns,
+                payload=first.payload,
+            )
+            with self.assertRaisesRegex(SelfHarnessE2EError, "hard run bound"):
+                bounded.append(second)
+            self.assertEqual(bounded.events(), (first,))
 
     def test_proposal_only_mode_cannot_construct_operator_orchestrator(self):
         with tempfile.TemporaryDirectory() as tmp:

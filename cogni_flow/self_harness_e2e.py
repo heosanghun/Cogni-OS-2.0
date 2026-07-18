@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import stat
+from threading import RLock
 from time import time_ns
 from typing import Any, Mapping
 
@@ -165,50 +166,59 @@ class SelfHarnessE2ELedger:
             raise ValueError("operator E2E run bound is invalid")
         self.directory = Path(directory)
         self.max_runs = max_runs
+        self._lock = RLock()
         self.directory.mkdir(parents=True, exist_ok=True)
         _require_directory(self.directory)
 
     def events(self, run_id: str | None = None) -> tuple[SelfHarnessE2EEventV1, ...]:
-        _require_directory(self.directory)
-        events: list[SelfHarnessE2EEventV1] = []
-        observed_run_ids: set[str] = set()
-        entries = sorted(os.scandir(self.directory), key=lambda item: item.name)
-        if len(entries) > self.max_runs * 3:
-            raise SelfHarnessE2EError("operator E2E ledger crossed its event bound")
-        for entry in entries:
-            item_stat = entry.stat(follow_symlinks=False)
-            attributes = getattr(item_stat, "st_file_attributes", 0)
-            if (
-                entry.is_symlink()
-                or attributes & _FILE_ATTRIBUTE_REPARSE_POINT
-                or not stat.S_ISREG(item_stat.st_mode)
-                or not entry.name.endswith(".json")
-            ):
-                raise SelfHarnessE2EError(
-                    "operator E2E ledger contains an invalid entry"
-                )
-            raw = _read_bounded(Path(entry.path))
-            data = _strict_json(raw)
-            event = SelfHarnessE2EEventV1.from_mapping(data)
-            expected_name = f"{event.run_id}-{event.sequence:02d}.json"
-            if (
-                entry.name != expected_name
-                or canonical_json_bytes(asdict(event)) != raw
-            ):
-                raise SelfHarnessE2EError(
-                    "operator E2E event filename/canonical form is invalid"
-                )
-            observed_run_ids.add(event.run_id)
-            if run_id is None or event.run_id == run_id:
-                events.append(event)
-        if len(observed_run_ids) > self.max_runs:
-            raise SelfHarnessE2EError("operator E2E ledger crossed its hard bound")
-        selected = tuple(sorted(events, key=lambda item: (item.run_id, item.sequence)))
-        if run_id is not None and selected:
-            if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
-                raise SelfHarnessE2EError("operator E2E run id is invalid")
-            _validate_chain(selected)
-        return selected
+        with self._lock:
+            _require_directory(self.directory)
+            events: list[SelfHarnessE2EEventV1] = []
+            observed_run_ids: set[str] = set()
+            entries = sorted(os.scandir(self.directory), key=lambda item: item.name)
+            if len(entries) > self.max_runs * 3:
+                raise SelfHarnessE2EError("operator E2E ledger crossed its event bound")
+            for entry in entries:
+                item_stat = entry.stat(follow_symlinks=False)
+                attributes = getattr(item_stat, "st_file_attributes", 0)
+                if (
+                    entry.is_symlink()
+                    or attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+                    or not stat.S_ISREG(item_stat.st_mode)
+                    or not entry.name.endswith(".json")
+                ):
+                    raise SelfHarnessE2EError(
+                        "operator E2E ledger contains an invalid entry"
+                    )
+                raw = _read_bounded(Path(entry.path))
+                data = _strict_json(raw)
+                event = SelfHarnessE2EEventV1.from_mapping(data)
+                expected_name = f"{event.run_id}-{event.sequence:02d}.json"
+                if (
+                    entry.name != expected_name
+                    or canonical_json_bytes(asdict(event)) != raw
+                ):
+                    raise SelfHarnessE2EError(
+                        "operator E2E event filename/canonical form is invalid"
+                    )
+                observed_run_ids.add(event.run_id)
+                if run_id is None or event.run_id == run_id:
+                    events.append(event)
+            if len(observed_run_ids) > self.max_runs:
+                raise SelfHarnessE2EError("operator E2E ledger crossed its hard bound")
+            selected = tuple(
+                sorted(events, key=lambda item: (item.run_id, item.sequence))
+            )
+            if run_id is None:
+                for observed in sorted(observed_run_ids):
+                    _validate_chain(
+                        tuple(item for item in selected if item.run_id == observed)
+                    )
+            elif selected:
+                if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
+                    raise SelfHarnessE2EError("operator E2E run id is invalid")
+                _validate_chain(selected)
+            return selected
 
     def consume_run_nonce(self, nonce: str, evaluation_id: str) -> str:
         if not isinstance(nonce, str) or _NONCE.fullmatch(nonce) is None:
@@ -225,15 +235,28 @@ class SelfHarnessE2ELedger:
         return run_id
 
     def append(self, event: SelfHarnessE2EEventV1) -> None:
-        existing = self.events(event.run_id)
-        expected_sequence = len(existing) + 1
-        if event.sequence != expected_sequence:
-            raise SelfHarnessE2EError("operator E2E append sequence is invalid")
-        expected_previous = _ZERO_DIGEST if not existing else existing[-1].event_sha256
-        if event.previous_event_sha256 != expected_previous:
-            raise SelfHarnessE2EError("operator E2E append chain is invalid")
-        target = self.directory / f"{event.run_id}-{event.sequence:02d}.json"
-        _write_exclusive(target, canonical_json_bytes(asdict(event)))
+        if not isinstance(event, SelfHarnessE2EEventV1):
+            raise TypeError("event must be a SelfHarnessE2EEventV1")
+        with self._lock:
+            all_events = self.events()
+            run_ids = {item.run_id for item in all_events}
+            existing = tuple(item for item in all_events if item.run_id == event.run_id)
+            if existing:
+                _validate_chain(existing)
+            elif len(run_ids) >= self.max_runs:
+                raise SelfHarnessE2EError(
+                    "operator E2E ledger reached its hard run bound"
+                )
+            expected_sequence = len(existing) + 1
+            if event.sequence != expected_sequence:
+                raise SelfHarnessE2EError("operator E2E append sequence is invalid")
+            expected_previous = (
+                _ZERO_DIGEST if not existing else existing[-1].event_sha256
+            )
+            if event.previous_event_sha256 != expected_previous:
+                raise SelfHarnessE2EError("operator E2E append chain is invalid")
+            target = self.directory / f"{event.run_id}-{event.sequence:02d}.json"
+            _write_exclusive(target, canonical_json_bytes(asdict(event)))
 
 
 class OperatorSelfHarnessE2E:
@@ -465,8 +488,31 @@ def validate_self_harness_e2e(
     _validate_chain(chain)
     first = chain[0]
     evaluation = CandidateEvaluationV1.from_mapping(first.payload["evaluation"])
-    if evaluation.runner_evidence_sha256 != first.payload["runner_attestation_sha256"]:
-        raise SelfHarnessE2EError("E2E runner attestation binding is invalid")
+    expected_run_id = sha256(first.payload["run_nonce"].encode("ascii")).hexdigest()[
+        :32
+    ]
+    if first.run_id != expected_run_id:
+        raise SelfHarnessE2EError("E2E run id is not nonce-bound")
+    first_bindings = {
+        "source_before_sha256": evaluation.source_surface_sha256,
+        "target_before_sha256": evaluation.base_sha256,
+        "runner_attestation_sha256": evaluation.runner_evidence_sha256,
+        "regression_result_sha256": evaluation.result_sha256,
+    }
+    for field, expected in first_bindings.items():
+        if first.payload[field] != expected:
+            raise SelfHarnessE2EError(f"E2E {field} binding is invalid")
+    if evaluation.returncode != 0:
+        raise SelfHarnessE2EError("E2E evaluation is not a zero-exit pass")
+    if not evaluation.completed_ns <= first.created_ns < evaluation.expires_ns:
+        raise SelfHarnessE2EError("E2E evaluation timeline is invalid")
+    if evaluation.proposal_id not in first.payload["candidate_proposal_ids"]:
+        raise SelfHarnessE2EError("E2E selected proposal is absent from candidates")
+    if (
+        evaluation.replacement_sha256
+        not in first.payload["candidate_replacement_sha256"]
+    ):
+        raise SelfHarnessE2EError("E2E selected replacement is absent from candidates")
     terminal = chain[-1].stage
     if len(chain) >= 2:
         promotion = chain[1]
@@ -485,8 +531,12 @@ def validate_self_harness_e2e(
         if approval_id != promotion.payload["approval_id"]:
             raise SelfHarnessE2EError("E2E approval identity is invalid")
         promotion_record = BackupRecord(**dict(promotion.payload["journal_record"]))
+        _validate_backup_record(promotion_record)
         if (
-            promotion_record.before_sha256 != evaluation.base_sha256
+            promotion_record.relative_path != evaluation.relative_path
+            or promotion_record.created_ns < promotion.payload["operation_started_ns"]
+            or promotion_record.created_ns > promotion.created_ns
+            or promotion_record.before_sha256 != evaluation.base_sha256
             or promotion_record.after_sha256 != evaluation.replacement_sha256
         ):
             raise SelfHarnessE2EError("E2E promotion journal is not evaluation-bound")
@@ -494,16 +544,22 @@ def validate_self_harness_e2e(
             raise SelfHarnessE2EError("E2E health command binding is invalid")
         if promotion.stage == "promotion_committed" and (
             promotion.payload["health_passed"] is not True
+            or promotion.payload["health_returncode"] != 0
             or promotion.payload["byte_restore_verified"] is not False
             or promotion.payload["target_live_sha256"] != promotion_record.after_sha256
+            or promotion_record.status != "committed"
         ):
             raise SelfHarnessE2EError("E2E committed promotion evidence is invalid")
         if promotion.stage == "promotion_health_restore":
             if (
                 promotion.payload["health_passed"] is not False
+                or promotion.payload["health_returncode"] == 0
                 or promotion.payload["byte_restore_verified"] is not True
                 or promotion.payload["target_live_sha256"]
                 != promotion_record.before_sha256
+                or promotion.payload["source_after_sha256"]
+                != first.payload["source_before_sha256"]
+                or promotion_record.status != "rolled_back"
             ):
                 raise SelfHarnessE2EError(
                     "E2E promotion health-failure restore is invalid"
@@ -520,6 +576,21 @@ def validate_self_harness_e2e(
             rollback.payload["authorization"]
         )
         promotion_record = BackupRecord(**dict(chain[1].payload["journal_record"]))
+        rollback_record = BackupRecord(**dict(rollback.payload["journal_record"]))
+        _validate_backup_record(rollback_record)
+        for field in (
+            "record_id",
+            "relative_path",
+            "before_sha256",
+            "after_sha256",
+            "backup_file",
+            "file_mode",
+            "created_ns",
+        ):
+            if getattr(rollback_record, field) != getattr(promotion_record, field):
+                raise SelfHarnessE2EError(
+                    f"E2E rollback journal changed immutable {field}"
+                )
         authorization_id = approval_verifier.verify_rollback(
             authorization,
             journal_record_id=promotion_record.record_id,
@@ -552,14 +623,18 @@ def validate_self_harness_e2e(
             raise SelfHarnessE2EError("E2E rollback byte restoration is invalid")
         if rollback.stage == "rollback_completed" and (
             rollback.payload["health_passed"] is not True
+            or rollback.payload["health_returncode"] != 0
             or rollback.payload["source_final_sha256"]
             != first.payload["source_before_sha256"]
+            or rollback_record.status != "operator_rolled_back"
         ):
             raise SelfHarnessE2EError("E2E completed rollback is not source-identical")
         if rollback.stage == "rollback_health_restore" and (
             rollback.payload["health_passed"] is not False
+            or rollback.payload["health_returncode"] == 0
             or rollback.payload["source_final_sha256"]
             != chain[1].payload["source_after_sha256"]
+            or rollback_record.status != "committed"
         ):
             raise SelfHarnessE2EError("E2E rejected rollback restore is invalid")
     return SelfHarnessE2EValidationResult(
@@ -831,6 +906,31 @@ def _digest(value: object, label: str) -> str:
     if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
         raise SelfHarnessE2EError(f"{label} must be a lowercase SHA-256 digest")
     return value
+
+
+def _validate_backup_record(record: BackupRecord) -> None:
+    if (
+        not isinstance(record.record_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", record.record_id) is None
+        or record.backup_file != f"{record.record_id}.bak"
+    ):
+        raise SelfHarnessE2EError("E2E journal record identity is invalid")
+    _digest(record.before_sha256, "journal before")
+    _digest(record.after_sha256, "journal after")
+    if (
+        not isinstance(record.file_mode, int)
+        or isinstance(record.file_mode, bool)
+        or not 0 <= record.file_mode <= 0o777
+    ):
+        raise SelfHarnessE2EError("E2E journal file mode is invalid")
+    if (
+        not isinstance(record.created_ns, int)
+        or isinstance(record.created_ns, bool)
+        or record.created_ns < 1
+    ):
+        raise SelfHarnessE2EError("E2E journal creation time is invalid")
+    if record.status not in {"committed", "rolled_back", "operator_rolled_back"}:
+        raise SelfHarnessE2EError("E2E journal status is invalid")
 
 
 def _record_root(records: tuple[object, ...]) -> str:

@@ -266,6 +266,10 @@ class TestCogniBoardUI(unittest.TestCase):
 
         self.assertIn("ragAnswerIntegrationReady: false", script)
         self.assertIn("rag.answer_integration === true", script)
+        self.assertIn(
+            'rag.answer_integration_schema === "cogni.agent.retrieval-evidence.v1"',
+            script,
+        )
         self.assertIn("|| !ui.ragAnswerIntegrationReady", script)
         self.assertIn("&& ui.ragAnswerIntegrationReady", script)
         self.assertIn('return "인덱스 전용"', script)
@@ -448,6 +452,56 @@ class TestCogniBoardUI(unittest.TestCase):
             "const sourceIdentity = parseCanonicalRagSourceId(item.source_id)",
             script,
         )
+        self.assertIn(
+            "const provenance = normalizedRetrievalProvenance(item.provenance, sourceIdentity)",
+            script,
+        )
+        self.assertIn("if (!sourceIdentity || !provenance) return", script)
+        self.assertIn("function normalizedRetrievalProvenance", script)
+        self.assertIn(
+            'value.retrieval_mode !== "lexical_only"',
+            script,
+        )
+        self.assertIn("value.semantic_embedding !== false", script)
+        self.assertIn(
+            'value.answer_integration_schema !== "cogni.agent.retrieval-evidence.v1"',
+            script,
+        )
+        self.assertIn(
+            "value.selected_excerpt_chars < value.indexed_excerpt_chars", script
+        )
+        self.assertIn(
+            "value.selected_excerpt_sha256 !== value.indexed_excerpt_sha256",
+            script,
+        )
+        provenance_keys_start = script.index("const RAG_PROVENANCE_EXACT_KEYS")
+        provenance_keys_end = script.index("].sort());", provenance_keys_start)
+        provenance_keys = set(
+            re.findall(
+                r'"([a-z0-9_]+)"',
+                script[provenance_keys_start:provenance_keys_end],
+            )
+        )
+        self.assertEqual(
+            provenance_keys,
+            {
+                "answer_integration_schema",
+                "embedding",
+                "indexed_excerpt_chars",
+                "indexed_excerpt_sha256",
+                "prompt_excerpt_chars",
+                "prompt_excerpt_representation",
+                "prompt_excerpt_sha256",
+                "repository",
+                "retrieval_mode",
+                "revision",
+                "selected_excerpt_chars",
+                "selected_excerpt_sha256",
+                "selected_excerpt_truncated",
+                "semantic_embedding",
+                "source_sha256",
+            },
+        )
         self.assertIn("chunkIndex > 127", script)
         normalization_start = script.index("function normalizedRetrievalSources")
         normalization_end = script.index(
@@ -462,6 +516,10 @@ class TestCogniBoardUI(unittest.TestCase):
             "title.textContent = `[근거 ${source.number}] ${source.title}`", script
         )
         self.assertIn("sourcesList.replaceChildren(fragment)", script)
+        self.assertIn("source.provenance.retrievalMode", script)
+        self.assertIn("source.provenance.selectedExcerptChars", script)
+        self.assertIn("source.provenance.indexedExcerptChars", script)
+        self.assertIn("selected excerpt truncated", script)
         self.assertNotRegex(script, r"\.innerHTML\b|insertAdjacentHTML")
 
     def test_rag_evidence_drawer_is_exact_integrity_checked_and_accessible(
@@ -503,6 +561,19 @@ class TestCogniBoardUI(unittest.TestCase):
             script,
         )
         self.assertIn('button.dataset.action = "rag-evidence-open"', script)
+        self.assertIn(
+            "button.dataset.expectedExcerptSha256 = "
+            "source.provenance.indexedExcerptSha256",
+            script,
+        )
+        self.assertIn(
+            'const expectedExcerptSha256 = trigger.dataset.expectedExcerptSha256 || ""',
+            script,
+        )
+        self.assertIn(
+            "candidate.expectedExcerptSha256 === identity.expectedExcerptSha256",
+            script,
+        )
         self.assertIn(
             "document.createTextNode(text.slice(cursor, match.index))", script
         )
@@ -563,6 +634,10 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("const documentLocationValid = (", script)
         self.assertIn("const pdfLocationValid = (", script)
         self.assertIn("if (!documentLocationValid && !pdfLocationValid)", script)
+        self.assertIn(
+            "exactSource.excerptSha256 !== source.expectedExcerptSha256", script
+        )
+        self.assertIn('ragSourceError("RAG_SOURCE_INTEGRITY_FAILED")', script)
         self.assertIn(
             "!/^[a-z0-9.+-]+\\/[a-z0-9.+-]+$/.test(payload.media_type)", script
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 from threading import Event
 from time import monotonic, sleep
@@ -18,6 +19,7 @@ from cogni_agent.manager import (
     AgentBusyError,
     AgentManager,
     RetrievalEvidence,
+    RetrievalProvenance,
     safe_quality_fallback,
 )
 from cogni_agent.fact_grounding import RuntimeFactGrounder
@@ -586,6 +588,145 @@ class TestAgentManager(unittest.TestCase):
         self.assertNotIn("절대 UI", repr(assistant["sources"]))
         self.assertEqual(state["completion"]["generation_mode"], "cogni_core_rag")
         self.assertTrue(state["completion"]["rag_used"])
+
+    def test_retrieval_snapshot_preserves_immutable_origin_provenance(self) -> None:
+        service = _ScriptedService([("감사된 로컬 근거입니다 [근거 1].", "stop")])
+        manager = self.manager(service)
+        provenance = RetrievalProvenance(
+            repository="https://github.com/heosanghun/AkasicDB.git",
+            revision="a6c8e8ebd487e7cb86079f9804a66aaf0914d1dc",
+            retrieval_mode="lexical_only",
+            embedding="stable_sha256_lexical_sketch_v1",
+            semantic_embedding=False,
+            answer_integration_schema="cogni.agent.retrieval-evidence.v1",
+            source_sha256="a" * 64,
+            indexed_excerpt_sha256=sha256("원문 근거".encode()).hexdigest(),
+            indexed_excerpt_chars=len("원문 근거"),
+        )
+        evidence = (
+            RetrievalEvidence(
+                "security-1",
+                "보안 정책",
+                "원문 근거",
+                0.75,
+                provenance,
+            ),
+        )
+
+        manager.start_turn("정책을 설명해 주세요.", evidence=evidence)
+        state = _wait(manager)
+
+        source = state["conversation"][-1]["sources"][0]
+        self.assertEqual(
+            source["provenance"],
+            {
+                **provenance.as_payload(),
+                "selected_excerpt_sha256": sha256("원문 근거".encode()).hexdigest(),
+                "selected_excerpt_chars": len("원문 근거"),
+                "selected_excerpt_truncated": False,
+                "prompt_excerpt_sha256": sha256("원문 근거".encode()).hexdigest(),
+                "prompt_excerpt_chars": len("원문 근거"),
+                "prompt_excerpt_representation": "xml_entity_escaped_v1",
+            },
+        )
+        self.assertNotIn("원문 근거", repr(source))
+
+    def test_retrieval_provenance_rejects_semantic_overclaim(self) -> None:
+        with self.assertRaisesRegex(ValueError, "lexical retrieval"):
+            RetrievalProvenance(
+                repository="https://github.com/heosanghun/AkasicDB.git",
+                revision="a6c8e8ebd487e7cb86079f9804a66aaf0914d1dc",
+                retrieval_mode="lexical_only",
+                embedding="stable_sha256_lexical_sketch_v1",
+                semantic_embedding=True,
+                answer_integration_schema="cogni.agent.retrieval-evidence.v1",
+                source_sha256="a" * 64,
+                indexed_excerpt_sha256="b" * 64,
+                indexed_excerpt_chars=1,
+            )
+
+    def test_prompt_trimming_keeps_full_indexed_excerpt_digest_unambiguous(
+        self,
+    ) -> None:
+        service = _ScriptedService([("사용되지 않음", "stop")])
+        service.tokenizer = _CountingTokenizer()
+        service.max_input_tokens = 1_800
+        manager = self.manager(service)
+        provenance = RetrievalProvenance(
+            repository="https://github.com/heosanghun/AkasicDB.git",
+            revision="a6c8e8ebd487e7cb86079f9804a66aaf0914d1dc",
+            retrieval_mode="lexical_only",
+            embedding="stable_sha256_lexical_sketch_v1",
+            semantic_embedding=False,
+            answer_integration_schema="cogni.agent.retrieval-evidence.v1",
+            source_sha256="a" * 64,
+            indexed_excerpt_sha256=sha256(("가" * 1_600).encode()).hexdigest(),
+            indexed_excerpt_chars=1_600,
+        )
+        evidence = (
+            RetrievalEvidence("doc-1", "긴 근거", "가" * 1_600, 0.9, provenance),
+        )
+
+        selected = manager._fit_retrieval_evidence_to_prompt(
+            "핵심은 무엇인가요?",
+            evidence,
+            partial_assistant=None,
+            system_prompt=manager.system_prompt,
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertLess(len(selected[0].text), len(evidence[0].text))
+        self.assertIs(selected[0].provenance, provenance)
+        metadata = manager._retrieval_source_metadata(selected)[0]["provenance"]
+        self.assertEqual(
+            metadata["indexed_excerpt_sha256"],
+            sha256(("가" * 1_600).encode()).hexdigest(),
+        )
+        self.assertEqual(
+            metadata["selected_excerpt_sha256"],
+            sha256(selected[0].text.encode()).hexdigest(),
+        )
+        self.assertEqual(metadata["selected_excerpt_chars"], len(selected[0].text))
+        self.assertTrue(metadata["selected_excerpt_truncated"])
+        self.assertEqual(
+            metadata["prompt_excerpt_sha256"],
+            sha256(selected[0].text.encode()).hexdigest(),
+        )
+        self.assertEqual(metadata["prompt_excerpt_chars"], len(selected[0].text))
+        self.assertEqual(
+            metadata["prompt_excerpt_representation"], "xml_entity_escaped_v1"
+        )
+
+    def test_prompt_excerpt_provenance_hashes_the_actual_entity_escaped_text(
+        self,
+    ) -> None:
+        raw = "근거 & <태그> [인용]"
+        escaped = "근거 &amp; &lt;태그&gt; &#91;인용&#93;"
+        provenance = RetrievalProvenance(
+            repository="https://github.com/heosanghun/AkasicDB.git",
+            revision="a6c8e8ebd487e7cb86079f9804a66aaf0914d1dc",
+            retrieval_mode="lexical_only",
+            embedding="stable_sha256_lexical_sketch_v1",
+            semantic_embedding=False,
+            answer_integration_schema="cogni.agent.retrieval-evidence.v1",
+            source_sha256="a" * 64,
+            indexed_excerpt_sha256=sha256(raw.encode()).hexdigest(),
+            indexed_excerpt_chars=len(raw),
+        )
+        evidence = (RetrievalEvidence("doc-1", "title", raw, 0.9, provenance),)
+
+        metadata = AgentManager._retrieval_source_metadata(evidence)[0]["provenance"]
+        context = AgentManager._retrieval_user_context("질문", evidence)
+
+        self.assertIn(escaped, context)
+        self.assertEqual(
+            metadata["selected_excerpt_sha256"], sha256(raw.encode()).hexdigest()
+        )
+        self.assertEqual(metadata["selected_excerpt_chars"], len(raw))
+        self.assertEqual(
+            metadata["prompt_excerpt_sha256"], sha256(escaped.encode()).hexdigest()
+        )
+        self.assertEqual(metadata["prompt_excerpt_chars"], len(escaped))
 
     def test_retrieval_override_survives_repair_and_continuation_prompts(self) -> None:
         evidence = (RetrievalEvidence("doc-1", "설계", "핵심은 고정 경계다."),)

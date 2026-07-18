@@ -84,6 +84,9 @@ MAX_RETRIEVAL_TITLE_CHARS = 160
 MAX_RETRIEVAL_CHUNK_CHARS = 1_600
 MAX_RETRIEVAL_TOTAL_CHARS = 6_000
 MAX_RETRIEVAL_FALLBACK_PROMPT_CHARS = 1_200
+# Exact in-process wiring contract only.  This identifier is not a signature,
+# attestation, or independent claim that retrieval quality is semantic.
+RETRIEVAL_EVIDENCE_SCHEMA = "cogni.agent.retrieval-evidence.v1"
 HARD_MAX_REQUEST_TOKENS = 512
 HARD_MAX_TOTAL_TOKENS = 1_536
 HARD_MAX_CONTINUATIONS = 2
@@ -479,6 +482,77 @@ class ResponseBudget:
 
 
 @dataclass(frozen=True, slots=True)
+class RetrievalProvenance:
+    """Immutable origin metadata for one answer-bearing retrieval excerpt."""
+
+    repository: str
+    revision: str
+    retrieval_mode: str
+    embedding: str
+    semantic_embedding: bool
+    answer_integration_schema: str
+    source_sha256: str
+    indexed_excerpt_sha256: str
+    indexed_excerpt_chars: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.repository, str)
+            or re.fullmatch(
+                r"https://github\.com/[A-Za-z0-9_.-]{1,64}/"
+                r"[A-Za-z0-9_.-]{1,128}(?:\.git)?",
+                self.repository,
+            )
+            is None
+        ):
+            raise ValueError("retrieval repository must be a bounded GitHub URL")
+        if (
+            not isinstance(self.revision, str)
+            or re.fullmatch(r"[0-9a-f]{40}", self.revision) is None
+        ):
+            raise ValueError("retrieval revision must be a full commit digest")
+        if self.retrieval_mode != "lexical_only":
+            raise ValueError("retrieval mode is not an admitted lexical profile")
+        if (
+            not isinstance(self.embedding, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", self.embedding) is None
+        ):
+            raise ValueError("retrieval embedding profile is invalid")
+        if self.semantic_embedding is not False:
+            raise ValueError("lexical retrieval cannot claim a semantic embedding")
+        if self.answer_integration_schema != RETRIEVAL_EVIDENCE_SCHEMA:
+            raise ValueError("retrieval answer integration schema is invalid")
+        for label, digest in (
+            ("source", self.source_sha256),
+            ("indexed excerpt", self.indexed_excerpt_sha256),
+        ):
+            if (
+                not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise ValueError(f"retrieval {label} digest must be SHA-256")
+        if (
+            not isinstance(self.indexed_excerpt_chars, int)
+            or isinstance(self.indexed_excerpt_chars, bool)
+            or not 1 <= self.indexed_excerpt_chars <= MAX_RETRIEVAL_CHUNK_CHARS
+        ):
+            raise ValueError("indexed excerpt character count is invalid")
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "repository": self.repository,
+            "revision": self.revision,
+            "retrieval_mode": self.retrieval_mode,
+            "embedding": self.embedding,
+            "semantic_embedding": self.semantic_embedding,
+            "answer_integration_schema": self.answer_integration_schema,
+            "source_sha256": self.source_sha256,
+            "indexed_excerpt_sha256": self.indexed_excerpt_sha256,
+            "indexed_excerpt_chars": self.indexed_excerpt_chars,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RetrievalEvidence:
     """One bounded, untrusted local-retrieval excerpt for a chat turn."""
 
@@ -486,6 +560,7 @@ class RetrievalEvidence:
     title: str
     text: str
     score: float | None = None
+    provenance: RetrievalProvenance | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -514,6 +589,19 @@ class RetrievalEvidence:
             or not 0.0 <= float(self.score) <= 1.0
         ):
             raise ValueError("score must be finite and lie in [0, 1]")
+        if self.provenance is not None and not isinstance(
+            self.provenance, RetrievalProvenance
+        ):
+            raise TypeError("provenance must be RetrievalProvenance or None")
+        if self.provenance is not None:
+            if len(self.text) > self.provenance.indexed_excerpt_chars:
+                raise ValueError("delivered retrieval text exceeds its indexed excerpt")
+            if (
+                len(self.text) == self.provenance.indexed_excerpt_chars
+                and hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+                != self.provenance.indexed_excerpt_sha256
+            ):
+                raise ValueError("full delivered retrieval text changed after indexing")
 
 
 def _validate_retrieval_text(value: str, *, label: str, maximum: int) -> None:
@@ -525,6 +613,18 @@ def _validate_retrieval_text(value: str, *, label: str, maximum: int) -> None:
         for character in value
     ):
         raise ValueError(f"retrieval {label} contains unsupported controls")
+
+
+def _escape_retrieval_prompt_text(value: str) -> str:
+    """Apply the exact entity transform used inside ``reference_data``."""
+
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("[", "&#91;")
+        .replace("]", "&#93;")
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -591,6 +691,8 @@ _UI_CAPABILITY_NAMES = (
 
 class AgentManager:
     """Own one bounded conversational turn and expose immutable UI snapshots."""
+
+    RETRIEVAL_EVIDENCE_SCHEMA = RETRIEVAL_EVIDENCE_SCHEMA
 
     def __init__(
         self,
@@ -3384,6 +3486,7 @@ class AgentManager:
                     title=item.title,
                     text=bounded_text,
                     score=item.score,
+                    provenance=item.provenance,
                 )
                 if fits((*selected, bounded)):
                     best = bounded
@@ -3418,8 +3521,10 @@ class AgentManager:
     def _retrieval_source_metadata(
         evidence: tuple[RetrievalEvidence, ...],
     ) -> tuple[dict[str, Any], ...]:
-        return tuple(
-            {
+        sources: list[dict[str, Any]] = []
+        for number, item in enumerate(evidence, start=1):
+            prompt_excerpt = _escape_retrieval_prompt_text(item.text)
+            source = {
                 "number": number,
                 "source_id": item.source_id,
                 "title": item.title,
@@ -3428,29 +3533,43 @@ class AgentManager:
                     if item.score is not None
                     else {}
                 ),
+                **(
+                    {
+                        "provenance": {
+                            **item.provenance.as_payload(),
+                            "selected_excerpt_sha256": hashlib.sha256(
+                                item.text.encode("utf-8")
+                            ).hexdigest(),
+                            "selected_excerpt_chars": len(item.text),
+                            "selected_excerpt_truncated": (
+                                len(item.text) < item.provenance.indexed_excerpt_chars
+                            ),
+                            "prompt_excerpt_sha256": hashlib.sha256(
+                                prompt_excerpt.encode("utf-8")
+                            ).hexdigest(),
+                            "prompt_excerpt_chars": len(prompt_excerpt),
+                            "prompt_excerpt_representation": ("xml_entity_escaped_v1"),
+                        }
+                    }
+                    if item.provenance is not None
+                    else {}
+                ),
             }
-            for number, item in enumerate(evidence, start=1)
-        )
+            sources.append(source)
+        return tuple(sources)
 
     @staticmethod
     def _retrieval_user_context(
         message: str,
         evidence: tuple[RetrievalEvidence, ...],
     ) -> str:
-        def escaped(value: str) -> str:
-            return (
-                value.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-                .replace("[", "&#91;")
-                .replace("]", "&#93;")
-            )
-
         references = []
         for number, item in enumerate(evidence, start=1):
             references.append(
-                f"[근거 {number}]\nsource_id: {escaped(item.source_id)}\n"
-                f"title: {escaped(item.title)}\ntext:\n{escaped(item.text)}"
+                f"[근거 {number}]\nsource_id: "
+                f"{_escape_retrieval_prompt_text(item.source_id)}\n"
+                f"title: {_escape_retrieval_prompt_text(item.title)}\ntext:\n"
+                f"{_escape_retrieval_prompt_text(item.text)}"
             )
         return (
             '<reference_data trust="untrusted" authority="none">\n'

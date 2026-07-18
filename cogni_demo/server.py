@@ -46,9 +46,15 @@ from cogni_demo.protocol import (
     validate_terminal_metrics,
 )
 from cogni_demo.workspace_capabilities import (
+    AKASICDB_AUDITED_REVISION,
+    AKASICDB_REPOSITORY,
     MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_BASE64_CHARS,
     MAX_INDEXED_TEXT_CHARS,
+    RAG_ANSWER_INTEGRATION_SCHEMA,
+    RAG_EMBEDDING_PROFILE,
+    RAG_QUERY_SCHEMA_VERSION,
+    RAG_RETRIEVAL_MODE,
     WorkspaceCapabilityError,
     WorkspaceCapabilityService,
     web_policy_from_environment,
@@ -197,6 +203,25 @@ _RAG_SOURCE_MEDIA_TYPES = frozenset(
         "text/markdown",
         "text/plain",
     }
+)
+_RAG_QUERY_RESPONSE_KEYS = frozenset(
+    {
+        "schema_version",
+        "engine",
+        "repository",
+        "revision",
+        "retrieval_mode",
+        "embedding",
+        "semantic_embedding",
+        "answer_integration",
+        "answer_integration_schema",
+        "query",
+        "results",
+        "count",
+    }
+)
+_RAG_QUERY_RESULT_KEYS = frozenset(
+    (_RAG_SOURCE_RESPONSE_KEYS - {"schema_version"}) | {"source_sha256", "score"}
 )
 
 _ACTIVE_STATUSES = {"starting", "running", "cancelling"}
@@ -369,6 +394,90 @@ def _rag_source_payload_is_valid(
         isinstance(page_number, int)
         and not isinstance(page_number, bool)
         and 1 <= page_number <= 128
+    )
+
+
+def _admitted_product_retrieval_identity(item: object) -> tuple[str, int] | None:
+    """Return the canonical source identity only for exact product authority."""
+
+    from cogni_agent.manager import RetrievalEvidence, RetrievalProvenance
+
+    if type(item) is not RetrievalEvidence:
+        return None
+    source_id = item.source_id
+    match = re.fullmatch(r"([0-9a-f]{24})\.(0|[1-9][0-9]{0,2})", source_id)
+    if match is None:
+        return None
+    attachment_id = match.group(1)
+    chunk_index = int(match.group(2))
+    if chunk_index >= 128:
+        return None
+    provenance = item.provenance
+    selected_text = item.text
+    if (
+        type(provenance) is not RetrievalProvenance
+        or provenance.repository != AKASICDB_REPOSITORY
+        or provenance.revision != AKASICDB_AUDITED_REVISION
+        or provenance.retrieval_mode != RAG_RETRIEVAL_MODE
+        or provenance.embedding != RAG_EMBEDDING_PROFILE
+        or provenance.semantic_embedding is not False
+        or provenance.answer_integration_schema != RAG_ANSWER_INTEGRATION_SCHEMA
+        or re.fullmatch(r"[0-9a-f]{64}", provenance.source_sha256) is None
+        or not provenance.source_sha256.startswith(attachment_id)
+        or re.fullmatch(r"[0-9a-f]{64}", provenance.indexed_excerpt_sha256) is None
+        or type(provenance.indexed_excerpt_chars) is not int
+        or not 1 <= provenance.indexed_excerpt_chars <= MAX_RAG_EVIDENCE_CHUNK_CHARS
+        or not isinstance(selected_text, str)
+        or not 1 <= len(selected_text) <= provenance.indexed_excerpt_chars
+        or (
+            len(selected_text) == provenance.indexed_excerpt_chars
+            and sha256(selected_text.encode("utf-8")).hexdigest()
+            != provenance.indexed_excerpt_sha256
+        )
+    ):
+        return None
+    return attachment_id, chunk_index
+
+
+def _product_retrieval_evidence_matches_current_source(
+    item: object, workspace_service: object | None
+) -> bool:
+    """Bind an answer citation to the workspace's current exact source snapshot."""
+
+    identity = _admitted_product_retrieval_identity(item)
+    if identity is None or workspace_service is None:
+        return False
+    authority_reader = getattr(workspace_service, "current_rag_source_authority", None)
+    if not callable(authority_reader):
+        return False
+    attachment_id, chunk_index = identity
+    try:
+        authority = authority_reader(attachment_id, chunk_index)
+    except (OSError, TypeError, ValueError, WorkspaceCapabilityError):
+        return False
+    if not isinstance(authority, dict) or set(authority) != {
+        "source",
+        "source_sha256",
+    }:
+        return False
+    current = authority["source"]
+    current_source_sha256 = authority["source_sha256"]
+    if not _rag_source_payload_is_valid(
+        current,
+        attachment_id=attachment_id,
+        chunk_index=chunk_index,
+    ):
+        return False
+    provenance = item.provenance
+    current_text = current["text"]
+    return bool(
+        isinstance(current_source_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", current_source_sha256) is not None
+        and current_source_sha256 == provenance.source_sha256
+        and current["name"] == item.title
+        and current["excerpt_sha256"] == provenance.indexed_excerpt_sha256
+        and len(current_text) == provenance.indexed_excerpt_chars
+        and current_text.startswith(item.text)
     )
 
 
@@ -2038,9 +2147,22 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 raise ComputeBusyError("validation or evolution owns local compute")
             if type(retrieval_requested) is not bool:
                 raise TypeError("retrieval_requested must be a bool")
-            if retrieval_requested and image_content is not None:
+            if type(evidence) is not tuple:
+                raise TypeError("evidence must be an immutable tuple")
+            effective_retrieval = retrieval_requested or bool(evidence)
+            if effective_retrieval and image_content is not None:
                 raise ValueError("retrieval and image content are mutually exclusive")
-            if retrieval_requested:
+            if evidence:
+                # Product callers may bypass the HTTP adapter.  Do not let
+                # unprovenanced generic AgentManager evidence acquire the
+                # answer-bearing RAG authority at this boundary, including
+                # when the caller omits ``retrieval_requested``.
+                for item in evidence:
+                    if not _product_retrieval_evidence_matches_current_source(
+                        item, self.workspace_service
+                    ):
+                        raise ValueError("retrieval evidence lacks admitted provenance")
+            if effective_retrieval:
                 return self.agent_manager.start_turn(
                     message,
                     mode,
@@ -2054,8 +2176,6 @@ class DemoHTTPServer(ThreadingHTTPServer):
                     evidence=evidence,
                     image_content=image_content,
                 )
-            if evidence:
-                return self.agent_manager.start_turn(message, mode, evidence=evidence)
             return self.agent_manager.start_turn(message, mode)
 
     def transcribe_voice(
@@ -2622,10 +2742,13 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                     )
                     return
                 try:
+                    rag_query = message.strip()[:MAX_RAG_QUERY_CHARS]
                     retrieved = self.server.workspace_service.query_rag(
-                        message.strip()[:MAX_RAG_QUERY_CHARS], limit=5
+                        rag_query, limit=5
                     )
-                    evidence = self._retrieval_evidence(retrieved)
+                    evidence = self._retrieval_evidence(
+                        retrieved, expected_query=rag_query
+                    )
                 except WorkspaceCapabilityError as exc:
                     self._workspace_error(exc)
                     return
@@ -2960,23 +3083,45 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
         self._json_error(HTTPStatus.BAD_REQUEST, code)
 
     @staticmethod
-    def _retrieval_evidence(payload: object) -> tuple[Any, ...]:
+    def _retrieval_evidence(payload: object, *, expected_query: str) -> tuple[Any, ...]:
         """Validate the local adapter response before it can enter a prompt."""
 
-        from cogni_agent.manager import RetrievalEvidence
+        from cogni_agent.manager import RetrievalEvidence, RetrievalProvenance
 
-        if not isinstance(payload, dict):
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != _RAG_QUERY_RESPONSE_KEYS
+            or type(payload.get("schema_version")) is not int
+            or payload.get("schema_version") != RAG_QUERY_SCHEMA_VERSION
+            or payload.get("engine") != "AkasicDB"
+            or payload.get("repository") != AKASICDB_REPOSITORY
+            or payload.get("revision") != AKASICDB_AUDITED_REVISION
+            or payload.get("retrieval_mode") != RAG_RETRIEVAL_MODE
+            or payload.get("embedding") != RAG_EMBEDDING_PROFILE
+            or payload.get("semantic_embedding") is not False
+            or payload.get("answer_integration") is not True
+            or payload.get("answer_integration_schema") != RAG_ANSWER_INTEGRATION_SCHEMA
+            or payload.get("query") != expected_query
+        ):
             raise WorkspaceCapabilityError(
-                "WORKSPACE_RESPONSE_INVALID", "RAG response must be an object"
+                "WORKSPACE_RESPONSE_INVALID",
+                "RAG response provenance is invalid",
             )
         results = payload.get("results")
-        if not isinstance(results, list) or len(results) > 12:
+        count = payload.get("count")
+        if (
+            not isinstance(results, list)
+            or len(results) > 12
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count != len(results)
+        ):
             raise WorkspaceCapabilityError(
                 "WORKSPACE_RESPONSE_INVALID", "RAG results are invalid"
             )
-        candidates: list[tuple[str, int, str, str, float]] = []
+        candidates: list[tuple[str, int, str, str, float, str, str]] = []
         for item in results:
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or set(item) != _RAG_QUERY_RESULT_KEYS:
                 raise WorkspaceCapabilityError(
                     "WORKSPACE_RESPONSE_INVALID", "RAG result is invalid"
                 )
@@ -2985,6 +3130,8 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             title = item.get("name")
             text = item.get("text")
             score = item.get("score")
+            source_sha256 = item.get("source_sha256")
+            excerpt_sha256 = item.get("excerpt_sha256")
             if (
                 not isinstance(attachment_id, str)
                 or re.fullmatch(r"[0-9a-f]{24}", attachment_id) is None
@@ -3005,9 +3152,32 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 or not isinstance(score, (int, float))
                 or isinstance(score, bool)
                 or not isfinite(float(score))
+                or not isinstance(source_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
+                or not isinstance(excerpt_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", excerpt_sha256) is None
+                or excerpt_sha256 != sha256(text.encode("utf-8")).hexdigest()
+                or not source_sha256.startswith(attachment_id)
             ):
                 raise WorkspaceCapabilityError(
                     "WORKSPACE_RESPONSE_INVALID", "RAG result fields are invalid"
+                )
+            source_payload = {
+                "schema_version": 2,
+                **{
+                    key: item[key]
+                    for key in _RAG_SOURCE_RESPONSE_KEYS
+                    if key != "schema_version"
+                },
+            }
+            if not _rag_source_payload_is_valid(
+                source_payload,
+                attachment_id=attachment_id,
+                chunk_index=chunk_index,
+            ):
+                raise WorkspaceCapabilityError(
+                    "WORKSPACE_RESPONSE_INVALID",
+                    "RAG result provenance is invalid",
                 )
             numeric_score = float(score)
             if numeric_score <= 0.0:
@@ -3016,16 +3186,30 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 raise WorkspaceCapabilityError(
                     "WORKSPACE_RESPONSE_INVALID", "RAG score is invalid"
                 )
-            candidates.append((attachment_id, chunk_index, title, text, numeric_score))
-            if len(candidates) >= MAX_RAG_EVIDENCE_CHUNKS:
-                break
-
+            candidates.append(
+                (
+                    attachment_id,
+                    chunk_index,
+                    title,
+                    text,
+                    numeric_score,
+                    source_sha256,
+                    excerpt_sha256,
+                )
+            )
         evidence: list[Any] = []
         remaining_chars = MAX_RAG_EVIDENCE_CHARS
-        for index, (attachment_id, chunk_index, title, text, score) in enumerate(
-            candidates
-        ):
-            remaining_slots = len(candidates) - index
+        selected_candidates = candidates[:MAX_RAG_EVIDENCE_CHUNKS]
+        for index, (
+            attachment_id,
+            chunk_index,
+            title,
+            text,
+            score,
+            source_sha256,
+            excerpt_sha256,
+        ) in enumerate(selected_candidates):
+            remaining_slots = len(selected_candidates) - index
             text_limit = min(
                 MAX_RAG_EVIDENCE_CHUNK_CHARS,
                 remaining_chars // remaining_slots,
@@ -3033,14 +3217,29 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             bounded_text = text[:text_limit].rstrip()
             if not bounded_text:
                 continue
-            evidence.append(
-                RetrievalEvidence(
-                    source_id=f"{attachment_id}.{chunk_index}",
-                    title=title,
-                    text=bounded_text,
-                    score=score,
-                )
+            selected = RetrievalEvidence(
+                source_id=f"{attachment_id}.{chunk_index}",
+                title=title,
+                text=bounded_text,
+                score=score,
+                provenance=RetrievalProvenance(
+                    repository=AKASICDB_REPOSITORY,
+                    revision=AKASICDB_AUDITED_REVISION,
+                    retrieval_mode=RAG_RETRIEVAL_MODE,
+                    embedding=RAG_EMBEDDING_PROFILE,
+                    semantic_embedding=False,
+                    answer_integration_schema=RAG_ANSWER_INTEGRATION_SCHEMA,
+                    source_sha256=source_sha256,
+                    indexed_excerpt_sha256=excerpt_sha256,
+                    indexed_excerpt_chars=len(text),
+                ),
             )
+            if _admitted_product_retrieval_identity(selected) is None:
+                raise WorkspaceCapabilityError(
+                    "WORKSPACE_RESPONSE_INVALID",
+                    "RAG result product authority is invalid",
+                )
+            evidence.append(selected)
             remaining_chars -= len(bounded_text)
         return tuple(evidence)
 
@@ -3112,7 +3311,11 @@ def _build_product_controls(
 
     from cogni_agent.conversation_fastpath import ConversationFastPath
     from cogni_agent.fact_grounding import RuntimeFactGrounder
-    from cogni_agent.manager import SYSTEM_PROMPT, AgentManager
+    from cogni_agent.manager import (
+        RETRIEVAL_EVIDENCE_SCHEMA,
+        SYSTEM_PROMPT,
+        AgentManager,
+    )
     from cogni_agent.model_service import (
         ModelService,
         _require_instruction_tuned_e4b,
@@ -3152,8 +3355,11 @@ def _build_product_controls(
             akasicdb_path=os.environ.get("COGNI_OS_AKASICDB_DIR") or None,
             web_policy=web_policy_from_environment(os.environ),
             lens_client=LensApiClient.from_environment(os.environ),
-            answer_integration_enabled=(
-                "evidence" in signature(AgentManager.start_turn).parameters
+            answer_integration_schema=(
+                RETRIEVAL_EVIDENCE_SCHEMA
+                if AgentManager.RETRIEVAL_EVIDENCE_SCHEMA
+                == RAG_ANSWER_INTEGRATION_SCHEMA
+                else None
             ),
         )
     except (OSError, ValueError, WorkspaceCapabilityError):

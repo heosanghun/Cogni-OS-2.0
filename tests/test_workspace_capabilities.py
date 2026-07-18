@@ -482,11 +482,17 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 indexed = service.index_attachments([admitted["attachment_id"]])
                 self.assertEqual(indexed["documents"], 1)
                 result = service.query_rag("equilibrium")
+                self.assertEqual(result["schema_version"], 2)
+                self.assertEqual(result["repository"], capabilities.AKASICDB_REPOSITORY)
+                self.assertEqual(result["revision"], AKASICDB_AUDITED_REVISION)
+                self.assertEqual(result["retrieval_mode"], "lexical_only")
+                self.assertFalse(result["semantic_embedding"])
                 self.assertEqual(result["count"], 1)
                 self.assertEqual(
                     result["results"][0]["attachment_id"], admitted["attachment_id"]
                 )
                 source = result["results"][0]
+                self.assertEqual(source["source_sha256"], admitted["sha256"])
                 self.assertEqual(source["chunk_index"], 0)
                 self.assertEqual(source["page_number"], 1)
                 self.assertEqual(source["offset_basis"], "normalized_pdf_page_text_v1")
@@ -1373,6 +1379,10 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                 normal = service.query_rag("authority evidence")
                 self.assertEqual(normal["count"], 1)
                 exact = service.preview_rag_source(attachment_id, 0)
+                authority = service.current_rag_source_authority(attachment_id, 0)
+                self.assertEqual(set(authority), {"source", "source_sha256"})
+                self.assertEqual(authority["source"], exact)
+                self.assertEqual(authority["source_sha256"], admitted["sha256"])
                 for key, value in exact.items():
                     if key != "schema_version":
                         self.assertEqual(normal["results"][0][key], value)
@@ -1594,7 +1604,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 first = service.add_attachment(
                     name="committed.md",
@@ -1641,7 +1651,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 self._assert_rag_quarantined(
                     restarted,
@@ -1662,7 +1672,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 admitted = service.add_attachment(
                     name="reindex.md",
@@ -1703,7 +1713,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 self._assert_rag_quarantined(
                     restarted,
@@ -1724,7 +1734,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 first = service.add_attachment(
                     name="delete.md",
@@ -1775,7 +1785,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 self._assert_rag_quarantined(
                     restarted,
@@ -1798,7 +1808,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 victim = service.add_attachment(
                     name="victim.md",
@@ -1854,7 +1864,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 self.assertEqual(restarted.list_attachments()["count"], 1)
                 self.assertNotIn(victim_id, restarted._attachments)
@@ -1880,7 +1890,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 first = service.add_attachment(
                     name="first.md",
@@ -2007,7 +2017,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                         project,
                         _model(),
                         akasicdb_path=clone,
-                        answer_integration_enabled=True,
+                        answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                     )
                     admitted = service.add_attachment(
                         name="marker.md",
@@ -2019,7 +2029,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                         project,
                         _model(),
                         akasicdb_path=clone,
-                        answer_integration_enabled=True,
+                        answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                     )
                     self._assert_rag_quarantined(
                         restarted,
@@ -2040,7 +2050,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 admitted = service.add_attachment(
                     name="symlink.md",
@@ -2057,7 +2067,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 self._assert_rag_quarantined(
                     restarted,
@@ -2080,7 +2090,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 admitted = service.add_attachment(
                     name="publication.md",
@@ -2130,7 +2140,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 admitted = service.add_attachment(
                     name="before-commit.md",
@@ -2175,7 +2185,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 self._assert_rag_quarantined(
                     restarted,
@@ -2196,7 +2206,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 admitted = service.add_attachment(
                     name="after-commit.md",
@@ -2239,7 +2249,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 self.assertIsNotNone(restarted.akasicdb)
                 self.assertEqual(
@@ -2260,7 +2270,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 admitted = service.add_attachment(
                     name="mismatch.md",
@@ -2278,7 +2288,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 self._assert_rag_quarantined(
                     restarted,
@@ -2299,7 +2309,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 admitted = service.add_attachment(
                     name="leftover.md",
@@ -2337,7 +2347,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 admitted = service.add_attachment(
                     name="clear.md",
@@ -2362,7 +2372,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 self.assertIsNotNone(restarted.akasicdb)
                 self.assertEqual(restarted.query_rag("clear authority")["count"], 1)
@@ -2383,7 +2393,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 admitted = service.add_attachment(
                     name="fsync-clear.md",
@@ -2414,7 +2424,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 self.assertIsNotNone(restarted.akasicdb)
                 self.assertEqual(
@@ -2485,7 +2495,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     project,
                     _model(),
                     akasicdb_path=clone,
-                    answer_integration_enabled=True,
+                    answer_integration_schema=capabilities.RAG_ANSWER_INTEGRATION_SCHEMA,
                 )
                 admitted = service.add_attachment(
                     name="paper.md",
@@ -2497,7 +2507,15 @@ class TestWorkspaceCapabilities(unittest.TestCase):
             self.assertTrue(service.capability_payload()["rag"]["answer_integration"])
             self.assertTrue(indexed["answer_integration"])
             self.assertTrue(queried["answer_integration"])
+            self.assertEqual(queried["schema_version"], 2)
+            self.assertEqual(queried["repository"], capabilities.AKASICDB_REPOSITORY)
+            self.assertEqual(queried["revision"], AKASICDB_AUDITED_REVISION)
+            self.assertEqual(queried["retrieval_mode"], "lexical_only")
+            self.assertFalse(queried["semantic_embedding"])
             self.assertEqual(queried["embedding"], "stable_sha256_lexical_sketch_v1")
+            rag = service.capability_payload()["rag"]
+            self.assertEqual(rag["license_status"], "unverified_no_license_file")
+            self.assertFalse(rag["redistribution_authorized"])
 
 
 if __name__ == "__main__":

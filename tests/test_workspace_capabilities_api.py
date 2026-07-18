@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from cogni_demo.server import (
     DemoHTTPServer,
+    DemoRequestHandler,
     MAX_AGENT_CHAT_REQUEST_BODY_BYTES,
     MAX_INDEXED_TEXT_CHARS,
     MAX_REQUEST_BODY_BYTES,
@@ -26,6 +27,7 @@ class _Evidence:
     title: str
     text: str
     score: float | None = None
+    provenance: object | None = None
 
 
 class _Agent:
@@ -160,10 +162,45 @@ class _Workspace:
     def query_rag(self, query, *, limit=5):
         self.queries.append(query)
         results = self.rag_results
+        if isinstance(results, list):
+            enriched = []
+            for item in results[:limit]:
+                selected = dict(item)
+                text = selected.get("text")
+                if isinstance(text, str):
+                    selected.setdefault(
+                        "excerpt_sha256", sha256(text.encode()).hexdigest()
+                    )
+                    selected.setdefault("char_start", 0)
+                    selected.setdefault("char_end", len(text))
+                attachment_id = selected.get("attachment_id")
+                selected.setdefault(
+                    "source_sha256",
+                    (
+                        attachment_id + "b" * 40
+                        if isinstance(attachment_id, str) and len(attachment_id) == 24
+                        else "b" * 64
+                    ),
+                )
+                selected.setdefault("media_type", "text/markdown")
+                selected.setdefault("representation", "normalized_extracted_excerpt_v1")
+                selected.setdefault("page_number", None)
+                selected.setdefault("offset_basis", "normalized_document_text_v1")
+                enriched.append(selected)
+            results = enriched
         return {
+            "schema_version": 2,
+            "engine": "AkasicDB",
+            "repository": "https://github.com/heosanghun/AkasicDB.git",
+            "revision": "a6c8e8ebd487e7cb86079f9804a66aaf0914d1dc",
+            "retrieval_mode": "lexical_only",
+            "embedding": "stable_sha256_lexical_sketch_v1",
+            "semantic_embedding": False,
+            "answer_integration": True,
+            "answer_integration_schema": "cogni.agent.retrieval-evidence.v1",
             "query": query,
             "count": len(results) if isinstance(results, list) else 0,
-            "results": results[:limit] if isinstance(results, list) else results,
+            "results": results,
         }
 
     def preview_rag_source(self, attachment_id, chunk_index):
@@ -172,20 +209,49 @@ class _Workspace:
             raise self.raise_source
         if self.source_payload is not None:
             return self.source_payload
-        text = "검증된 로컬 검색 근거"
+        selected = None
+        if isinstance(self.rag_results, list):
+            selected = next(
+                (
+                    item
+                    for item in self.rag_results
+                    if item.get("attachment_id") == attachment_id
+                    and item.get("chunk_index") == chunk_index
+                ),
+                None,
+            )
+        selected = selected or {
+            "name": "paper.md",
+            "media_type": "text/markdown",
+            "text": "검증된 로컬 검색 근거",
+            "representation": "normalized_extracted_excerpt_v1",
+            "page_number": None,
+            "char_start": 0,
+            "offset_basis": "normalized_document_text_v1",
+        }
+        text = selected["text"]
+        char_start = selected.get("char_start", 0)
         return {
             "schema_version": 2,
             "attachment_id": attachment_id,
             "chunk_index": chunk_index,
-            "name": "paper.md",
-            "media_type": "text/markdown",
+            "name": selected.get("name", "paper.md"),
+            "media_type": selected.get("media_type", "text/markdown"),
             "text": text,
-            "representation": "normalized_extracted_excerpt_v1",
-            "page_number": None,
-            "char_start": 4,
-            "char_end": 4 + len(text),
-            "offset_basis": "normalized_document_text_v1",
+            "representation": selected.get(
+                "representation", "normalized_extracted_excerpt_v1"
+            ),
+            "page_number": selected.get("page_number"),
+            "char_start": char_start,
+            "char_end": char_start + len(text),
+            "offset_basis": selected.get("offset_basis", "normalized_document_text_v1"),
             "excerpt_sha256": sha256(text.encode()).hexdigest(),
+        }
+
+    def current_rag_source_authority(self, attachment_id, chunk_index):
+        return {
+            "source": self.preview_rag_source(attachment_id, chunk_index),
+            "source_sha256": attachment_id + "b" * 40,
         }
 
     def select_model(self, model_id):
@@ -707,6 +773,19 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         self.assertEqual(len(self.agent.evidence), 1)
         self.assertTrue(self.agent.retrieval_requested)
         self.assertEqual(self.agent.evidence[0].source_id, f"{'a' * 24}.0")
+        provenance = self.agent.evidence[0].provenance
+        self.assertEqual(provenance.retrieval_mode, "lexical_only")
+        self.assertFalse(provenance.semantic_embedding)
+        self.assertEqual(provenance.source_sha256, "a" * 24 + "b" * 40)
+        self.assertEqual(
+            provenance.answer_integration_schema,
+            "cogni.agent.retrieval-evidence.v1",
+        )
+        self.assertEqual(provenance.indexed_excerpt_chars, len("검증된 로컬 검색 근거"))
+        self.assertEqual(
+            provenance.indexed_excerpt_sha256,
+            sha256("검증된 로컬 검색 근거".encode()).hexdigest(),
+        )
 
         self.workspace.rag_results = []
         with patch.object(manager_module, "RetrievalEvidence", _Evidence, create=True):
@@ -754,6 +833,262 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"]["code"], "WORKSPACE_RESPONSE_INVALID")
         self.assertNotIn("secret", json.dumps(payload))
+
+    def test_rag_chat_rejects_non_answer_bearing_query_envelope(self) -> None:
+        original = self.workspace.query_rag
+
+        def query_without_answer_authority(query, *, limit=5):
+            payload = original(query, limit=limit)
+            payload["answer_integration"] = False
+            return payload
+
+        self.workspace.query_rag = query_without_answer_authority
+        status, payload = self._post(
+            "/api/agent/chat",
+            {"message": "권한 없는 근거", "mode": "chat", "rag": True},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "WORKSPACE_RESPONSE_INVALID")
+
+    def test_rag_chat_rejects_mismatched_or_ambiguous_query_envelopes(self) -> None:
+        original = self.workspace.query_rag
+
+        def mismatched_query(query, *, limit=5):
+            payload = original(query, limit=limit)
+            payload["query"] = query + " altered"
+            return payload
+
+        def mismatched_count(query, *, limit=5):
+            payload = original(query, limit=limit)
+            payload["count"] += 1
+            return payload
+
+        def extra_envelope_key(query, *, limit=5):
+            payload = original(query, limit=limit)
+            payload["semantic_score"] = 1.0
+            return payload
+
+        def extra_result_key(query, *, limit=5):
+            payload = original(query, limit=limit)
+            payload["results"][0]["semantic_score"] = 1.0
+            return payload
+
+        def boolean_schema_version(query, *, limit=5):
+            payload = original(query, limit=limit)
+            payload["schema_version"] = True
+            return payload
+
+        def floating_schema_version(query, *, limit=5):
+            payload = original(query, limit=limit)
+            payload["schema_version"] = 2.0
+            return payload
+
+        for malformed in (
+            mismatched_query,
+            mismatched_count,
+            extra_envelope_key,
+            extra_result_key,
+            boolean_schema_version,
+            floating_schema_version,
+        ):
+            with (
+                self.subTest(malformed=malformed.__name__),
+                patch.object(self.workspace, "query_rag", side_effect=malformed),
+            ):
+                status, payload = self._post(
+                    "/api/agent/chat",
+                    {"message": "엄격한 근거", "mode": "chat", "rag": True},
+                )
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"]["code"], "WORKSPACE_RESPONSE_INVALID")
+
+    def test_product_rag_boundary_rejects_unprovenanced_internal_evidence(self) -> None:
+        unprovenanced = _Evidence(
+            source_id="a" * 24 + ".0",
+            title="untrusted",
+            text="generic manager evidence",
+            score=1.0,
+        )
+        with self.assertRaisesRegex(ValueError, "admitted provenance"):
+            self.server.start_agent_turn(
+                "internal caller",
+                "chat",
+                evidence=(unprovenanced,),
+                retrieval_requested=True,
+            )
+        with self.assertRaisesRegex(ValueError, "admitted provenance"):
+            self.server.start_agent_turn(
+                "default flag bypass",
+                "chat",
+                evidence=(unprovenanced,),
+            )
+        self.assertEqual(self.agent.evidence, ())
+
+        turn_id = self.server.start_agent_turn(
+            "no local hit",
+            "chat",
+            evidence=(),
+            retrieval_requested=True,
+        )
+        self.assertEqual(turn_id, "turn-rag")
+        self.assertTrue(self.agent.retrieval_requested)
+
+    def test_product_rag_boundary_rejects_forged_exact_shape_provenance(self) -> None:
+        from cogni_agent.manager import RetrievalEvidence, RetrievalProvenance
+        from cogni_demo.workspace_capabilities import (
+            AKASICDB_AUDITED_REVISION,
+            AKASICDB_REPOSITORY,
+            RAG_ANSWER_INTEGRATION_SCHEMA,
+            RAG_EMBEDDING_PROFILE,
+        )
+
+        attachment_id = "a" * 24
+        text = "검증된 로컬 검색 근거"
+        common = {
+            "retrieval_mode": "lexical_only",
+            "semantic_embedding": False,
+            "answer_integration_schema": RAG_ANSWER_INTEGRATION_SCHEMA,
+            "source_sha256": attachment_id + "b" * 40,
+            "indexed_excerpt_chars": len(text),
+        }
+        forged = (
+            RetrievalProvenance(
+                repository="https://github.com/attacker/AkasicDB.git",
+                revision=AKASICDB_AUDITED_REVISION,
+                embedding=RAG_EMBEDDING_PROFILE,
+                indexed_excerpt_sha256=sha256(text.encode()).hexdigest(),
+                **common,
+            ),
+            RetrievalProvenance(
+                repository=AKASICDB_REPOSITORY,
+                revision="f" * 40,
+                embedding=RAG_EMBEDDING_PROFILE,
+                indexed_excerpt_sha256=sha256(text.encode()).hexdigest(),
+                **common,
+            ),
+            RetrievalProvenance(
+                repository=AKASICDB_REPOSITORY,
+                revision=AKASICDB_AUDITED_REVISION,
+                embedding="forged_lexical_profile",
+                indexed_excerpt_sha256=sha256(text.encode()).hexdigest(),
+                **common,
+            ),
+            RetrievalProvenance(
+                repository=AKASICDB_REPOSITORY,
+                revision=AKASICDB_AUDITED_REVISION,
+                embedding=RAG_EMBEDDING_PROFILE,
+                indexed_excerpt_sha256=sha256(text.encode()).hexdigest(),
+                **{
+                    **common,
+                    "source_sha256": attachment_id + "c" * 40,
+                },
+            ),
+        )
+        for provenance in forged:
+            evidence = RetrievalEvidence(
+                source_id=f"{attachment_id}.0",
+                title="paper.md",
+                text=text,
+                score=1.0,
+                provenance=provenance,
+            )
+            with (
+                self.subTest(
+                    repository=provenance.repository,
+                    revision=provenance.revision,
+                    embedding=provenance.embedding,
+                    digest=provenance.indexed_excerpt_sha256,
+                ),
+                self.assertRaisesRegex(ValueError, "admitted provenance"),
+            ):
+                self.server.start_agent_turn(
+                    "forged internal caller",
+                    "chat",
+                    evidence=(evidence,),
+                )
+
+        forged_digest = RetrievalProvenance(
+            repository=AKASICDB_REPOSITORY,
+            revision=AKASICDB_AUDITED_REVISION,
+            embedding=RAG_EMBEDDING_PROFILE,
+            indexed_excerpt_sha256="c" * 64,
+            **common,
+        )
+        truncated = RetrievalEvidence(
+            source_id=f"{attachment_id}.0",
+            title="paper.md",
+            text=text[:-1],
+            score=1.0,
+            provenance=forged_digest,
+        )
+        with self.assertRaisesRegex(ValueError, "admitted provenance"):
+            self.server.start_agent_turn(
+                "forged digest",
+                "chat",
+                evidence=(truncated,),
+                retrieval_requested=True,
+            )
+        self.assertEqual(self.agent.evidence, ())
+
+    def test_product_rag_boundary_rechecks_current_source_snapshot(self) -> None:
+        query = self.workspace.query_rag("검증된 로컬", limit=5)
+        evidence = DemoRequestHandler._retrieval_evidence(
+            query,
+            expected_query="검증된 로컬",
+        )
+        self.assertEqual(len(evidence), 1)
+        attachment_id = "a" * 24
+        original = self.workspace.preview_rag_source(attachment_id, 0)
+        changed_text = "재색인 후 변경된 근거"
+        self.workspace.source_payload = {
+            **original,
+            "text": changed_text,
+            "char_end": original["char_start"] + len(changed_text),
+            "excerpt_sha256": sha256(changed_text.encode()).hexdigest(),
+        }
+        with self.assertRaisesRegex(ValueError, "admitted provenance"):
+            self.server.start_agent_turn(
+                "stale citation",
+                "chat",
+                evidence=evidence,
+            )
+
+        self.workspace.source_payload = None
+        self.server.workspace_service = None
+        with self.assertRaisesRegex(ValueError, "admitted provenance"):
+            self.server.start_agent_turn(
+                "missing authority service",
+                "chat",
+                evidence=evidence,
+                retrieval_requested=True,
+            )
+        self.assertEqual(self.agent.evidence, ())
+
+    def test_rag_evidence_validates_all_results_before_selecting_first_five(
+        self,
+    ) -> None:
+        self.workspace.rag_results = [
+            {
+                "attachment_id": f"{index + 1:024x}",
+                "chunk_index": index,
+                "name": f"paper-{index}.md",
+                "text": f"evidence {index}",
+                "score": 0.9,
+            }
+            for index in range(6)
+        ]
+        payload = self.workspace.query_rag("all results", limit=12)
+        evidence = DemoRequestHandler._retrieval_evidence(
+            payload, expected_query="all results"
+        )
+        self.assertEqual(len(evidence), 5)
+
+        payload["results"][5]["unexpected"] = True
+        with self.assertRaises(WorkspaceCapabilityError) as captured:
+            DemoRequestHandler._retrieval_evidence(
+                payload, expected_query="all results"
+            )
+        self.assertEqual(captured.exception.code, "WORKSPACE_RESPONSE_INVALID")
 
     def test_workspace_routes_are_503_when_service_is_absent(self) -> None:
         self.server.workspace_service = None

@@ -78,6 +78,11 @@ RAG_VECTOR_DIMENSIONS = 256
 RAG_CHUNK_CHARS = 1_600
 RAG_CHUNK_OVERLAP_CHARS = 200
 RAG_EXCERPT_REPRESENTATION = "normalized_extracted_excerpt_v1"
+RAG_QUERY_SCHEMA_VERSION = 2
+RAG_RETRIEVAL_MODE = "lexical_only"
+RAG_EMBEDDING_PROFILE = "stable_sha256_lexical_sketch_v1"
+# Explicit in-process wiring contract; not cryptographic attestation.
+RAG_ANSWER_INTEGRATION_SCHEMA = "cogni.agent.retrieval-evidence.v1"
 MAX_WEB_ALLOWLIST_HOSTS = 32
 MAX_LOCAL_MODEL_REGISTRY_ENTRIES = 64
 MAX_LOCAL_MODEL_CANDIDATES = 16
@@ -2002,10 +2007,17 @@ class AkasicDBAdapter:
             "integration": "external_pinned_core_adapter",
             "storage_lifetime": "process_memory",
             "restart_recovery": "persistent_catalog_rebuild",
-            "embedding": "stable_sha256_lexical_sketch_v1",
+            "retrieval_mode": RAG_RETRIEVAL_MODE,
+            "embedding": RAG_EMBEDDING_PROFILE,
+            "semantic_embedding": False,
             "documents": self.document_count,
             "chunks": self.chunk_count,
-            "license_claim": "MIT_README_BADGE",
+            "license_status": (
+                "license_file_present_unreviewed"
+                if license_file
+                else "unverified_no_license_file"
+            ),
+            "redistribution_authorized": False,
             "license_file_present": license_file,
             "source_vendored": False,
         }
@@ -2354,7 +2366,7 @@ class WorkspaceCapabilityService:
         akasicdb_path: str | Path | None = None,
         web_policy: WebAccessPolicy | None = None,
         lens_client: LensApiClient | None = None,
-        answer_integration_enabled: bool = False,
+        answer_integration_schema: str | None = None,
     ) -> None:
         root = Path(project_root).resolve(strict=True)
         if not root.is_dir():
@@ -2371,9 +2383,12 @@ class WorkspaceCapabilityService:
         }
         self.web_policy = web_policy or WebAccessPolicy()
         self.lens_client = lens_client or LensApiClient.from_environment({})
-        if not isinstance(answer_integration_enabled, bool):
-            raise TypeError("answer_integration_enabled must be bool")
-        self.answer_integration_enabled = answer_integration_enabled
+        if answer_integration_schema not in (None, RAG_ANSWER_INTEGRATION_SCHEMA):
+            raise ValueError("answer integration schema is not admitted")
+        self.answer_integration_schema = answer_integration_schema
+        self.answer_integration_enabled = (
+            answer_integration_schema == RAG_ANSWER_INTEGRATION_SCHEMA
+        )
         self.storage_root = _prepare_storage_root(root)
         self.catalog_path = self.storage_root.parent / _CATALOG_FILENAME
         self.rag_quarantine_path = self.storage_root.parent / _RAG_QUARANTINE_FILENAME
@@ -2592,6 +2607,7 @@ class WorkspaceCapabilityService:
             rag = {
                 "state": "unavailable",
                 "answer_integration": False,
+                "answer_integration_schema": None,
                 "error": {
                     "code": self.akasicdb_error[0],
                     "message": self.akasicdb_error[1],
@@ -2603,6 +2619,7 @@ class WorkspaceCapabilityService:
             rag = {
                 "state": "local_index_ready",
                 "answer_integration": self.answer_integration_enabled,
+                "answer_integration_schema": self.answer_integration_schema,
                 "query_api": True,
                 **self.akasicdb.status_payload(),
             }
@@ -3365,6 +3382,7 @@ class WorkspaceCapabilityService:
             "documents": self.akasicdb.document_count,
             "chunks": self.akasicdb.chunk_count,
             "answer_integration": self.answer_integration_enabled,
+            "answer_integration_schema": self.answer_integration_schema,
         }
 
     def reindex_attachments(self, attachment_ids: list[str]) -> dict[str, object]:
@@ -3475,6 +3493,7 @@ class WorkspaceCapabilityService:
             "documents": self.akasicdb.document_count,
             "chunks": self.akasicdb.chunk_count,
             "answer_integration": self.answer_integration_enabled,
+            "answer_integration_schema": self.answer_integration_schema,
         }
 
     def query_rag(self, query: str, *, limit: int = 5) -> dict[str, object]:
@@ -3557,12 +3576,24 @@ class WorkspaceCapabilityService:
                         "RAG_QUERY_INTEGRITY_FAILED",
                         "the local RAG query result did not match its source snapshot",
                     )
-                verified_results.append({**authority, "score": float(score)})
+                verified_results.append(
+                    {
+                        **authority,
+                        "source_sha256": record.sha256,
+                        "score": float(score),
+                    }
+                )
 
             return {
+                "schema_version": RAG_QUERY_SCHEMA_VERSION,
                 "engine": "AkasicDB",
-                "embedding": "stable_sha256_lexical_sketch_v1",
+                "repository": AKASICDB_REPOSITORY,
+                "revision": self.akasicdb.revision,
+                "retrieval_mode": RAG_RETRIEVAL_MODE,
+                "embedding": RAG_EMBEDDING_PROFILE,
+                "semantic_embedding": False,
                 "answer_integration": self.answer_integration_enabled,
+                "answer_integration_schema": self.answer_integration_schema,
                 "query": query,
                 "results": verified_results,
                 "count": len(verified_results),
@@ -3623,6 +3654,29 @@ class WorkspaceCapabilityService:
                     "the indexed source no longer matches the admitted attachment",
                 )
             return {"schema_version": 2, **snapshot.as_payload()}
+
+    def current_rag_source_authority(
+        self, attachment_id: str, chunk_index: int
+    ) -> dict[str, object]:
+        """Return product-internal source authority under one re-entrant lock.
+
+        The full attachment digest is intentionally not part of the browser
+        source-preview schema.  Product answer admission uses this method to
+        bind an evidence object to both the current indexed excerpt and the
+        current content-addressed attachment record without a TOCTOU window.
+        """
+
+        with self._lock:
+            source = self.preview_rag_source(attachment_id, chunk_index)
+            record = self._attachments.get(attachment_id)
+            if record is None or attachment_id not in self._indexed_attachment_ids:
+                raise WorkspaceCapabilityError(
+                    "RAG_SOURCE_NOT_FOUND", "the indexed source was not found"
+                )
+            return {
+                "source": source,
+                "source_sha256": record.sha256,
+            }
 
     def search_lens(
         self,
@@ -3710,7 +3764,11 @@ __all__ = [
     "MAX_PDF_EXTRACTED_CHARS",
     "MAX_PDF_PAGES",
     "MAX_RAG_RESULTS",
+    "RAG_ANSWER_INTEGRATION_SCHEMA",
+    "RAG_EMBEDDING_PROFILE",
     "RAG_EXCERPT_REPRESENTATION",
+    "RAG_QUERY_SCHEMA_VERSION",
+    "RAG_RETRIEVAL_MODE",
     "LocalModelDiscoveryRejection",
     "LocalModelDiscoveryResult",
     "VerifiedModelMetadata",

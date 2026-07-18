@@ -489,6 +489,85 @@ function parseCanonicalRagSourceId(rawSourceId) {
   });
 }
 
+const RAG_PROVENANCE_EXACT_KEYS = Object.freeze([
+  "answer_integration_schema",
+  "embedding",
+  "indexed_excerpt_chars",
+  "indexed_excerpt_sha256",
+  "prompt_excerpt_chars",
+  "prompt_excerpt_representation",
+  "prompt_excerpt_sha256",
+  "repository",
+  "retrieval_mode",
+  "revision",
+  "selected_excerpt_chars",
+  "selected_excerpt_sha256",
+  "selected_excerpt_truncated",
+  "semantic_embedding",
+  "source_sha256",
+].sort());
+// Keep static assets network-inert while still comparing the exact authority
+// returned by the loopback product API.
+const RAG_AKASICDB_REPOSITORY = [
+  "https:",
+  "",
+  "github.com",
+  "heosanghun",
+  "AkasicDB.git",
+].join("/");
+
+function normalizedRetrievalProvenance(value, sourceIdentity) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !sourceIdentity) return null;
+  const keys = Object.keys(value).sort();
+  if (
+    keys.length !== RAG_PROVENANCE_EXACT_KEYS.length
+    || keys.some((key, index) => key !== RAG_PROVENANCE_EXACT_KEYS[index])
+  ) return null;
+  if (value.repository !== RAG_AKASICDB_REPOSITORY) return null;
+  if (value.revision !== "a6c8e8ebd487e7cb86079f9804a66aaf0914d1dc") return null;
+  if (value.retrieval_mode !== "lexical_only") return null;
+  if (value.embedding !== "stable_sha256_lexical_sketch_v1") return null;
+  if (value.semantic_embedding !== false) return null;
+  if (value.answer_integration_schema !== "cogni.agent.retrieval-evidence.v1") return null;
+  if (!/^[0-9a-f]{64}$/.test(value.source_sha256)) return null;
+  if (!value.source_sha256.startsWith(sourceIdentity.attachmentId)) return null;
+  if (!/^[0-9a-f]{64}$/.test(value.indexed_excerpt_sha256)) return null;
+  if (!/^[0-9a-f]{64}$/.test(value.selected_excerpt_sha256)) return null;
+  if (!/^[0-9a-f]{64}$/.test(value.prompt_excerpt_sha256)) return null;
+  if (
+    !Number.isInteger(value.indexed_excerpt_chars)
+    || value.indexed_excerpt_chars < 1
+    || value.indexed_excerpt_chars > 1600
+    || !Number.isInteger(value.selected_excerpt_chars)
+    || value.selected_excerpt_chars < 1
+    || value.selected_excerpt_chars > value.indexed_excerpt_chars
+    || !Number.isInteger(value.prompt_excerpt_chars)
+    || value.prompt_excerpt_chars < value.selected_excerpt_chars
+    || value.prompt_excerpt_chars > 10000
+    || value.prompt_excerpt_representation !== "xml_entity_escaped_v1"
+  ) return null;
+  const truncated = value.selected_excerpt_chars < value.indexed_excerpt_chars;
+  if (value.selected_excerpt_truncated !== truncated) return null;
+  if (!truncated && value.selected_excerpt_sha256 !== value.indexed_excerpt_sha256) return null;
+  return Object.freeze({
+    repository: value.repository,
+    revision: value.revision,
+    retrievalMode: value.retrieval_mode,
+    embedding: value.embedding,
+    semanticEmbedding: false,
+    answerIntegrationSchema: value.answer_integration_schema,
+    sourceSha256: value.source_sha256,
+    indexedExcerptSha256: value.indexed_excerpt_sha256,
+    indexedExcerptChars: value.indexed_excerpt_chars,
+    selectedExcerptSha256: value.selected_excerpt_sha256,
+    selectedExcerptChars: value.selected_excerpt_chars,
+    selectedExcerptTruncated: truncated,
+    promptExcerptSha256: value.prompt_excerpt_sha256,
+    promptExcerptChars: value.prompt_excerpt_chars,
+    promptExcerptRepresentation: value.prompt_excerpt_representation,
+  });
+}
+
 function normalizedRetrievalSources(items) {
   if (!Array.isArray(items)) return [];
   const seen = new Set();
@@ -504,6 +583,8 @@ function normalizedRetrievalSources(items) {
       ? Math.max(0, Math.min(1, Number(item.score)))
       : null;
     const sourceIdentity = parseCanonicalRagSourceId(item.source_id);
+    const provenance = normalizedRetrievalProvenance(item.provenance, sourceIdentity);
+    if (!sourceIdentity || !provenance) return;
     seen.add(number);
     sources.push({
       number,
@@ -512,6 +593,7 @@ function normalizedRetrievalSources(items) {
       sourceId: sourceIdentity?.sourceId || "",
       attachmentId: sourceIdentity?.attachmentId || "",
       chunkIndex: sourceIdentity?.chunkIndex ?? null,
+      provenance,
     });
   });
   return sources;
@@ -525,6 +607,7 @@ function configureRagEvidenceButton(button, source) {
     || !Number.isInteger(source.chunkIndex)
     || source.chunkIndex < 0
     || source.chunkIndex > 127
+    || !/^[0-9a-f]{64}$/.test(source.provenance?.indexedExcerptSha256 || "")
   ) return false;
   button.type = "button";
   button.dataset.action = "rag-evidence-open";
@@ -533,6 +616,7 @@ function configureRagEvidenceButton(button, source) {
   button.dataset.chunkIndex = String(source.chunkIndex);
   button.dataset.sourceTitle = source.title;
   button.dataset.sourceScore = source.score === null ? "" : String(source.score);
+  button.dataset.expectedExcerptSha256 = source.provenance.indexedExcerptSha256;
   button.setAttribute("aria-label", `근거 ${source.number} 정규화 추출 발췌 열기: ${source.title}`);
   button.setAttribute("aria-haspopup", "dialog");
   button.setAttribute("aria-controls", "evidence-drawer-layer");
@@ -553,6 +637,7 @@ function evidenceSourceFromTrigger(trigger) {
   const rawTitle = trigger.dataset.sourceTitle || "";
   const title = rawTitle.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim().slice(0, 160);
   const rawScore = trigger.dataset.sourceScore;
+  const expectedExcerptSha256 = trigger.dataset.expectedExcerptSha256 || "";
   const parsedScore = rawScore === "" || rawScore === undefined ? null : Number(rawScore);
   if (
     !Number.isInteger(number)
@@ -562,6 +647,7 @@ function evidenceSourceFromTrigger(trigger) {
     || !Number.isInteger(chunkIndex)
     || chunkIndex < 0
     || chunkIndex > 127
+    || !/^[0-9a-f]{64}$/.test(expectedExcerptSha256)
     || !title
     || (parsedScore !== null && !Number.isFinite(parsedScore))
   ) return null;
@@ -570,6 +656,7 @@ function evidenceSourceFromTrigger(trigger) {
     title,
     attachmentId,
     chunkIndex,
+    expectedExcerptSha256,
     score: parsedScore === null ? null : Math.max(0, Math.min(1, parsedScore)),
   };
 }
@@ -712,12 +799,14 @@ function evidenceTriggerMatchesIdentity(trigger, identity) {
     || !Number.isInteger(identity.chunkIndex)
     || identity.chunkIndex < 0
     || identity.chunkIndex > 127
+    || !/^[0-9a-f]{64}$/.test(identity.expectedExcerptSha256 || "")
   ) return false;
   const candidate = evidenceSourceFromTrigger(trigger);
   return Boolean(
     candidate
     && candidate.attachmentId === identity.attachmentId
     && candidate.chunkIndex === identity.chunkIndex
+    && candidate.expectedExcerptSha256 === identity.expectedExcerptSha256
   );
 }
 
@@ -728,6 +817,7 @@ function evidenceOpenerIdentity(source, returnFocus) {
     || !Number.isInteger(source.chunkIndex)
     || source.chunkIndex < 0
     || source.chunkIndex > 127
+    || !/^[0-9a-f]{64}$/.test(source.expectedExcerptSha256 || "")
   ) return null;
   const message = (
     returnFocus instanceof HTMLElement
@@ -742,6 +832,7 @@ function evidenceOpenerIdentity(source, returnFocus) {
   return Object.freeze({
     attachmentId: source.attachmentId,
     chunkIndex: source.chunkIndex,
+    expectedExcerptSha256: source.expectedExcerptSha256,
     messageId,
   });
 }
@@ -815,6 +906,7 @@ async function openRagEvidenceSource(source, returnFocus) {
     || !Number.isInteger(source.chunkIndex)
     || source.chunkIndex < 0
     || source.chunkIndex > 127
+    || !/^[0-9a-f]{64}$/.test(source.expectedExcerptSha256 || "")
   ) return;
   if (ui.evidenceDrawerAbortController) ui.evidenceDrawerAbortController.abort();
   const requestId = ui.evidenceDrawerRequestId + 1;
@@ -854,6 +946,9 @@ async function openRagEvidenceSource(source, returnFocus) {
     );
     if (requestId !== ui.evidenceDrawerRequestId) return;
     const exactSource = normalizedExactRagSource(payload, source);
+    if (exactSource.excerptSha256 !== source.expectedExcerptSha256) {
+      throw ragSourceError("RAG_SOURCE_INTEGRITY_FAILED");
+    }
     setText("#evidence-drawer-title", exactSource.name);
     const pageLocation = exactSource.pageNumber === null
       ? "정규화 문서 텍스트"
@@ -1135,7 +1230,8 @@ function applyWorkspaceCapabilities(capabilities) {
   const lens = web.official_lens_connector || {};
   ui.ragBackendReady = rag.state === "local_index_ready";
   ui.ragAnswerIntegrationReady = ui.ragBackendReady
-    && rag.answer_integration === true;
+    && rag.answer_integration === true
+    && rag.answer_integration_schema === "cogni.agent.retrieval-evidence.v1";
   ui.imageModelIntegrationReady = attachments.image_to_model_integration === true;
   if (!ui.imageModelIntegrationReady) ui.selectedImageAttachmentId = "";
   ui.ragDocumentCount = Number.isInteger(rag.documents) ? Math.max(0, rag.documents) : 0;
@@ -3006,6 +3102,13 @@ function renderAgentConversation(messages = []) {
         if (source.attachmentId) provenance.push(`attachment_id ${source.attachmentId}`);
         if (source.chunkIndex !== null) provenance.push(`chunk_index ${source.chunkIndex}`);
         provenance.push(source.score === null ? "score 미제공" : `score ${source.score.toFixed(4)}`);
+        provenance.push(source.provenance.retrievalMode);
+        provenance.push(`revision ${source.provenance.revision.slice(0, 12)}`);
+        provenance.push(`source_sha256 ${source.provenance.sourceSha256.slice(0, 12)}…`);
+        provenance.push(
+          `selected ${source.provenance.selectedExcerptChars}/${source.provenance.indexedExcerptChars} chars`,
+        );
+        if (source.provenance.selectedExcerptTruncated) provenance.push("selected excerpt truncated");
         score.textContent = provenance.join(" · ");
         row.append(title, score);
         fragment.append(row);

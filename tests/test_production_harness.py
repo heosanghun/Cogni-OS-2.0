@@ -10,10 +10,12 @@ import torch
 
 from cogni_flow.approval import (
     APPROVAL_SCHEMA,
+    ROLLBACK_AUTHORIZATION_SCHEMA,
     ApprovalError,
     ApprovalReplayError,
     Ed25519ApprovalVerifier,
     HumanApprovalV1,
+    RollbackAuthorizationV1,
     canonical_json_bytes,
     ed25519_backend_available,
 )
@@ -226,6 +228,41 @@ def _signed_approval(private, verifier, evaluation, **overrides):
     payload.update(overrides)
     payload["signature"] = private.sign(canonical_json_bytes(payload)).hex()
     return HumanApprovalV1.from_mapping(payload)
+
+
+def _signed_rollback(private, verifier, service, record, **overrides):
+    patcher = service.harness.patcher
+    issued = max(record.created_ns, time_ns() - 1)
+    payload = {
+        "schema": ROLLBACK_AUTHORIZATION_SCHEMA,
+        "journal_record_id": record.record_id,
+        "relative_path": record.relative_path,
+        "before_sha256": record.before_sha256,
+        "after_sha256": record.after_sha256,
+        "source_surface_sha256": service._source_surface_digest(),
+        "runner_id": patcher.sandbox.runner_id,
+        "runner_evidence_sha256": patcher.sandbox.evidence_sha256,
+        "health_command_sha256": command_sha256(service.config.health_check_command),
+        "nonce": "rollback_nonce_0123456789abcdef0",
+        "approver_id": "operator.test",
+        "issued_ns": issued,
+        "expires_ns": issued + 10_000_000_000,
+        "decision": "rollback_committed_once",
+        "public_key_sha256": verifier.public_key_sha256,
+    }
+    payload.update(overrides)
+    payload["signature"] = private.sign(canonical_json_bytes(payload)).hex()
+    return RollbackAuthorizationV1.from_mapping(payload)
+
+
+def _promote_for_rollback(fixture, service, clock, private, verifier):
+    tick = fixture.submit_evidence_and_run(service, clock)
+    evaluation = service.candidate_evaluations[0]
+    approval = _signed_approval(private, verifier, evaluation)
+    result = service.promote_approved_once(tick.result.evaluation_id, approval)
+    if not result.promoted:
+        raise AssertionError("rollback fixture promotion did not commit")
+    return service.journal.records()[0]
 
 
 class TestProductionSelfHarness(unittest.TestCase):
@@ -783,6 +820,286 @@ class TestProductionSelfHarness(unittest.TestCase):
                     service.promote_approved_once(tick.result.evaluation_id, approval)
             self.assertEqual(fixture.target.read_text(encoding="utf-8"), "VALUE = 99\n")
             self.assertFalse(service.journal.records())
+
+    @unittest.skipUnless(
+        ed25519_backend_available(),
+        "optional Ed25519 backend is not functional",
+    )
+    def test_signed_operator_rollback_restores_committed_backup_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = ProductionHarnessFixture(Path(tmp))
+            private, verifier = _signing_authority(fixture.root)
+            checkpoints = []
+            clock = FakeClock()
+            config = ProductionHarnessConfig(
+                idle_seconds=1,
+                promotion_mode=PromotionMode.ATTESTED,
+                regression_command=("regression",),
+                health_check_command=("health",),
+                trusted_runner_evidence_sha256=("a" * 64,),
+            )
+            runner = FakeAttestedRunner(
+                (config.regression_command, config.health_check_command),
+                outcomes=(True, True, True),
+            )
+            service = fixture.build(
+                config,
+                clock=clock,
+                runner=runner,
+                checkpoint=lambda: checkpoints.append("checkpoint"),
+                approval_verifier=verifier,
+            )
+
+            with service:
+                record = _promote_for_rollback(
+                    fixture, service, clock, private, verifier
+                )
+                authorization = _signed_rollback(private, verifier, service, record)
+                result = service.rollback_committed_once(
+                    record.record_id,
+                    authorization,
+                )
+
+                self.assertTrue(result.rolled_back)
+                self.assertEqual(
+                    fixture.target.read_text(encoding="utf-8"), "VALUE = 1\n"
+                )
+                self.assertEqual(
+                    service.journal.records()[0].status,
+                    "operator_rolled_back",
+                )
+                self.assertEqual(service.rhythm.mode.value, "inference")
+                self.assertEqual(len(checkpoints), 3)
+                rollback_audit = [
+                    event
+                    for event in service.logdb.audit_events()
+                    if event.kind == "operator_rollback"
+                ]
+                self.assertEqual(len(rollback_audit), 1)
+                self.assertEqual(rollback_audit[0].detail, "operator_rolled_back")
+
+            self.assertEqual(
+                [item[0] for item in runner.calls],
+                [
+                    config.regression_command,
+                    config.health_check_command,
+                    config.health_check_command,
+                ],
+            )
+
+    @unittest.skipUnless(
+        ed25519_backend_available(),
+        "optional Ed25519 backend is not functional",
+    )
+    def test_operator_rollback_health_failure_reapplies_exact_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = ProductionHarnessFixture(Path(tmp))
+            private, verifier = _signing_authority(fixture.root)
+            clock = FakeClock()
+            config = ProductionHarnessConfig(
+                idle_seconds=1,
+                promotion_mode=PromotionMode.ATTESTED,
+                regression_command=("regression",),
+                health_check_command=("health",),
+                trusted_runner_evidence_sha256=("a" * 64,),
+            )
+            runner = FakeAttestedRunner(
+                (config.regression_command, config.health_check_command),
+                outcomes=(True, True, False),
+            )
+            service = fixture.build(
+                config,
+                clock=clock,
+                runner=runner,
+                approval_verifier=verifier,
+            )
+
+            with service:
+                record = _promote_for_rollback(
+                    fixture, service, clock, private, verifier
+                )
+                committed_bytes = fixture.target.read_bytes()
+                authorization = _signed_rollback(private, verifier, service, record)
+                result = service.rollback_committed_once(
+                    record.record_id,
+                    authorization,
+                )
+
+                self.assertFalse(result.rolled_back)
+                self.assertEqual(fixture.target.read_bytes(), committed_bytes)
+                self.assertEqual(service.journal.records()[0].status, "committed")
+                self.assertEqual(service.rhythm.mode.value, "inference")
+
+    @unittest.skipUnless(
+        ed25519_backend_available(),
+        "optional Ed25519 backend is not functional",
+    )
+    def test_operator_rollback_rejects_forged_expired_and_stale_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = ProductionHarnessFixture(Path(tmp))
+            private, verifier = _signing_authority(fixture.root)
+            clock = FakeClock()
+            config = ProductionHarnessConfig(
+                idle_seconds=1,
+                promotion_mode=PromotionMode.ATTESTED,
+                regression_command=("regression",),
+                health_check_command=("health",),
+                trusted_runner_evidence_sha256=("a" * 64,),
+            )
+            runner = FakeAttestedRunner(
+                (config.regression_command, config.health_check_command),
+                outcomes=(True, True),
+            )
+            service = fixture.build(
+                config,
+                clock=clock,
+                runner=runner,
+                approval_verifier=verifier,
+            )
+
+            with service:
+                record = _promote_for_rollback(
+                    fixture, service, clock, private, verifier
+                )
+                valid = _signed_rollback(private, verifier, service, record)
+                forged_payload = asdict(valid)
+                forged_payload["signature"] = "00" * 64
+                forged = RollbackAuthorizationV1.from_mapping(forged_payload)
+                with self.assertRaisesRegex(ApprovalError, "signature"):
+                    service.rollback_committed_once(record.record_id, forged)
+                expired = _signed_rollback(
+                    private,
+                    verifier,
+                    service,
+                    record,
+                    issued_ns=record.created_ns,
+                    expires_ns=record.created_ns + 1,
+                    nonce="rollback_expired_0123456789abcdef0",
+                )
+                with self.assertRaisesRegex(ApprovalError, "currently valid"):
+                    service.rollback_committed_once(record.record_id, expired)
+                stale = _signed_rollback(
+                    private,
+                    verifier,
+                    service,
+                    record,
+                    nonce="rollback_stale_0123456789abcdef000",
+                )
+                (fixture.root / "cogni_flow" / "unrelated.py").write_text(
+                    "UNCHANGED = False\n", encoding="utf-8"
+                )
+                with self.assertRaisesRegex(ApprovalError, "source_surface"):
+                    service.rollback_committed_once(record.record_id, stale)
+
+            self.assertEqual(fixture.target.read_text(encoding="utf-8"), "VALUE = 2\n")
+            self.assertEqual(service.journal.records()[0].status, "committed")
+
+    @unittest.skipUnless(
+        ed25519_backend_available(),
+        "optional Ed25519 backend is not functional",
+    )
+    def test_operator_rollback_refuses_live_bytes_outside_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = ProductionHarnessFixture(Path(tmp))
+            private, verifier = _signing_authority(fixture.root)
+            clock = FakeClock()
+            config = ProductionHarnessConfig(
+                idle_seconds=1,
+                promotion_mode=PromotionMode.ATTESTED,
+                regression_command=("regression",),
+                health_check_command=("health",),
+                trusted_runner_evidence_sha256=("a" * 64,),
+            )
+            runner = FakeAttestedRunner(
+                (config.regression_command, config.health_check_command),
+                outcomes=(True, True),
+            )
+            service = fixture.build(
+                config,
+                clock=clock,
+                runner=runner,
+                approval_verifier=verifier,
+            )
+
+            with service:
+                record = _promote_for_rollback(
+                    fixture, service, clock, private, verifier
+                )
+                authorization = _signed_rollback(private, verifier, service, record)
+                fixture.target.write_text("VALUE = 99\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    JournalIntegrityError, "committed after digest"
+                ):
+                    service.rollback_committed_once(
+                        record.record_id,
+                        authorization,
+                    )
+
+            self.assertEqual(fixture.target.read_text(encoding="utf-8"), "VALUE = 99\n")
+            self.assertEqual(service.journal.records()[0].status, "committed")
+
+    @unittest.skipUnless(
+        ed25519_backend_available(),
+        "optional Ed25519 backend is not functional",
+    )
+    def test_operator_rollback_write_fault_preserves_commit_and_burns_nonce(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = ProductionHarnessFixture(Path(tmp))
+            private, verifier = _signing_authority(fixture.root)
+            clock = FakeClock()
+            config = ProductionHarnessConfig(
+                idle_seconds=1,
+                promotion_mode=PromotionMode.ATTESTED,
+                regression_command=("regression",),
+                health_check_command=("health",),
+                trusted_runner_evidence_sha256=("a" * 64,),
+            )
+            runner = FakeAttestedRunner(
+                (config.regression_command, config.health_check_command),
+                outcomes=(True, True),
+            )
+            service = fixture.build(
+                config,
+                clock=clock,
+                runner=runner,
+                approval_verifier=verifier,
+            )
+
+            with service:
+                record = _promote_for_rollback(
+                    fixture, service, clock, private, verifier
+                )
+                authorization = _signed_rollback(private, verifier, service, record)
+                real_atomic_write = production_module._atomic_write_bytes
+                injected = False
+
+                def fail_operator_restore(target, payload, **kwargs):
+                    nonlocal injected
+                    if not injected:
+                        injected = True
+                        raise OSError("injected atomic restore failure")
+                    return real_atomic_write(target, payload, **kwargs)
+
+                with patch.object(
+                    production_module,
+                    "_atomic_write_bytes",
+                    side_effect=fail_operator_restore,
+                ):
+                    with self.assertRaisesRegex(OSError, "injected"):
+                        service.rollback_committed_once(
+                            record.record_id,
+                            authorization,
+                        )
+                self.assertEqual(
+                    fixture.target.read_text(encoding="utf-8"), "VALUE = 2\n"
+                )
+                self.assertEqual(service.journal.records()[0].status, "committed")
+                self.assertEqual(service.rhythm.mode.value, "inference")
+                with self.assertRaises(ApprovalReplayError):
+                    service.rollback_committed_once(
+                        record.record_id,
+                        authorization,
+                    )
 
     def test_startup_recovers_exact_crash_interrupted_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:

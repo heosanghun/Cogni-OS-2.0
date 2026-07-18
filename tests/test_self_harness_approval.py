@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from cogni_flow.approval import (
     APPROVAL_SCHEMA,
+    ROLLBACK_AUTHORIZATION_SCHEMA,
     ApprovalError,
     ApprovalReplayError,
     CandidateEvaluationLedger,
@@ -16,6 +17,7 @@ from cogni_flow.approval import (
     ConsumedApprovalLedger,
     Ed25519ApprovalVerifier,
     HumanApprovalV1,
+    RollbackAuthorizationV1,
     ed25519_backend_available,
 )
 
@@ -66,6 +68,33 @@ def _approval(
     )
 
 
+def _rollback_authorization(
+    *,
+    nonce: str = "rollback_nonce_0123456789abcdef0",
+) -> RollbackAuthorizationV1:
+    now = time_ns()
+    return RollbackAuthorizationV1.from_mapping(
+        {
+            "schema": ROLLBACK_AUTHORIZATION_SCHEMA,
+            "journal_record_id": "a" * 32,
+            "relative_path": "cogni_flow/target.py",
+            "before_sha256": "1" * 64,
+            "after_sha256": "2" * 64,
+            "source_surface_sha256": "3" * 64,
+            "runner_id": "audited-runner",
+            "runner_evidence_sha256": "4" * 64,
+            "health_command_sha256": "5" * 64,
+            "nonce": nonce,
+            "approver_id": "operator.test",
+            "issued_ns": now,
+            "expires_ns": now + 10_000_000_000,
+            "decision": "rollback_committed_once",
+            "public_key_sha256": "6" * 64,
+            "signature": "00" * 64,
+        }
+    )
+
+
 class TestSelfHarnessApproval(unittest.TestCase):
     def test_evaluation_ledger_rejects_tampered_immutable_record(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -99,6 +128,47 @@ class TestSelfHarnessApproval(unittest.TestCase):
             self.assertNotEqual(resigned.approval_id, approval.approval_id)
             with self.assertRaises(ApprovalReplayError):
                 ledger.consume_once(resigned, evaluation)
+
+    def test_rollback_nonce_is_consumed_in_global_mutation_namespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evaluation = _evaluation(time_ns())
+            key_digest = sha256(bytes(range(32))).hexdigest()
+            approval = _approval(evaluation, key_digest)
+            authorization = _rollback_authorization(nonce=approval.nonce)
+            ledger = ConsumedApprovalLedger(Path(tmp) / "consumed")
+
+            ledger.consume_once(approval, evaluation)
+            with self.assertRaises(ApprovalReplayError):
+                ledger.consume_rollback_once(authorization)
+
+    def test_rollback_nonce_cannot_be_resigned_for_a_second_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            authorization = _rollback_authorization()
+            ledger = ConsumedApprovalLedger(Path(tmp) / "consumed")
+            first = ledger.consume_rollback_once(authorization)
+            self.assertEqual(first, authorization.authorization_id)
+
+            resigned_payload = asdict(authorization)
+            resigned_payload["expires_ns"] -= 1
+            resigned_payload["signature"] = "11" * 64
+            resigned = RollbackAuthorizationV1.from_mapping(resigned_payload)
+            self.assertNotEqual(
+                resigned.authorization_id,
+                authorization.authorization_id,
+            )
+            with self.assertRaises(ApprovalReplayError):
+                ledger.consume_rollback_once(resigned)
+
+    def test_rollback_authorization_rejects_unversioned_or_unbound_shapes(self):
+        authorization = _rollback_authorization()
+        malformed = asdict(authorization)
+        malformed["schema"] = "rollback"
+        with self.assertRaisesRegex(ApprovalError, "schema"):
+            RollbackAuthorizationV1.from_mapping(malformed)
+        malformed = asdict(authorization)
+        malformed.pop("source_surface_sha256")
+        with self.assertRaisesRegex(ApprovalError, "fields"):
+            RollbackAuthorizationV1.from_mapping(malformed)
 
     def test_missing_optional_cryptography_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -21,7 +21,10 @@ from typing import Any, Mapping
 EVALUATION_SCHEMA = "cogni.self_harness.candidate_evaluation.v1"
 APPROVAL_SCHEMA = "cogni.self_harness.human_approval.v1"
 CONSUMPTION_SCHEMA = "cogni.self_harness.approval_consumption.v1"
+ROLLBACK_AUTHORIZATION_SCHEMA = "cogni.self_harness.operator_rollback_authorization.v1"
+ROLLBACK_CONSUMPTION_SCHEMA = "cogni.self_harness.operator_rollback_consumption.v1"
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_RECORD_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SIGNATURE = re.compile(r"[0-9a-f]{128}\Z")
 _NONCE = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 _MAX_EVIDENCE_BYTES = 32_768
@@ -80,6 +83,12 @@ def canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
 def _digest(value: object, label: str) -> str:
     if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
         raise ApprovalError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _record_id(value: object) -> str:
+    if not isinstance(value, str) or _RECORD_ID.fullmatch(value) is None:
+        raise ApprovalError("journal record id must be lowercase hexadecimal")
     return value
 
 
@@ -289,6 +298,79 @@ class HumanApprovalV1:
         return sha256(canonical_json_bytes(asdict(self))).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class RollbackAuthorizationV1:
+    """External one-time authority for one exact committed journal rollback."""
+
+    schema: str
+    journal_record_id: str
+    relative_path: str
+    before_sha256: str
+    after_sha256: str
+    source_surface_sha256: str
+    runner_id: str
+    runner_evidence_sha256: str
+    health_command_sha256: str
+    nonce: str
+    approver_id: str
+    issued_ns: int
+    expires_ns: int
+    decision: str
+    public_key_sha256: str
+    signature: str
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> RollbackAuthorizationV1:
+        if set(payload) != set(cls.__dataclass_fields__):
+            raise ApprovalError("rollback authorization fields are invalid")
+        try:
+            authorization = cls(**dict(payload))
+        except TypeError as exc:
+            raise ApprovalError("rollback authorization is malformed") from exc
+        authorization._validate_shape()
+        return authorization
+
+    def _validate_shape(self) -> None:
+        if self.schema != ROLLBACK_AUTHORIZATION_SCHEMA:
+            raise ApprovalError("rollback authorization schema is unsupported")
+        _record_id(self.journal_record_id)
+        _safe_relative_python(self.relative_path)
+        for value, label in (
+            (self.before_sha256, "rollback before digest"),
+            (self.after_sha256, "rollback after digest"),
+            (self.source_surface_sha256, "rollback source surface digest"),
+            (self.runner_evidence_sha256, "rollback runner evidence digest"),
+            (self.health_command_sha256, "rollback health command digest"),
+            (self.public_key_sha256, "rollback public key digest"),
+        ):
+            _digest(value, label)
+        _text(self.runner_id, "rollback runner id", maximum=128)
+        _text(self.approver_id, "rollback approver id", maximum=128)
+        if not isinstance(self.nonce, str) or _NONCE.fullmatch(self.nonce) is None:
+            raise ApprovalError("rollback authorization nonce is invalid")
+        _integer(self.issued_ns, "rollback issue time", minimum=1)
+        _integer(self.expires_ns, "rollback expiry time", minimum=1)
+        if self.expires_ns <= self.issued_ns:
+            raise ApprovalError("rollback expiry must follow issue time")
+        if self.decision != "rollback_committed_once":
+            raise ApprovalError("rollback decision must be rollback_committed_once")
+        if (
+            not isinstance(self.signature, str)
+            or _SIGNATURE.fullmatch(self.signature) is None
+        ):
+            raise ApprovalError("rollback signature must be lowercase Ed25519 hex")
+
+    def signed_payload(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload.pop("signature")
+        return payload
+
+    @property
+    def authorization_id(self) -> str:
+        self._validate_shape()
+        return sha256(canonical_json_bytes(asdict(self))).hexdigest()
+
+
 class Ed25519ApprovalVerifier:
     """Verify externally generated approvals without importing crypto eagerly."""
 
@@ -365,8 +447,80 @@ class Ed25519ApprovalVerifier:
             or approval.expires_ns > evaluation.expires_ns
         ):
             raise ApprovalError("human approval exceeds evaluation validity")
-        signature = bytes.fromhex(approval.signature)
-        message = canonical_json_bytes(approval.signed_payload())
+        self._verify_signature(
+            approval.signature,
+            approval.signed_payload(),
+            invalid_message="human approval signature is invalid",
+        )
+        return approval.approval_id
+
+    def verify_rollback(
+        self,
+        authorization: RollbackAuthorizationV1,
+        *,
+        journal_record_id: str,
+        relative_path: str,
+        before_sha256: str,
+        after_sha256: str,
+        source_surface_sha256: str,
+        runner_id: str,
+        runner_evidence_sha256: str,
+        health_command_sha256: str,
+        record_created_ns: int,
+        now_ns: int | None = None,
+    ) -> str:
+        """Verify one rollback authorization against live committed facts."""
+
+        if not isinstance(authorization, RollbackAuthorizationV1):
+            raise ApprovalError(
+                "rollback authorization must be a RollbackAuthorizationV1 record"
+            )
+        authorization._validate_shape()
+        expected = {
+            "journal_record_id": _record_id(journal_record_id),
+            "relative_path": _safe_relative_python(relative_path),
+            "before_sha256": _digest(before_sha256, "rollback before digest"),
+            "after_sha256": _digest(after_sha256, "rollback after digest"),
+            "source_surface_sha256": _digest(
+                source_surface_sha256, "rollback source surface digest"
+            ),
+            "runner_id": _text(runner_id, "rollback runner id", maximum=128),
+            "runner_evidence_sha256": _digest(
+                runner_evidence_sha256, "rollback runner evidence digest"
+            ),
+            "health_command_sha256": _digest(
+                health_command_sha256, "rollback health command digest"
+            ),
+        }
+        for field, value in expected.items():
+            if getattr(authorization, field) != value:
+                raise ApprovalError(f"rollback authorization does not bind {field}")
+        if authorization.public_key_sha256 != self.public_key_sha256:
+            raise ApprovalError("rollback authorization names an unpinned public key")
+        if authorization.approver_id not in self.approver_ids:
+            raise ApprovalError("rollback approver identity is not allowlisted")
+        created = _integer(record_created_ns, "journal creation time", minimum=1)
+        current = time_ns() if now_ns is None else _integer(now_ns, "current time")
+        if authorization.issued_ns < created:
+            raise ApprovalError("rollback authorization predates the journal record")
+        if not authorization.issued_ns <= current < authorization.expires_ns:
+            raise ApprovalError("rollback authorization is not currently valid")
+        self._verify_signature(
+            authorization.signature,
+            authorization.signed_payload(),
+            invalid_message="rollback authorization signature is invalid",
+        )
+        return authorization.authorization_id
+
+    def _verify_signature(
+        self,
+        signature_hex: str,
+        payload: Mapping[str, Any],
+        *,
+        invalid_message: str,
+    ) -> None:
+        signature = bytes.fromhex(signature_hex)
+        message = canonical_json_bytes(payload)
         try:
             from cryptography.exceptions import InvalidSignature
             from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -374,23 +528,22 @@ class Ed25519ApprovalVerifier:
             )
         except Exception as exc:
             raise ApprovalError(
-                "Ed25519 verification is unavailable; promotion remains disabled"
+                "Ed25519 verification is unavailable; signed source mutation remains disabled"
             ) from exc
         try:
             key = Ed25519PublicKey.from_public_bytes(self._public_key)
         except Exception as exc:
             raise ApprovalError(
-                "Ed25519 verification is unavailable; promotion remains disabled"
+                "Ed25519 verification is unavailable; signed source mutation remains disabled"
             ) from exc
         try:
             key.verify(signature, message)
         except InvalidSignature as exc:
-            raise ApprovalError("human approval signature is invalid") from exc
+            raise ApprovalError(invalid_message) from exc
         except Exception as exc:
             raise ApprovalError(
-                "Ed25519 verification is unavailable; promotion remains disabled"
+                "Ed25519 verification is unavailable; signed source mutation remains disabled"
             ) from exc
-        return approval.approval_id
 
 
 class CandidateEvaluationLedger:
@@ -469,6 +622,43 @@ class ConsumedApprovalLedger:
             raise ApprovalReplayError("human approval was already consumed") from exc
         return approval_id
 
+    def consume_rollback_once(
+        self,
+        authorization: RollbackAuthorizationV1,
+        *,
+        consumed_ns: int | None = None,
+    ) -> str:
+        """Consume a rollback nonce in the same global namespace as promotion."""
+
+        if not isinstance(authorization, RollbackAuthorizationV1):
+            raise TypeError("authorization must be RollbackAuthorizationV1")
+        authorization._validate_shape()
+        authorization_id = authorization.authorization_id
+        if len(tuple(self.directory.glob("consumed-nonce-*.json"))) >= self.max_records:
+            raise ApprovalError("approval consumption ledger reached its hard bound")
+        payload = {
+            "schema": ROLLBACK_CONSUMPTION_SCHEMA,
+            "authorization_id": authorization_id,
+            "journal_record_id": authorization.journal_record_id,
+            "relative_path": authorization.relative_path,
+            "before_sha256": authorization.before_sha256,
+            "after_sha256": authorization.after_sha256,
+            "source_surface_sha256": authorization.source_surface_sha256,
+            "nonce": authorization.nonce,
+            "approver_id": authorization.approver_id,
+            "consumed_ns": time_ns() if consumed_ns is None else consumed_ns,
+        }
+        _integer(payload["consumed_ns"], "rollback consumption time", minimum=1)
+        nonce_id = sha256(authorization.nonce.encode("ascii")).hexdigest()
+        target = self.directory / f"consumed-nonce-{nonce_id}.json"
+        try:
+            _atomic_write_exclusive(target, canonical_json_bytes(payload))
+        except FileExistsError as exc:
+            raise ApprovalReplayError(
+                "rollback authorization was already consumed"
+            ) from exc
+        return authorization_id
+
 
 def _prepare_directory(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
@@ -542,6 +732,8 @@ __all__ = [
     "ConsumedApprovalLedger",
     "Ed25519ApprovalVerifier",
     "HumanApprovalV1",
+    "ROLLBACK_AUTHORIZATION_SCHEMA",
+    "RollbackAuthorizationV1",
     "canonical_json_bytes",
     "ed25519_backend_available",
 ]

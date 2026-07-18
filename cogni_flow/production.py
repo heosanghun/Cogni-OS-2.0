@@ -22,6 +22,7 @@ from .approval import (
     ConsumedApprovalLedger,
     Ed25519ApprovalVerifier,
     HumanApprovalV1,
+    RollbackAuthorizationV1,
     canonical_json_bytes,
 )
 from .cycle import EvolutionReport, SelfHarness
@@ -58,6 +59,7 @@ _TERMINAL_JOURNAL_STATES = {
     "rolled_back",
     "recovered_rollback",
     "aborted",
+    "operator_rolled_back",
 }
 _DEFAULT_TEST_COMMAND = (
     sys.executable,
@@ -668,6 +670,14 @@ class BackupRecord:
     created_ns: int
 
 
+@dataclass(frozen=True)
+class _CommittedRollbackMaterial:
+    record: BackupRecord
+    target: Path
+    before: bytes
+    after: bytes
+
+
 class BackupJournal:
     """Bounded, digest-verified source backup journal for atomic promotion."""
 
@@ -735,7 +745,7 @@ class BackupJournal:
             return record
 
     def mark(self, record: BackupRecord, status: str) -> BackupRecord:
-        if status not in _TERMINAL_JOURNAL_STATES:
+        if status not in _TERMINAL_JOURNAL_STATES - {"operator_rolled_back"}:
             raise ValueError("invalid terminal journal status")
         with self._lock:
             current = self._load_record(record.record_id)
@@ -773,6 +783,56 @@ class BackupJournal:
             return self.mark(
                 current, "recovered_rollback" if recovered else "rolled_back"
             )
+
+    def committed_rollback_material(self, record_id: str) -> _CommittedRollbackMaterial:
+        """Load exact before/after bytes for one still-committed promotion."""
+
+        with self._lock:
+            current = self._load_record(record_id)
+            if current.status != "committed":
+                raise JournalIntegrityError(
+                    "operator rollback requires a committed journal record"
+                )
+            target = self._safe_target(
+                Path(current.relative_path), require_existing=True
+            )
+            after = target.read_bytes()
+            if len(after) > self.max_backup_bytes:
+                raise JournalIntegrityError(
+                    "committed source exceeds the journal size limit"
+                )
+            if sha256(after).hexdigest() != current.after_sha256:
+                raise JournalIntegrityError(
+                    "live source differs from the committed after digest"
+                )
+            if target.stat().st_mode & 0o777 != current.file_mode:
+                raise JournalIntegrityError(
+                    "live source mode differs from the committed file mode"
+                )
+            backup_path = self.directory / current.backup_file
+            if backup_path.is_symlink() or backup_path.parent != self.directory:
+                raise JournalIntegrityError("journal backup cannot be linked")
+            before = backup_path.read_bytes()
+            if len(before) > self.max_backup_bytes:
+                raise JournalIntegrityError("backup exceeds the journal size limit")
+            if sha256(before).hexdigest() != current.before_sha256:
+                raise JournalIntegrityError("backup digest verification failed")
+            return _CommittedRollbackMaterial(current, target, before, after)
+
+    def mark_operator_rolled_back(self, record: BackupRecord) -> BackupRecord:
+        """Finalize one committed record after an operator rollback passes health."""
+
+        with self._lock:
+            current = self._load_record(record.record_id)
+            if current.status == "operator_rolled_back":
+                return current
+            if current.status != "committed":
+                raise JournalIntegrityError(
+                    "only a committed record can be operator rolled back"
+                )
+            updated = replace(current, status="operator_rolled_back")
+            self._write_record(updated)
+            return updated
 
     def recover_incomplete(self) -> int:
         """Fail closed or restore any crash-interrupted exact candidate digest."""
@@ -913,6 +973,14 @@ class CandidateEvaluationResult:
     evaluation: CandidateEvaluationV1 | None
 
 
+@dataclass(frozen=True)
+class OperatorRollbackResult:
+    rolled_back: bool
+    health: SandboxResult
+    target: Path
+    journal_record: BackupRecord
+
+
 class JournaledHarnessPatcher(SafeHarnessPatcher):
     """Attested evaluation plus externally approved one-time promotion."""
 
@@ -960,6 +1028,7 @@ class JournaledHarnessPatcher(SafeHarnessPatcher):
             project_root,
             excluded_roots=(ignored_stage_root,),
         )
+        self._operator_rollback_lock = RLock()
 
     @property
     def requires_manual_approval(self) -> bool:
@@ -1121,6 +1190,164 @@ class JournaledHarnessPatcher(SafeHarnessPatcher):
             except BaseException:
                 self._rollback_after_exception(record, target)
                 raise
+
+    def rollback_committed_once(
+        self,
+        record_id: str,
+        authorization: RollbackAuthorizationV1,
+    ) -> OperatorRollbackResult:
+        """Restore one committed backup only under exact signed authority."""
+
+        if self.rhythm.mode != SystemMode.EVOLUTION:
+            raise RuntimeError("operator rollback requires a fresh evolution mode")
+        material: _CommittedRollbackMaterial | None = None
+        terminal = False
+        with self._operator_rollback_lock, self.rhythm.evolution_slot():
+            try:
+                material = self.journal.committed_rollback_material(record_id)
+                source_surface = self.source_surface_digest()
+                self.approval_verifier.verify_rollback(
+                    authorization,
+                    journal_record_id=material.record.record_id,
+                    relative_path=material.record.relative_path,
+                    before_sha256=material.record.before_sha256,
+                    after_sha256=material.record.after_sha256,
+                    source_surface_sha256=source_surface,
+                    runner_id=self.sandbox.runner_id,
+                    runner_evidence_sha256=self.sandbox.evidence_sha256,
+                    health_command_sha256=command_sha256(self.health_check_command),
+                    record_created_ns=material.record.created_ns,
+                )
+                # Close the check/use window before burning the one-time nonce.
+                current = self.journal.committed_rollback_material(record_id)
+                if current != material:
+                    raise JournalIntegrityError(
+                        "committed rollback material changed during authorization"
+                    )
+                if self.source_surface_digest() != source_surface:
+                    raise ApprovalError(
+                        "source surface changed after rollback authorization"
+                    )
+                self.consumed_approvals.consume_rollback_once(authorization)
+                self.rhythm.transition(
+                    SystemMode.VALIDATING,
+                    "signed operator rollback authorization verified",
+                )
+                self.rhythm.transition(
+                    SystemMode.ROLLING_BACK,
+                    f"operator rollback {material.record.relative_path}",
+                )
+                _atomic_write_bytes(
+                    material.target,
+                    material.before,
+                    mode=material.record.file_mode,
+                )
+                self._verify_material(
+                    material.target,
+                    material.record.before_sha256,
+                    material.record.file_mode,
+                    "operator-restored source",
+                )
+                with tempfile.TemporaryDirectory(
+                    prefix="cogni-operator-rollback-health-"
+                ) as tmp:
+                    health_stage = Path(tmp) / "project"
+                    self._copy_project(health_stage)
+                    health = self.sandbox.run(
+                        health_stage,
+                        self.health_check_command,
+                        self.health_timeout_seconds,
+                    )
+                if not health.passed:
+                    self._ensure_committed_after(material)
+                    self.rhythm.transition(
+                        SystemMode.EVOLUTION,
+                        "operator rollback health failed; committed source restored",
+                    )
+                    return OperatorRollbackResult(
+                        False,
+                        health,
+                        material.target,
+                        material.record,
+                    )
+                finalized = self.journal.mark_operator_rolled_back(material.record)
+                terminal = True
+                self.rhythm.transition(
+                    SystemMode.EVOLUTION,
+                    "operator rollback health verified",
+                )
+                return OperatorRollbackResult(
+                    True,
+                    health,
+                    material.target,
+                    finalized,
+                )
+            except BaseException:
+                if material is not None and not terminal:
+                    try:
+                        self._ensure_committed_after(material)
+                    except BaseException:
+                        if self.rhythm.mode == SystemMode.EVOLUTION:
+                            self.rhythm.transition(
+                                SystemMode.SAFE_MODE,
+                                "operator rollback could not preserve committed source",
+                            )
+                        elif self.rhythm.mode in {
+                            SystemMode.VALIDATING,
+                            SystemMode.ROLLING_BACK,
+                        }:
+                            if self.rhythm.mode == SystemMode.VALIDATING:
+                                self.rhythm.transition(
+                                    SystemMode.ROLLING_BACK,
+                                    "operator rollback recovery failed",
+                                )
+                            self.rhythm.transition(
+                                SystemMode.SAFE_MODE,
+                                "operator rollback could not restore committed source",
+                            )
+                        raise
+                if self.rhythm.mode == SystemMode.VALIDATING:
+                    self.rhythm.transition(
+                        SystemMode.ROLLING_BACK,
+                        "operator rollback validation failed",
+                    )
+                if self.rhythm.mode == SystemMode.ROLLING_BACK:
+                    self.rhythm.transition(
+                        SystemMode.EVOLUTION,
+                        "operator rollback rejection restored committed source",
+                    )
+                raise
+
+    @staticmethod
+    def _verify_material(
+        target: Path,
+        digest: str,
+        file_mode: int,
+        label: str,
+    ) -> None:
+        if sha256(target.read_bytes()).hexdigest() != digest:
+            raise JournalIntegrityError(f"{label} digest verification failed")
+        if target.stat().st_mode & 0o777 != file_mode:
+            raise JournalIntegrityError(f"{label} mode verification failed")
+
+    def _ensure_committed_after(self, material: _CommittedRollbackMaterial) -> None:
+        digest = sha256(material.target.read_bytes()).hexdigest()
+        if digest != material.record.after_sha256:
+            if digest != material.record.before_sha256:
+                raise JournalIntegrityError(
+                    "operator rollback left an unknown live source digest"
+                )
+            _atomic_write_bytes(
+                material.target,
+                material.after,
+                mode=material.record.file_mode,
+            )
+        self._verify_material(
+            material.target,
+            material.record.after_sha256,
+            material.record.file_mode,
+            "reapplied committed source",
+        )
 
     @staticmethod
     def _match_evaluation(
@@ -1316,6 +1543,54 @@ class ProductionSelfHarness:
                     self.rhythm.transition(
                         SystemMode.INFERENCE,
                         "approved promotion validation rollback complete",
+                    )
+                raise
+
+    def rollback_committed_once(
+        self,
+        record_id: str,
+        authorization: RollbackAuthorizationV1,
+    ) -> OperatorRollbackResult:
+        """Run one fresh drain/checkpoint transaction for signed rollback."""
+
+        if self.config.promotion_mode != PromotionMode.ATTESTED:
+            raise ApprovalError("operator rollback is disabled in proposal-only mode")
+        if not self.failure_daemon.running:
+            raise RuntimeError("production self-harness is not running")
+        patcher = self.harness.patcher
+        if not isinstance(patcher, JournaledHarnessPatcher):
+            raise ApprovalError("operator rollback patcher is unavailable")
+        with self._lock:
+            self.rhythm.enter_evolution(self.harness.checkpoint)
+            try:
+                result = patcher.rollback_committed_once(
+                    record_id,
+                    authorization,
+                )
+                self.rhythm.resume_inference(
+                    "signed operator rollback complete"
+                    if result.rolled_back
+                    else "operator rollback rejected by health check",
+                )
+                self.logdb.audit(
+                    "operator_rollback",
+                    result.journal_record.record_id,
+                    "operator_rolled_back"
+                    if result.rolled_back
+                    else "committed_source_reapplied",
+                )
+                return result
+            except BaseException:
+                if self.rhythm.mode == SystemMode.EVOLUTION:
+                    self.rhythm.resume_inference("operator rollback rejected")
+                elif self.rhythm.mode == SystemMode.VALIDATING:
+                    self.rhythm.transition(
+                        SystemMode.ROLLING_BACK,
+                        "operator rollback validation failed",
+                    )
+                    self.rhythm.transition(
+                        SystemMode.INFERENCE,
+                        "operator rollback validation rollback complete",
                     )
                 raise
 
@@ -1776,6 +2051,7 @@ def _atomic_write_bytes(
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
+        os.chmod(target, mode)
         _fsync_directory(target.parent)
         return
     temporary = target.with_name(f"{target.name}.cogni-tmp-{token_hex(8)}")
@@ -1785,6 +2061,7 @@ def _atomic_write_bytes(
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
         os.replace(temporary, target)
         _fsync_directory(target.parent)
     finally:

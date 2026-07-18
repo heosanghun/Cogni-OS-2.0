@@ -2,11 +2,14 @@
 
 ## Release boundary
 
-Version 0.4.1 is a local research runtime with a **proposal-only** evolution
-boundary. It may observe failures, build evidence-linked candidates, and store
-an inert proposal archive. It may not execute candidate source, replace active
-source, or promote a proposal. Safe promotion belongs to a later phase and
-requires independently attested kernel isolation.
+Version 0.4.1 is a local research runtime whose shipped UI and default profile
+have a **proposal-only** evolution boundary. They may observe failures, build
+evidence-linked candidates, and expose read-only review without approve/apply
+authority. The working tree also contains an internal Linux
+`PromotionMode.ATTESTED` path for bounded candidate evaluation, external
+Ed25519-approved atomic promotion, and separately signed committed rollback.
+That path is disabled by default, unavailable on native Windows, not automatic,
+and not independently production-attested.
 
 ## Enforced controls
 
@@ -181,6 +184,28 @@ requires independently attested kernel isolation.
   the same active process;
 - source hashes are compared before and after a proposal-only night cycle; any
   change enters safe mode.
+- ATTESTED mode requires a bounded regular-file-only snapshot, pinned local OCI
+  engine/image/argv evidence, network-none, read-only mounts/rootfs, non-root
+  execution, dropped capabilities, no-new-privileges, bounded resources/output
+  and fail-closed cleanup checks;
+- a passing candidate produces immutable evaluation evidence and resumes
+  inference without mutation. Promotion requires a fresh drain/checkpoint and
+  one external Ed25519 approval bound to the exact proposal, source surface,
+  snapshot, runner, command, result, expiry and one-time nonce;
+- rollback of a committed promotion requires a separate signed one-time
+  authorization bound to the exact journal record and before/after bytes. It
+  restores byte-identical backup content, runs the fixed health check, and
+  reapplies committed bytes if rollback health fails;
+- the server integration record uses schema
+  `cogni.kernel-sandbox-integration-smoke.v1` with
+  `assurance=implementation_integration_smoke_only`,
+  `production_attestation=false` and `gpu_measurement=not_performed`. It
+  observed loopback-only network configuration, read-only root/project,
+  UID 65534 and verified cleanup in that named run;
+- none of these implementation contracts proves the rootful daemon, runtime,
+  kernel, user namespace, seccomp/AppArmor, socket ownership or hostile-code
+  escape boundary. The validator requested and queried no GPU; that is not a
+  measured GPU-isolation attestation.
 
 ## Day/night exclusion
 
@@ -204,9 +229,11 @@ an external evaluator is honest.
 
 ## Deliberately unavailable in v0.4.1
 
-- automatic source promotion or live-code replacement;
+- automatic source promotion, a production-enabled apply endpoint, or a fully
+  attested live-code replacement service;
 - a trusted kernel-isolated Windows Sandbox/VM/container attestation;
-- network/host-filesystem escape evidence for a candidate runner;
+- independent network/host-filesystem/daemon escape evidence for a candidate
+  runner and one-environment promote/committed-rollback E2E;
 - signed executable, signed installer/update trust chain, or hardware-backed
   signing identity; the release builder does emit an unsigned-status manifest,
   CycloneDX dependency inventory and third-party metadata notice;
@@ -224,9 +251,10 @@ an external evaluator is honest.
   acceptance evidence;
 - production code signing and a signed installer/update trust chain.
 
-`SubprocessSandbox` and any previous atomic-replacement primitives are
-development/research components, not product authority. A class name, process
-boundary or marker is never accepted as proof of kernel isolation.
+`SubprocessSandbox`, `LinuxOciSandboxRunner`, promotion and rollback primitives
+are development/research components, not product authority. A class name,
+container flag, local integration smoke, process boundary or marker is never
+accepted as proof of production kernel isolation.
 
 ## Deployment responsibility
 

@@ -5,7 +5,10 @@ dense Gemma 4 E4B-it artifact. Version 0.4.1 adds a persistent local document
 workspace, provenance-bearing AkasicDB RAG, bounded Gemma image/audio routes,
 local speech input/output, and an explicitly opt-in Lens patent/scholarly API
 connector to the existing conversation, Cogni-Core, typed-task, and
-**proposal-only** Self-Harness boundaries.
+**proposal-only-by-default** Self-Harness boundary. An internal Linux
+`PromotionMode.ATTESTED` path exists for evidence-bound evaluation, external
+signed promotion and signed committed rollback, but it is not enabled by the
+desktop UI or production-attested in this release candidate.
 
 This release is not an AGI claim, an RTX 4090 certification, or evidence that
 every research module improves model quality. A Python implementation or a
@@ -24,7 +27,7 @@ passing component test never upgrades a capability by itself.
 | System 3 experts | `advisory` | no | calibrated/trained expert checkpoint and independent verifier |
 | System 4 swarm/PCAS | `advisory` | no | production PCAS calibration and answer-quality evidence |
 | AFlow/ADAS | `research` | no | attested real evaluator and held-out evidence |
-| Self-Harness | `proposal_only` | no runtime mutation | Phase 12 attested sandbox and safe-promotion evidence |
+| Self-Harness | default `proposal_only`; internal `ATTESTED` path unverified | no mutation in the shipped UI/default profile | hostile-code production isolation attestation, exact-scope evidence and full promote/rollback E2E |
 | persistent attachments + PDF extraction | `local_verified_path` | only after explicit RAG/image selection | deployment-specific parser and corpus review |
 | AkasicDB RAG | `local_index_ready` when pinned clone verifies | yes, with bounded source provenance | semantic embedder and independent retrieval-quality benchmark |
 | Gemma image/audio tensor IPC | `bounded_runtime_path` | yes when the verified processor admits the modality | broad multimodal quality and combined-VRAM evidence |
@@ -288,8 +291,11 @@ and
 - Local tasks execute only typed, allowlisted operations. Natural language is
   never passed to a shell.
 - AFlow can only create a bounded research archive.
-- Self-Harness stores inert proposals and exposes a read-only diff review; it
-  cannot approve, execute, install, promote, or roll back source in v0.4.1.
+- The shipped UI/default Self-Harness stores inert proposals and exposes a
+  read-only diff review with no approve/apply endpoint. An internal Linux
+  ATTESTED library path can evaluate a snapshot and, only after external
+  Ed25519 authority, atomically promote or roll back one exact committed
+  record. It is not automatic, production-attested, or full-E2E verified.
 - The graphical server is loopback-only, uses per-session authentication and
   local allowlisted assets, and has no CDN or analytics dependency.
 

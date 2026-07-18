@@ -20,7 +20,7 @@ def test_outstanding_renderer_consumes_only_a_fully_validated_master() -> None:
     assert len(records) == 170
     assert [record.identifier for record in records] == list(range(1, 171))
     assert "전체 미완료: **170개**" in result
-    assert "구현됐으나 승인 증거 미결합: **101개**" in result
+    assert "구현됐으나 승인 증거 미결합: **103개**" in result
     assert "| 1 | [ ] | Gemma 4 E4B-it 로컬 백본 |" in result
 
 

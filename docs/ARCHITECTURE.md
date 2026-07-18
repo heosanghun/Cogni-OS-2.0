@@ -283,12 +283,20 @@ an exclusive evolution window.
 - AFlow uses sealed operators/evaluator/policy/suite and emits
   `research_archive_only` records.
 - Self-Harness records evidence and may construct inert proposals after the
-  required causal support. Current review is read-only.
+  required causal support. The shipped UI and default profile remain
+  proposal-only with read-only review and no approve/apply endpoint.
+- The internal Linux `PromotionMode.ATTESTED` path copies a bounded
+  regular-file snapshot, evaluates one exact replacement with an evidence-bound
+  OCI runner, persists immutable evaluation evidence, and returns to inference
+  while it waits for external Ed25519 authority. A fresh drain/checkpoint is
+  required for one atomic promotion or one signed committed rollback.
+- The named-engine/image CPU integration smoke is not independent production
+  isolation evidence. Rootful daemon, runtime, kernel, user namespace,
+  seccomp/AppArmor, socket ownership and hostile-code escape boundaries remain
+  unverified, and no full promote/rollback E2E has been accepted.
 
-There is no v0.4.1 source-patch approval/apply/promotion path. Attested sandbox
-execution, independent approval, byte-identical rollback, and safe promotion
-remain outside this working-tree capability and must not be presented as
-automatic self-modification.
+This internal path is never automatic self-modification and does not change the
+Runtime Fact-book or desktop UI from `proposal_only`.
 
 ## Memory and hardware claims
 

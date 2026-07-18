@@ -6,9 +6,9 @@
 ## 현재 집계
 
 - 전체 미완료: **170개**
-- 구현됐으나 승인 증거 미결합: **101개**
-- 코드/제품 경로 미구현: **8개**
-- 부분 구현 또는 검증 잔여: **56개**
+- 구현됐으나 승인 증거 미결합: **103개**
+- 코드/제품 경로 미구현: **5개**
+- 부분 구현 또는 검증 잔여: **57개**
 - 외부 장치·토큰·아티팩트 차단: **5개**
 
 ## 구현됐으나 승인 증거 미결합
@@ -51,10 +51,12 @@
 | 62 | [ ] | 변경 전 diff 제안 | `cogni_flow/proposal_review.py`, 읽기 전용 `/api/evolution/proposals`와 diff dialog, `tests/test_proposal_review.py`, API/UI tests | source 적용·승인 endpoint 없이 digest/stale-base/read-only 경계 유지 |
 | 65 | [ ] | 오류·반복·hallucination 증거 수집 | `cogni_flow/logdb.py`, `cogni_flow/production.py`, Phase 11 tests | 실제 실패 corpus capture ≥99% 외부 검증 |
 | 66 | [ ] | 실패 원인/causal signature 분류 | `cogni_flow/evolution.py`, `tests/test_evolution.py` | 수동 label precision 외부 검증 |
-| 67 | [ ] | evolution 모드에서만 후보 생성 | `cogni_flow/rhythm.py`, harness/orchestrator tests | inference와 동시 실행 금지 유지 |
+| 67 | [ ] | evolution 모드에서만 후보 생성 | `cogni_flow/rhythm.py`, `cogni_flow/cycle.py`, `ProductionSelfHarness.promote_approved_once`/`rollback_committed_once`; fresh drain·checkpoint tests | inference와 동시 실행 금지 유지 |
 | 68 | [ ] | 수정 후보 생성 | `cogni_flow/local_proposer.py`, `cogni_flow/proposals.py` | 후보는 inert proposal임을 UI에 유지 |
 | 71 | [ ] | 실패 후보 폐기·negative archive | `cogni_flow/proposals.py`, proposal/evolution tests | archive 무결성·보존 상한 유지 |
-| 74 | [ ] | 증거·후보 이력 영속 저장 | `cogni_flow/logdb.py`, proposal persistence tests | scope/content digest 검증 유지 |
+| 72 | [ ] | 검증 후 승격/승인 | immutable evaluation, pinned Ed25519 승인·TTL·nonce·replay 차단, fresh evolution drain과 one-shot atomic promotion; `tests/test_production_harness.py`, `tests/test_self_harness_approval.py` | independently attested production runner·operator import·exact-scope 승인 evidence; 자동 승격은 계속 차단 |
+| 73 | [ ] | 기존 코드 rollback | exact committed journal record에 묶인 외부 Ed25519 `rollback_committed_once`, one-time nonce, byte-identical restore·health check·실패 시 committed bytes 재적용 | independently attested production runner의 signed rollback drill과 exact-scope 승인 evidence |
+| 74 | [ ] | 증거·후보 이력 영속 저장 | `cogni_flow/logdb.py`, proposal/evaluation ledger, consumed approval/rollback nonce와 backup journal persistence tests | scope/content digest 검증 유지 |
 | 76 | [ ] | `+` 파일/이미지 첨부 UI·API | `cogni_demo/static/index.html`, `app.js`, `/api/workspace/attachments/add`, API/UI tests | 최신 bundle에 포함하여 E2E smoke |
 | 77 | [ ] | TXT/MD/CSV/JSON 수신·UTF-8 검증 | `cogni_demo/workspace_capabilities.py`, `tests/test_workspace_capabilities.py` | parser/크기/깊이 상한 유지 |
 | 78 | [ ] | PDF 텍스트 추출·색인 | `cogni_demo/pdf_extract_worker.py`, `cogni_demo/workspace_capabilities.py`, `tests/test_pdf_malicious_corpus.py`; Windows Job Object/POSIX rlimit의 256MiB·CPU 6초·wall 18초 격리 worker, 128쪽/256,000자 상한, 물리 page·정규화 offset·excerpt digest, encrypted/truncated/textless/page-limit/control-character corpus와 timeout kill/reap·host-path redaction 회귀 | exact-commit CPU attestation과 승인된 독립 evidence 결합 |
@@ -121,10 +123,7 @@
 
 | ID | 체크 | 요구사항 | 현재 근거 | 완료 승격 조건 |
 |---:|:---:|---|---|---|
-| 69 | [ ] | 격리된 실제 patch 실행 | v0.3.2는 `proposal_only`; `README.md` | Phase 12 kernel/process/network 격리 sandbox |
-| 72 | [ ] | 검증 후 승격/승인 | 자동 승격은 명시적으로 차단 | 사람 승인 + attested promotion transaction |
-| 73 | [ ] | 기존 코드 rollback | 후보 lifecycle rollback은 source rollback이 아님 | 실제 설치 bytes의 원자적·byte-identical rollback |
-| 75 | [ ] | UI가 아닌 실제 자가수정 E2E | Self-Harness UI는 proposal-only 상태 표시 | 실패 재현→patch→격리검증→승인→승격→rollback E2E |
+| 75 | [ ] | UI가 아닌 실제 자가수정 E2E | 기본 UI는 proposal-only; 내부 ATTESTED 평가·승격·signed committed rollback 단위 경로는 있으나 한 production boundary의 전체 E2E 없음 | 실패 재현→patch→독립 격리검증→외부 승인→승격→signed committed rollback E2E |
 | 85 | [ ] | 비디오 processor 연결 | video token/config 표시는 실행 권한이 아님 | frame/sampling/time/VRAM 상한과 실제 추론 |
 | 100 | [ ] | 검증된 로컬 semantic embedder | 현재 검색은 안정적 lexical projection | 모델 artifact/manifest, 품질·VRAM·라이선스 검증 |
 | 116 | [ ] | 안전한 unload/load 전환 | 단일 worker lifecycle만 존재 | lease drain→unload→memory check→load→rollback E2E |
@@ -156,13 +155,14 @@
 | 39 | [ ] | 임의의 일반 질문 응답 | 실제 Gemma 대화 경로 존재; typed tool 권한은 제한 | 독립 human-labelled 다양한 주제 acceptance |
 | 40 | [ ] | 자연스러운 한국어 대화 | validator와 품질 계약은 구현; v0.4.0 10/10 JSON은 historical | current exact commit·E4B-it GPU5 guard에서 10-turn strict gate |
 | 52 | [ ] | 현재 소스 actual-model 품질 stress | v0.4.0 10/10·20/20 JSON은 historical; stress validator와 회귀 tests는 구현 | current exact commit·E4B-it GPU5 guard에서 동일 corpus strict gate |
-| 54 | [ ] | 코드 작성·수정 | output-only write와 T2 proposal staging; 실제 source mutation 금지 | 승인·격리·회귀·rollback이 결합된 source patch 경로 |
+| 54 | [ ] | 코드 작성·수정 | 기본 UI는 output-only/T2 proposal이며, 내부 `PromotionMode.ATTESTED`는 immutable 평가·외부 서명 승인 뒤 기존 allowlisted Python 파일 하나만 변경 | production 격리 독립 attestation과 operator E2E 유지 |
 | 55 | [ ] | PoC/MVP 개발 지원 | `cogni_agent/tools.py`의 bounded `/project` 다중 파일 묶음, `cogni_flow/task_plan.py`, `tests/test_agent_project_bundle.py`; output-only·무실행·무덮어쓰기 | 자연어 요청→검토 가능한 typed bundle 생성과 선택적 격리 테스트 E2E |
-| 56 | [ ] | 테스트 실행 | 고정 pytest primitive, `cogni_flow/task_plan.py`; 기본 차단 | OS 격리와 명시적 trusted opt-in |
-| 61 | [ ] | 임의 shell·네트워크·경로 탈출 차단 | 정책/경로 단위 테스트는 통과; `docs/SECURITY.md` | process-tree와 network를 강제하는 OS sandbox 실증 |
-| 63 | [ ] | 적용 전 회귀 테스트 | 후보 평가/negative archive는 구현 | source patch 격리 실행과 전체 gate 연결 |
-| 64 | [ ] | 취소·timeout·rollback | IPC/task deadline·취소·candidate rollback tests | 실제 source/bundle 변경의 byte-identical rollback |
-| 70 | [ ] | 후보 회귀·보안 테스트 | sealed evaluator/negative archive 단위 경로 | 실제 patch sandbox에서 전체 회귀·fault injection |
+| 56 | [ ] | 테스트 실행 | 고정 pytest primitive와 `LinuxOciSandboxRunner`의 read-only snapshot CPU integration smoke; 기본 UI에서는 차단 | hostile-code용 production 격리 독립 attestation과 전체 회귀 연결 |
+| 61 | [ ] | 임의 shell·네트워크·경로 탈출 차단 | `cogni_flow/kernel_sandbox.py`, `tests/test_kernel_sandbox.py`; pinned image/argv, network-none, read-only, non-root, cap/NNP, bounded output·cleanup·mount/special-file gate 구현 | rootful daemon·runtime·kernel·userns·seccomp/AppArmor·socket 경계의 독립 production attestation |
+| 63 | [ ] | 적용 전 회귀 테스트 | `JournaledHarnessPatcher.evaluate_candidate`가 bounded snapshot에 replacement를 적용해 고정 회귀 후 immutable evaluation을 기록 | 독립 attested production boundary와 전체 release gate 연결 |
+| 64 | [ ] | 취소·timeout·rollback | IPC/task deadline, OCI timeout cleanup, health-failure rollback, crash recovery와 signed committed rollback tests | 실제 production boundary에서 cancel·timeout·rollback 통합 E2E |
+| 69 | [ ] | 격리된 실제 patch 실행 | `cogni_flow/kernel_sandbox.py`, `cogni_flow/snapshot.py`, `JournaledHarnessPatcher.evaluate_candidate`; 서버 smoke schema `cogni.kernel-sandbox-integration-smoke.v1`, `assurance=implementation_integration_smoke_only`, `production_attestation=false`, `gpu_measurement=not_performed` | hostile-code production 격리와 daemon/runtime/kernel 경계의 독립 attestation; integration smoke를 production 증명으로 사용 금지 |
+| 70 | [ ] | 후보 회귀·보안 테스트 | OCI snapshot 회귀·health check, forged/expired/stale 승인, cleanup·mount·output·rollback fault tests | 독립 attested production boundary에서 전체 회귀·hostile fault injection |
 | 82 | [ ] | Gemma4Processor 이미지 tensor화 | `cogni_agent/multimodal.py`와 processor tests는 구현; v0.4.0 image JSON은 historical | current manifest-bound E4B-it guard run과 pixel/byte/tensor·finite 증거 |
 | 83 | [ ] | 이미지 tensor를 모델 입력에 연결 | 고정 CPU tensor IPC와 worker/model/manager/server tests는 구현; 과거 blue-square smoke는 current scope 아님 | current exact commit image inference와 ID 86 VRAM gate |
 | 84 | [ ] | 로컬 audio processor 연결 | audio chat-template·고정 CPU tensor IPC·worker/service tests는 구현; 과거 STT smoke는 current scope 아님 | current exact commit E4B-it guard에서 16 kHz mono·finite/shape 검증 |

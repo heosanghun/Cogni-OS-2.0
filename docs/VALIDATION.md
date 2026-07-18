@@ -131,7 +131,12 @@ The suite covers the following Phase 1–11 invariants:
   capture/playback lifecycle cleanup;
 - four-gate Lens authorization, fixed official endpoints, bounded responses,
   secret redaction, attribution, provenance and explicit Lens-to-RAG indexing;
-- read-only Self-Harness diff review with no approve/apply endpoint.
+- read-only Self-Harness diff review with no approve/apply endpoint in the
+  shipped UI/default profile;
+- internal ATTESTED candidate evaluation, immutable evaluation/approval
+  binding, one-time Ed25519 promotion and separately signed committed rollback
+  software contracts. These are implementation tests, not production isolation
+  attestation or full Self-Harness E2E evidence.
 
 ## Workspace, multimodal, and voice gates
 
@@ -417,8 +422,14 @@ These are not completed by the repository test suite and remain gated:
 - attested real AFlow evaluator and held-out non-regression;
 - real production failure-corpus capture ≥99% and manually labelled cluster
   precision ≥95%;
-- Phase 12 kernel-isolated sandbox, promotion fault injection and byte-identical
-  rollback evidence;
+- independent hostile-code production isolation evidence for the OCI
+  daemon/runtime/kernel/userns/seccomp/AppArmor/socket boundary, plus an exact
+  one-environment candidate→external approval→promotion→signed committed
+  rollback E2E. The named local engine/image CPU integration smoke and fault
+  tests do not satisfy this gate. Its schema is
+  `cogni.kernel-sandbox-integration-smoke.v1`, assurance is explicitly
+  `implementation_integration_smoke_only`, `production_attestation=false`, and
+  `gpu_measurement=not_performed`;
 - code signing, a signed installer/update trust chain, independent license
   review and distribution approval. The local builder emits a CycloneDX SBOM,
   declared-license inventory and artifact/checksum provenance but cannot turn

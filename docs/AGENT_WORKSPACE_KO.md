@@ -146,11 +146,18 @@ output-only `/save`다.
 evidence, expected behavior, risk, reproduction test와 rollback trigger를 가진다.
 거부된 후보는 negative archive에 남는다.
 
-v0.4.1 지원 profile은 `proposal_only`다. source는 실행·덮어쓰기·승격되지 않는다.
-UI의 제안 diff는 읽기 전용이며 승인·적용·promotion·rollback 버튼을 제공하지 않는다.
-야간 주기 전후 source digest가 달라지면 safe mode로 진입한다. 별도 kernel, network/
-host-filesystem isolation, immutable image와 command digest가 독립 검증되는 Phase 12
-이전에는 자동 승격을 기능으로 표시하지 않는다.
+v0.4.1 사용자 UI와 기본 지원 profile은 `proposal_only`다. 이 경로에서 source는
+실행·덮어쓰기·승격되지 않으며 제안 diff는 읽기 전용이다. 승인·적용·promotion·rollback
+버튼이나 endpoint도 제공하지 않는다. 야간 주기 전후 source digest가 달라지면 safe
+mode로 진입한다.
+
+소스에는 별도의 Linux 내부 `PromotionMode.ATTESTED` 경로가 있다. bounded snapshot의
+후보 회귀가 통과해도 즉시 승격하지 않고 immutable evaluation을 저장한 뒤 inference로
+복귀한다. 이후 fresh drain/checkpoint와 exact external Ed25519 승인을 받아야 한 번만
+원자 승격할 수 있고, committed 결과의 rollback도 별도 signed one-time authorization을
+요구한다. 이 경로는 기본 UI 기능이 아니며 named engine/image의 CPU integration smoke만
+있다. daemon/runtime/kernel/network/host-filesystem 격리의 독립 production attestation과
+전체 E2E가 없으므로 자동 자가수정 또는 검증된 제품 권한으로 표시하지 않는다.
 
 ## 재현
 

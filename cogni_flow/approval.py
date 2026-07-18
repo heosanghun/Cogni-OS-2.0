@@ -36,6 +36,29 @@ class ApprovalReplayError(ApprovalError):
     """Raised when a one-time approval has already been consumed."""
 
 
+def ed25519_backend_available() -> bool:
+    """Return whether the optional Ed25519 backend works end to end.
+
+    Package discovery or even module import is insufficient: binary wheels can
+    be present while their CFFI/OpenSSL backend is missing.  This probe stays
+    lazy and exercises key construction, signing, and verification without
+    making ``cryptography`` a base dependency.
+    """
+
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey,
+        )
+
+        private_key = Ed25519PrivateKey.from_private_bytes(b"\x17" * 32)
+        message = b"cogni-ed25519-backend-probe-v1"
+        signature = private_key.sign(message)
+        private_key.public_key().verify(signature, message)
+    except Exception:
+        return False
+    return True
+
+
 def canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
     """Encode one bounded contract without implementation-dependent whitespace."""
 
@@ -342,23 +365,31 @@ class Ed25519ApprovalVerifier:
             or approval.expires_ns > evaluation.expires_ns
         ):
             raise ApprovalError("human approval exceeds evaluation validity")
+        signature = bytes.fromhex(approval.signature)
+        message = canonical_json_bytes(approval.signed_payload())
         try:
             from cryptography.exceptions import InvalidSignature
             from cryptography.hazmat.primitives.asymmetric.ed25519 import (
                 Ed25519PublicKey,
             )
-        except ImportError as exc:
+        except Exception as exc:
             raise ApprovalError(
                 "Ed25519 verification is unavailable; promotion remains disabled"
             ) from exc
         try:
             key = Ed25519PublicKey.from_public_bytes(self._public_key)
-            key.verify(
-                bytes.fromhex(approval.signature),
-                canonical_json_bytes(approval.signed_payload()),
-            )
-        except (InvalidSignature, TypeError, ValueError) as exc:
+        except Exception as exc:
+            raise ApprovalError(
+                "Ed25519 verification is unavailable; promotion remains disabled"
+            ) from exc
+        try:
+            key.verify(signature, message)
+        except InvalidSignature as exc:
             raise ApprovalError("human approval signature is invalid") from exc
+        except Exception as exc:
+            raise ApprovalError(
+                "Ed25519 verification is unavailable; promotion remains disabled"
+            ) from exc
         return approval.approval_id
 
 
@@ -512,4 +543,5 @@ __all__ = [
     "Ed25519ApprovalVerifier",
     "HumanApprovalV1",
     "canonical_json_bytes",
+    "ed25519_backend_available",
 ]

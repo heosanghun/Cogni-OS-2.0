@@ -2,6 +2,7 @@ from dataclasses import asdict
 from hashlib import sha256
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from time import time_ns
 import unittest
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from cogni_flow.approval import (
     ConsumedApprovalLedger,
     Ed25519ApprovalVerifier,
     HumanApprovalV1,
+    ed25519_backend_available,
 )
 
 
@@ -119,12 +121,61 @@ class TestSelfHarnessApproval(unittest.TestCase):
                 return real_import(name, *args, **kwargs)
 
             with patch("builtins.__import__", side_effect=guarded_import):
+                self.assertFalse(ed25519_backend_available())
                 with self.assertRaisesRegex(ApprovalError, "unavailable"):
                     verifier.verify(
                         approval,
                         evaluation,
                         now_ns=evaluation.completed_ns + 1,
                     )
+
+    def test_broken_binary_backend_fails_closed_during_key_construction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            public = bytes(range(32))
+            key = root / "operator.key"
+            key.write_bytes(public)
+            verifier = Ed25519ApprovalVerifier(
+                key,
+                expected_sha256=sha256(public).hexdigest(),
+                approver_ids=("operator.test",),
+            )
+            evaluation = _evaluation(time_ns())
+            approval = _approval(evaluation, verifier.public_key_sha256)
+            real_import = __import__
+
+            class FakeInvalidSignature(Exception):
+                pass
+
+            class BrokenPublicKey:
+                @classmethod
+                def from_public_bytes(cls, payload):
+                    raise ModuleNotFoundError("No module named '_cffi_backend'")
+
+            class BrokenPrivateKey:
+                @classmethod
+                def from_private_bytes(cls, payload):
+                    raise ModuleNotFoundError("No module named '_cffi_backend'")
+
+            def broken_backend_import(name, *args, **kwargs):
+                if name == "cryptography.exceptions":
+                    return SimpleNamespace(InvalidSignature=FakeInvalidSignature)
+                if name == "cryptography.hazmat.primitives.asymmetric.ed25519":
+                    return SimpleNamespace(
+                        Ed25519PrivateKey=BrokenPrivateKey,
+                        Ed25519PublicKey=BrokenPublicKey,
+                    )
+                return real_import(name, *args, **kwargs)
+
+            with patch("builtins.__import__", side_effect=broken_backend_import):
+                self.assertFalse(ed25519_backend_available())
+                with self.assertRaisesRegex(ApprovalError, "unavailable") as caught:
+                    verifier.verify(
+                        approval,
+                        evaluation,
+                        now_ns=evaluation.completed_ns + 1,
+                    )
+            self.assertIsInstance(caught.exception.__cause__, ModuleNotFoundError)
 
 
 if __name__ == "__main__":

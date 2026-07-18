@@ -1,6 +1,5 @@
 from dataclasses import asdict
 from hashlib import sha256
-import importlib.util
 import tempfile
 from pathlib import Path
 from time import time_ns
@@ -16,6 +15,7 @@ from cogni_flow.approval import (
     Ed25519ApprovalVerifier,
     HumanApprovalV1,
     canonical_json_bytes,
+    ed25519_backend_available,
 )
 from cogni_flow.harness import FailureTrace, SandboxResult
 import cogni_flow.production as production_module
@@ -615,8 +615,8 @@ class TestProductionSelfHarness(unittest.TestCase):
             self.assertFalse(service.journal.records())
 
     @unittest.skipUnless(
-        importlib.util.find_spec("cryptography"),
-        "optional Ed25519 verifier unavailable",
+        ed25519_backend_available(),
+        "optional Ed25519 backend is not functional",
     )
     def test_valid_external_approval_promotes_exactly_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -664,8 +664,8 @@ class TestProductionSelfHarness(unittest.TestCase):
             )
 
     @unittest.skipUnless(
-        importlib.util.find_spec("cryptography"),
-        "optional Ed25519 verifier unavailable",
+        ed25519_backend_available(),
+        "optional Ed25519 backend is not functional",
     )
     def test_failed_post_promotion_health_restores_verified_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -704,8 +704,8 @@ class TestProductionSelfHarness(unittest.TestCase):
             self.assertEqual(service.rhythm.mode.value, "inference")
 
     @unittest.skipUnless(
-        importlib.util.find_spec("cryptography"),
-        "optional Ed25519 verifier unavailable",
+        ed25519_backend_available(),
+        "optional Ed25519 backend is not functional",
     )
     def test_forged_and_expired_approvals_never_mutate_source(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -750,8 +750,8 @@ class TestProductionSelfHarness(unittest.TestCase):
             self.assertFalse(service.journal.records())
 
     @unittest.skipUnless(
-        importlib.util.find_spec("cryptography"),
-        "optional Ed25519 verifier unavailable",
+        ed25519_backend_available(),
+        "optional Ed25519 backend is not functional",
     )
     def test_source_change_after_evaluation_invalidates_approval(self):
         with tempfile.TemporaryDirectory() as tmp:

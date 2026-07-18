@@ -27,10 +27,10 @@ passing component test never upgrades a capability by itself.
 | System 3 experts | `advisory` | no | calibrated/trained expert checkpoint and independent verifier |
 | System 4 swarm/PCAS | `advisory` | no | production PCAS calibration and answer-quality evidence |
 | AFlow/ADAS | `research` | no | attested real evaluator and held-out evidence |
-| Self-Harness | default `proposal_only`; internal `ATTESTED` path unverified | no mutation in the shipped UI/default profile | hostile-code production isolation attestation, exact-scope evidence and full promote/rollback E2E |
+| Self-Harness | default `proposal_only`; internal `ATTESTED` path unverified | no mutation in the shipped UI/default profile | independent production-runner statement and current raw production E2E evidence |
 | persistent attachments + PDF extraction | `local_verified_path` | only after explicit RAG/image selection | deployment-specific parser and corpus review |
 | AkasicDB RAG | `local_index_ready` when pinned clone verifies | yes, with bounded source provenance | semantic embedder and independent retrieval-quality benchmark |
-| Gemma image/audio tensor IPC | `bounded_runtime_path` | yes when the verified processor admits the modality | broad multimodal quality and combined-VRAM evidence |
+| Gemma image/audio tensor IPC | `bounded_runtime_path`; current UI readiness unverified | only after a current-process processor probe and answer-bearing inference attestation | guarded current-scope model run, broad multimodal quality and combined-VRAM evidence |
 | local STT/TTS | `historical_dev_host_observation`; current scope unverified | gated until current guarded evidence | GPU5-guarded current-scope run, multi-speaker WER, noise, language, latency and accessibility study |
 | Lens patent/scholarly search | `opt_in_gated` | only after explicit search/index action | token, terms acceptance, allowlist, live validation and distribution attribution review |
 
@@ -54,7 +54,7 @@ malformed evidence.
 | 8 | bounded 8-slot, top-k=2 expert candidate lifecycle with quarantine and rollback | `advisory`; no independently verified trained expert artifact |
 | 9 | immutable typed plans, one-use capabilities, bounded T0/T1 execution and T2 proposal staging | T3/network/arbitrary shell are denied; free-form model plans have no authority |
 | 10 | sealed, replayable, held-in/out AFlow research evaluator and archive | `research_archive_only`; no production installation path |
-| 11 | persistent success/failure ledger, causal signatures, K≥3 distinct proposals and negative archive | `proposal_only`; active source mutation is forbidden |
+| 11 | persistent success/failure ledger, causal signatures, K≥3 distinct proposals, negative archive and an operator-only E2E evidence-chain validator | the shipped UI/default profile forbids mutation; the internal `ATTESTED` path remains non-automatic and production-unattested |
 
 Detailed gates and commands are in
 [Validation](docs/VALIDATION.md) and
@@ -239,13 +239,13 @@ Image and audio preprocessing use the manifest-bound `Gemma4Processor`, then
 cross the worker boundary as fixed-schema CPU tensors with request/artifact/
 session binding. One explicitly selected image can be used for one turn.
 Browser audio is accepted only as bounded mono 16-bit PCM WAV at 16 kHz and
-at most 30 seconds. A local development smoke transcribed a Korean phrase with
+at most 30 seconds. A retained v0.4.0 historical development-host smoke transcribed a Korean phrase with
 normalized similarity 1.0 and synthesized it with the installed Microsoft
 Heami `ko-KR` Windows voice, with zero application external calls. This single
 synthetic phrase is not a WER or general speech-quality benchmark. Video input
 is not implemented.
 
-A separate actual-model smoke sent a locally generated 256×256 PNG containing
+A retained v0.4.0 historical actual-model smoke sent a locally generated 256×256 PNG containing
 one blue square through the Cogni-Core image route. The response was
 `중앙의 큰 도형은 파란색 정사각형입니다.`, with `finish_reason=stop` and zero
 external calls. This one fixed case is not general visual-reasoning or
@@ -258,6 +258,11 @@ local AkasicDB adapter. No live Lens query is claimed for this release because
 the release process has no distributable user token or terms acceptance.
 
 ## Windows launcher
+
+This source checkout does **not** contain `release\CogniBoard-v0.4.1.exe`.
+The path below is the expected build output only. Do not present it as an
+available current executable until the frozen exact commit has produced the
+binary and its checksum and cold-start smoke have passed.
 
 Build the v0.4.1 launcher from the exact source tree:
 
@@ -295,7 +300,10 @@ and
   read-only diff review with no approve/apply endpoint. An internal Linux
   ATTESTED library path can evaluate a snapshot and, only after external
   Ed25519 authority, atomically promote or roll back one exact committed
-  record. It is not automatic, production-attested, or full-E2E verified.
+  record. An operator-only append-only validator now checks the complete
+  promotion/health/signed-rollback evidence chain, but no independent
+  production-runner statement or current raw production E2E evidence has been
+  accepted. The path is not automatic or production-attested.
 - The graphical server is loopback-only, uses per-session authentication and
   local allowlisted assets, and has no CDN or analytics dependency.
 

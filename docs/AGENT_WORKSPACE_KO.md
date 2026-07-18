@@ -155,9 +155,12 @@ mode로 진입한다.
 후보 회귀가 통과해도 즉시 승격하지 않고 immutable evaluation을 저장한 뒤 inference로
 복귀한다. 이후 fresh drain/checkpoint와 exact external Ed25519 승인을 받아야 한 번만
 원자 승격할 수 있고, committed 결과의 rollback도 별도 signed one-time authorization을
-요구한다. 이 경로는 기본 UI 기능이 아니며 named engine/image의 CPU integration smoke만
-있다. daemon/runtime/kernel/network/host-filesystem 격리의 독립 production attestation과
-전체 E2E가 없으므로 자동 자가수정 또는 검증된 제품 권한으로 표시하지 않는다.
+요구한다. 이 경로는 기본 UI 기능이 아니며 named engine/image의 CPU integration smoke는
+production 격리 증거로 인정하지 않는다. 운영자 전용 append-only validator가 승격·health·별도
+signed rollback E2E 증거 체인을 검사하지만, daemon/runtime/kernel/network/host-filesystem
+격리의 독립 production attestation, 독립 평가자의 runner statement와 같은 boundary에서
+생성한 current raw production E2E 증거가 없으므로 자동 자가수정 또는 검증된 제품 권한으로
+표시하지 않는다.
 
 ## 재현
 

@@ -179,7 +179,7 @@ tree·model·config·device scope를 파생한다. `COMPLETED`가 있는 유효 
 | 83 | [ ] | 이미지 tensor를 모델 입력에 연결 | `PARTIAL` | 고정 CPU tensor IPC와 worker/model/manager/server tests는 구현; 과거 blue-square smoke는 current scope 아님 | current exact commit image inference와 ID 86 VRAM gate |
 | 84 | [ ] | 로컬 audio processor 연결 | `PARTIAL` | audio chat-template·고정 CPU tensor IPC·worker/service tests는 구현; 과거 STT smoke는 current scope 아님 | current exact commit E4B-it guard에서 16 kHz mono·finite/shape 검증 |
 | 85 | [ ] | 비디오 processor 연결 | `NOT_IMPLEMENTED` | video token/config 표시는 실행 권한이 아님 | frame/sampling/time/VRAM 상한과 실제 추론 |
-| 86 | [ ] | 멀티모달 VRAM 경계 검증 | `PARTIAL` | 이미지와 오디오 actual-model smoke는 PASS이나 증거 JSON에 peak allocated/reserved VRAM은 없음 | image/audio 조합을 current commit에서 16.7 GiB/finite/latency로 실측 |
+| 86 | [ ] | 멀티모달 VRAM 경계 검증 | `PARTIAL` | v0.4.0의 고정 이미지·합성 음성 actual-model smoke는 historical PASS이나 current scope가 아니며 peak allocated/reserved VRAM도 기록하지 않음 | image/audio 조합을 current commit에서 16.7 GiB/finite/latency로 실측 |
 | 87 | [ ] | 미지원 modality를 이유와 함께 비활성화 | `IMPLEMENTED_UNVERIFIED` | workspace capability payload, disabled UI controls, UI tests | capability 없을 때 자동 활성화 금지 |
 
 ### I. 로컬 RAG·AkasicDB (88–102)
@@ -192,7 +192,7 @@ tree·model·config·device scope를 파생한다. `COMPLETED`가 있는 유효 
 | 91 | [ ] | 관련성 있는 bounded 검색 | `IMPLEMENTED_UNVERIFIED` | deterministic lexical sketch와 Akasic stores, 실제 smoke/adapter tests | semantic 검색으로 과장하지 않기 |
 | 92 | [ ] | 검색 근거를 모델 prompt에 주입 | `IMPLEMENTED_UNVERIFIED` | `cogni_demo/server.py`, `cogni_agent/manager.py`, manager/API tests | RAG off/no-result에서 일반 답변과 명확히 분리 |
 | 93 | [ ] | 답변의 `[근거 N]` 인용 계약 | `IMPLEMENTED_UNVERIFIED` | `cogni_agent/response_quality.py`, RAG manager tests | 존재하지 않는 번호를 block/fallback |
-| 94 | [ ] | source/chunk/score provenance 반환 | `IMPLEMENTED_UNVERIFIED` | RAG query payload와 UI message source rendering | 원문 위치/page까지 확대 시 schema 버전 갱신 |
+| 94 | [ ] | source/chunk/score provenance 반환 | `IMPLEMENTED_UNVERIFIED` | schema v2 query/answer payload와 UI source rendering이 file/chunk/score, PDF 물리 page·정규화 offset·indexed/selected excerpt digest를 구분; manager/server/API/UI tests | exact-commit CPU/UI attestation과 승인된 독립 evidence 결합 |
 | 95 | [ ] | 근거 없는 RAG 성공 표시 금지 | `IMPLEMENTED_UNVERIFIED` | `server.py` fail-closed RAG path, API tests | backend 미가동을 모델 지식으로 대체하지 않기 |
 | 96 | [ ] | 잘못된 citation 차단 | `IMPLEMENTED_UNVERIFIED` | response quality citation validator와 tests | 문장별 다중 출처 회귀 추가 |
 | 97 | [ ] | 문서 prompt injection 방어 | `IMPLEMENTED_UNVERIFIED` | evidence sanitization/bounded prompt, security tests | 실제 Gemma adversarial corpus 확대 |
@@ -212,14 +212,14 @@ tree·model·config·device scope를 파생한다. `COMPLETED`가 있는 유효 
 | 106 | [ ] | 음성→입력창 전사 | `IMPLEMENTED_UNVERIFIED` | `/api/workspace/voice/transcribe` 결과를 자동 전송 없이 편집 가능한 composer에 넣는 `app.js`, voice API/UI contract tests | transcript 편집과 명시적 전송 분리 유지 |
 | 107 | [ ] | 녹음 시작·정지·취소 | `PARTIAL` | 30초/2 MiB 상한, start/stop/cancel/cleanup 상태 기계와 UI contract tests | 실제 브라우저에서 취소·권한 실패·최대시간·연속 녹음 E2E |
 | 108 | [ ] | 음성 외부 전송 0 검증 | `PARTIAL` | 실제 voice evidence의 STT/TTS `external_calls=0`, 인증 loopback-only API와 fixed local runners | 완성 bundle에 대한 packet/egress 감사 |
-| 109 | [ ] | 선택적 로컬 TTS | `IMPLEMENTED_UNVERIFIED` | Windows System.Speech 고정 runner, 실제 Microsoft Heami ko-KR WAV smoke, 인증 API와 play/stop/object-URL cleanup tests | 설치 voice probe·사용자 실행·stop·크기/시간 상한과 외부 호출 0 유지 |
+| 109 | [ ] | 선택적 로컬 TTS | `IMPLEMENTED_UNVERIFIED` | Windows System.Speech 고정 runner와 current-startup host WAV probe 경로, v0.4.0 Microsoft Heami ko-KR smoke는 historical; 인증 API와 play/stop/object-URL cleanup tests | current host probe·실제 브라우저 playback/stop·크기/시간 상한과 외부 호출 0 유지 |
 | 110 | [ ] | 음성 미지원 이유 명시 | `IMPLEMENTED_UNVERIFIED` | capability payload와 disabled microphone tooltip/status | 지원 전까지 enabled 표시 금지 |
 
 ### K. 로컬 모델 선택 (111–117)
 
 | ID | 체크 | 요구사항 | 상태 | 실제 근거 | 완료 승격 조건 |
 |---:|:---:|---|---|---|---|
-| 111 | [ ] | 로컬 모델 선택기 | `PARTIAL` | composer selector와 `/api/workspace/models/select`; 검증된 단일 모델만 표시 | 복수 manifest registry와 실제 worker 전환 |
+| 111 | [ ] | 로컬 모델 선택기 | `PARTIAL` | composer selector와 `/api/workspace/models/select`; 현재 worker 모델만 selectable이고 bounded registry의 검증 후보는 non-selectable로 표시 | 발견 후보의 lease-safe worker unload/load·검증 실패 rollback E2E |
 | 112 | [ ] | 현재 선택 Gemma 상태 표시 | `IMPLEMENTED_UNVERIFIED` | workspace capability/UI model selector tests | Fact-book와 실시간 일치 유지 |
 | 113 | [ ] | 로컬 모델 자동 발견 | `IMPLEMENTED_UNVERIFIED` | `cogni_demo/workspace_capabilities.py::discover_verified_local_models`, `tests/test_workspace_capabilities.py`; 명시적 absolute registry의 직접 자식만 bounded scan하고 sibling manifest·closed-world layout·고정 E4B-it fingerprint를 검증하며 symlink/reparse/UNC/URL/Hub ID를 차단 | exact-commit CPU attestation과 독립 evidence 결합; 발견 모델은 ID 116 전까지 로드 불가 유지 |
 | 114 | [ ] | 모델별 modality 지원 표시 | `PARTIAL` | metadata/Fact-book에는 modality 구성과 active 구분 | 복수 모델 registry 및 실제 processor gate |

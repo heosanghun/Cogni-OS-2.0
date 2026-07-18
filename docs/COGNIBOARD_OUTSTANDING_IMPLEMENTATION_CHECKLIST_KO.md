@@ -54,8 +54,8 @@
 | 67 | [ ] | evolution 모드에서만 후보 생성 | `cogni_flow/rhythm.py`, `cogni_flow/cycle.py`, `ProductionSelfHarness.promote_approved_once`/`rollback_committed_once`; fresh drain·checkpoint tests | inference와 동시 실행 금지 유지 |
 | 68 | [ ] | 수정 후보 생성 | `cogni_flow/local_proposer.py`, `cogni_flow/proposals.py` | 후보는 inert proposal임을 UI에 유지 |
 | 71 | [ ] | 실패 후보 폐기·negative archive | `cogni_flow/proposals.py`, proposal/evolution tests | archive 무결성·보존 상한 유지 |
-| 72 | [ ] | 검증 후 승격/승인 | immutable evaluation, pinned Ed25519 승인·TTL·nonce·replay 차단, fresh evolution drain과 one-shot atomic promotion; `tests/test_production_harness.py`, `tests/test_self_harness_approval.py` | independently attested production runner·operator import·exact-scope 승인 evidence; 자동 승격은 계속 차단 |
-| 73 | [ ] | 기존 코드 rollback | exact committed journal record에 묶인 외부 Ed25519 `rollback_committed_once`, one-time nonce, byte-identical restore·health check·실패 시 committed bytes 재적용 | independently attested production runner의 signed rollback drill과 exact-scope 승인 evidence |
+| 72 | [ ] | 검증 후 승격/승인 | immutable evaluation, pinned Ed25519 승인·TTL·nonce·replay 차단, fresh evolution drain과 one-shot atomic promotion; detached external runner statement의 engine/image/command/source/TTL/nonce 검증·1회 import는 `cogni_flow/runner_attestation.py` | 독립 평가자가 실제 production boundary에 발행한 exact-scope statement·raw 실행 evidence; 자동 승격은 계속 차단 |
+| 73 | [ ] | 기존 코드 rollback | exact committed journal record에 묶인 외부 Ed25519 `rollback_committed_once`, one-time nonce, byte-identical restore·health check·실패 시 committed bytes 재적용; operator evidence chain validator 포함 | independently attested production runner에서 수행한 signed rollback drill의 current raw evidence |
 | 74 | [ ] | 증거·후보 이력 영속 저장 | `cogni_flow/logdb.py`, proposal/evaluation ledger, consumed approval/rollback nonce와 backup journal persistence tests | scope/content digest 검증 유지 |
 | 76 | [ ] | `+` 파일/이미지 첨부 UI·API | `cogni_demo/static/index.html`, `app.js`, `/api/workspace/attachments/add`, API/UI tests | 최신 bundle에 포함하여 E2E smoke |
 | 77 | [ ] | TXT/MD/CSV/JSON 수신·UTF-8 검증 | `cogni_demo/workspace_capabilities.py`, `tests/test_workspace_capabilities.py` | parser/크기/깊이 상한 유지 |
@@ -70,7 +70,7 @@
 | 91 | [ ] | 관련성 있는 bounded 검색 | deterministic lexical sketch와 Akasic stores, 실제 smoke/adapter tests | semantic 검색으로 과장하지 않기 |
 | 92 | [ ] | 검색 근거를 모델 prompt에 주입 | `cogni_demo/server.py`, `cogni_agent/manager.py`, manager/API tests | RAG off/no-result에서 일반 답변과 명확히 분리 |
 | 93 | [ ] | 답변의 `[근거 N]` 인용 계약 | `cogni_agent/response_quality.py`, RAG manager tests | 존재하지 않는 번호를 block/fallback |
-| 94 | [ ] | source/chunk/score provenance 반환 | RAG query payload와 UI message source rendering | 원문 위치/page까지 확대 시 schema 버전 갱신 |
+| 94 | [ ] | source/chunk/score provenance 반환 | schema v2 query/answer payload와 UI source rendering이 file/chunk/score, PDF 물리 page·정규화 offset·indexed/selected excerpt digest를 구분; manager/server/API/UI tests | exact-commit CPU/UI attestation과 승인된 독립 evidence 결합 |
 | 95 | [ ] | 근거 없는 RAG 성공 표시 금지 | `server.py` fail-closed RAG path, API tests | backend 미가동을 모델 지식으로 대체하지 않기 |
 | 96 | [ ] | 잘못된 citation 차단 | response quality citation validator와 tests | 문장별 다중 출처 회귀 추가 |
 | 97 | [ ] | 문서 prompt injection 방어 | evidence sanitization/bounded prompt, security tests | 실제 Gemma adversarial corpus 확대 |
@@ -79,7 +79,7 @@
 | 101 | [ ] | RAG on/off toggle | `static/index.html`, `app.js`, chat `rag` API flag, UI/API tests | 상태와 backend capability 일치 유지 |
 | 102 | [ ] | 답변 provenance drawer | 문장 내 `[근거 N]`과 source list가 인증된 exact-source API 및 독립 drawer를 열고 file/chunk/score·PDF 물리 page·정규화 offset·excerpt digest를 표시; schema v2의 `normalized_extracted_excerpt_v1`로 원본 bytes/summary와 구분, `tests/test_demo_ui.py`, `tests/test_workspace_capabilities_api.py` | exact-commit CPU/UI attestation과 승인된 독립 evidence 결합 |
 | 106 | [ ] | 음성→입력창 전사 | `/api/workspace/voice/transcribe` 결과를 자동 전송 없이 편집 가능한 composer에 넣는 `app.js`, voice API/UI contract tests | transcript 편집과 명시적 전송 분리 유지 |
-| 109 | [ ] | 선택적 로컬 TTS | Windows System.Speech 고정 runner, 실제 Microsoft Heami ko-KR WAV smoke, 인증 API와 play/stop/object-URL cleanup tests | 설치 voice probe·사용자 실행·stop·크기/시간 상한과 외부 호출 0 유지 |
+| 109 | [ ] | 선택적 로컬 TTS | Windows System.Speech 고정 runner와 current-startup host WAV probe 경로, v0.4.0 Microsoft Heami ko-KR smoke는 historical; 인증 API와 play/stop/object-URL cleanup tests | current host probe·실제 브라우저 playback/stop·크기/시간 상한과 외부 호출 0 유지 |
 | 110 | [ ] | 음성 미지원 이유 명시 | capability payload와 disabled microphone tooltip/status | 지원 전까지 enabled 표시 금지 |
 | 112 | [ ] | 현재 선택 Gemma 상태 표시 | workspace capability/UI model selector tests | Fact-book와 실시간 일치 유지 |
 | 113 | [ ] | 로컬 모델 자동 발견 | `cogni_demo/workspace_capabilities.py::discover_verified_local_models`, `tests/test_workspace_capabilities.py`; 명시적 absolute registry의 직접 자식만 bounded scan하고 sibling manifest·closed-world layout·고정 E4B-it fingerprint를 검증하며 symlink/reparse/UNC/URL/Hub ID를 차단 | exact-commit CPU attestation과 독립 evidence 결합; 발견 모델은 ID 116 전까지 로드 불가 유지 |
@@ -123,7 +123,6 @@
 
 | ID | 체크 | 요구사항 | 현재 근거 | 완료 승격 조건 |
 |---:|:---:|---|---|---|
-| 75 | [ ] | UI가 아닌 실제 자가수정 E2E | 기본 UI는 proposal-only; detached external runner statement import와 운영자 전용 K≥3 후보→immutable regression→외부 승인→승격→health→별도 signed rollback append-only evidence chain/validator 구현 | 독립 평가자가 서명한 실제 production runner statement와 current production boundary의 원시 전체 E2E evidence; UI/자동 승격은 계속 금지 |
 | 85 | [ ] | 비디오 processor 연결 | video token/config 표시는 실행 권한이 아님 | frame/sampling/time/VRAM 상한과 실제 추론 |
 | 100 | [ ] | 검증된 로컬 semantic embedder | 현재 검색은 안정적 lexical projection | 모델 artifact/manifest, 품질·VRAM·라이선스 검증 |
 | 116 | [ ] | 안전한 unload/load 전환 | 단일 worker lifecycle만 존재 | lease drain→unload→memory check→load→rollback E2E |
@@ -163,16 +162,17 @@
 | 64 | [ ] | 취소·timeout·rollback | IPC/task deadline, OCI timeout cleanup, health-failure rollback, crash recovery와 signed committed rollback tests | 실제 production boundary에서 cancel·timeout·rollback 통합 E2E |
 | 69 | [ ] | 격리된 실제 patch 실행 | `cogni_flow/kernel_sandbox.py`, `cogni_flow/snapshot.py`, `JournaledHarnessPatcher.evaluate_candidate`; 서버 smoke schema `cogni.kernel-sandbox-integration-smoke.v1`, `assurance=implementation_integration_smoke_only`, `production_attestation=false`, `gpu_measurement=not_performed` | hostile-code production 격리와 daemon/runtime/kernel 경계의 독립 attestation; integration smoke를 production 증명으로 사용 금지 |
 | 70 | [ ] | 후보 회귀·보안 테스트 | OCI snapshot 회귀·health check, forged/expired/stale 승인, cleanup·mount·output·rollback fault tests | 독립 attested production boundary에서 전체 회귀·hostile fault injection |
+| 75 | [ ] | UI가 아닌 실제 자가수정 E2E | 기본 UI는 proposal-only; `cogni_flow/self_harness_e2e.py`의 운영자 전용 immutable evaluation→외부 승인→원자 승격→health→별도 signed rollback append-only chain과 read-only CLI validator, health-fail byte restore/replay/restart 회귀 구현 | 독립 평가자가 서명한 실제 production runner statement와 한 current production boundary에서 생성한 원시 전체 E2E evidence 결합; UI/자동 승격은 계속 금지 |
 | 82 | [ ] | Gemma4Processor 이미지 tensor화 | `cogni_agent/multimodal.py`와 processor tests는 구현; v0.4.0 image JSON은 historical | current manifest-bound E4B-it guard run과 pixel/byte/tensor·finite 증거 |
 | 83 | [ ] | 이미지 tensor를 모델 입력에 연결 | 고정 CPU tensor IPC와 worker/model/manager/server tests는 구현; 과거 blue-square smoke는 current scope 아님 | current exact commit image inference와 ID 86 VRAM gate |
 | 84 | [ ] | 로컬 audio processor 연결 | audio chat-template·고정 CPU tensor IPC·worker/service tests는 구현; 과거 STT smoke는 current scope 아님 | current exact commit E4B-it guard에서 16 kHz mono·finite/shape 검증 |
-| 86 | [ ] | 멀티모달 VRAM 경계 검증 | 이미지와 오디오 actual-model smoke는 PASS이나 증거 JSON에 peak allocated/reserved VRAM은 없음 | image/audio 조합을 current commit에서 16.7 GiB/finite/latency로 실측 |
+| 86 | [ ] | 멀티모달 VRAM 경계 검증 | v0.4.0의 고정 이미지·합성 음성 actual-model smoke는 historical PASS이나 current scope가 아니며 peak allocated/reserved VRAM도 기록하지 않음 | image/audio 조합을 current commit에서 16.7 GiB/finite/latency로 실측 |
 | 103 | [ ] | 마이크 입력 | 브라우저 `getUserMedia`→16 kHz mono WAV→인증 loopback STT 경로와 UI/API contract tests | 실제 Windows 마이크 장치에서 권한·녹음·전사 브라우저 E2E |
 | 104 | [ ] | Windows 마이크 권한 처리 | 클릭 시에만 권한 요청하고 오류/취소 cleanup UI 경로 구현 | 권한 거부·철회·장치 없음·장치 전환을 실제 브라우저에서 검증 |
 | 105 | [ ] | 로컬 STT | 로컬 voice/API tests와 Gemma audio 경로는 구현; v0.4.0 TTS→STT JSON은 historical | current E4B-it GPU5 guard smoke와 다화자·잡음 품질 gate |
 | 107 | [ ] | 녹음 시작·정지·취소 | 30초/2 MiB 상한, start/stop/cancel/cleanup 상태 기계와 UI contract tests | 실제 브라우저에서 취소·권한 실패·최대시간·연속 녹음 E2E |
 | 108 | [ ] | 음성 외부 전송 0 검증 | 실제 voice evidence의 STT/TTS `external_calls=0`, 인증 loopback-only API와 fixed local runners | 완성 bundle에 대한 packet/egress 감사 |
-| 111 | [ ] | 로컬 모델 선택기 | composer selector와 `/api/workspace/models/select`; 검증된 단일 모델만 표시 | 복수 manifest registry와 실제 worker 전환 |
+| 111 | [ ] | 로컬 모델 선택기 | composer selector와 `/api/workspace/models/select`; 현재 worker 모델만 selectable이고 bounded registry의 검증 후보는 non-selectable로 표시 | 발견 후보의 lease-safe worker unload/load·검증 실패 rollback E2E |
 | 114 | [ ] | 모델별 modality 지원 표시 | metadata/Fact-book에는 modality 구성과 active 구분 | 복수 모델 registry 및 실제 processor gate |
 | 115 | [ ] | 모델별 VRAM 요구량 표시 | 목표/과거 실측 표시는 있으나 모델별 현재 실측 registry 없음 | 동일 장치·prompt scope의 current measurement |
 | 119 | [ ] | 사용자 명시적 online 전환 | 권한/allowlist 정책은 구현, 실제 executor 없음 | 세션 opt-in UI·감사 로그·즉시 revoke E2E |

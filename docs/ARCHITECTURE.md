@@ -293,7 +293,10 @@ an exclusive evolution window.
 - The named-engine/image CPU integration smoke is not independent production
   isolation evidence. Rootful daemon, runtime, kernel, user namespace,
   seccomp/AppArmor, socket ownership and hostile-code escape boundaries remain
-  unverified, and no full promote/rollback E2E has been accepted.
+  unverified. An operator-only append-only validator covers the
+  promotion/health/separately signed rollback evidence-chain contract, but no
+  independent production-runner statement or current raw production E2E
+  evidence has been accepted.
 
 This internal path is never automatic self-modification and does not change the
 Runtime Fact-book or desktop UI from `proposal_only`.

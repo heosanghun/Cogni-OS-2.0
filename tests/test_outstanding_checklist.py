@@ -11,6 +11,7 @@ from scripts.validate_master_acceptance_checklist import ChecklistValidationErro
 
 ROOT = Path(__file__).resolve().parents[1]
 MASTER = ROOT / "docs" / "COGNIBOARD_MASTER_ACCEPTANCE_CHECKLIST_KO.md"
+OUTSTANDING = ROOT / "docs" / "COGNIBOARD_OUTSTANDING_IMPLEMENTATION_CHECKLIST_KO.md"
 
 
 def test_outstanding_renderer_consumes_only_a_fully_validated_master() -> None:
@@ -22,6 +23,11 @@ def test_outstanding_renderer_consumes_only_a_fully_validated_master() -> None:
     assert "전체 미완료: **170개**" in result
     assert "구현됐으나 승인 증거 미결합: **103개**" in result
     assert "| 1 | [ ] | Gemma 4 E4B-it 로컬 백본 |" in result
+
+
+def test_checked_in_outstanding_checklist_matches_renderer() -> None:
+    expected = render(parse_master(MASTER))
+    assert OUTSTANDING.read_text(encoding="utf-8") == expected
 
 
 @pytest.mark.parametrize(

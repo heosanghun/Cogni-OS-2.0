@@ -135,8 +135,10 @@ The suite covers the following Phase 1–11 invariants:
   shipped UI/default profile;
 - internal ATTESTED candidate evaluation, immutable evaluation/approval
   binding, one-time Ed25519 promotion and separately signed committed rollback
-  software contracts. These are implementation tests, not production isolation
-  attestation or full Self-Harness E2E evidence.
+  software contracts, plus the operator-only append-only validator for the
+  promotion/health/separately signed rollback chain. These are implementation
+  tests, not production isolation attestation, an independently issued runner
+  statement, or current raw production E2E evidence.
 
 ## Workspace, multimodal, and voice gates
 

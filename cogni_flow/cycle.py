@@ -16,6 +16,8 @@ class EvolutionReport:
     target: str | None
     proposal_only: bool = False
     blocked_reason: str | None = None
+    awaiting_approval: bool = False
+    evaluation_id: str | None = None
 
 
 class SelfHarness:
@@ -44,6 +46,8 @@ class SelfHarness:
         proposal_count = 0
         try:
             promoted_target: str | None = None
+            awaiting_target: str | None = None
+            evaluation_id: str | None = None
             # Proposal generation is evolution work too. Keep the lifetime
             # counter active across generation, nested sandbox validation, and
             # promotion so another thread cannot resume daytime inference in
@@ -60,6 +64,34 @@ class SelfHarness:
                                 "proposal_only",
                             )
                             continue
+                        if getattr(self.patcher, "requires_manual_approval", False):
+                            identity = getattr(
+                                self.proposer, "proposal_id_for_patch", None
+                            )
+                            if not callable(identity):
+                                raise RuntimeError(
+                                    "candidate evaluation requires proposal evidence identity"
+                                )
+                            result = self.patcher.evaluate_candidate(
+                                proposal,
+                                proposal_id=identity(proposal),
+                            )
+                            self.logdb.audit(
+                                "candidate",
+                                proposal.relative_path,
+                                "awaiting_approval"
+                                if result.passed
+                                else f"failed:{result.sandbox.returncode}",
+                            )
+                            if result.passed:
+                                if result.evaluation is None:
+                                    raise RuntimeError(
+                                        "passing candidate has no evaluation evidence"
+                                    )
+                                awaiting_target = str(result.target)
+                                evaluation_id = result.evaluation.evaluation_id
+                                break
+                            continue
                         result = self.patcher.validate_and_promote(proposal)
                         self.logdb.audit(
                             "candidate",
@@ -73,6 +105,8 @@ class SelfHarness:
                             break
                     if promoted_target is not None:
                         break
+                    if awaiting_target is not None:
+                        break
             if promoted_target is not None:
                 self.rhythm.resume_inference("validated patch promoted")
                 return EvolutionReport(
@@ -82,6 +116,20 @@ class SelfHarness:
                     promoted_target,
                     False,
                     None,
+                )
+            if awaiting_target is not None:
+                self.rhythm.resume_inference(
+                    "candidate evaluation awaits external approval"
+                )
+                return EvolutionReport(
+                    len(clusters),
+                    proposal_count,
+                    False,
+                    awaiting_target,
+                    False,
+                    "external human approval required",
+                    True,
+                    evaluation_id,
                 )
             self.rhythm.resume_inference("no candidate passed validation")
             return EvolutionReport(

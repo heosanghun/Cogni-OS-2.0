@@ -1,11 +1,24 @@
+from dataclasses import asdict
 from hashlib import sha256
+import importlib.util
 import tempfile
 from pathlib import Path
+from time import time_ns
 import unittest
+from unittest.mock import patch
 
 import torch
 
+from cogni_flow.approval import (
+    APPROVAL_SCHEMA,
+    ApprovalError,
+    ApprovalReplayError,
+    Ed25519ApprovalVerifier,
+    HumanApprovalV1,
+    canonical_json_bytes,
+)
 from cogni_flow.harness import FailureTrace, SandboxResult
+import cogni_flow.production as production_module
 from cogni_flow.production import (
     BackupJournal,
     BoundedLogDB,
@@ -109,17 +122,40 @@ class ProductionHarnessFixture:
         self.signature = ("ValueError", "V1", "workflow")
         self.targets = {self.signature: "cogni_flow/target.py"}
 
-    def build(self, config, *, clock, runner=None, checkpoint=None):
-        return build_production_self_harness(
-            self.root,
-            FakeModel(),
-            FakeTokenizer(),
-            self.targets,
-            checkpoint or (lambda: None),
-            config=config,
-            runner=runner,
-            clock=clock,
-        )
+    def build(
+        self,
+        config,
+        *,
+        clock,
+        runner=None,
+        checkpoint=None,
+        approval_verifier=None,
+    ):
+        if (
+            config.promotion_mode == PromotionMode.ATTESTED
+            and approval_verifier is None
+        ):
+            key = self.root / "test-approval-public.key"
+            key.write_bytes(bytes(range(32)))
+            approval_verifier = Ed25519ApprovalVerifier(
+                key,
+                expected_sha256=sha256(key.read_bytes()).hexdigest(),
+                approver_ids=("operator.test",),
+            )
+        # Native Windows remains fail-closed in product code.  This narrowly
+        # scoped test seam exercises platform-independent transaction logic.
+        with patch.object(production_module, "_require_kernel_promotion_platform"):
+            return build_production_self_harness(
+                self.root,
+                FakeModel(),
+                FakeTokenizer(),
+                self.targets,
+                checkpoint or (lambda: None),
+                config=config,
+                runner=runner,
+                approval_verifier=approval_verifier,
+                clock=clock,
+            )
 
     @staticmethod
     def submit_and_run(service, clock):
@@ -129,6 +165,67 @@ class ProductionHarnessFixture:
         service.failure_daemon.flush()
         clock.advance(service.config.idle_seconds)
         return service.tick()
+
+    def submit_evidence_and_run(self, service, clock):
+        service.capture_exception(
+            "wf-1", ValueError("wrong result"), verifier_code="V1"
+        )
+        service.failure_daemon.flush()
+        cluster = next(
+            item
+            for item in service.proposal_ledger.clusters()
+            if item.signature == self.signature
+        )
+        for replacement in ("VALUE = 3", "VALUE = 4", "VALUE = 2"):
+            service.proposer.proposer.tokenizer.decoded = replacement
+            service.proposer(cluster)
+        clock.advance(service.config.idle_seconds)
+        return service.tick()
+
+
+def _signing_authority(root: Path):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    private = Ed25519PrivateKey.from_private_bytes(b"\x19" * 32)
+    public = private.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    key = root / "operator-ed25519-public.key"
+    key.write_bytes(public)
+    verifier = Ed25519ApprovalVerifier(
+        key,
+        expected_sha256=sha256(public).hexdigest(),
+        approver_ids=("operator.test",),
+    )
+    return private, verifier
+
+
+def _signed_approval(private, verifier, evaluation, **overrides):
+    issued = max(evaluation.completed_ns, time_ns() - 1)
+    payload = {
+        "schema": APPROVAL_SCHEMA,
+        "evaluation_id": evaluation.evaluation_id,
+        "proposal_id": evaluation.proposal_id,
+        "relative_path": evaluation.relative_path,
+        "base_sha256": evaluation.base_sha256,
+        "replacement_sha256": evaluation.replacement_sha256,
+        "source_surface_sha256": evaluation.source_surface_sha256,
+        "snapshot_tree_sha256": evaluation.snapshot_tree_sha256,
+        "runner_id": evaluation.runner_id,
+        "runner_evidence_sha256": evaluation.runner_evidence_sha256,
+        "regression_command_sha256": evaluation.regression_command_sha256,
+        "nonce": "approval_nonce_0123456789abcdef0",
+        "approver_id": "operator.test",
+        "issued_ns": issued,
+        "expires_ns": evaluation.expires_ns,
+        "decision": "approve_once",
+        "public_key_sha256": verifier.public_key_sha256,
+    }
+    payload.update(overrides)
+    payload["signature"] = private.sign(canonical_json_bytes(payload)).hex()
+    return HumanApprovalV1.from_mapping(payload)
 
 
 class TestProductionSelfHarness(unittest.TestCase):
@@ -429,7 +526,58 @@ class TestProductionSelfHarness(unittest.TestCase):
             ):
                 fixture.build(untrusted, clock=FakeClock(), runner=runner)
 
-    def test_attested_promotion_runs_staging_then_post_atomic_health(self):
+    def test_attested_mode_requires_a_pinned_external_approval_verifier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = ProductionHarnessFixture(Path(tmp))
+            config = ProductionHarnessConfig(
+                promotion_mode=PromotionMode.ATTESTED,
+                regression_command=("regression",),
+                health_check_command=("health",),
+                trusted_runner_evidence_sha256=("a" * 64,),
+            )
+            runner = FakeAttestedRunner(
+                (config.regression_command, config.health_check_command)
+            )
+            with patch.object(production_module, "_require_kernel_promotion_platform"):
+                with self.assertRaisesRegex(ApprovalError, "approval verifier"):
+                    build_production_self_harness(
+                        fixture.root,
+                        FakeModel(),
+                        FakeTokenizer(),
+                        fixture.targets,
+                        lambda: None,
+                        config=config,
+                        runner=runner,
+                        clock=FakeClock(),
+                    )
+
+    @unittest.skipUnless(production_module.os.name == "nt", "native Windows only")
+    def test_native_windows_attested_mode_fails_closed_before_state_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = ProductionHarnessFixture(Path(tmp))
+            config = ProductionHarnessConfig(
+                promotion_mode=PromotionMode.ATTESTED,
+                regression_command=("regression",),
+                health_check_command=("health",),
+                trusted_runner_evidence_sha256=("a" * 64,),
+            )
+            runner = FakeAttestedRunner(
+                (config.regression_command, config.health_check_command)
+            )
+            with self.assertRaisesRegex(IsolationAttestationError, "native Windows"):
+                build_production_self_harness(
+                    fixture.root,
+                    FakeModel(),
+                    FakeTokenizer(),
+                    fixture.targets,
+                    lambda: None,
+                    config=config,
+                    runner=runner,
+                    clock=FakeClock(),
+                )
+            self.assertFalse((fixture.root / ".cogni_state").exists())
+
+    def test_attested_regression_only_creates_awaiting_approval_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = ProductionHarnessFixture(Path(tmp))
             clock = FakeClock()
@@ -447,22 +595,82 @@ class TestProductionSelfHarness(unittest.TestCase):
             service = fixture.build(config, clock=clock, runner=runner)
 
             with service:
-                tick = fixture.submit_and_run(service, clock)
+                tick = fixture.submit_evidence_and_run(service, clock)
 
-            self.assertTrue(tick.result.promoted)
-            self.assertEqual(fixture.target.read_text(encoding="utf-8"), "VALUE = 2\n")
+            self.assertFalse(tick.result.promoted)
+            self.assertTrue(tick.result.awaiting_approval)
+            self.assertFalse(service.status.promotion_enabled)
+            self.assertIn("one-time approval", service.status.blocked_reason)
+            self.assertEqual(len(service.candidate_evaluations), 1)
+            self.assertEqual(
+                tick.result.evaluation_id,
+                service.candidate_evaluations[0].evaluation_id,
+            )
+            self.assertEqual(fixture.target.read_text(encoding="utf-8"), "VALUE = 1\n")
+            self.assertEqual(
+                [item[0] for item in runner.calls],
+                [config.regression_command],
+            )
+            self.assertIn("VALUE = 2", runner.calls[0][1])
+            self.assertFalse(service.journal.records())
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("cryptography"),
+        "optional Ed25519 verifier unavailable",
+    )
+    def test_valid_external_approval_promotes_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = ProductionHarnessFixture(Path(tmp))
+            private, verifier = _signing_authority(fixture.root)
+            clock = FakeClock()
+            config = ProductionHarnessConfig(
+                idle_seconds=1,
+                promotion_mode=PromotionMode.ATTESTED,
+                regression_command=("regression",),
+                health_check_command=("health",),
+                trusted_runner_evidence_sha256=("a" * 64,),
+            )
+            runner = FakeAttestedRunner(
+                (config.regression_command, config.health_check_command)
+            )
+            service = fixture.build(
+                config,
+                clock=clock,
+                runner=runner,
+                approval_verifier=verifier,
+            )
+
+            with service:
+                tick = fixture.submit_evidence_and_run(service, clock)
+                evaluation = service.candidate_evaluations[0]
+                approval = _signed_approval(private, verifier, evaluation)
+                result = service.promote_approved_once(
+                    tick.result.evaluation_id, approval
+                )
+
+                self.assertTrue(result.promoted)
+                self.assertEqual(
+                    fixture.target.read_text(encoding="utf-8"), "VALUE = 2\n"
+                )
+                self.assertEqual(service.journal.records()[0].status, "committed")
+                with self.assertRaises(ApprovalReplayError):
+                    service.harness.patcher.consumed_approvals.consume_once(
+                        approval, evaluation
+                    )
+
             self.assertEqual(
                 [item[0] for item in runner.calls],
                 [config.regression_command, config.health_check_command],
             )
-            self.assertTrue(all("VALUE = 2" in item[1] for item in runner.calls))
-            records = service.journal.records()
-            self.assertEqual(len(records), 1)
-            self.assertEqual(records[0].status, "committed")
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("cryptography"),
+        "optional Ed25519 verifier unavailable",
+    )
     def test_failed_post_promotion_health_restores_verified_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = ProductionHarnessFixture(Path(tmp))
+            private, verifier = _signing_authority(fixture.root)
             clock = FakeClock()
             config = ProductionHarnessConfig(
                 idle_seconds=1,
@@ -475,15 +683,106 @@ class TestProductionSelfHarness(unittest.TestCase):
                 (config.regression_command, config.health_check_command),
                 outcomes=(True, False),
             )
-            service = fixture.build(config, clock=clock, runner=runner)
+            service = fixture.build(
+                config,
+                clock=clock,
+                runner=runner,
+                approval_verifier=verifier,
+            )
 
             with service:
-                tick = fixture.submit_and_run(service, clock)
+                tick = fixture.submit_evidence_and_run(service, clock)
+                evaluation = service.candidate_evaluations[0]
+                approval = _signed_approval(private, verifier, evaluation)
+                result = service.promote_approved_once(
+                    tick.result.evaluation_id, approval
+                )
 
-            self.assertFalse(tick.result.promoted)
+            self.assertFalse(result.promoted)
             self.assertEqual(fixture.target.read_text(encoding="utf-8"), "VALUE = 1\n")
             self.assertEqual(service.journal.records()[0].status, "rolled_back")
             self.assertEqual(service.rhythm.mode.value, "inference")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("cryptography"),
+        "optional Ed25519 verifier unavailable",
+    )
+    def test_forged_and_expired_approvals_never_mutate_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = ProductionHarnessFixture(Path(tmp))
+            private, verifier = _signing_authority(fixture.root)
+            clock = FakeClock()
+            config = ProductionHarnessConfig(
+                idle_seconds=1,
+                promotion_mode=PromotionMode.ATTESTED,
+                regression_command=("regression",),
+                health_check_command=("health",),
+                trusted_runner_evidence_sha256=("a" * 64,),
+            )
+            runner = FakeAttestedRunner(
+                (config.regression_command, config.health_check_command)
+            )
+            service = fixture.build(
+                config,
+                clock=clock,
+                runner=runner,
+                approval_verifier=verifier,
+            )
+            with service:
+                tick = fixture.submit_evidence_and_run(service, clock)
+                evaluation = service.candidate_evaluations[0]
+                valid = _signed_approval(private, verifier, evaluation)
+                forged_payload = asdict(valid)
+                forged_payload["signature"] = "00" * 64
+                forged = HumanApprovalV1.from_mapping(forged_payload)
+                with self.assertRaisesRegex(ApprovalError, "signature"):
+                    service.promote_approved_once(tick.result.evaluation_id, forged)
+                expired = _signed_approval(
+                    private,
+                    verifier,
+                    evaluation,
+                    issued_ns=evaluation.completed_ns,
+                    expires_ns=evaluation.completed_ns + 1,
+                )
+                with self.assertRaisesRegex(ApprovalError, "currently valid"):
+                    service.promote_approved_once(tick.result.evaluation_id, expired)
+            self.assertEqual(fixture.target.read_text(encoding="utf-8"), "VALUE = 1\n")
+            self.assertFalse(service.journal.records())
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("cryptography"),
+        "optional Ed25519 verifier unavailable",
+    )
+    def test_source_change_after_evaluation_invalidates_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = ProductionHarnessFixture(Path(tmp))
+            private, verifier = _signing_authority(fixture.root)
+            clock = FakeClock()
+            config = ProductionHarnessConfig(
+                idle_seconds=1,
+                promotion_mode=PromotionMode.ATTESTED,
+                regression_command=("regression",),
+                health_check_command=("health",),
+                trusted_runner_evidence_sha256=("a" * 64,),
+            )
+            runner = FakeAttestedRunner(
+                (config.regression_command, config.health_check_command)
+            )
+            service = fixture.build(
+                config,
+                clock=clock,
+                runner=runner,
+                approval_verifier=verifier,
+            )
+            with service:
+                tick = fixture.submit_evidence_and_run(service, clock)
+                evaluation = service.candidate_evaluations[0]
+                approval = _signed_approval(private, verifier, evaluation)
+                fixture.target.write_text("VALUE = 99\n", encoding="utf-8")
+                with self.assertRaisesRegex(ApprovalError, "source surface changed"):
+                    service.promote_approved_once(tick.result.evaluation_id, approval)
+            self.assertEqual(fixture.target.read_text(encoding="utf-8"), "VALUE = 99\n")
+            self.assertFalse(service.journal.records())
 
     def test_startup_recovers_exact_crash_interrupted_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:

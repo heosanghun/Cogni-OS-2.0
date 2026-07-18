@@ -11,6 +11,16 @@ from typing import Any
 
 
 _EXPORTS = {
+    "ApprovalError": ("approval", "ApprovalError"),
+    "ApprovalReplayError": ("approval", "ApprovalReplayError"),
+    "CandidateEvaluationLedger": ("approval", "CandidateEvaluationLedger"),
+    "CandidateEvaluationV1": ("approval", "CandidateEvaluationV1"),
+    "ConsumedApprovalLedger": ("approval", "ConsumedApprovalLedger"),
+    "Ed25519ApprovalVerifier": ("approval", "Ed25519ApprovalVerifier"),
+    "HumanApprovalV1": ("approval", "HumanApprovalV1"),
+    "SafeProjectSnapshotBuilder": ("snapshot", "SafeProjectSnapshotBuilder"),
+    "SnapshotBoundaryError": ("snapshot", "SnapshotBoundaryError"),
+    "SnapshotEvidence": ("snapshot", "SnapshotEvidence"),
     "LogDB": ("logdb", "LogDB"),
     "AFlowOptimizer": ("aflow", "AFlowOptimizer"),
     "AttestedLocalGemmaWorkflowProposer": (

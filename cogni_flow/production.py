@@ -9,13 +9,21 @@ import json
 import os
 from pathlib import Path
 from secrets import token_hex
-import shutil
 import sys
 import tempfile
 from threading import RLock
 from time import monotonic, time, time_ns
 from typing import Any, Callable, Iterator, Mapping, Protocol
 
+from .approval import (
+    ApprovalError,
+    CandidateEvaluationLedger,
+    CandidateEvaluationV1,
+    ConsumedApprovalLedger,
+    Ed25519ApprovalVerifier,
+    HumanApprovalV1,
+    canonical_json_bytes,
+)
 from .cycle import EvolutionReport, SelfHarness
 from .daemon import FailureCaptureDaemon
 from .harness import (
@@ -32,6 +40,7 @@ from .local_proposer import LocalGemmaPatchProposer, ResolvedPatchTarget
 from .logdb import LogDB
 from .rhythm import RhythmController, SystemMode
 from .scheduler import IdleNightScheduler, ScheduleTick
+from .snapshot import SafeProjectSnapshotBuilder, SnapshotEvidence
 from .proposals import (
     CandidateDraft,
     NegativeProposalV1,
@@ -128,6 +137,9 @@ class ProductionHarnessConfig:
     max_journal_records: int = 32
     max_pending_proposals: int = 8
     max_target_mappings: int = 128
+    evaluation_ttl_seconds: int = 86_400
+    max_evaluation_records: int = 64
+    max_consumed_approvals: int = 256
 
     def __post_init__(self) -> None:
         state = Path(self.state_directory)
@@ -178,6 +190,9 @@ class ProductionHarnessConfig:
             ("max_journal_records", self.max_journal_records, 256),
             ("max_pending_proposals", self.max_pending_proposals, 64),
             ("max_target_mappings", self.max_target_mappings, 256),
+            ("evaluation_ttl_seconds", self.evaluation_ttl_seconds, 604_800),
+            ("max_evaluation_records", self.max_evaluation_records, 1_024),
+            ("max_consumed_approvals", self.max_consumed_approvals, 4_096),
         ):
             if not 1 <= value <= maximum:
                 raise ValueError(f"{name} is outside the bounded range")
@@ -198,6 +213,8 @@ class ProductionHarnessStatus:
     negative_proposals: int
     unreviewable_proposals: int
     proposal_integrity_errors: tuple[tuple[str, str], ...]
+    awaiting_approval_evaluations: int
+    latest_evaluation_id: str | None
 
 
 class _VerifiedRunner:
@@ -209,9 +226,12 @@ class _VerifiedRunner:
         self,
         delegate: AttestedSandboxRunner,
         allowed_commands: tuple[str, ...],
+        attestation: RunnerAttestation,
     ) -> None:
         self._delegate = delegate
         self._allowed_commands = frozenset(allowed_commands)
+        self.runner_id = attestation.runner_id
+        self.evidence_sha256 = attestation.evidence_sha256.lower()
 
     def run(
         self, project: Path, command: tuple[str, ...], timeout_seconds: int
@@ -296,7 +316,7 @@ def verify_runner_attestation(
         raise IsolationAttestationError(
             "runner attestation does not cover regression and health commands"
         )
-    return _VerifiedRunner(runner, tuple(required_commands))
+    return _VerifiedRunner(runner, tuple(required_commands), attestation)
 
 
 class BoundedLogDB(LogDB):
@@ -562,6 +582,26 @@ class RecordingProposer:
     def rich_pending(self) -> tuple[PatchProposalV1, ...]:
         with self._lock:
             return tuple(self._rich_pending)
+
+    def proposal_id_for_patch(self, patch: PatchProposal) -> str:
+        """Resolve one plain patch back to its immutable evidence record."""
+
+        if not isinstance(patch, PatchProposal):
+            raise TypeError("patch must be a PatchProposal")
+        replacement_sha256 = sha256(patch.replacement.encode("utf-8")).hexdigest()
+        with self._lock:
+            matches = tuple(
+                item
+                for item in self._rich_pending
+                if item.relative_path == patch.relative_path
+                and item.base_sha256 == patch.base_sha256.lower()
+                and item.replacement_sha256 == replacement_sha256
+            )
+        if len(matches) != 1:
+            raise ProposalOnlyError(
+                "candidate execution requires one evidence-linked proposal"
+            )
+        return matches[0].proposal_id
 
     def reject_rich(
         self,
@@ -865,8 +905,16 @@ class BackupJournal:
                 backup.unlink(missing_ok=True)
 
 
+@dataclass(frozen=True)
+class CandidateEvaluationResult:
+    passed: bool
+    sandbox: SandboxResult
+    target: Path
+    evaluation: CandidateEvaluationV1 | None
+
+
 class JournaledHarnessPatcher(SafeHarnessPatcher):
-    """Attested staging, journaled promotion, live health gate, and rollback."""
+    """Attested evaluation plus externally approved one-time promotion."""
 
     def __init__(
         self,
@@ -881,6 +929,11 @@ class JournaledHarnessPatcher(SafeHarnessPatcher):
         timeout_seconds: int,
         health_timeout_seconds: int,
         ignored_stage_root: str,
+        evaluation_ledger: CandidateEvaluationLedger,
+        approval_verifier: Ed25519ApprovalVerifier,
+        consumed_approvals: ConsumedApprovalLedger,
+        source_surface_digest: Callable[[], str],
+        evaluation_ttl_seconds: int,
     ) -> None:
         if not isinstance(sandbox, _VerifiedRunner):
             raise IsolationAttestationError(
@@ -898,39 +951,141 @@ class JournaledHarnessPatcher(SafeHarnessPatcher):
         self.health_check_command = health_check_command
         self.health_timeout_seconds = health_timeout_seconds
         self.ignored_stage_root = ignored_stage_root
+        self.evaluation_ledger = evaluation_ledger
+        self.approval_verifier = approval_verifier
+        self.consumed_approvals = consumed_approvals
+        self.source_surface_digest = source_surface_digest
+        self.evaluation_ttl_seconds = evaluation_ttl_seconds
+        self.snapshot_builder = SafeProjectSnapshotBuilder(
+            project_root,
+            excluded_roots=(ignored_stage_root,),
+        )
+
+    @property
+    def requires_manual_approval(self) -> bool:
+        return True
 
     def validate_and_promote(self, proposal: PatchProposal) -> PromotionResult:
+        """Never turn a scheduled regression result into mutation authority."""
+
+        raise ApprovalError(
+            "automatic promotion is disabled; evaluate and import one signed approval"
+        )
+
+    def evaluate_candidate(
+        self, proposal: PatchProposal, *, proposal_id: str
+    ) -> CandidateEvaluationResult:
+        """Run regression in the attested boundary and persist immutable evidence."""
+
         if self.rhythm.mode != SystemMode.EVOLUTION:
-            raise RuntimeError("patching is allowed only during evolution mode")
-        record: BackupRecord | None = None
-        target: Path | None = None
+            raise RuntimeError("candidate evaluation requires evolution mode")
         with self.rhythm.evolution_slot():
             target = self.validate_proposal(proposal)
             if not target.is_file():
-                raise ValueError("production promotion only patches existing files")
+                raise ValueError("production evaluation only patches existing files")
             relative = target.relative_to(self.project_root)
             before = target.read_bytes()
             if sha256(before).hexdigest() != proposal.base_sha256:
                 raise RuntimeError("base file changed during proposal validation")
             after = proposal.replacement.encode("utf-8")
+            source_surface = self.source_surface_digest()
             self.rhythm.transition(
                 SystemMode.VALIDATING, f"validating {relative.as_posix()}"
             )
             with tempfile.TemporaryDirectory(prefix="cogni-regression-") as tmp:
                 stage = Path(tmp) / "project"
-                self._copy_project(stage)
+                snapshot = self._copy_project(stage)
                 staged_target = stage / relative
                 staged_target.parent.mkdir(parents=True, exist_ok=True)
                 staged_target.write_bytes(after)
                 regression = self.sandbox.run(
                     stage, self.test_command, self.timeout_seconds
                 )
+            if self.source_surface_digest() != source_surface:
+                self.rhythm.transition(
+                    SystemMode.ROLLING_BACK,
+                    "candidate runner changed the active source surface",
+                )
+                self.rhythm.transition(
+                    SystemMode.SAFE_MODE,
+                    "candidate isolation integrity failure",
+                )
+                raise JournalIntegrityError(
+                    "candidate runner changed the active source surface"
+                )
             if not regression.passed:
                 self.rhythm.transition(
                     SystemMode.EVOLUTION, "candidate failed regression tests"
                 )
-                return PromotionResult(False, regression, target)
+                return CandidateEvaluationResult(False, regression, target, None)
 
+            completed = time_ns()
+            result_sha256 = sha256(
+                canonical_json_bytes(
+                    {
+                        "passed": regression.passed,
+                        "returncode": regression.returncode,
+                        "output_sha256": sha256(
+                            regression.output.encode("utf-8")
+                        ).hexdigest(),
+                    }
+                )
+            ).hexdigest()
+            evaluation = CandidateEvaluationV1.create(
+                proposal_id=proposal_id,
+                relative_path=relative.as_posix(),
+                base_sha256=proposal.base_sha256.lower(),
+                replacement_sha256=sha256(after).hexdigest(),
+                source_surface_sha256=source_surface,
+                snapshot_tree_sha256=snapshot.tree_sha256,
+                runner_id=self.sandbox.runner_id,
+                runner_evidence_sha256=self.sandbox.evidence_sha256,
+                regression_command_sha256=command_sha256(self.test_command),
+                result_sha256=result_sha256,
+                returncode=regression.returncode,
+                completed_ns=completed,
+                expires_ns=completed + self.evaluation_ttl_seconds * 1_000_000_000,
+            )
+            self.evaluation_ledger.record(evaluation)
+            self.rhythm.transition(
+                SystemMode.EVOLUTION, "candidate awaits external human approval"
+            )
+            return CandidateEvaluationResult(True, regression, target, evaluation)
+
+    def promote_approved_once(
+        self,
+        proposal: PatchProposal,
+        *,
+        evaluation_id: str,
+        approval: HumanApprovalV1,
+    ) -> PromotionResult:
+        """Install one exact candidate after signed, one-time approval."""
+
+        if self.rhythm.mode != SystemMode.EVOLUTION:
+            raise RuntimeError("approved promotion requires a fresh evolution mode")
+        record: BackupRecord | None = None
+        target: Path | None = None
+        with self.rhythm.evolution_slot():
+            evaluation = self.evaluation_ledger.load(evaluation_id)
+            if self.source_surface_digest() != evaluation.source_surface_sha256:
+                raise ApprovalError("source surface changed after candidate evaluation")
+            target = self.validate_proposal(proposal)
+            if not target.is_file():
+                raise ValueError("production promotion only patches existing files")
+            relative = target.relative_to(self.project_root)
+            before = target.read_bytes()
+            after = proposal.replacement.encode("utf-8")
+            self._match_evaluation(evaluation, proposal, relative)
+            self.approval_verifier.verify(approval, evaluation)
+            if sha256(target.read_bytes()).hexdigest() != evaluation.base_sha256:
+                raise ApprovalError("candidate base changed after human approval")
+            # Consumption is the last pre-mutation operation.  Once claimed,
+            # an approval is never reusable even when journal preparation or
+            # health checking later fails; the operator must issue a new nonce.
+            self.consumed_approvals.consume_once(approval, evaluation)
+            self.rhythm.transition(
+                SystemMode.VALIDATING, "signed approval and candidate digests verified"
+            )
             self.rhythm.transition(
                 SystemMode.PROMOTING, f"promoting {relative.as_posix()}"
             )
@@ -953,7 +1108,8 @@ class JournaledHarnessPatcher(SafeHarnessPatcher):
                     )
                 if not health.passed:
                     self.rhythm.transition(
-                        SystemMode.ROLLING_BACK, "post-promotion health check failed"
+                        SystemMode.ROLLING_BACK,
+                        "post-promotion health check failed",
                     )
                     self.journal.rollback(record)
                     self.rhythm.transition(
@@ -966,18 +1122,25 @@ class JournaledHarnessPatcher(SafeHarnessPatcher):
                 self._rollback_after_exception(record, target)
                 raise
 
-    def _copy_project(self, destination: Path) -> None:
-        shutil.copytree(
-            self.project_root,
-            destination,
-            ignore=shutil.ignore_patterns(
-                "work",
-                ".git",
-                "__pycache__",
-                "*.pyc",
-                self.ignored_stage_root,
-            ),
-        )
+    @staticmethod
+    def _match_evaluation(
+        evaluation: CandidateEvaluationV1,
+        proposal: PatchProposal,
+        relative: Path,
+    ) -> None:
+        expected = {
+            "relative_path": relative.as_posix(),
+            "base_sha256": proposal.base_sha256.lower(),
+            "replacement_sha256": sha256(
+                proposal.replacement.encode("utf-8")
+            ).hexdigest(),
+        }
+        for field, value in expected.items():
+            if getattr(evaluation, field) != value:
+                raise ApprovalError(f"evaluation does not match candidate {field}")
+
+    def _copy_project(self, destination: Path) -> SnapshotEvidence:
+        return self.snapshot_builder.copy_to(destination)
 
     def _rollback_after_exception(
         self, record: BackupRecord | None, target: Path
@@ -1021,6 +1184,7 @@ class ProductionSelfHarness:
         proposal_ledger: ProposalOnlySelfHarness,
         harness: SelfHarness,
         journal: BackupJournal,
+        evaluation_ledger: CandidateEvaluationLedger | None,
         source_digest_resolver: Callable[[tuple[str, str, str]], str],
         source_surface_digest: Callable[[], str],
         clock: Callable[[], float],
@@ -1033,6 +1197,7 @@ class ProductionSelfHarness:
         self.proposal_ledger = proposal_ledger
         self.harness = harness
         self.journal = journal
+        self.evaluation_ledger = evaluation_ledger
         self._source_digest_resolver = source_digest_resolver
         self._source_surface_digest = source_surface_digest
         self._failure_cursor = 0.0
@@ -1047,11 +1212,16 @@ class ProductionSelfHarness:
     @property
     def status(self) -> ProductionHarnessStatus:
         proposal_only = self.config.promotion_mode == PromotionMode.PROPOSAL_ONLY
+        evaluations = (
+            () if self.evaluation_ledger is None else self.evaluation_ledger.records()
+        )
         return ProductionHarnessStatus(
             self.failure_daemon.running,
             self.config.promotion_mode,
-            not proposal_only,
-            self.harness.proposal_only_reason,
+            False,
+            self.harness.proposal_only_reason
+            if proposal_only
+            else "automatic promotion disabled: external one-time approval required",
             len(self.proposer.pending),
             self._failure_cursor,
             len(self.proposal_ledger.failures),
@@ -1061,6 +1231,8 @@ class ProductionSelfHarness:
             len(self.proposal_ledger.negative_archive),
             len(self.proposal_ledger.unreviewable_proposals),
             self.proposal_ledger.unreviewable_proposals,
+            len(evaluations),
+            None if not evaluations else evaluations[-1].evaluation_id,
         )
 
     @property
@@ -1085,6 +1257,67 @@ class ProductionSelfHarness:
             reason_code=reason_code,
             evidence_sha256=evidence_sha256,
         )
+
+    @property
+    def candidate_evaluations(self) -> tuple[CandidateEvaluationV1, ...]:
+        if self.evaluation_ledger is None:
+            return ()
+        return self.evaluation_ledger.records()
+
+    def promote_approved_once(
+        self,
+        evaluation_id: str,
+        approval: HumanApprovalV1,
+    ) -> PromotionResult:
+        """Run one fresh drain/checkpoint transaction for signed promotion."""
+
+        if self.config.promotion_mode != PromotionMode.ATTESTED:
+            raise ApprovalError("source promotion is disabled in proposal-only mode")
+        if not self.failure_daemon.running:
+            raise RuntimeError("production self-harness is not running")
+        if self.evaluation_ledger is None:
+            raise ApprovalError("candidate evaluation ledger is unavailable")
+        evaluation = self.evaluation_ledger.load(evaluation_id)
+        patch = dict(self.proposal_ledger.reviewable_patches).get(
+            evaluation.proposal_id
+        )
+        if not isinstance(patch, PatchProposal):
+            raise ApprovalError("approved proposal is no longer reviewable")
+        patcher = self.harness.patcher
+        if not isinstance(patcher, JournaledHarnessPatcher):
+            raise ApprovalError("approved promotion patcher is unavailable")
+        with self._lock:
+            self.rhythm.enter_evolution(self.harness.checkpoint)
+            try:
+                result = patcher.promote_approved_once(
+                    patch,
+                    evaluation_id=evaluation_id,
+                    approval=approval,
+                )
+                self.rhythm.resume_inference(
+                    "approved patch promoted"
+                    if result.promoted
+                    else "approved patch rolled back after health failure"
+                )
+                self.logdb.audit(
+                    "approved_candidate",
+                    evaluation.proposal_id,
+                    "promoted" if result.promoted else "rolled_back",
+                )
+                return result
+            except BaseException:
+                if self.rhythm.mode == SystemMode.EVOLUTION:
+                    self.rhythm.resume_inference("approved promotion rejected")
+                elif self.rhythm.mode == SystemMode.VALIDATING:
+                    self.rhythm.transition(
+                        SystemMode.ROLLING_BACK,
+                        "approved promotion validation failed",
+                    )
+                    self.rhythm.transition(
+                        SystemMode.INFERENCE,
+                        "approved promotion validation rollback complete",
+                    )
+                raise
 
     def _record_failure_evidence(
         self,
@@ -1265,16 +1498,18 @@ class ProductionSelfHarness:
         source_before = self._source_surface_digest()
         report = self.harness.run_night_cycle(since=self._failure_cursor)
         source_after = self._source_surface_digest()
-        if (
-            self.config.promotion_mode == PromotionMode.PROPOSAL_ONLY
-            and source_before != source_after
-        ):
+        if source_before != source_after:
+            proposal_only = self.config.promotion_mode == PromotionMode.PROPOSAL_ONLY
             self.rhythm.transition(
                 SystemMode.SAFE_MODE,
-                "proposal-only source surface changed",
+                "proposal-only source surface changed"
+                if proposal_only
+                else "scheduled Self-Harness cycle changed the source surface",
             )
             raise JournalIntegrityError(
                 "proposal-only cycle changed the active source surface"
+                if proposal_only
+                else "scheduled Self-Harness cycle changed the active source surface"
             )
         if self.config.promotion_mode == PromotionMode.PROPOSAL_ONLY:
             self._record_success_evidence(
@@ -1343,6 +1578,7 @@ def build_production_self_harness(
     config: ProductionHarnessConfig | None = None,
     rhythm: RhythmController | None = None,
     runner: AttestedSandboxRunner | None = None,
+    approval_verifier: Ed25519ApprovalVerifier | None = None,
     clock: Callable[[], float] | None = None,
 ) -> ProductionSelfHarness:
     """Build a local Self-Harness without implicitly enabling code mutation."""
@@ -1355,12 +1591,17 @@ def build_production_self_harness(
         raise TypeError("checkpoint must be callable")
     verified_runner: SandboxRunner | None = None
     if selected.promotion_mode == PromotionMode.ATTESTED:
+        _require_kernel_promotion_platform()
         if runner is None:
             raise IsolationAttestationError(
                 "attested promotion mode requires an injected runner"
             )
         # Verify the external trust boundary before creating state files.
         verified_runner = verify_runner_attestation(runner, selected)
+        if not isinstance(approval_verifier, Ed25519ApprovalVerifier):
+            raise ApprovalError(
+                "attested promotion requires a pinned Ed25519 approval verifier"
+            )
     state_root = (root / selected.state_directory).resolve()
     if root not in state_root.parents:
         raise ValueError("state directory escaped project root")
@@ -1421,6 +1662,7 @@ def build_production_self_harness(
         max_records=selected.max_journal_records,
         max_backup_bytes=selected.max_patch_bytes,
     )
+    evaluation_ledger: CandidateEvaluationLedger | None = None
     proposal_only_reason: str | None
     if selected.promotion_mode == PromotionMode.PROPOSAL_ONLY:
         patcher: SafeHarnessPatcher = SafeHarnessPatcher(
@@ -1434,6 +1676,15 @@ def build_production_self_harness(
         )
     else:
         assert verified_runner is not None
+        assert approval_verifier is not None
+        evaluation_ledger = CandidateEvaluationLedger(
+            state_root / "candidate-evaluations-v1",
+            max_records=selected.max_evaluation_records,
+        )
+        consumed_approvals = ConsumedApprovalLedger(
+            state_root / "consumed-approvals-v1",
+            max_records=selected.max_consumed_approvals,
+        )
         patcher = JournaledHarnessPatcher(
             root,
             active_rhythm,
@@ -1445,6 +1696,11 @@ def build_production_self_harness(
             timeout_seconds=selected.regression_timeout_seconds,
             health_timeout_seconds=selected.health_timeout_seconds,
             ignored_stage_root=Path(selected.state_directory).parts[0],
+            evaluation_ledger=evaluation_ledger,
+            approval_verifier=approval_verifier,
+            consumed_approvals=consumed_approvals,
+            source_surface_digest=source_surface_digest,
+            evaluation_ttl_seconds=selected.evaluation_ttl_seconds,
         )
         proposal_only_reason = None
     harness = SelfHarness(
@@ -1464,6 +1720,7 @@ def build_production_self_harness(
         proposal_ledger=proposal_ledger,
         harness=harness,
         journal=journal,
+        evaluation_ledger=evaluation_ledger,
         source_digest_resolver=source_digest_resolver,
         source_surface_digest=source_surface_digest,
         clock=clock or monotonic,
@@ -1481,6 +1738,16 @@ def _validate_command(command: tuple[str, ...], label: str) -> None:
         )
     ):
         raise ValueError(f"{label} must be a bounded, non-empty argv tuple")
+
+
+def _require_kernel_promotion_platform() -> None:
+    """Keep native Windows fail-closed until its full isolation is attested."""
+
+    if os.name == "nt":
+        raise IsolationAttestationError(
+            "native Windows source promotion has no approved kernel/process/"
+            "network/filesystem isolation boundary"
+        )
 
 
 def _require_digest(value: str, label: str) -> str:

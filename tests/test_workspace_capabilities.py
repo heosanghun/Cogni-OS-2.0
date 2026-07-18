@@ -246,7 +246,7 @@ class TestWorkspaceCapabilities(unittest.TestCase):
     def test_audited_akasic_modules_reject_content_and_line_ending_tamper(
         self,
     ) -> None:
-        for tamper in ("content", "mixed", "lone_cr"):
+        for tamper in ("content", "mixed", "lone_cr", "invalid_utf8"):
             with (
                 self.subTest(tamper=tamper),
                 tempfile.TemporaryDirectory() as temporary,
@@ -260,8 +260,10 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     source = source.replace(b"GraphStore", b"GraphSt0re", 1)
                 elif tamper == "mixed":
                     source = source.replace(b"\n", b"\r\n", 1)
-                else:
+                elif tamper == "lone_cr":
                     source = source.replace(b"\n", b"\r", 1)
+                else:
+                    source = b"\xff\xfe" + source
                 target.write_bytes(source)
                 with patch.dict(
                     AKASICDB_AUDITED_DIGESTS,
@@ -271,6 +273,38 @@ class TestWorkspaceCapabilities(unittest.TestCase):
                     with self.assertRaises(WorkspaceCapabilityError) as captured:
                         AkasicDBAdapter(clone)
                 self.assertEqual(captured.exception.code, "AKASICDB_DIGEST_MISMATCH")
+
+    def test_audited_akasic_import_executes_captured_verified_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            clone = Path(temporary) / "AkasicDB"
+            clone.mkdir()
+            canonical_digests = _write_clone(clone)
+            original_loader = capabilities._load_verified_class
+            replacement_observed = False
+
+            def replace_after_capture(path, class_name, digest, source):
+                nonlocal replacement_observed
+                if not replacement_observed:
+                    path.write_bytes(b"raise RuntimeError('unverified replacement')\n")
+                    replacement_observed = True
+                return original_loader(path, class_name, digest, source)
+
+            with (
+                patch.dict(
+                    AKASICDB_AUDITED_DIGESTS,
+                    canonical_digests,
+                    clear=True,
+                ),
+                patch.object(
+                    capabilities,
+                    "_load_verified_class",
+                    side_effect=replace_after_capture,
+                ),
+            ):
+                adapter = AkasicDBAdapter(clone)
+
+        self.assertTrue(replacement_observed)
+        self.assertEqual(adapter.graph_store.__class__.__name__, "GraphStore")
 
     def test_model_metadata_rejects_non_sha256_digests(self) -> None:
         with self.assertRaisesRegex(ValueError, "manifest_sha256"):

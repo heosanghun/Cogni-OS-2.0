@@ -141,6 +141,7 @@ class RuntimeHealthEvidence:
     binding_id: str
     model_authority_digest: str
     lease_epoch: int
+    worker_generation: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.ready, bool):
@@ -155,6 +156,12 @@ class RuntimeHealthEvidence:
             or self.lease_epoch <= 0
         ):
             raise ValueError("health lease epoch must be positive")
+        if (
+            not isinstance(self.worker_generation, int)
+            or isinstance(self.worker_generation, bool)
+            or self.worker_generation <= 0
+        ):
+            raise ValueError("health worker generation must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +186,7 @@ class RuntimeUnloadEvidence:
     binding_id: str
     model_authority_digest: str
     lease_epoch: int
+    worker_generation: int
     acknowledged: bool
 
     def __post_init__(self) -> None:
@@ -192,6 +200,12 @@ class RuntimeUnloadEvidence:
             or self.lease_epoch <= 0
         ):
             raise ValueError("unload lease epoch must be positive")
+        if (
+            not isinstance(self.worker_generation, int)
+            or isinstance(self.worker_generation, bool)
+            or self.worker_generation <= 0
+        ):
+            raise ValueError("unload worker generation must be positive")
         if not isinstance(self.acknowledged, bool):
             raise TypeError("unload acknowledgement must be bool")
 
@@ -203,6 +217,7 @@ class MemoryReleaseEvidence:
     binding_id: str
     model_authority_digest: str
     lease_epoch: int
+    worker_generation: int
     released: bool
 
     def __post_init__(self) -> None:
@@ -216,8 +231,84 @@ class MemoryReleaseEvidence:
             or self.lease_epoch <= 0
         ):
             raise ValueError("memory-release lease epoch must be positive")
+        if (
+            not isinstance(self.worker_generation, int)
+            or isinstance(self.worker_generation, bool)
+            or self.worker_generation <= 0
+        ):
+            raise ValueError("memory-release worker generation must be positive")
         if not isinstance(self.released, bool):
             raise TypeError("memory-release result must be bool")
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimePublicationFence:
+    """Exact worker/lease/slot identity admitted at one publication boundary."""
+
+    expected_slot_generation: int
+    binding_id: str
+    model_authority_digest: str
+    worker_generation: int
+    lease_id: str
+    lease_epoch: int
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "expected_slot_generation",
+            "worker_generation",
+            "lease_epoch",
+        ):
+            value = getattr(self, field_name)
+            minimum = 0 if field_name == "expected_slot_generation" else 1
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f"{field_name} is invalid")
+        if _BINDING_ID.fullmatch(self.binding_id) is None:
+            raise ValueError("publication binding id is invalid")
+        if _SHA256.fullmatch(self.model_authority_digest) is None:
+            raise ValueError("publication model authority digest is invalid")
+        if not isinstance(self.lease_id, str) or not self.lease_id:
+            raise ValueError("publication lease id is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionFenceToken:
+    """Capability presented when reopening request admission."""
+
+    transaction_id: str
+    publication: RuntimePublicationFence
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.transaction_id, str) or not self.transaction_id:
+            raise ValueError("admission transaction id is invalid")
+        if not isinstance(self.publication, RuntimePublicationFence):
+            raise TypeError("admission publication fence is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionOpenEvidence:
+    token: AdmissionFenceToken
+    opened: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token, AdmissionFenceToken):
+            raise TypeError("admission token acknowledgement is invalid")
+        if not isinstance(self.opened, bool):
+            raise TypeError("admission opened acknowledgement must be bool")
+
+
+@dataclass(frozen=True, slots=True)
+class SafeModeEvidence:
+    transaction_id: str
+    error_code: str
+    admission_closed: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.transaction_id, str) or not self.transaction_id:
+            raise ValueError("safe-mode transaction id is invalid")
+        if _ERROR_CODE.fullmatch(self.error_code) is None:
+            raise ValueError("safe-mode error code is invalid")
+        if not isinstance(self.admission_closed, bool):
+            raise TypeError("safe-mode admission proof must be bool")
 
 
 class ModelSwitchCancellation:
@@ -260,6 +351,9 @@ class ResidentRuntimePort(ModelBindingPort, Protocol):
     def worker_alive(self) -> bool: ...
 
     @property
+    def worker_generation(self) -> int: ...
+
+    @property
     def gpu_lease(self) -> GPULease | None: ...
 
     def start(self) -> None: ...
@@ -278,6 +372,14 @@ class LeaseAuthorityPort(Protocol):
 
     @property
     def max_vram_bytes(self) -> int: ...
+
+    def validate(
+        self,
+        lease: GPULease,
+        *,
+        purpose: str | None = None,
+        required_vram_bytes: int | None = None,
+    ) -> GPULease: ...
 
     def release_evidence(self, lease: GPULease) -> LeaseReleaseEvidence | None: ...
 
@@ -312,9 +414,13 @@ class ModelSwitchMaintenancePort(Protocol):
         candidate: VerifiedModelSwitchDescriptor,
     ) -> None: ...
 
-    def open_admission(self, transaction_id: str) -> None: ...
+    def open_admission(
+        self, transaction_id: str, token: AdmissionFenceToken
+    ) -> AdmissionOpenEvidence: ...
 
-    def enter_safe_mode(self, transaction_id: str, error_code: str) -> None: ...
+    def enter_safe_mode(
+        self, transaction_id: str, error_code: str
+    ) -> SafeModeEvidence: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,9 +473,16 @@ class ActiveRuntimeBundle:
                 ):
                     raise ValueError(f"{expected_component} binding")
             alive = self.runtime.worker_alive
+            worker_generation = self.runtime.worker_generation
             lease = self.runtime.gpu_lease
             if not isinstance(alive, bool):
                 raise TypeError("worker_alive")
+            if (
+                not isinstance(worker_generation, int)
+                or isinstance(worker_generation, bool)
+                or worker_generation < 0
+            ):
+                raise TypeError("worker_generation")
             if lease is not None and not isinstance(lease, GPULease):
                 raise TypeError("gpu_lease")
             if require_stopped and (alive or lease is not None):
@@ -406,6 +519,7 @@ class AtomicRuntimeSlot:
         self,
         expected: RuntimeSlotSnapshot,
         replacement: ActiveRuntimeBundle,
+        publication_fence: RuntimePublicationFence,
     ) -> RuntimeSlotSnapshot:
         replacement.validate_complete()
         with self._lock:
@@ -416,9 +530,58 @@ class AtomicRuntimeSlot:
                 raise AtomicRuntimeCommitError(
                     "active runtime changed before atomic commit"
                 )
+            self._validate_publication_fence(expected, replacement, publication_fence)
+            previous_bundle = self._bundle
+            previous_generation = self._generation
             self._bundle = replacement
             self._generation += 1
+            try:
+                self._validate_publication_fence(
+                    expected, replacement, publication_fence
+                )
+            except Exception:
+                self._bundle = previous_bundle
+                self._generation = previous_generation
+                raise
             return RuntimeSlotSnapshot(self._generation, replacement)
+
+    @staticmethod
+    def _validate_publication_fence(
+        expected: RuntimeSlotSnapshot,
+        replacement: ActiveRuntimeBundle,
+        fence: RuntimePublicationFence,
+    ) -> None:
+        try:
+            lease = replacement.runtime.gpu_lease
+            generation = replacement.runtime.worker_generation
+            if (
+                not isinstance(fence, RuntimePublicationFence)
+                or fence.expected_slot_generation != expected.generation
+                or fence.binding_id != replacement.binding_id
+                or fence.model_authority_digest
+                != replacement.descriptor.authority_digest
+                or replacement.runtime.worker_alive is not True
+                or not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation <= 0
+                or fence.worker_generation != generation
+                or not isinstance(lease, GPULease)
+                or fence.lease_id != lease.lease_id
+                or fence.lease_epoch != lease.epoch
+                or replacement.lease_authority.active != lease
+            ):
+                raise ValueError("publication identity changed")
+            validated = replacement.lease_authority.validate(
+                lease,
+                purpose=replacement.lease_profile.purpose,
+                required_vram_bytes=replacement.lease_profile.vram_budget_bytes,
+            )
+            if validated != lease:
+                raise ValueError("publication lease validation changed identity")
+        except Exception as error:
+            raise AtomicRuntimeCommitError(
+                "runtime publication fence was not proved"
+            ) from error
 
 
 class ModelSwitchState(str, Enum):
@@ -434,6 +597,7 @@ class ModelSwitchState(str, Enum):
     SUCCEEDED = "succeeded"
     ROLLED_BACK = "rolled_back"
     SAFE_MODE = "safe_mode"
+    SAFE_MODE_UNPROVEN = "safe_mode_unproven"
 
 
 _ALLOWED_TRANSITIONS: dict[ModelSwitchState, set[ModelSwitchState]] = {
@@ -441,49 +605,59 @@ _ALLOWED_TRANSITIONS: dict[ModelSwitchState, set[ModelSwitchState]] = {
         ModelSwitchState.DRAINING,
         ModelSwitchState.ROLLING_BACK,
         ModelSwitchState.SAFE_MODE,
+        ModelSwitchState.SAFE_MODE_UNPROVEN,
     },
     ModelSwitchState.DRAINING: {
         ModelSwitchState.CHECKPOINTING,
         ModelSwitchState.ROLLING_BACK,
         ModelSwitchState.SAFE_MODE,
+        ModelSwitchState.SAFE_MODE_UNPROVEN,
     },
     ModelSwitchState.CHECKPOINTING: {
         ModelSwitchState.UNLOADING_OLD,
         ModelSwitchState.ROLLING_BACK,
         ModelSwitchState.SAFE_MODE,
+        ModelSwitchState.SAFE_MODE_UNPROVEN,
     },
     ModelSwitchState.UNLOADING_OLD: {
         ModelSwitchState.LOADING_CANDIDATE,
         ModelSwitchState.ROLLING_BACK,
         ModelSwitchState.SAFE_MODE,
+        ModelSwitchState.SAFE_MODE_UNPROVEN,
     },
     ModelSwitchState.LOADING_CANDIDATE: {
         ModelSwitchState.HEALTHCHECKING,
         ModelSwitchState.ROLLING_BACK,
         ModelSwitchState.SAFE_MODE,
+        ModelSwitchState.SAFE_MODE_UNPROVEN,
     },
     ModelSwitchState.HEALTHCHECKING: {
         ModelSwitchState.COMMITTING,
         ModelSwitchState.ROLLING_BACK,
         ModelSwitchState.SAFE_MODE,
+        ModelSwitchState.SAFE_MODE_UNPROVEN,
     },
     ModelSwitchState.COMMITTING: {
         ModelSwitchState.SUCCEEDED,
         ModelSwitchState.ROLLING_BACK,
         ModelSwitchState.SAFE_MODE,
+        ModelSwitchState.SAFE_MODE_UNPROVEN,
     },
     ModelSwitchState.ROLLING_BACK: {
         ModelSwitchState.RESTORING_OLD,
         ModelSwitchState.ROLLED_BACK,
         ModelSwitchState.SAFE_MODE,
+        ModelSwitchState.SAFE_MODE_UNPROVEN,
     },
     ModelSwitchState.RESTORING_OLD: {
         ModelSwitchState.ROLLED_BACK,
         ModelSwitchState.SAFE_MODE,
+        ModelSwitchState.SAFE_MODE_UNPROVEN,
     },
     ModelSwitchState.SUCCEEDED: set(),
     ModelSwitchState.ROLLED_BACK: set(),
     ModelSwitchState.SAFE_MODE: set(),
+    ModelSwitchState.SAFE_MODE_UNPROVEN: set(),
 }
 
 
@@ -502,6 +676,7 @@ class ModelSwitchSnapshot:
     candidate_model_id: str
     state: ModelSwitchState
     error_code: str | None
+    safety_error_code: str | None
     rollback_restored: bool
     transitions: tuple[ModelSwitchTransition, ...]
 
@@ -514,6 +689,7 @@ class _MutableTransaction:
     state: ModelSwitchState
     transitions: list[ModelSwitchTransition]
     error_code: str | None = None
+    safety_error_code: str | None = None
     rollback_restored: bool = False
 
     def snapshot(self) -> ModelSwitchSnapshot:
@@ -523,6 +699,7 @@ class _MutableTransaction:
             candidate_model_id=self.candidate_model_id,
             state=self.state,
             error_code=self.error_code,
+            safety_error_code=self.safety_error_code,
             rollback_restored=self.rollback_restored,
             transitions=tuple(self.transitions),
         )
@@ -604,6 +781,18 @@ class ModelSwitchController:
             if candidate.model_id == source.descriptor.model_id:
                 raise ValueError("candidate must differ from the active model")
 
+            # Cancellation is checked before invoking the factory.  A factory
+            # is allowed to allocate host-side loader state, so a request that
+            # is already cancelled must never call it.
+            if cancellation is not None and cancellation.requested:
+                self._begin(source.descriptor, candidate)
+                with self._state_lock:
+                    assert self._transaction is not None
+                    self._transaction.error_code = "MODEL_SWITCH_CANCELLED"
+                self._transition(ModelSwitchState.ROLLING_BACK)
+                self._transition(ModelSwitchState.ROLLED_BACK)
+                return self._snapshot_required()
+
             # Fact-book, validator, voice, harness and resident bindings are all
             # checked before admission is closed or either worker is touched.
             try:
@@ -616,7 +805,27 @@ class ModelSwitchController:
                 raise RuntimeBundleIncompleteError(
                     "candidate runtime factory failed"
                 ) from None
-            self._validate_prepared_bundle(prepared, candidate, source)
+            try:
+                self._validate_prepared_bundle(prepared, candidate, source)
+            except RuntimeBundleIncompleteError:
+                cleanup_proven = self._cleanup_invalid_prepared(
+                    prepared,
+                    source,
+                    float(stop_timeout_seconds),
+                    float(memory_timeout_seconds),
+                )
+                if cleanup_proven:
+                    raise
+                self._begin(source.descriptor, candidate)
+                with self._state_lock:
+                    assert self._transaction is not None
+                    self._transaction.error_code = "RUNTIME_BUNDLE_INCOMPLETE"
+                    self._transaction.safety_error_code = "PREFLIGHT_CLEANUP_UNPROVEN"
+                self._transition(ModelSwitchState.ROLLING_BACK)
+                return self._safe_mode(
+                    "RUNTIME_BUNDLE_INCOMPLETE",
+                    safety_error_code="PREFLIGHT_CLEANUP_UNPROVEN",
+                )
 
             transaction = self._begin(source.descriptor, candidate)
             source_retired = False
@@ -663,7 +872,14 @@ class ModelSwitchController:
                     raise _TransactionFailure("ATOMIC_RUNTIME_CHANGED")
                 self._prove_source_consistent(source)
                 old_lease = source.runtime.gpu_lease
+                old_worker_generation = source.runtime.worker_generation
                 if not isinstance(old_lease, GPULease):
+                    raise _TransactionFailure("SOURCE_WORKER_NOT_RUNNING")
+                if (
+                    not isinstance(old_worker_generation, int)
+                    or isinstance(old_worker_generation, bool)
+                    or old_worker_generation <= 0
+                ):
                     raise _TransactionFailure("SOURCE_WORKER_NOT_RUNNING")
                 unload_error: Exception | None = None
                 unload: RuntimeUnloadEvidence | None = None
@@ -683,7 +899,7 @@ class ModelSwitchController:
                     raise _TransactionFailure("OLD_UNLOAD_FAILED") from unload_error
                 if self._expired(stop_deadline):
                     raise _TransactionFailure("OLD_UNLOAD_TIMEOUT")
-                self._prove_unload_ack(source, old_lease, unload)
+                self._prove_unload_ack(source, old_lease, old_worker_generation, unload)
                 self._prove_memory_released(
                     source,
                     unload,
@@ -713,15 +929,25 @@ class ModelSwitchController:
 
                 self._transition(ModelSwitchState.COMMITTING)
                 prepared.validate_complete()
+                publication = self._prove_publication_fence(
+                    prepared,
+                    expected_slot_generation=source_slot.generation,
+                    expected_lease=candidate_lease,
+                    expected_worker_generation=health.worker_generation,
+                )
                 self._claim_commit(cancellation)
-                committed_slot = self.slot.compare_and_swap(source_slot, prepared)
+                committed_slot = self.slot.compare_and_swap(
+                    source_slot, prepared, publication
+                )
                 # The cancellation token's commit claim and this CAS form one
                 # publication boundary: later cancellation is rejected, while
                 # a pre-existing request cannot reach the CAS.
-                self._call(
-                    "ADMISSION_OPEN_FAILED",
-                    self.maintenance.open_admission,
-                    transaction.transaction_id,
+                self._open_admission_with_fence(
+                    prepared,
+                    committed_slot,
+                    candidate_lease,
+                    health.worker_generation,
+                    "ADMISSION_OPEN",
                 )
                 self._transition(ModelSwitchState.SUCCEEDED)
                 return self._snapshot_required()
@@ -863,12 +1089,69 @@ class ModelSwitchController:
                 "candidate bundle escaped the active lease authority"
             )
 
+    def _cleanup_invalid_prepared(
+        self,
+        prepared: object,
+        source: ActiveRuntimeBundle,
+        stop_timeout_seconds: float,
+        memory_timeout_seconds: float,
+    ) -> bool:
+        """Prove that a contract-violating factory result left no live worker."""
+
+        if not isinstance(prepared, ActiveRuntimeBundle):
+            return True
+        try:
+            alive = prepared.runtime.worker_alive
+            prior_lease = prepared.runtime.gpu_lease
+            prior_generation = prepared.runtime.worker_generation
+            if alive is not True and prior_lease is None:
+                self._prove_source_consistent(source)
+                return True
+            deadline = self._deadline_after(stop_timeout_seconds)
+            unload: RuntimeUnloadEvidence | None = None
+            try:
+                unload = prepared.runtime.stop(
+                    self._remaining(deadline, "PREFLIGHT_CLEANUP_TIMEOUT")
+                )
+            except Exception:
+                # Some runtimes cannot author unload evidence when a malformed
+                # factory marked the process alive without acquiring a lease.
+                # For that exact no-lease case the independent stopped state is
+                # sufficient; a leased worker still requires complete evidence.
+                if prior_lease is not None:
+                    return False
+            if self._expired(deadline):
+                return False
+            if prepared.runtime.worker_alive or prepared.runtime.gpu_lease is not None:
+                return False
+            if prior_lease is not None:
+                if not isinstance(prior_generation, int) or prior_generation <= 0:
+                    return False
+                self._prove_retired(prepared, prior_lease)
+                self._prove_unload_ack(prepared, prior_lease, prior_generation, unload)
+                self._prove_memory_released(
+                    prepared,
+                    unload,
+                    memory_timeout_seconds,
+                    "PREFLIGHT_MEMORY_RELEASE_UNPROVEN",
+                )
+            self._prove_source_consistent(source)
+            return True
+        except Exception:
+            return False
+
     @classmethod
     def _prove_source_consistent(cls, bundle: ActiveRuntimeBundle) -> None:
         alive = bundle.runtime.worker_alive
+        generation = bundle.runtime.worker_generation
         lease = bundle.runtime.gpu_lease
         active = bundle.lease_authority.active
-        if alive is not True:
+        if (
+            alive is not True
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation <= 0
+        ):
             raise RuntimeBundleIncompleteError(
                 "published resident worker is unavailable"
             )
@@ -877,6 +1160,17 @@ class ModelSwitchController:
                 "active worker lacks its exact resident lease"
             )
         cls._prove_lease_profile(lease, bundle.lease_profile)
+        try:
+            cls._validate_authority_lease(
+                bundle.lease_authority,
+                bundle.lease_profile,
+                lease,
+                "SOURCE_LEASE_UNPROVEN",
+            )
+        except _TransactionFailure as error:
+            raise RuntimeBundleIncompleteError(
+                "published resident lease is stale or expired"
+            ) from error
 
     @staticmethod
     def _prove_lease_profile(
@@ -889,6 +1183,25 @@ class ModelSwitchController:
             or lease.epoch <= 0
         ):
             raise _TransactionFailure("RESIDENT_LEASE_AUTHORITY_MISMATCH")
+
+    @staticmethod
+    def _validate_authority_lease(
+        authority: LeaseAuthorityPort,
+        profile: StableResidentLeaseAuthority,
+        lease: GPULease,
+        failure_code: str,
+    ) -> GPULease:
+        try:
+            validated = authority.validate(
+                lease,
+                purpose=profile.purpose,
+                required_vram_bytes=profile.vram_budget_bytes,
+            )
+        except Exception as error:
+            raise _TransactionFailure(failure_code) from error
+        if validated != lease:
+            raise _TransactionFailure(failure_code)
+        return validated
 
     @classmethod
     def _prove_retired(
@@ -914,6 +1227,7 @@ class ModelSwitchController:
     def _prove_unload_ack(
         bundle: ActiveRuntimeBundle,
         prior_lease: GPULease,
+        prior_worker_generation: int,
         unload: RuntimeUnloadEvidence | None,
     ) -> None:
         if (
@@ -922,6 +1236,7 @@ class ModelSwitchController:
             or unload.binding_id != bundle.binding_id
             or unload.model_authority_digest != bundle.descriptor.authority_digest
             or unload.lease_epoch != prior_lease.epoch
+            or unload.worker_generation != prior_worker_generation
         ):
             raise _TransactionFailure("UNLOAD_ACK_UNPROVEN")
 
@@ -953,6 +1268,7 @@ class ModelSwitchController:
             or evidence.binding_id != bundle.binding_id
             or evidence.model_authority_digest != bundle.descriptor.authority_digest
             or evidence.lease_epoch != unload.lease_epoch
+            or evidence.worker_generation != unload.worker_generation
         ):
             raise _TransactionFailure(failure_code)
 
@@ -964,14 +1280,24 @@ class ModelSwitchController:
     @classmethod
     def _prove_running(cls, bundle: ActiveRuntimeBundle, epoch_floor: int) -> GPULease:
         lease = bundle.runtime.gpu_lease
+        generation = bundle.runtime.worker_generation
         if (
             bundle.runtime.worker_alive is not True
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation <= 0
             or not isinstance(lease, GPULease)
             or bundle.lease_authority.active != lease
             or lease.epoch <= epoch_floor
         ):
             raise _TransactionFailure("WORKER_START_UNPROVEN")
         cls._prove_lease_profile(lease, bundle.lease_profile)
+        cls._validate_authority_lease(
+            bundle.lease_authority,
+            bundle.lease_profile,
+            lease,
+            "WORKER_START_UNPROVEN",
+        )
         return lease
 
     @staticmethod
@@ -986,12 +1312,100 @@ class ModelSwitchController:
             or health.binding_id != bundle.binding_id
             or health.model_authority_digest != bundle.descriptor.authority_digest
             or health.lease_epoch != lease.epoch
+            or health.worker_generation != bundle.runtime.worker_generation
             or bundle.runtime.worker_alive is not True
             or bundle.runtime.gpu_lease != lease
             or bundle.lease_authority.active != lease
         ):
             raise _TransactionFailure("CANDIDATE_HEALTH_UNPROVEN")
+        ModelSwitchController._validate_authority_lease(
+            bundle.lease_authority,
+            bundle.lease_profile,
+            lease,
+            "CANDIDATE_HEALTH_UNPROVEN",
+        )
         bundle.validate_complete()
+
+    @classmethod
+    def _prove_publication_fence(
+        cls,
+        bundle: ActiveRuntimeBundle,
+        *,
+        expected_slot_generation: int,
+        expected_lease: GPULease,
+        expected_worker_generation: int,
+    ) -> RuntimePublicationFence:
+        if (
+            bundle.runtime.worker_alive is not True
+            or bundle.runtime.gpu_lease != expected_lease
+            or bundle.runtime.worker_generation != expected_worker_generation
+            or bundle.lease_authority.active != expected_lease
+        ):
+            raise _TransactionFailure("PUBLICATION_FENCE_UNPROVEN")
+        cls._prove_lease_profile(expected_lease, bundle.lease_profile)
+        cls._validate_authority_lease(
+            bundle.lease_authority,
+            bundle.lease_profile,
+            expected_lease,
+            "PUBLICATION_FENCE_UNPROVEN",
+        )
+        bundle.validate_complete()
+        return RuntimePublicationFence(
+            expected_slot_generation=expected_slot_generation,
+            binding_id=bundle.binding_id,
+            model_authority_digest=bundle.descriptor.authority_digest,
+            worker_generation=expected_worker_generation,
+            lease_id=expected_lease.lease_id,
+            lease_epoch=expected_lease.epoch,
+        )
+
+    def _open_admission_with_fence(
+        self,
+        bundle: ActiveRuntimeBundle,
+        slot_snapshot: RuntimeSlotSnapshot,
+        lease: GPULease,
+        worker_generation: int,
+        code_prefix: str,
+    ) -> None:
+        observed = self.slot.snapshot()
+        if (
+            observed.generation != slot_snapshot.generation
+            or observed.bundle is not bundle
+        ):
+            raise _TransactionFailure(f"{code_prefix}_FENCE_UNPROVEN")
+        publication = self._prove_publication_fence(
+            bundle,
+            expected_slot_generation=slot_snapshot.generation,
+            expected_lease=lease,
+            expected_worker_generation=worker_generation,
+        )
+        token = AdmissionFenceToken(self._transaction_id(), publication)
+        evidence = self._call(
+            f"{code_prefix}_FAILED",
+            self.maintenance.open_admission,
+            self._transaction_id(),
+            token,
+        )
+        if (
+            not isinstance(evidence, AdmissionOpenEvidence)
+            or evidence.opened is not True
+            or evidence.token != token
+        ):
+            raise _TransactionFailure(f"{code_prefix}_FENCE_UNPROVEN")
+        observed_after = self.slot.snapshot()
+        if (
+            observed_after.generation != slot_snapshot.generation
+            or observed_after.bundle is not bundle
+        ):
+            raise _TransactionFailure(f"{code_prefix}_FENCE_UNPROVEN")
+        after = self._prove_publication_fence(
+            bundle,
+            expected_slot_generation=slot_snapshot.generation,
+            expected_lease=lease,
+            expected_worker_generation=worker_generation,
+        )
+        if after != publication:
+            raise _TransactionFailure(f"{code_prefix}_FENCE_UNPROVEN")
 
     def _rollback(
         self,
@@ -1031,6 +1445,13 @@ class ModelSwitchController:
             if candidate_started or candidate.runtime.worker_alive or candidate_lease:
                 if not isinstance(candidate_lease, GPULease):
                     raise _TransactionFailure("CANDIDATE_LEASE_UNPROVEN")
+                candidate_worker_generation = candidate.runtime.worker_generation
+                if (
+                    not isinstance(candidate_worker_generation, int)
+                    or isinstance(candidate_worker_generation, bool)
+                    or candidate_worker_generation <= 0
+                ):
+                    raise _TransactionFailure("CANDIDATE_LEASE_UNPROVEN")
                 stop_deadline = self._deadline_after(stop_timeout_seconds)
                 candidate_unload = self._call(
                     "CANDIDATE_RETIRE_FAILED",
@@ -1040,7 +1461,12 @@ class ModelSwitchController:
                 if self._expired(stop_deadline):
                     raise _TransactionFailure("CANDIDATE_RETIRE_TIMEOUT")
                 self._prove_retired(candidate, candidate_lease)
-                self._prove_unload_ack(candidate, candidate_lease, candidate_unload)
+                self._prove_unload_ack(
+                    candidate,
+                    candidate_lease,
+                    candidate_worker_generation,
+                    candidate_unload,
+                )
                 self._prove_memory_released(
                     candidate,
                     candidate_unload,
@@ -1057,10 +1483,15 @@ class ModelSwitchController:
             if not source_retired:
                 self._prove_source_consistent(source_slot.bundle)
                 if admission_closed:
-                    self._call(
-                        "ADMISSION_RESTORE_FAILED",
-                        self.maintenance.open_admission,
-                        self._transaction_id(),
+                    source_lease = source_slot.bundle.runtime.gpu_lease
+                    if not isinstance(source_lease, GPULease):
+                        raise _TransactionFailure("SOURCE_WORKER_NOT_RUNNING")
+                    self._open_admission_with_fence(
+                        source_slot.bundle,
+                        source_slot,
+                        source_lease,
+                        source_slot.bundle.runtime.worker_generation,
+                        "ADMISSION_RESTORE",
                     )
                 self._transition(ModelSwitchState.ROLLED_BACK)
                 return self._snapshot_required()
@@ -1077,46 +1508,109 @@ class ModelSwitchController:
             epoch_floor = restored.lease_authority.latest_epoch
             self._call("ROLLBACK_START_FAILED", restored.runtime.start)
             restored_lease = self._prove_running(restored, epoch_floor)
+            restored_worker_generation = restored.runtime.worker_generation
+            health_deadline = self._deadline_after(health_timeout_seconds)
             restored_health = self._call(
                 "ROLLBACK_HEALTHCHECK_FAILED",
                 restored.runtime.healthcheck,
-                health_timeout_seconds,
+                self._remaining(health_deadline, "ROLLBACK_HEALTHCHECK_TIMEOUT"),
             )
+            if self._expired(health_deadline):
+                raise _TransactionFailure("ROLLBACK_HEALTHCHECK_TIMEOUT")
             self._prove_healthy(restored, restored_lease, restored_health)
             expected = committed_slot or source_slot
-            self.slot.compare_and_swap(expected, restored)
+            publication = self._prove_publication_fence(
+                restored,
+                expected_slot_generation=expected.generation,
+                expected_lease=restored_lease,
+                expected_worker_generation=restored_worker_generation,
+            )
+            restored_slot = self.slot.compare_and_swap(expected, restored, publication)
             restored_committed = True
-            self._call(
-                "ADMISSION_RESTORE_FAILED",
-                self.maintenance.open_admission,
-                self._transaction_id(),
+            self._open_admission_with_fence(
+                restored,
+                restored_slot,
+                restored_lease,
+                restored_worker_generation,
+                "ADMISSION_RESTORE",
             )
             with self._state_lock:
                 assert self._transaction is not None
                 self._transaction.rollback_restored = True
             self._transition(ModelSwitchState.ROLLED_BACK)
             return self._snapshot_required()
-        except Exception:
+        except Exception as rollback_error:
+            cleanup_code = self._stable_failure_code(rollback_error, "ROLLBACK_FAILED")
             if restored is not None and not restored_committed:
                 restored_lease = restored.runtime.gpu_lease
                 if restored.runtime.worker_alive or restored_lease is not None:
                     try:
-                        restored.runtime.stop(stop_timeout_seconds)
+                        if not isinstance(restored_lease, GPULease):
+                            raise _TransactionFailure("ROLLBACK_CLEANUP_LEASE_UNPROVEN")
+                        restored_worker_generation = restored.runtime.worker_generation
+                        cleanup_deadline = self._deadline_after(stop_timeout_seconds)
+                        restored_unload = restored.runtime.stop(
+                            self._remaining(
+                                cleanup_deadline, "ROLLBACK_CLEANUP_TIMEOUT"
+                            )
+                        )
+                        if self._expired(cleanup_deadline):
+                            raise _TransactionFailure("ROLLBACK_CLEANUP_TIMEOUT")
                         self._prove_retired(restored, restored_lease)
-                    except Exception:
-                        pass
-            return self._safe_mode(failure.code)
+                        self._prove_unload_ack(
+                            restored,
+                            restored_lease,
+                            restored_worker_generation,
+                            restored_unload,
+                        )
+                        self._prove_memory_released(
+                            restored,
+                            restored_unload,
+                            memory_timeout_seconds,
+                            "ROLLBACK_CLEANUP_MEMORY_UNPROVEN",
+                        )
+                    except Exception as cleanup_error:
+                        cleanup_code = self._stable_failure_code(
+                            cleanup_error, "ROLLBACK_CLEANUP_UNPROVEN"
+                        )
+            return self._safe_mode(failure.code, safety_error_code=cleanup_code)
 
-    def _safe_mode(self, error_code: str) -> ModelSwitchSnapshot:
+    @staticmethod
+    def _stable_failure_code(error: Exception, fallback: str) -> str:
+        code = getattr(error, "code", None)
+        if isinstance(code, str) and _ERROR_CODE.fullmatch(code):
+            return code
+        return fallback
+
+    def _safe_mode(
+        self, error_code: str, *, safety_error_code: str | None = None
+    ) -> ModelSwitchSnapshot:
+        transaction_id = self._transaction_id()
+        proof_valid = False
         try:
-            self.maintenance.enter_safe_mode(self._transaction_id(), error_code)
+            evidence = self.maintenance.enter_safe_mode(transaction_id, error_code)
+            proof_valid = (
+                isinstance(evidence, SafeModeEvidence)
+                and evidence.transaction_id == transaction_id
+                and evidence.error_code == error_code
+                and evidence.admission_closed is True
+            )
         except Exception:
-            pass
+            proof_valid = False
         with self._state_lock:
             assert self._transaction is not None
+            if safety_error_code is not None:
+                self._transaction.safety_error_code = safety_error_code
+            if not proof_valid:
+                self._transaction.safety_error_code = "SAFE_MODE_UNPROVEN"
             state = self._transaction.state
-        if ModelSwitchState.SAFE_MODE in _ALLOWED_TRANSITIONS[state]:
-            self._transition(ModelSwitchState.SAFE_MODE)
+        target = (
+            ModelSwitchState.SAFE_MODE
+            if proof_valid
+            else ModelSwitchState.SAFE_MODE_UNPROVEN
+        )
+        if target in _ALLOWED_TRANSITIONS[state]:
+            self._transition(target)
         return self._snapshot_required()
 
     def _transaction_id(self) -> str:
@@ -1134,6 +1628,8 @@ class ModelSwitchController:
 
 __all__ = [
     "ActiveRuntimeBundle",
+    "AdmissionFenceToken",
+    "AdmissionOpenEvidence",
     "AtomicRuntimeCommitError",
     "AtomicRuntimeSlot",
     "LeaseReleaseEvidence",
@@ -1149,7 +1645,9 @@ __all__ = [
     "RuntimeBindingEvidence",
     "RuntimeBundleIncompleteError",
     "RuntimeHealthEvidence",
+    "RuntimePublicationFence",
     "RuntimeUnloadEvidence",
+    "SafeModeEvidence",
     "StableResidentLeaseAuthority",
     "VerifiedModelSwitchDescriptor",
 ]

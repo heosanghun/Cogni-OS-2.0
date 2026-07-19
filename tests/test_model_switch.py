@@ -8,6 +8,9 @@ import pytest
 
 from cogni_demo.model_switch import (
     ActiveRuntimeBundle,
+    AdmissionFenceToken,
+    AdmissionOpenEvidence,
+    AtomicRuntimeCommitError,
     AtomicRuntimeSlot,
     LeaseReleaseEvidence,
     MemoryReleaseEvidence,
@@ -19,7 +22,9 @@ from cogni_demo.model_switch import (
     RuntimeBindingEvidence,
     RuntimeBundleIncompleteError,
     RuntimeHealthEvidence,
+    RuntimePublicationFence,
     RuntimeUnloadEvidence,
+    SafeModeEvidence,
     StableResidentLeaseAuthority,
     VerifiedModelSwitchDescriptor,
 )
@@ -48,9 +53,14 @@ class _Binding:
 
 
 class _LeaseAuthority:
-    def __init__(self, profile: StableResidentLeaseAuthority) -> None:
-        self.manager = GPULeaseManager(max_vram_bytes=profile.vram_budget_bytes)
+    def __init__(
+        self, profile: StableResidentLeaseAuthority, *, clock=monotonic
+    ) -> None:
+        self.manager = GPULeaseManager(
+            max_vram_bytes=profile.vram_budget_bytes, clock=clock
+        )
         self._release_evidence: dict[str, LeaseReleaseEvidence] = {}
+        self.on_validate = None
 
     @property
     def active(self) -> GPULease | None:
@@ -71,6 +81,21 @@ class _LeaseAuthority:
             profile.vram_budget_bytes,
             deadline=self.manager.deadline_after(60.0),
             owner_alive=lambda: True,
+        )
+
+    def validate(
+        self,
+        lease: GPULease,
+        *,
+        purpose: str | None = None,
+        required_vram_bytes: int | None = None,
+    ) -> GPULease:
+        if self.on_validate is not None:
+            self.on_validate(lease)
+        return self.manager.validate(
+            lease,
+            purpose=purpose,
+            required_vram_bytes=required_vram_bytes,
         )
 
     def release(self, lease: GPULease, *, prove: bool) -> None:
@@ -110,6 +135,7 @@ class _Runtime:
         self.on_health = None
         self._alive = False
         self._lease: GPULease | None = None
+        self._generation = 0
         self.start_count = 0
         self.stop_count = 0
 
@@ -123,12 +149,17 @@ class _Runtime:
         return self._alive
 
     @property
+    def worker_generation(self) -> int:
+        return self._generation
+
+    @property
     def gpu_lease(self) -> GPULease | None:
         return self._lease
 
     def start(self) -> None:
         self.start_count += 1
         self._lease = self.authority.acquire(self.profile)
+        self._generation += 1
         self._alive = True
 
     def stop(self, timeout_seconds: float) -> RuntimeUnloadEvidence:
@@ -146,6 +177,7 @@ class _Runtime:
             binding_id=self.binding_id,
             model_authority_digest=self.descriptor.authority_digest,
             lease_epoch=lease.epoch,
+            worker_generation=self._generation,
             acknowledged=self.acknowledge_unload,
         )
 
@@ -159,6 +191,7 @@ class _Runtime:
             binding_id=self.binding_id,
             model_authority_digest=self.descriptor.authority_digest,
             lease_epoch=self._lease.epoch,
+            worker_generation=self._generation,
         )
         if self.on_health is not None:
             self.on_health()
@@ -241,6 +274,9 @@ class _Maintenance:
         self.drain_started: Event | None = None
         self.drain_release: Event | None = None
         self.on_drain = None
+        self.on_open = None
+        self.prove_safe = True
+        self.admission_token: AdmissionFenceToken | None = None
 
     def close_admission(self, transaction_id: str) -> None:
         self.calls.append("close")
@@ -259,14 +295,25 @@ class _Maintenance:
     def checkpoint(self, transaction_id, source, candidate) -> None:
         self.calls.append("checkpoint")
 
-    def open_admission(self, transaction_id: str) -> None:
+    def open_admission(
+        self, transaction_id: str, token: AdmissionFenceToken
+    ) -> AdmissionOpenEvidence:
         self.calls.append("open")
+        if self.on_open is not None:
+            self.on_open(token)
+        self.admission_token = token
         self.admission_open = True
+        return AdmissionOpenEvidence(token=token, opened=True)
 
-    def enter_safe_mode(self, transaction_id: str, error_code: str) -> None:
+    def enter_safe_mode(self, transaction_id: str, error_code: str) -> SafeModeEvidence:
         self.calls.append("safe")
         self.safe_error = error_code
-        self.admission_open = False
+        self.admission_open = not self.prove_safe
+        return SafeModeEvidence(
+            transaction_id=transaction_id,
+            error_code=error_code,
+            admission_closed=self.prove_safe,
+        )
 
     def try_admit(self) -> bool:
         return self.admission_open
@@ -292,6 +339,7 @@ class _MemoryProbe:
             binding_id=bundle.binding_id,
             model_authority_digest=bundle.descriptor.authority_digest,
             lease_epoch=unload.lease_epoch,
+            worker_generation=unload.worker_generation,
             released=bundle.descriptor.model_id not in self.unreleased_models,
         )
 
@@ -307,9 +355,9 @@ class _Clock:
         self.value += seconds
 
 
-def _system(*, enabled: bool = True, clock=monotonic):
+def _system(*, enabled: bool = True, clock=monotonic, lease_clock=monotonic):
     profile = StableResidentLeaseAuthority()
-    authority = _LeaseAuthority(profile)
+    authority = _LeaseAuthority(profile, clock=lease_clock)
     source = _bundle(SOURCE, authority, profile, 1)
     source.runtime.start()
     slot = AtomicRuntimeSlot(source)
@@ -716,7 +764,7 @@ def test_structured_failure_snapshot_does_not_leak_host_path_or_secret() -> None
 
 
 def test_pre_cancelled_switch_has_no_admission_or_worker_side_effects() -> None:
-    controller, slot, source, _factory, maintenance, authority = _system()
+    controller, slot, source, factory, maintenance, authority = _system()
     cancellation = ModelSwitchCancellation()
     cancellation.cancel()
     old_lease = source.runtime.gpu_lease
@@ -726,6 +774,7 @@ def test_pre_cancelled_switch_has_no_admission_or_worker_side_effects() -> None:
     assert result.state is ModelSwitchState.ROLLED_BACK
     assert result.error_code == "MODEL_SWITCH_CANCELLED"
     assert maintenance.calls == []
+    assert factory.built == []
     assert slot.snapshot().bundle is source
     assert source.runtime.worker_alive
     assert source.runtime.gpu_lease == old_lease == authority.active
@@ -751,3 +800,203 @@ def test_factory_preflight_error_is_stable_and_redacted() -> None:
     assert slot.snapshot().bundle is source
     assert source.runtime.worker_alive
     assert source.runtime.gpu_lease == authority.active
+
+
+def test_expired_candidate_lease_is_rejected_before_publication() -> None:
+    lease_clock = _Clock()
+    controller, slot, source, factory, maintenance, authority = _system(
+        lease_clock=lease_clock
+    )
+
+    def configure(bundle: ActiveRuntimeBundle) -> None:
+        if bundle.descriptor == CANDIDATE:
+            bundle.runtime.on_health = lambda: lease_clock.advance(61.0)
+
+    factory.on_build = configure
+    result = controller.switch(CANDIDATE)
+
+    assert result.state is ModelSwitchState.ROLLED_BACK
+    assert result.error_code == "CANDIDATE_HEALTH_UNPROVEN"
+    assert result.rollback_restored
+    assert slot.snapshot().bundle.descriptor == SOURCE
+    assert slot.snapshot().bundle.runtime.gpu_lease == authority.active
+    assert maintenance.admission_open
+
+
+def test_atomic_slot_rejects_stopped_replacement_even_with_forged_fence() -> None:
+    _controller, slot, source, _factory, _maintenance, authority = _system()
+    replacement = _bundle(CANDIDATE, authority, source.lease_profile, 20)
+    source_lease = source.runtime.gpu_lease
+    assert source_lease is not None
+    forged = RuntimePublicationFence(
+        expected_slot_generation=slot.snapshot().generation,
+        binding_id=replacement.binding_id,
+        model_authority_digest=replacement.descriptor.authority_digest,
+        worker_generation=source.runtime.worker_generation,
+        lease_id=source_lease.lease_id,
+        lease_epoch=source_lease.epoch,
+    )
+
+    with pytest.raises(AtomicRuntimeCommitError):
+        slot.compare_and_swap(slot.snapshot(), replacement, forged)
+
+    assert slot.snapshot().bundle is source
+
+
+def test_cas_postcheck_restores_slot_if_worker_dies_inside_publication() -> None:
+    controller, slot, source, factory, _maintenance, authority = _system()
+
+    def configure(bundle: ActiveRuntimeBundle) -> None:
+        if bundle.descriptor != CANDIDATE:
+            return
+
+        def arm_publication_failure() -> None:
+            validations = 0
+
+            def fail_on_cas_postcheck(_lease: GPULease) -> None:
+                nonlocal validations
+                validations += 1
+                if validations != 4:
+                    return
+                current = bundle.runtime.gpu_lease
+                assert current is not None
+                bundle.runtime._alive = False
+                bundle.runtime._lease = None
+                authority.release(current, prove=True)
+
+            authority.on_validate = fail_on_cas_postcheck
+
+        bundle.runtime.on_health = arm_publication_failure
+
+    factory.on_build = configure
+    result = controller.switch(CANDIDATE)
+
+    assert result.state is ModelSwitchState.SAFE_MODE
+    assert result.error_code == "ATOMIC_RUNTIME_COMMIT_FAILED"
+    assert slot.snapshot().bundle is source
+    assert slot.snapshot().bundle.descriptor != CANDIDATE
+
+
+def test_admission_open_revalidates_candidate_after_ack() -> None:
+    controller, slot, _source, factory, maintenance, authority = _system()
+
+    def kill_acknowledged_worker(_token: AdmissionFenceToken) -> None:
+        active = slot.snapshot().bundle
+        if active.descriptor != CANDIDATE:
+            return
+        lease = active.runtime.gpu_lease
+        assert lease is not None
+        active.runtime._alive = False
+        active.runtime._lease = None
+        authority.release(lease, prove=True)
+
+    maintenance.on_open = kill_acknowledged_worker
+    result = controller.switch(CANDIDATE)
+
+    assert result.state is ModelSwitchState.SAFE_MODE
+    assert result.error_code == "PUBLICATION_FENCE_UNPROVEN"
+    assert not maintenance.admission_open
+    assert slot.snapshot().bundle is factory.built[0]
+    assert not slot.snapshot().bundle.runtime.worker_alive
+
+
+def test_admission_ack_must_echo_the_exact_publication_token() -> None:
+    controller, slot, _source, _factory, maintenance, _authority = _system()
+    real_open = maintenance.open_admission
+    forged_once = False
+
+    def open_with_one_forged_ack(
+        transaction_id: str, token: AdmissionFenceToken
+    ) -> AdmissionOpenEvidence:
+        nonlocal forged_once
+        if forged_once:
+            return real_open(transaction_id, token)
+        forged_once = True
+        maintenance.calls.append("open")
+        maintenance.admission_open = True
+        return AdmissionOpenEvidence(
+            token=AdmissionFenceToken(transaction_id + "-forged", token.publication),
+            opened=True,
+        )
+
+    maintenance.open_admission = open_with_one_forged_ack
+    result = controller.switch(CANDIDATE)
+
+    assert result.state is ModelSwitchState.ROLLED_BACK
+    assert result.error_code == "ADMISSION_OPEN_FENCE_UNPROVEN"
+    assert result.rollback_restored
+    assert maintenance.admission_open
+    assert slot.snapshot().bundle.descriptor == SOURCE
+
+
+def test_source_rollback_open_uses_same_post_ack_publication_fence() -> None:
+    controller, slot, source, _factory, maintenance, authority = _system()
+    maintenance.drained = False
+
+    def kill_source(_token: AdmissionFenceToken) -> None:
+        lease = source.runtime.gpu_lease
+        assert lease is not None
+        source.runtime._alive = False
+        source.runtime._lease = None
+        authority.release(lease, prove=True)
+
+    maintenance.on_open = kill_source
+    result = controller.switch(CANDIDATE)
+
+    assert result.state is ModelSwitchState.SAFE_MODE
+    assert result.error_code == "DRAIN_TIMEOUT"
+    assert result.safety_error_code == "PUBLICATION_FENCE_UNPROVEN"
+    assert not maintenance.admission_open
+    assert slot.snapshot().bundle is source
+    assert not source.runtime.worker_alive
+
+
+def test_unproved_safe_mode_ack_is_exposed_as_distinct_terminal_state() -> None:
+    controller, _slot, source, _factory, maintenance, _authority = _system()
+    source.runtime.prove_release = False
+    maintenance.prove_safe = False
+
+    result = controller.switch(CANDIDATE)
+
+    assert result.state is ModelSwitchState.SAFE_MODE_UNPROVEN
+    assert result.error_code == "LEASE_RELEASE_UNPROVEN"
+    assert result.safety_error_code == "SAFE_MODE_UNPROVEN"
+    assert maintenance.admission_open
+
+
+def test_live_invalid_factory_result_is_stopped_before_rejection() -> None:
+    controller, slot, source, factory, maintenance, authority = _system()
+
+    def violate_factory_contract(bundle: ActiveRuntimeBundle) -> None:
+        if bundle.descriptor == CANDIDATE:
+            bundle.runtime._alive = True
+
+    factory.on_build = violate_factory_contract
+
+    with pytest.raises(RuntimeBundleIncompleteError):
+        controller.switch(CANDIDATE)
+
+    invalid = factory.built[0]
+    assert invalid.runtime.stop_count == 1
+    assert not invalid.runtime.worker_alive
+    assert invalid.runtime.gpu_lease is None
+    assert maintenance.calls == []
+    assert slot.snapshot().bundle is source
+    assert source.runtime.gpu_lease == authority.active
+
+
+def test_rollback_health_deadline_and_cleanup_code_are_preserved() -> None:
+    clock = _Clock()
+    controller, _slot, _source, factory, _maintenance, _authority = _system(clock=clock)
+    factory.fail_health_for.add(CANDIDATE.model_id)
+
+    def configure(bundle: ActiveRuntimeBundle) -> None:
+        if bundle.descriptor == SOURCE:
+            bundle.runtime.on_health = lambda: clock.advance(2.0)
+
+    factory.on_build = configure
+    result = controller.switch(CANDIDATE, health_timeout_seconds=1.0)
+
+    assert result.state is ModelSwitchState.SAFE_MODE
+    assert result.error_code == "CANDIDATE_HEALTHCHECK_FAILED"
+    assert result.safety_error_code == "ROLLBACK_HEALTHCHECK_TIMEOUT"

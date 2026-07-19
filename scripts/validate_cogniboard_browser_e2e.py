@@ -1344,7 +1344,34 @@ def _profile_checks(
             """return document.querySelector('[data-action="workspace-rag-toggle"]')
               ?.getAttribute('aria-pressed') === 'true';""",
         )
+        voice_posts_before_cancel = sum(
+            item.get("method") == "POST"
+            and item.get("path") == "/api/workspace/voice/transcribe"
+            for item in server.state.requests
+        )
         microphone_id = client.find('[data-action="workspace-microphone"]')
+        client.click(microphone_id)
+        _wait_script(
+            client,
+            """return document.querySelector('[data-action="workspace-microphone"]')
+              ?.getAttribute('aria-pressed') === 'true';""",
+        )
+        cancel_id = client.find('[data-action="workspace-voice-cancel"]')
+        client.click(cancel_id)
+        microphone_cancelled = _wait_script(
+            client,
+            """
+            const microphone = document.querySelector('[data-action="workspace-microphone"]');
+            const panel = document.querySelector('#agent-voice-capture');
+            return microphone?.getAttribute('aria-pressed') === 'false'
+              && panel?.dataset.state === 'idle';
+            """,
+        )
+        voice_posts_after_cancel = sum(
+            item.get("method") == "POST"
+            and item.get("path") == "/api/workspace/voice/transcribe"
+            for item in server.state.requests
+        )
         client.click(microphone_id)
         _wait_script(
             client,
@@ -1372,11 +1399,17 @@ def _profile_checks(
                 "optional_ui_interactions",
                 attachment_ready is True
                 and rag_ready is True
+                and microphone_cancelled is True
+                and voice_posts_after_cancel == voice_posts_before_cancel
                 and voice_ready is True
                 and expected_routes <= routes,
                 {
                     "attachment": attachment_ready,
                     "rag": rag_ready,
+                    "microphone_cancelled": microphone_cancelled,
+                    "voice_posts_during_cancel": (
+                        voice_posts_after_cancel - voice_posts_before_cancel
+                    ),
                     "microphone": voice_ready,
                     "api_routes": sorted(f"{method} {path}" for method, path in routes),
                 },

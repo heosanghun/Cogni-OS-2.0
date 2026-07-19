@@ -1,11 +1,29 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
+import subprocess
 import unittest
 
 
 STATIC = Path(__file__).resolve().parents[1] / "cogni_demo" / "static"
 SERVER = Path(__file__).resolve().parents[1] / "cogni_demo" / "server.py"
+_BUNDLED_NODE = (
+    Path.home()
+    / ".cache"
+    / "codex-runtimes"
+    / "codex-primary-runtime"
+    / "dependencies"
+    / "node"
+    / "bin"
+    / "node.exe"
+)
+NODE = shutil.which("node") or (str(_BUNDLED_NODE) if _BUNDLED_NODE.is_file() else None)
+
+
+def _source_between(source: str, start_marker: str, end_marker: str) -> str:
+    start = source.index(start_marker)
+    return source[start : source.index(end_marker, start)]
 
 
 class TestVoiceUIContract(unittest.TestCase):
@@ -48,8 +66,13 @@ class TestVoiceUIContract(unittest.TestCase):
         self.assertIn("VOICE_RECORDER_STOP_TIMEOUT_MS = 5000", script)
         self.assertIn("VOICE_DECODE_TIMEOUT_MS = 5000", script)
         self.assertIn("function stopVoiceRecorder(session)", script)
-        self.assertIn("async function decodeVoiceRecording(blob)", script)
+        self.assertIn("async function decodeVoiceRecording(blob, signal)", script)
         self.assertIn("context.decodeAudioData(encoded.slice(0))", script)
+        self.assertIn("session.pendingStopSettle?.(voiceAbortError())", script)
+        self.assertIn("session.pendingStopSettle = settle", script)
+        self.assertIn("requireActiveVoiceSession(session)", script)
+        self.assertIn("if (channel.length > maxFrames)", script)
+        self.assertIn("await context.close().catch(() => {})", script)
         self.assertNotIn("context.resume()", script)
         self.assertIn('writeAscii(0, "RIFF")', script)
         self.assertIn('writeAscii(8, "WAVE")', script)
@@ -68,7 +91,8 @@ class TestVoiceUIContract(unittest.TestCase):
             "new Blob(session.encodedChunks", recorder_stop_index
         )
         decode_index = stop_flow.index(
-            "await decodeVoiceRecording(recorded)", blob_index
+            "await decodeVoiceRecording(recorded, session.abortController.signal)",
+            blob_index,
         )
         response_index = stop_flow.index('await api("/api/workspace/voice/transcribe"')
         refresh_index = stop_flow.index("await refreshWorkspaceCapabilityDisclosure()")
@@ -111,6 +135,197 @@ class TestVoiceUIContract(unittest.TestCase):
         self.assertIn('"Permissions-Policy", "microphone=(self)"', server)
         self.assertIn("tts.host_probe_passed === true", script)
         self.assertIn("tts.browser_playback_verified === true", script)
+
+    @unittest.skipUnless(NODE, "Node.js is required for deterministic voice race tests")
+    def test_cancel_settles_pending_recorder_stop_once(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        release_source = _source_between(
+            script,
+            "function voiceAbortError()",
+            "function resampleVoiceSamples",
+        )
+        stop_source = _source_between(
+            script,
+            "function stopVoiceRecorder(session)",
+            "async function decodeVoiceRecording",
+        )
+        node_source = "\n".join(
+            [
+                "globalThis.window = { setTimeout, clearTimeout };",
+                "const VOICE_RECORDER_STOP_TIMEOUT_MS = 5000;",
+                "const ui = { voiceSession: null };",
+                release_source,
+                stop_source,
+                r"""
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+class FakeRecorder {
+  constructor() {
+    this.state = "recording";
+    this.stopCalls = 0;
+    this.listeners = new Map();
+  }
+  addEventListener(type, callback) { this.listeners.set(type, callback); }
+  removeEventListener(type, callback) {
+    if (this.listeners.get(type) === callback) this.listeners.delete(type);
+  }
+  stop() {
+    this.stopCalls += 1;
+    this.state = "inactive";
+  }
+}
+(async () => {
+  const recorder = new FakeRecorder();
+  let trackStops = 0;
+  const session = {
+    recorder,
+    stream: { getTracks: () => [{ stop: () => { trackStops += 1; } }] },
+    stopRequested: false,
+  };
+  const pending = stopVoiceRecorder(session);
+  assert(typeof session.pendingStopSettle === "function", "missing pending stop settler");
+  releaseVoiceSession(session);
+  const outcome = await Promise.race([
+    pending.then(
+      () => ({ resolved: true }),
+      error => ({ rejected: true, name: error?.name }),
+    ),
+    new Promise(resolve => setTimeout(() => resolve({ timeout: true }), 100)),
+  ]);
+  assert(outcome.rejected && outcome.name === "AbortError", "cancel did not reject with AbortError");
+  assert(!outcome.timeout, "recorder stop promise remained pending");
+  assert(recorder.stopCalls === 1, "recorder.stop was not exactly once");
+  assert(recorder.listeners.size === 0, "recorder listeners leaked");
+  assert(session.pendingStopSettle == null, "pending settler leaked");
+  assert(trackStops === 1, "media track was not released exactly once");
+})().catch(error => { console.error(error.stack || error); process.exit(1); });
+""",
+            ]
+        )
+        completed = subprocess.run(
+            [str(NODE), "--input-type=module", "--eval", node_source],
+            capture_output=True,
+            check=False,
+            encoding="utf-8",
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    @unittest.skipUnless(NODE, "Node.js is required for deterministic voice race tests")
+    def test_cancel_during_decode_blocks_post_and_duplicate_stop(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        release_source = _source_between(
+            script,
+            "function voiceAbortError()",
+            "function resampleVoiceSamples",
+        )
+        stop_flow_source = _source_between(
+            script,
+            "async function stopVoiceCapture()",
+            "function toggleVoiceCapture()",
+        )
+        node_source = "\n".join(
+            [
+                "globalThis.window = { setTimeout, clearTimeout };",
+                "const ui = { voiceSession: null, voiceCaptureState: 'idle', voiceTranscriptionReady: true };",
+                "const API_ERROR_COPY = {};",
+                release_source,
+                r"""
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+let apiCalls = 0;
+let refreshCalls = 0;
+let inserted = 0;
+let decodeGate = deferred();
+let postGate = null;
+function setVoiceCaptureState(state) { ui.voiceCaptureState = state; }
+function updateWorkspaceControlStates() {}
+function showToast() {}
+async function stopVoiceRecorder(session) {
+  session.stopRequested = true;
+  session.recorder.state = "inactive";
+}
+let decodeVoiceRecording = () => decodeGate.promise;
+function resampleVoiceSamples(samples) { return samples; }
+function encodeVoiceWav() { return new Uint8Array([1, 2, 3]); }
+function voiceBytesToBase64() { return "AQID"; }
+let api = () => {
+  apiCalls += 1;
+  return postGate ? postGate.promise : Promise.resolve({ transcript: "unexpected" });
+};
+async function refreshWorkspaceCapabilityDisclosure() {
+  refreshCalls += 1;
+  return true;
+}
+function insertVoiceTranscript() { inserted += 1; return true; }
+function makeSession() {
+  let trackStopped = false;
+  return {
+    cancelled: false,
+    abortController: new AbortController(),
+    encodedChunks: [new Blob(["encoded"], { type: "audio/ogg" })],
+    recorder: { state: "recording", mimeType: "audio/ogg", ondataavailable: null, onerror: null },
+    stream: { getTracks: () => [{ stop: () => { trackStopped = true; } }] },
+    stopRequested: false,
+    transcriptionStarted: false,
+    trackWasStopped: () => trackStopped,
+  };
+}
+""",
+                stop_flow_source,
+                r"""
+(async () => {
+  const duringDecode = makeSession();
+  ui.voiceSession = duringDecode;
+  ui.voiceCaptureState = "recording";
+  const decodingRun = stopVoiceCapture();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(ui.voiceCaptureState === "encoding", "decode phase was not reached");
+  cancelVoiceCapture();
+  decodeGate.resolve({ samples: new Float32Array([0]), sourceRate: 16000 });
+  await decodingRun;
+  assert(apiCalls === 0, "cancelled decode issued a transcription POST");
+  assert(refreshCalls === 0 && inserted === 0, "cancelled decode applied downstream work");
+  assert(ui.voiceSession === null && ui.voiceCaptureState === "idle", "cancel did not restore idle UI");
+  assert(duringDecode.trackWasStopped(), "cancelled decode leaked its media track");
+
+  decodeVoiceRecording = async () => ({ samples: new Float32Array([0]), sourceRate: 16000 });
+  postGate = deferred();
+  const duringPost = makeSession();
+  ui.voiceSession = duringPost;
+  ui.voiceCaptureState = "recording";
+  const first = stopVoiceCapture();
+  const duplicate = stopVoiceCapture();
+  await duplicate;
+  for (let index = 0; index < 8 && apiCalls < 1; index += 1) await Promise.resolve();
+  assert(apiCalls === 1, "duplicate stop issued an unexpected POST count");
+  cancelVoiceCapture();
+  postGate.resolve({ transcript: "must not be inserted" });
+  await first;
+  assert(apiCalls === 1, "cancelled POST was duplicated");
+  assert(refreshCalls === 0 && inserted === 0, "cancelled POST applied stale output");
+  assert(ui.voiceSession === null && ui.voiceCaptureState === "idle", "POST cancel did not restore idle UI");
+})().catch(error => { console.error(error.stack || error); process.exit(1); });
+""",
+            ]
+        )
+        completed = subprocess.run(
+            [str(NODE), "--input-type=module", "--eval", node_source],
+            capture_output=True,
+            check=False,
+            encoding="utf-8",
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 if __name__ == "__main__":

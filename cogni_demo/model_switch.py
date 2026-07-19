@@ -986,6 +986,9 @@ class ModelSwitchController:
             or health.binding_id != bundle.binding_id
             or health.model_authority_digest != bundle.descriptor.authority_digest
             or health.lease_epoch != lease.epoch
+            or bundle.runtime.worker_alive is not True
+            or bundle.runtime.gpu_lease != lease
+            or bundle.lease_authority.active != lease
         ):
             raise _TransactionFailure("CANDIDATE_HEALTH_UNPROVEN")
         bundle.validate_complete()

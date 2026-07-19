@@ -107,6 +107,7 @@ class _Runtime:
         self.prove_release = prove_release
         self.raise_after_stop = raise_after_stop
         self.acknowledge_unload = acknowledge_unload
+        self.on_health = None
         self._alive = False
         self._lease: GPULease | None = None
         self.start_count = 0
@@ -153,12 +154,15 @@ class _Runtime:
         if self.fail_health:
             raise RuntimeError("injected health failure")
         assert self._lease is not None
-        return RuntimeHealthEvidence(
+        evidence = RuntimeHealthEvidence(
             ready=True,
             binding_id=self.binding_id,
             model_authority_digest=self.descriptor.authority_digest,
             lease_epoch=self._lease.epoch,
         )
+        if self.on_health is not None:
+            self.on_health()
+        return evidence
 
 
 def _bundle(
@@ -209,6 +213,7 @@ class _Factory:
         self.unproven_release_for: set[str] = set()
         self.incomplete_for: dict[str, str] = {}
         self.built: list[ActiveRuntimeBundle] = []
+        self.on_build = None
 
     def build(self, descriptor, lease_authority, lease_profile):
         self.count += 1
@@ -222,6 +227,8 @@ class _Factory:
             incomplete_component=self.incomplete_for.get(descriptor.model_id),
         )
         self.built.append(bundle)
+        if self.on_build is not None:
+            self.on_build(bundle)
         return bundle
 
 
@@ -416,6 +423,32 @@ def test_candidate_health_failure_retires_candidate_and_restores_old_bundle() ->
     assert ModelSwitchState.RESTORING_OLD in [
         item.target for item in result.transitions
     ]
+
+
+def test_health_ack_cannot_publish_a_worker_that_died_before_commit() -> None:
+    controller, slot, _source, factory, _maintenance, authority = _system()
+
+    def configure(bundle: ActiveRuntimeBundle) -> None:
+        if bundle.descriptor != CANDIDATE:
+            return
+
+        def retire_after_ack() -> None:
+            lease = bundle.runtime.gpu_lease
+            assert lease is not None
+            bundle.runtime._alive = False
+            bundle.runtime._lease = None
+            authority.release(lease, prove=True)
+
+        bundle.runtime.on_health = retire_after_ack
+
+    factory.on_build = configure
+    result = controller.switch(CANDIDATE)
+
+    assert result.state is ModelSwitchState.SAFE_MODE
+    assert result.error_code == "CANDIDATE_HEALTH_UNPROVEN"
+    assert not result.rollback_restored
+    assert slot.snapshot().bundle.descriptor == SOURCE
+    assert slot.snapshot().bundle.descriptor != CANDIDATE
 
 
 def test_unproven_candidate_lease_release_enters_safe_mode_without_old_restart() -> (

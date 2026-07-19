@@ -323,6 +323,19 @@ def verify_semantic_embedder_manifest(
         raise SemanticEmbedderError(
             "SEMANTIC_LICENSE_UNVERIFIED", "declared license file is not manifested"
         )
+    manifested_names = set(files_payload)
+    if not {"config.json", "tokenizer.json"}.issubset(manifested_names) or not any(
+        name.endswith(".safetensors") for name in manifested_names
+    ):
+        raise SemanticEmbedderError(
+            "SEMANTIC_MANIFEST_INVALID",
+            "semantic artifact requires config, tokenizer, and safetensors weights",
+        )
+    if any(name.endswith((".bin", ".pt", ".pth", ".pkl")) for name in manifested_names):
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_UNSAFE",
+            "pickle-compatible semantic weights are not admitted",
+        )
 
     observed = _inventory_regular_files(selected_root)
     observed_without_manifest = {

@@ -48,6 +48,7 @@ def _write_manifest(
         "LICENSE": b"Apache License 2.0\n",
         "config.json": b'{"model_type":"bounded-test"}\n',
         "model.safetensors": b"bounded semantic weights fixture\n",
+        "tokenizer.json": b'{"version":"1.0"}\n',
     }
     for relative, content in files.items():
         (root / relative).write_bytes(content)
@@ -86,7 +87,7 @@ class TestSemanticEmbedderManifest(unittest.TestCase):
             self.assertEqual(verified.revision, "a" * 40)
             self.assertEqual(verified.dimensions, 4)
             self.assertEqual(verified.license_file, "LICENSE")
-            self.assertEqual(len(verified.files), 3)
+            self.assertEqual(len(verified.files), 4)
             self.assertRegex(verified.manifest_sha256, r"[0-9a-f]{64}")
             self.assertRegex(verified.profile, r"local_semantic_[0-9a-f]{16}_v1")
 

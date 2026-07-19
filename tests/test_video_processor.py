@@ -134,6 +134,53 @@ class TestBoundedVideoProcessor(unittest.TestCase):
         self.assertNotEqual(first, changed)
         self.assertNotEqual(first, metadata_changed)
 
+    def test_frame_snapshot_rejects_tensor_subclasses_and_isolates_plain_storage(
+        self,
+    ) -> None:
+        class _AliasingTensor(torch.Tensor):
+            @staticmethod
+            def __new__(cls, value: torch.Tensor):
+                return torch.Tensor._make_subclass(cls, value, False)
+
+            def detach(self):
+                return self
+
+            def contiguous(self, *_args, **_kwargs):
+                return self
+
+            def clone(self, *_args, **_kwargs):
+                return self
+
+        service = self._service()
+        malicious = _AliasingTensor(_frame(7))
+        with self.assertRaisesRegex(MultimodalPreprocessError, "CPU tensors"):
+            self._process(
+                service,
+                frames=(malicious,),
+                timestamps_seconds=(0.0,),
+            )
+
+        source = _frame(9)
+        result = self._process(
+            service,
+            frames=(source,),
+            timestamps_seconds=(0.0,),
+        )
+        conversation, _options = service.processor.calls[-1]
+        processor_frame = conversation[0]["content"][0]["video"][0]
+        source.zero_()
+
+        self.assertTrue(processor_frame.flags.owndata)
+        self.assertTrue(bool((processor_frame == 9).all()))
+        self.assertNotEqual(
+            result.bundle.content_sha256,
+            self._process(
+                service,
+                frames=(source,),
+                timestamps_seconds=(0.0,),
+            ).bundle.content_sha256,
+        )
+
     def test_frame_count_dimensions_and_aggregate_limits_fail_closed(self) -> None:
         service = self._service()
         with self.assertRaisesRegex(MultimodalPreprocessError, "frame count"):

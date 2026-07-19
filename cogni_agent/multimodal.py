@@ -501,7 +501,7 @@ def _bounded_video_frames(
     digest.update(struct.pack(">Idd", len(frames), duration, sample_rate))
     for index, value in enumerate(frames):
         if (
-            not isinstance(value, Tensor)
+            type(value) is not Tensor
             or value.device.type != "cpu"
             or value.layout != torch.strided
         ):
@@ -533,14 +533,29 @@ def _bounded_video_frames(
             raise MultimodalPreprocessError("video decoded bytes exceed their limit")
         # Snapshot caller-owned storage only after all allocation budgets pass.
         try:
-            frame = value.detach().contiguous().clone()
+            frame = value.detach().clone(memory_format=torch.contiguous_format)
+            isolated = (
+                type(frame) is Tensor
+                and frame.device.type == "cpu"
+                and frame.layout == torch.strided
+                and frame.dtype == torch.uint8
+                and frame.ndim == 3
+                and tuple(frame.shape) == (frame_height, frame_width, 3)
+                and frame.is_contiguous()
+                and frame.numel() == value.numel()
+                and frame.data_ptr() != value.data_ptr()
+                and frame.untyped_storage().data_ptr()
+                != value.untyped_storage().data_ptr()
+            )
             finite = bool(torch.isfinite(frame).all())
         except RuntimeError as exc:
             raise MultimodalPreprocessError(
                 "video frame tensor is unsupported"
             ) from exc
-        if frame.requires_grad or not finite:
-            raise MultimodalPreprocessError("video frame tensor is non-finite")
+        if not isolated or frame.requires_grad or not finite:
+            raise MultimodalPreprocessError(
+                "video frame tensor could not be isolated safely"
+            )
         digest.update(
             struct.pack(">IdII", index, timestamps[index], frame_height, frame_width)
         )

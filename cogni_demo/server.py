@@ -2984,7 +2984,21 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 raise failure
             return
 
+        authority_failure: BaseException | None = None
+        revoke_general_web = getattr(
+            self.workspace_service, "revoke_general_web", None
+        )
+        if callable(revoke_general_web):
+            try:
+                # Network authority closes before waiting for GPU/compute
+                # quiescence.  A busy validation job must never delay web
+                # search cancellation during process shutdown.
+                revoke_general_web()
+            except BaseException as error:
+                authority_failure = error
+
         acquired_compute = False
+        product_cleanup_started = False
         try:
             remaining = deadline - monotonic()
             if remaining <= 0.0 or not self._compute_lock.acquire(timeout=remaining):
@@ -2996,14 +3010,22 @@ class DemoHTTPServer(ThreadingHTTPServer):
             # so callbacks may safely re-enter shutdown after it is released.
             self._compute_lock.release()
             acquired_compute = False
+            product_cleanup_started = True
             _shutdown_product_components(
                 self.manager,
                 self.evolution_manager,
                 self.agent_manager,
                 self.workspace_service,
+                primary=authority_failure,
             )
         except BaseException as error:
-            failure = error
+            if authority_failure is not None and not product_cleanup_started:
+                failure = BaseExceptionGroup(
+                    _CLEANUP_ERROR_MESSAGE,
+                    [authority_failure, error],
+                )
+            else:
+                failure = error
         finally:
             if acquired_compute:
                 self._compute_lock.release()

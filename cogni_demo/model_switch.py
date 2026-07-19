@@ -14,7 +14,7 @@ from hashlib import sha256
 import math
 import re
 import secrets
-from threading import Event, Lock, RLock
+from threading import Condition, Event, Lock, RLock
 from time import monotonic
 from typing import Protocol
 
@@ -44,6 +44,10 @@ class ModelSwitchDisabledError(ModelSwitchError):
 
 class ModelSwitchBusyError(ModelSwitchError):
     code = "MODEL_SWITCH_BUSY"
+
+
+class ModelSwitchProductionUnavailableError(ModelSwitchError):
+    code = "MODEL_SWITCH_PRODUCTION_UNAVAILABLE"
 
 
 class RuntimeBundleIncompleteError(ModelSwitchError):
@@ -275,11 +279,18 @@ class AdmissionFenceToken:
     """Capability presented when reopening request admission."""
 
     transaction_id: str
+    slot_generation: int
     publication: RuntimePublicationFence
 
     def __post_init__(self) -> None:
         if not isinstance(self.transaction_id, str) or not self.transaction_id:
             raise ValueError("admission transaction id is invalid")
+        if (
+            not isinstance(self.slot_generation, int)
+            or isinstance(self.slot_generation, bool)
+            or self.slot_generation < 0
+        ):
+            raise ValueError("admission slot generation is invalid")
         if not isinstance(self.publication, RuntimePublicationFence):
             raise TypeError("admission publication fence is invalid")
 
@@ -287,13 +298,192 @@ class AdmissionFenceToken:
 @dataclass(frozen=True, slots=True)
 class AdmissionOpenEvidence:
     token: AdmissionFenceToken
-    opened: bool
+    gate_generation: int
+    entry_validation_required: bool
 
     def __post_init__(self) -> None:
         if not isinstance(self.token, AdmissionFenceToken):
             raise TypeError("admission token acknowledgement is invalid")
-        if not isinstance(self.opened, bool):
-            raise TypeError("admission opened acknowledgement must be bool")
+        if (
+            not isinstance(self.gate_generation, int)
+            or isinstance(self.gate_generation, bool)
+            or self.gate_generation <= 0
+        ):
+            raise ValueError("admission gate generation is invalid")
+        if self.entry_validation_required is not True:
+            raise ValueError("admission must require per-entry validation")
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionGateReadback:
+    """Independent state readback from the atomic request gate."""
+
+    gate_generation: int
+    mode: str
+    transaction_id: str | None
+    token: AdmissionFenceToken | None
+    in_flight_by_generation: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.gate_generation, int)
+            or isinstance(self.gate_generation, bool)
+            or self.gate_generation < 0
+        ):
+            raise ValueError("admission gate generation is invalid")
+        if self.mode not in {"open", "closed", "safe_mode"}:
+            raise ValueError("admission gate mode is invalid")
+        if self.transaction_id is not None and (
+            not isinstance(self.transaction_id, str) or not self.transaction_id
+        ):
+            raise ValueError("admission gate transaction id is invalid")
+        if self.token is not None and not isinstance(self.token, AdmissionFenceToken):
+            raise TypeError("admission gate token is invalid")
+        if self.mode == "open" and self.token is None:
+            raise ValueError("open admission gate lacks an entry token")
+        if self.mode != "open" and self.token is not None:
+            raise ValueError("closed admission gate retained an entry token")
+        previous = -1
+        for slot_generation, count in self.in_flight_by_generation:
+            if (
+                not isinstance(slot_generation, int)
+                or isinstance(slot_generation, bool)
+                or slot_generation < 0
+                or slot_generation <= previous
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+                or count <= 0
+            ):
+                raise ValueError("admission in-flight readback is invalid")
+            previous = slot_generation
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeRequestLease:
+    """One request pin for the exact published runtime generation."""
+
+    request_id: str
+    gate_generation: int
+    slot_generation: int
+    binding_id: str
+    model_authority_digest: str
+    worker_generation: int
+    lease_id: str
+    lease_epoch: int
+    runtime_snapshot: RuntimeSlotSnapshot
+
+    def __post_init__(self) -> None:
+        if _BINDING_ID.fullmatch(self.request_id) is None:
+            raise ValueError("request lease id is invalid")
+        for field_name in (
+            "gate_generation",
+            "slot_generation",
+            "worker_generation",
+            "lease_epoch",
+        ):
+            value = getattr(self, field_name)
+            minimum = 0 if field_name == "slot_generation" else 1
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f"request lease {field_name} is invalid")
+        if _BINDING_ID.fullmatch(self.binding_id) is None:
+            raise ValueError("request lease binding id is invalid")
+        if _SHA256.fullmatch(self.model_authority_digest) is None:
+            raise ValueError("request lease model authority is invalid")
+        if not isinstance(self.lease_id, str) or not self.lease_id:
+            raise ValueError("request lease GPU lease id is invalid")
+        if (
+            not isinstance(self.runtime_snapshot, RuntimeSlotSnapshot)
+            or self.runtime_snapshot.generation != self.slot_generation
+            or self.runtime_snapshot.bundle.binding_id != self.binding_id
+            or self.runtime_snapshot.bundle.descriptor.authority_digest
+            != self.model_authority_digest
+        ):
+            raise ValueError("request lease runtime snapshot is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimePreparationCleanupEvidence:
+    preparation_id: str
+    model_authority_digest: str
+    aborted: bool
+    factory_state_released: bool
+    worker_absent: bool
+    lease_absent: bool
+
+    def __post_init__(self) -> None:
+        if _BINDING_ID.fullmatch(self.preparation_id) is None:
+            raise ValueError("runtime preparation id is invalid")
+        if _SHA256.fullmatch(self.model_authority_digest) is None:
+            raise ValueError("runtime preparation model authority is invalid")
+        if not all(
+            isinstance(value, bool)
+            for value in (
+                self.aborted,
+                self.factory_state_released,
+                self.worker_absent,
+                self.lease_absent,
+            )
+        ):
+            raise TypeError("runtime preparation cleanup evidence is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimePreparationDisposeEvidence:
+    preparation_id: str
+    model_authority_digest: str
+    disposed: bool
+    runtime_transferred: bool
+
+    def __post_init__(self) -> None:
+        if _BINDING_ID.fullmatch(self.preparation_id) is None:
+            raise ValueError("runtime preparation id is invalid")
+        if _SHA256.fullmatch(self.model_authority_digest) is None:
+            raise ValueError("runtime preparation model authority is invalid")
+        if not isinstance(self.disposed, bool) or not isinstance(
+            self.runtime_transferred, bool
+        ):
+            raise TypeError("runtime preparation dispose evidence is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSwitchControlCapabilities:
+    """Auditable control-plane capability declaration.
+
+    Blocking calls are cooperative in this in-process primitive.  Crash journal
+    recovery and product wiring intentionally remain partial, so production
+    enablement must be refused even when test-mode switching is enabled.
+    """
+
+    cooperative_only: bool = True
+    atomic_entry_validation: bool = True
+    exact_generation_drain: bool = True
+    two_phase_factory: bool = True
+    independent_gate_readback: bool = True
+    crash_journal: bool = False
+    product_wiring: bool = False
+
+    @property
+    def production_ready(self) -> bool:
+        return (
+            not self.cooperative_only
+            and self.atomic_entry_validation
+            and self.exact_generation_drain
+            and self.two_phase_factory
+            and self.independent_gate_readback
+            and self.crash_journal
+            and self.product_wiring
+        )
+
+    @property
+    def partial_capabilities(self) -> tuple[str, ...]:
+        missing: list[str] = []
+        if self.cooperative_only:
+            missing.append("ENFORCED_WALL_CLOCK_ISOLATION")
+        if not self.crash_journal:
+            missing.append("CRASH_JOURNAL_RECOVERY")
+        if not self.product_wiring:
+            missing.append("PRODUCT_WIRING")
+        return tuple(missing)
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,19 +583,40 @@ class MemoryReleaseProbePort(Protocol):
     ) -> MemoryReleaseEvidence: ...
 
 
+class RuntimeBundlePreparationPort(Protocol):
+    """Retained cleanup handle for every potentially stateful materialization."""
+
+    @property
+    def preparation_id(self) -> str: ...
+
+    @property
+    def descriptor(self) -> VerifiedModelSwitchDescriptor: ...
+
+    def materialize(self) -> ActiveRuntimeBundle: ...
+
+    def abort(self, timeout_seconds: float) -> RuntimePreparationCleanupEvidence: ...
+
+    def dispose(self) -> RuntimePreparationDisposeEvidence: ...
+
+
 class RuntimeBundleFactoryPort(Protocol):
-    def build(
+    @property
+    def side_effect_free_prepare(self) -> bool: ...
+
+    def prepare(
         self,
         descriptor: VerifiedModelSwitchDescriptor,
         lease_authority: LeaseAuthorityPort,
         lease_profile: StableResidentLeaseAuthority,
-    ) -> ActiveRuntimeBundle: ...
+    ) -> RuntimeBundlePreparationPort: ...
 
 
 class ModelSwitchMaintenancePort(Protocol):
     def close_admission(self, transaction_id: str) -> None: ...
 
-    def wait_for_drain(self, transaction_id: str, timeout_seconds: float) -> bool: ...
+    def wait_for_drain(
+        self, transaction_id: str, slot_generation: int, timeout_seconds: float
+    ) -> bool: ...
 
     def checkpoint(
         self,
@@ -413,10 +624,6 @@ class ModelSwitchMaintenancePort(Protocol):
         source: VerifiedModelSwitchDescriptor,
         candidate: VerifiedModelSwitchDescriptor,
     ) -> None: ...
-
-    def open_admission(
-        self, transaction_id: str, token: AdmissionFenceToken
-    ) -> AdmissionOpenEvidence: ...
 
     def enter_safe_mode(
         self, transaction_id: str, error_code: str
@@ -507,13 +714,103 @@ class AtomicRuntimeSlot:
 
     def __init__(self, bundle: ActiveRuntimeBundle) -> None:
         bundle.validate_complete()
+        initial_fence = self.publication_fence_for(bundle, expected_slot_generation=0)
         self._bundle = bundle
         self._generation = 0
-        self._lock = RLock()
+        self._publication_fence = initial_fence
+        self._lock = Lock()
 
     def snapshot(self) -> RuntimeSlotSnapshot:
         with self._lock:
             return RuntimeSlotSnapshot(self._generation, self._bundle)
+
+    def publication_snapshot(
+        self,
+    ) -> tuple[RuntimeSlotSnapshot, RuntimePublicationFence]:
+        """Return immutable slot identity without invoking injected callbacks."""
+
+        with self._lock:
+            return (
+                RuntimeSlotSnapshot(self._generation, self._bundle),
+                self._publication_fence,
+            )
+
+    @staticmethod
+    def publication_fence_for(
+        bundle: ActiveRuntimeBundle, *, expected_slot_generation: int
+    ) -> RuntimePublicationFence:
+        """Capture and independently validate a live bundle outside slot locks."""
+
+        try:
+            bundle.validate_complete()
+            lease = bundle.runtime.gpu_lease
+            worker_generation = bundle.runtime.worker_generation
+            if (
+                bundle.runtime.worker_alive is not True
+                or not isinstance(lease, GPULease)
+                or not isinstance(worker_generation, int)
+                or isinstance(worker_generation, bool)
+                or worker_generation <= 0
+                or bundle.lease_authority.active != lease
+            ):
+                raise ValueError("publication runtime is unavailable")
+            validated = bundle.lease_authority.validate(
+                lease,
+                purpose=bundle.lease_profile.purpose,
+                required_vram_bytes=bundle.lease_profile.vram_budget_bytes,
+            )
+            if validated != lease:
+                raise ValueError("publication lease validation changed identity")
+            return RuntimePublicationFence(
+                expected_slot_generation=expected_slot_generation,
+                binding_id=bundle.binding_id,
+                model_authority_digest=bundle.descriptor.authority_digest,
+                worker_generation=worker_generation,
+                lease_id=lease.lease_id,
+                lease_epoch=lease.epoch,
+            )
+        except Exception as error:
+            raise AtomicRuntimeCommitError(
+                "runtime publication fence was not proved"
+            ) from error
+
+    def validates_entry_token(self, token: AdmissionFenceToken) -> bool:
+        """Validate a request token without holding the slot lock over callbacks."""
+
+        if not isinstance(token, AdmissionFenceToken):
+            return False
+        first, cached = self.publication_snapshot()
+        if (
+            first.generation != token.slot_generation
+            or cached != token.publication
+            or first.bundle.binding_id != token.publication.binding_id
+        ):
+            return False
+        try:
+            observed = self.publication_fence_for(
+                first.bundle,
+                expected_slot_generation=token.publication.expected_slot_generation,
+            )
+        except AtomicRuntimeCommitError:
+            return False
+        second, cached_after = self.publication_snapshot()
+        return (
+            observed == token.publication and second == first and cached_after == cached
+        )
+
+    def matches_cached_token(self, token: AdmissionFenceToken) -> bool:
+        """Pure lock-bounded comparison used at the final admission boundary."""
+
+        if not isinstance(token, AdmissionFenceToken):
+            return False
+        with self._lock:
+            return (
+                self._generation == token.slot_generation
+                and self._publication_fence == token.publication
+                and self._bundle.binding_id == token.publication.binding_id
+                and self._bundle.descriptor.authority_digest
+                == token.publication.model_authority_digest
+            )
 
     def compare_and_swap(
         self,
@@ -522,6 +819,10 @@ class AtomicRuntimeSlot:
         publication_fence: RuntimePublicationFence,
     ) -> RuntimeSlotSnapshot:
         replacement.validate_complete()
+        # All injected runtime/lease callbacks execute before taking the slot
+        # lock.  A re-entrant callback may publish first; the expected-generation
+        # check below then rejects this outer CAS without clobbering it.
+        self._validate_publication_fence(expected, replacement, publication_fence)
         with self._lock:
             if (
                 self._generation != expected.generation
@@ -530,20 +831,39 @@ class AtomicRuntimeSlot:
                 raise AtomicRuntimeCommitError(
                     "active runtime changed before atomic commit"
                 )
-            self._validate_publication_fence(expected, replacement, publication_fence)
             previous_bundle = self._bundle
             previous_generation = self._generation
+            previous_fence = self._publication_fence
             self._bundle = replacement
             self._generation += 1
-            try:
-                self._validate_publication_fence(
-                    expected, replacement, publication_fence
+            self._publication_fence = publication_fence
+            committed = RuntimeSlotSnapshot(self._generation, replacement)
+        try:
+            # Re-prove after publication while admission is still closed.  No
+            # callback runs under the slot lock, and rollback is conditional so
+            # a re-entrant successor publication is never overwritten.
+            self._validate_publication_fence(expected, replacement, publication_fence)
+        except Exception:
+            with self._lock:
+                if (
+                    self._generation == committed.generation
+                    and self._bundle is replacement
+                    and self._publication_fence == publication_fence
+                ):
+                    self._bundle = previous_bundle
+                    self._generation = previous_generation
+                    self._publication_fence = previous_fence
+            raise
+        with self._lock:
+            if (
+                self._generation != committed.generation
+                or self._bundle is not replacement
+                or self._publication_fence != publication_fence
+            ):
+                raise AtomicRuntimeCommitError(
+                    "active runtime changed during atomic commit postcheck"
                 )
-            except Exception:
-                self._bundle = previous_bundle
-                self._generation = previous_generation
-                raise
-            return RuntimeSlotSnapshot(self._generation, replacement)
+            return committed
 
     @staticmethod
     def _validate_publication_fence(
@@ -582,6 +902,189 @@ class AtomicRuntimeSlot:
             raise AtomicRuntimeCommitError(
                 "runtime publication fence was not proved"
             ) from error
+
+
+class AtomicAdmissionGate:
+    """Token-gated request admission with exact runtime-generation pins.
+
+    Installing a token merely arms the entry validator.  Every request must
+    revalidate the live publication and atomically acquire a generation pin;
+    there is no interval in which a bare boolean `open` admits work.
+    """
+
+    def __init__(self, slot: AtomicRuntimeSlot) -> None:
+        if not isinstance(slot, AtomicRuntimeSlot):
+            raise TypeError("slot must be AtomicRuntimeSlot")
+        snapshot, publication = slot.publication_snapshot()
+        token = AdmissionFenceToken(
+            transaction_id="bootstrap",
+            slot_generation=snapshot.generation,
+            publication=publication,
+        )
+        if not slot.validates_entry_token(token):
+            raise AtomicRuntimeCommitError("initial admission fence was not proved")
+        self._condition = Condition(Lock())
+        self._mode = "open"
+        self._gate_generation = 1
+        self._transaction_id: str | None = token.transaction_id
+        self._token: AdmissionFenceToken | None = token
+        self._active_requests: dict[str, RuntimeRequestLease] = {}
+        self._in_flight: dict[int, int] = {}
+
+    def readback(self) -> AdmissionGateReadback:
+        with self._condition:
+            return self._readback_locked()
+
+    def close(self, transaction_id: str) -> AdmissionGateReadback:
+        if not isinstance(transaction_id, str) or not transaction_id:
+            raise ValueError("admission transaction id is invalid")
+        with self._condition:
+            self._mode = "closed"
+            self._gate_generation += 1
+            self._transaction_id = transaction_id
+            self._token = None
+            self._condition.notify_all()
+            return self._readback_locked()
+
+    def install(
+        self,
+        transaction_id: str,
+        token: AdmissionFenceToken,
+        slot: AtomicRuntimeSlot,
+    ) -> AdmissionOpenEvidence:
+        if token.transaction_id != transaction_id:
+            raise AtomicRuntimeCommitError("admission token transaction changed")
+        if not slot.validates_entry_token(token):
+            raise AtomicRuntimeCommitError("admission entry fence was not proved")
+        with self._condition:
+            if self._mode != "closed" or self._transaction_id != transaction_id:
+                raise AtomicRuntimeCommitError(
+                    "admission gate is not closed for switch"
+                )
+            if any(self._in_flight.values()):
+                raise AtomicRuntimeCommitError(
+                    "admission gate still has in-flight work"
+                )
+            if not slot.matches_cached_token(token):
+                raise AtomicRuntimeCommitError("admission slot changed before install")
+            self._gate_generation += 1
+            self._mode = "open"
+            self._token = token
+            evidence = AdmissionOpenEvidence(
+                token=token,
+                gate_generation=self._gate_generation,
+                entry_validation_required=True,
+            )
+            self._condition.notify_all()
+            return evidence
+
+    def acquire(self, slot: AtomicRuntimeSlot) -> RuntimeRequestLease | None:
+        """Acquire a request pin or reject if any publication evidence changed."""
+
+        with self._condition:
+            if self._mode != "open" or self._token is None:
+                return None
+            token = self._token
+            gate_generation = self._gate_generation
+        if not slot.validates_entry_token(token):
+            return None
+        with self._condition:
+            if (
+                self._mode != "open"
+                or self._token != token
+                or self._gate_generation != gate_generation
+                or not slot.matches_cached_token(token)
+            ):
+                return None
+            publication = token.publication
+            runtime_snapshot = slot.snapshot()
+            if runtime_snapshot.generation != token.slot_generation:
+                return None
+            request = RuntimeRequestLease(
+                request_id=secrets.token_hex(16),
+                gate_generation=gate_generation,
+                slot_generation=token.slot_generation,
+                binding_id=publication.binding_id,
+                model_authority_digest=publication.model_authority_digest,
+                worker_generation=publication.worker_generation,
+                lease_id=publication.lease_id,
+                lease_epoch=publication.lease_epoch,
+                runtime_snapshot=runtime_snapshot,
+            )
+            self._active_requests[request.request_id] = request
+            self._in_flight[request.slot_generation] = (
+                self._in_flight.get(request.slot_generation, 0) + 1
+            )
+            return request
+
+    def release(self, request: RuntimeRequestLease) -> None:
+        if not isinstance(request, RuntimeRequestLease):
+            raise TypeError("request must be RuntimeRequestLease")
+        with self._condition:
+            active = self._active_requests.pop(request.request_id, None)
+            if active != request:
+                raise ValueError("request lease is unknown or already released")
+            count = self._in_flight.get(request.slot_generation, 0)
+            if count <= 1:
+                self._in_flight.pop(request.slot_generation, None)
+            else:
+                self._in_flight[request.slot_generation] = count - 1
+            self._condition.notify_all()
+
+    def wait_for_generation_drain(
+        self, transaction_id: str, slot_generation: int, timeout_seconds: float
+    ) -> bool:
+        if not isinstance(transaction_id, str) or not transaction_id:
+            raise ValueError("admission transaction id is invalid")
+        if (
+            not isinstance(slot_generation, int)
+            or isinstance(slot_generation, bool)
+            or slot_generation < 0
+        ):
+            raise ValueError("slot generation is invalid")
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not math.isfinite(float(timeout_seconds))
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("drain timeout is invalid")
+        deadline = monotonic() + float(timeout_seconds)
+        with self._condition:
+            if self._mode != "closed" or self._transaction_id != transaction_id:
+                return False
+            while self._in_flight.get(slot_generation, 0) > 0:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+                if self._mode != "closed" or self._transaction_id != transaction_id:
+                    return False
+            return True
+
+    def enter_safe_mode(
+        self, transaction_id: str, error_code: str
+    ) -> AdmissionGateReadback:
+        if not isinstance(transaction_id, str) or not transaction_id:
+            raise ValueError("admission transaction id is invalid")
+        if _ERROR_CODE.fullmatch(error_code) is None:
+            raise ValueError("safe-mode error code is invalid")
+        with self._condition:
+            self._mode = "safe_mode"
+            self._gate_generation += 1
+            self._transaction_id = transaction_id
+            self._token = None
+            self._condition.notify_all()
+            return self._readback_locked()
+
+    def _readback_locked(self) -> AdmissionGateReadback:
+        return AdmissionGateReadback(
+            gate_generation=self._gate_generation,
+            mode=self._mode,
+            transaction_id=self._transaction_id,
+            token=self._token,
+            in_flight_by_generation=tuple(sorted(self._in_flight.items())),
+        )
 
 
 class ModelSwitchState(str, Enum):
@@ -678,6 +1181,9 @@ class ModelSwitchSnapshot:
     error_code: str | None
     safety_error_code: str | None
     rollback_restored: bool
+    cooperative_only: bool
+    production_ready: bool
+    partial_capabilities: tuple[str, ...]
     transitions: tuple[ModelSwitchTransition, ...]
 
 
@@ -691,6 +1197,7 @@ class _MutableTransaction:
     error_code: str | None = None
     safety_error_code: str | None = None
     rollback_restored: bool = False
+    capabilities: ModelSwitchControlCapabilities = ModelSwitchControlCapabilities()
 
     def snapshot(self) -> ModelSwitchSnapshot:
         return ModelSwitchSnapshot(
@@ -701,6 +1208,9 @@ class _MutableTransaction:
             error_code=self.error_code,
             safety_error_code=self.safety_error_code,
             rollback_restored=self.rollback_restored,
+            cooperative_only=self.capabilities.cooperative_only,
+            production_ready=self.capabilities.production_ready,
+            partial_capabilities=self.capabilities.partial_capabilities,
             transitions=tuple(self.transitions),
         )
 
@@ -714,16 +1224,37 @@ class ModelSwitchController:
         factory: RuntimeBundleFactoryPort,
         maintenance: ModelSwitchMaintenancePort,
         *,
+        admission_gate: AtomicAdmissionGate | None = None,
         enabled: bool = False,
+        production_enable: bool = False,
         memory_release_probe: MemoryReleaseProbePort | None = None,
+        capabilities: ModelSwitchControlCapabilities | None = None,
         clock=monotonic,
     ) -> None:
         if not isinstance(slot, AtomicRuntimeSlot):
             raise TypeError("slot must be AtomicRuntimeSlot")
         if not isinstance(enabled, bool):
             raise TypeError("enabled must be bool")
+        if not isinstance(production_enable, bool):
+            raise TypeError("production_enable must be bool")
         if not callable(clock):
             raise TypeError("clock must be callable")
+        if admission_gate is not None and not isinstance(
+            admission_gate, AtomicAdmissionGate
+        ):
+            raise TypeError("admission_gate must be AtomicAdmissionGate")
+        declared = capabilities or ModelSwitchControlCapabilities()
+        if not isinstance(declared, ModelSwitchControlCapabilities):
+            raise TypeError("capabilities must be ModelSwitchControlCapabilities")
+        if declared != ModelSwitchControlCapabilities():
+            raise ValueError(
+                "in-process model switch capability evidence cannot be overridden"
+            )
+        if production_enable:
+            raise ModelSwitchProductionUnavailableError(
+                "model switching lacks enforced wall-clock isolation, crash recovery, "
+                "or product wiring"
+            )
         if memory_release_probe is not None and not callable(
             getattr(memory_release_probe, "verify_release", None)
         ):
@@ -732,10 +1263,33 @@ class ModelSwitchController:
             raise ValueError(
                 "enabled model switching requires an injected memory-release probe"
             )
+        if enabled and admission_gate is None:
+            raise ValueError(
+                "enabled model switching requires an atomic admission gate"
+            )
+        if enabled and admission_gate is not None:
+            initial_gate = admission_gate.readback()
+            if (
+                initial_gate.mode != "open"
+                or initial_gate.token is None
+                or not slot.validates_entry_token(initial_gate.token)
+            ):
+                raise ValueError(
+                    "enabled model switching requires a gate bound to the active slot"
+                )
+        if enabled and getattr(factory, "side_effect_free_prepare", None) is not True:
+            raise ValueError(
+                "enabled model switching requires a side-effect-free factory prepare"
+            )
+        if enabled and not callable(getattr(factory, "prepare", None)):
+            raise ValueError("enabled model switching requires a two-phase factory")
         self.slot = slot
         self.factory = factory
         self.maintenance = maintenance
+        self.admission_gate = admission_gate
         self.enabled = enabled
+        self.production_enable = production_enable
+        self.capabilities = declared
         self.memory_release_probe = memory_release_probe
         self._clock = clock
         self._run_lock = Lock()
@@ -793,29 +1347,20 @@ class ModelSwitchController:
                 self._transition(ModelSwitchState.ROLLED_BACK)
                 return self._snapshot_required()
 
-            # Fact-book, validator, voice, harness and resident bindings are all
-            # checked before admission is closed or either worker is touched.
+            # Factory.prepare is an admitted side-effect-free planning call.  The
+            # returned handle is retained before materialization so every later
+            # partial allocation has a mandatory abort/dispose path.
             try:
-                prepared = self.factory.build(
+                preparation = self.factory.prepare(
                     candidate, source.lease_authority, source.lease_profile
                 )
             except Exception:
-                # Factory diagnostics may contain host paths or loader secrets.
-                # The public preflight contract exposes only a stable code.
                 raise RuntimeBundleIncompleteError(
-                    "candidate runtime factory failed"
+                    "candidate runtime factory prepare failed"
                 ) from None
             try:
-                self._validate_prepared_bundle(prepared, candidate, source)
+                self._validate_preparation_handle(preparation, candidate)
             except RuntimeBundleIncompleteError:
-                cleanup_proven = self._cleanup_invalid_prepared(
-                    prepared,
-                    source,
-                    float(stop_timeout_seconds),
-                    float(memory_timeout_seconds),
-                )
-                if cleanup_proven:
-                    raise
                 self._begin(source.descriptor, candidate)
                 with self._state_lock:
                     assert self._transaction is not None
@@ -827,6 +1372,37 @@ class ModelSwitchController:
                     safety_error_code="PREFLIGHT_CLEANUP_UNPROVEN",
                 )
 
+            prepared: ActiveRuntimeBundle | None = None
+            try:
+                prepared = preparation.materialize()
+                self._validate_prepared_bundle(prepared, candidate, source)
+            except Exception as preflight_error:
+                cleanup_proven = self._abort_preparation(
+                    preparation,
+                    prepared,
+                    source,
+                    float(stop_timeout_seconds),
+                    float(memory_timeout_seconds),
+                )
+                if cleanup_proven:
+                    if isinstance(preflight_error, RuntimeBundleIncompleteError):
+                        raise preflight_error
+                    raise RuntimeBundleIncompleteError(
+                        "candidate runtime materialization failed"
+                    ) from None
+                self._begin(source.descriptor, candidate)
+                with self._state_lock:
+                    assert self._transaction is not None
+                    self._transaction.error_code = "RUNTIME_BUNDLE_INCOMPLETE"
+                    self._transaction.safety_error_code = "PREFLIGHT_CLEANUP_UNPROVEN"
+                self._transition(ModelSwitchState.ROLLING_BACK)
+                return self._safe_mode(
+                    "RUNTIME_BUNDLE_INCOMPLETE",
+                    safety_error_code="PREFLIGHT_CLEANUP_UNPROVEN",
+                )
+
+            assert prepared is not None
+
             transaction = self._begin(source.descriptor, candidate)
             source_retired = False
             candidate_started = False
@@ -835,18 +1411,34 @@ class ModelSwitchController:
             source_epoch_floor = source.lease_authority.latest_epoch
             try:
                 self._check_cancelled(cancellation)
+                gate = self._admission_gate_required()
+                gate_closed = gate.close(transaction.transaction_id)
+                self._prove_gate_closed(
+                    gate_closed, transaction.transaction_id, mode="closed"
+                )
                 self._call(
                     "ADMISSION_CLOSE_FAILED",
                     self.maintenance.close_admission,
                     transaction.transaction_id,
                 )
+                self._prove_gate_closed(
+                    gate.readback(), transaction.transaction_id, mode="closed"
+                )
                 admission_closed = True
                 self._transition(ModelSwitchState.DRAINING)
                 drain_deadline = self._deadline_after(float(drain_timeout_seconds))
+                exact_drained = gate.wait_for_generation_drain(
+                    transaction.transaction_id,
+                    source_slot.generation,
+                    self._remaining(drain_deadline, "DRAIN_TIMEOUT"),
+                )
+                if exact_drained is not True:
+                    raise _TransactionFailure("DRAIN_TIMEOUT")
                 drained = self._call(
                     "DRAIN_FAILED",
                     self.maintenance.wait_for_drain,
                     transaction.transaction_id,
+                    source_slot.generation,
                     self._remaining(drain_deadline, "DRAIN_TIMEOUT"),
                 )
                 if drained is not True or self._expired(drain_deadline):
@@ -942,6 +1534,7 @@ class ModelSwitchController:
                 # The cancellation token's commit claim and this CAS form one
                 # publication boundary: later cancellation is rejected, while
                 # a pre-existing request cannot reach the CAS.
+                self._dispose_preparation(preparation, prepared)
                 self._open_admission_with_fence(
                     prepared,
                     committed_slot,
@@ -969,6 +1562,7 @@ class ModelSwitchController:
                     source_retired=source_retired,
                     admission_closed=admission_closed,
                     candidate=prepared,
+                    candidate_preparation=preparation,
                     candidate_started=candidate_started,
                     stop_timeout_seconds=float(stop_timeout_seconds),
                     memory_timeout_seconds=float(memory_timeout_seconds),
@@ -1037,6 +1631,7 @@ class ModelSwitchController:
             transitions=[
                 ModelSwitchTransition(0, None, ModelSwitchState.REQUESTED, now)
             ],
+            capabilities=self.capabilities,
         )
         with self._state_lock:
             self._transaction = transaction
@@ -1089,56 +1684,139 @@ class ModelSwitchController:
                 "candidate bundle escaped the active lease authority"
             )
 
-    def _cleanup_invalid_prepared(
+    @staticmethod
+    def _validate_preparation_handle(
+        preparation: RuntimeBundlePreparationPort,
+        candidate: VerifiedModelSwitchDescriptor,
+    ) -> None:
+        try:
+            preparation_id = preparation.preparation_id
+            descriptor = preparation.descriptor
+            methods = (
+                preparation.materialize,
+                preparation.abort,
+                preparation.dispose,
+            )
+        except Exception as error:
+            raise RuntimeBundleIncompleteError(
+                "factory returned no retained preparation handle"
+            ) from error
+        if (
+            _BINDING_ID.fullmatch(preparation_id) is None
+            or descriptor != candidate
+            or not all(callable(method) for method in methods)
+        ):
+            raise RuntimeBundleIncompleteError(
+                "runtime preparation handle escaped its authority"
+            )
+
+    def _abort_preparation(
         self,
-        prepared: object,
+        preparation: RuntimeBundlePreparationPort,
+        prepared: object | None,
         source: ActiveRuntimeBundle,
         stop_timeout_seconds: float,
         memory_timeout_seconds: float,
+        *,
+        was_started: bool = False,
     ) -> bool:
-        """Prove that a contract-violating factory result left no live worker."""
+        """Abort factory state and independently prove any visible worker retired."""
 
-        if not isinstance(prepared, ActiveRuntimeBundle):
-            return True
+        runtime_cleanup_proven = True
         try:
-            alive = prepared.runtime.worker_alive
-            prior_lease = prepared.runtime.gpu_lease
-            prior_generation = prepared.runtime.worker_generation
-            if alive is not True and prior_lease is None:
+            if isinstance(prepared, ActiveRuntimeBundle):
+                alive = prepared.runtime.worker_alive
+                prior_lease = prepared.runtime.gpu_lease
+                prior_generation = prepared.runtime.worker_generation
+                if was_started and alive is not True and prior_lease is None:
+                    # A formerly resident worker vanished without an unload ack;
+                    # factory cleanup evidence cannot substitute for the
+                    # independent memory-release probe.
+                    runtime_cleanup_proven = False
+                if alive is True or prior_lease is not None:
+                    if not isinstance(prior_lease, GPULease):
+                        # The retained abort handle is the only authority that
+                        # can clean an invalid partially-started no-lease worker.
+                        if was_started:
+                            runtime_cleanup_proven = False
+                    else:
+                        if (
+                            not isinstance(prior_generation, int)
+                            or isinstance(prior_generation, bool)
+                            or prior_generation <= 0
+                        ):
+                            runtime_cleanup_proven = False
+                        else:
+                            try:
+                                deadline = self._deadline_after(stop_timeout_seconds)
+                                unload = prepared.runtime.stop(
+                                    self._remaining(
+                                        deadline, "PREFLIGHT_CLEANUP_TIMEOUT"
+                                    )
+                                )
+                                if self._expired(deadline):
+                                    raise _TransactionFailure(
+                                        "PREFLIGHT_CLEANUP_TIMEOUT"
+                                    )
+                                self._prove_retired(prepared, prior_lease)
+                                self._prove_unload_ack(
+                                    prepared, prior_lease, prior_generation, unload
+                                )
+                                self._prove_memory_released(
+                                    prepared,
+                                    unload,
+                                    memory_timeout_seconds,
+                                    "PREFLIGHT_MEMORY_RELEASE_UNPROVEN",
+                                )
+                            except Exception:
+                                runtime_cleanup_proven = False
+            cleanup_deadline = self._deadline_after(stop_timeout_seconds)
+            evidence = preparation.abort(
+                self._remaining(cleanup_deadline, "PREFLIGHT_CLEANUP_TIMEOUT")
+            )
+            if self._expired(cleanup_deadline):
+                return False
+            if (
+                not isinstance(evidence, RuntimePreparationCleanupEvidence)
+                or evidence.preparation_id != preparation.preparation_id
+                or evidence.model_authority_digest
+                != preparation.descriptor.authority_digest
+                or evidence.aborted is not True
+                or evidence.factory_state_released is not True
+                or evidence.worker_absent is not True
+                or evidence.lease_absent is not True
+            ):
+                return False
+            if isinstance(prepared, ActiveRuntimeBundle) and (
+                prepared.runtime.worker_alive is not False
+                or prepared.runtime.gpu_lease is not None
+            ):
+                return False
+            if source.runtime.worker_alive:
                 self._prove_source_consistent(source)
-                return True
-            deadline = self._deadline_after(stop_timeout_seconds)
-            unload: RuntimeUnloadEvidence | None = None
-            try:
-                unload = prepared.runtime.stop(
-                    self._remaining(deadline, "PREFLIGHT_CLEANUP_TIMEOUT")
-                )
-            except Exception:
-                # Some runtimes cannot author unload evidence when a malformed
-                # factory marked the process alive without acquiring a lease.
-                # For that exact no-lease case the independent stopped state is
-                # sufficient; a leased worker still requires complete evidence.
-                if prior_lease is not None:
-                    return False
-            if self._expired(deadline):
-                return False
-            if prepared.runtime.worker_alive or prepared.runtime.gpu_lease is not None:
-                return False
-            if prior_lease is not None:
-                if not isinstance(prior_generation, int) or prior_generation <= 0:
-                    return False
-                self._prove_retired(prepared, prior_lease)
-                self._prove_unload_ack(prepared, prior_lease, prior_generation, unload)
-                self._prove_memory_released(
-                    prepared,
-                    unload,
-                    memory_timeout_seconds,
-                    "PREFLIGHT_MEMORY_RELEASE_UNPROVEN",
-                )
-            self._prove_source_consistent(source)
-            return True
+            return runtime_cleanup_proven
         except Exception:
             return False
+
+    @staticmethod
+    def _dispose_preparation(
+        preparation: RuntimeBundlePreparationPort,
+        bundle: ActiveRuntimeBundle,
+    ) -> None:
+        try:
+            evidence = preparation.dispose()
+        except Exception as error:
+            raise _TransactionFailure("PREPARATION_DISPOSE_FAILED") from error
+        if (
+            not isinstance(evidence, RuntimePreparationDisposeEvidence)
+            or evidence.preparation_id != preparation.preparation_id
+            or evidence.model_authority_digest != bundle.descriptor.authority_digest
+            or evidence.disposed is not True
+            or evidence.runtime_transferred is not True
+            or bundle.runtime.worker_alive is not True
+            or bundle.runtime.gpu_lease is None
+        ):
+            raise _TransactionFailure("PREPARATION_DISPOSE_UNPROVEN")
 
     @classmethod
     def _prove_source_consistent(cls, bundle: ActiveRuntimeBundle) -> None:
@@ -1367,7 +2045,7 @@ class ModelSwitchController:
         worker_generation: int,
         code_prefix: str,
     ) -> None:
-        observed = self.slot.snapshot()
+        observed, cached_publication = self.slot.publication_snapshot()
         if (
             observed.generation != slot_snapshot.generation
             or observed.bundle is not bundle
@@ -1375,32 +2053,46 @@ class ModelSwitchController:
             raise _TransactionFailure(f"{code_prefix}_FENCE_UNPROVEN")
         publication = self._prove_publication_fence(
             bundle,
-            expected_slot_generation=slot_snapshot.generation,
+            expected_slot_generation=cached_publication.expected_slot_generation,
             expected_lease=lease,
             expected_worker_generation=worker_generation,
         )
-        token = AdmissionFenceToken(self._transaction_id(), publication)
-        evidence = self._call(
-            f"{code_prefix}_FAILED",
-            self.maintenance.open_admission,
-            self._transaction_id(),
-            token,
+        if publication != cached_publication:
+            raise _TransactionFailure(f"{code_prefix}_FENCE_UNPROVEN")
+        token = AdmissionFenceToken(
+            transaction_id=self._transaction_id(),
+            slot_generation=slot_snapshot.generation,
+            publication=publication,
         )
+        gate = self._admission_gate_required()
+        try:
+            evidence = gate.install(self._transaction_id(), token, self.slot)
+        except Exception as error:
+            raise _TransactionFailure(f"{code_prefix}_FENCE_UNPROVEN") from error
         if (
             not isinstance(evidence, AdmissionOpenEvidence)
-            or evidence.opened is not True
             or evidence.token != token
+            or evidence.entry_validation_required is not True
         ):
             raise _TransactionFailure(f"{code_prefix}_FENCE_UNPROVEN")
-        observed_after = self.slot.snapshot()
+        readback = gate.readback()
+        if (
+            readback.mode != "open"
+            or readback.transaction_id != self._transaction_id()
+            or readback.token != token
+            or readback.gate_generation != evidence.gate_generation
+        ):
+            raise _TransactionFailure(f"{code_prefix}_FENCE_UNPROVEN")
+        observed_after, cached_after = self.slot.publication_snapshot()
         if (
             observed_after.generation != slot_snapshot.generation
             or observed_after.bundle is not bundle
+            or cached_after != publication
         ):
             raise _TransactionFailure(f"{code_prefix}_FENCE_UNPROVEN")
         after = self._prove_publication_fence(
             bundle,
-            expected_slot_generation=slot_snapshot.generation,
+            expected_slot_generation=publication.expected_slot_generation,
             expected_lease=lease,
             expected_worker_generation=worker_generation,
         )
@@ -1416,6 +2108,7 @@ class ModelSwitchController:
         source_retired: bool,
         admission_closed: bool,
         candidate: ActiveRuntimeBundle,
+        candidate_preparation: RuntimeBundlePreparationPort,
         candidate_started: bool,
         stop_timeout_seconds: float,
         memory_timeout_seconds: float,
@@ -1425,7 +2118,26 @@ class ModelSwitchController:
             assert self._transaction is not None
             self._transaction.error_code = failure.code
         self._transition(ModelSwitchState.ROLLING_BACK)
+
+        candidate_cleanup = self._abort_preparation(
+            candidate_preparation,
+            candidate,
+            source_slot.bundle,
+            stop_timeout_seconds,
+            memory_timeout_seconds,
+            was_started=candidate_started,
+        )
+        if not candidate_cleanup:
+            return self._safe_mode(
+                failure.code, safety_error_code="CANDIDATE_PREPARATION_CLEANUP_UNPROVEN"
+            )
+
+        # These failures occur before an exact unload acknowledgement and memory
+        # probe have both completed.  No old or candidate worker may be created,
+        # even when process death and lease release happened to be observed.
         if failure.code in {
+            "OLD_UNLOAD_FAILED",
+            "OLD_UNLOAD_TIMEOUT",
             "WORKER_DEATH_UNPROVEN",
             "LEASE_RELEASE_UNPROVEN",
             "GPU_LEASE_NOT_RELEASED",
@@ -1438,48 +2150,17 @@ class ModelSwitchController:
             "SOURCE_WORKER_NOT_RUNNING",
         }:
             return self._safe_mode(failure.code)
+        if failure.code in {
+            "ATOMIC_RUNTIME_CHANGED",
+            "ATOMIC_RUNTIME_COMMIT_FAILED",
+        }:
+            return self._safe_mode(failure.code)
+
         restored: ActiveRuntimeBundle | None = None
+        restored_preparation: RuntimeBundlePreparationPort | None = None
         restored_committed = False
+        restored_started = False
         try:
-            candidate_lease = candidate.runtime.gpu_lease
-            if candidate_started or candidate.runtime.worker_alive or candidate_lease:
-                if not isinstance(candidate_lease, GPULease):
-                    raise _TransactionFailure("CANDIDATE_LEASE_UNPROVEN")
-                candidate_worker_generation = candidate.runtime.worker_generation
-                if (
-                    not isinstance(candidate_worker_generation, int)
-                    or isinstance(candidate_worker_generation, bool)
-                    or candidate_worker_generation <= 0
-                ):
-                    raise _TransactionFailure("CANDIDATE_LEASE_UNPROVEN")
-                stop_deadline = self._deadline_after(stop_timeout_seconds)
-                candidate_unload = self._call(
-                    "CANDIDATE_RETIRE_FAILED",
-                    candidate.runtime.stop,
-                    self._remaining(stop_deadline, "CANDIDATE_RETIRE_TIMEOUT"),
-                )
-                if self._expired(stop_deadline):
-                    raise _TransactionFailure("CANDIDATE_RETIRE_TIMEOUT")
-                self._prove_retired(candidate, candidate_lease)
-                self._prove_unload_ack(
-                    candidate,
-                    candidate_lease,
-                    candidate_worker_generation,
-                    candidate_unload,
-                )
-                self._prove_memory_released(
-                    candidate,
-                    candidate_unload,
-                    memory_timeout_seconds,
-                    "CANDIDATE_MEMORY_RELEASE_UNPROVEN",
-                )
-
-            if failure.code in {
-                "ATOMIC_RUNTIME_CHANGED",
-                "ATOMIC_RUNTIME_COMMIT_FAILED",
-            }:
-                return self._safe_mode(failure.code)
-
             if not source_retired:
                 self._prove_source_consistent(source_slot.bundle)
                 if admission_closed:
@@ -1497,16 +2178,21 @@ class ModelSwitchController:
                 return self._snapshot_required()
 
             self._transition(ModelSwitchState.RESTORING_OLD)
-            restored = self.factory.build(
+            restored_preparation = self.factory.prepare(
                 source_slot.bundle.descriptor,
                 source_slot.bundle.lease_authority,
                 source_slot.bundle.lease_profile,
             )
+            self._validate_preparation_handle(
+                restored_preparation, source_slot.bundle.descriptor
+            )
+            restored = restored_preparation.materialize()
             self._validate_prepared_bundle(
                 restored, source_slot.bundle.descriptor, source_slot.bundle
             )
             epoch_floor = restored.lease_authority.latest_epoch
             self._call("ROLLBACK_START_FAILED", restored.runtime.start)
+            restored_started = True
             restored_lease = self._prove_running(restored, epoch_floor)
             restored_worker_generation = restored.runtime.worker_generation
             health_deadline = self._deadline_after(health_timeout_seconds)
@@ -1527,6 +2213,7 @@ class ModelSwitchController:
             )
             restored_slot = self.slot.compare_and_swap(expected, restored, publication)
             restored_committed = True
+            self._dispose_preparation(restored_preparation, restored)
             self._open_admission_with_fence(
                 restored,
                 restored_slot,
@@ -1541,38 +2228,17 @@ class ModelSwitchController:
             return self._snapshot_required()
         except Exception as rollback_error:
             cleanup_code = self._stable_failure_code(rollback_error, "ROLLBACK_FAILED")
-            if restored is not None and not restored_committed:
-                restored_lease = restored.runtime.gpu_lease
-                if restored.runtime.worker_alive or restored_lease is not None:
-                    try:
-                        if not isinstance(restored_lease, GPULease):
-                            raise _TransactionFailure("ROLLBACK_CLEANUP_LEASE_UNPROVEN")
-                        restored_worker_generation = restored.runtime.worker_generation
-                        cleanup_deadline = self._deadline_after(stop_timeout_seconds)
-                        restored_unload = restored.runtime.stop(
-                            self._remaining(
-                                cleanup_deadline, "ROLLBACK_CLEANUP_TIMEOUT"
-                            )
-                        )
-                        if self._expired(cleanup_deadline):
-                            raise _TransactionFailure("ROLLBACK_CLEANUP_TIMEOUT")
-                        self._prove_retired(restored, restored_lease)
-                        self._prove_unload_ack(
-                            restored,
-                            restored_lease,
-                            restored_worker_generation,
-                            restored_unload,
-                        )
-                        self._prove_memory_released(
-                            restored,
-                            restored_unload,
-                            memory_timeout_seconds,
-                            "ROLLBACK_CLEANUP_MEMORY_UNPROVEN",
-                        )
-                    except Exception as cleanup_error:
-                        cleanup_code = self._stable_failure_code(
-                            cleanup_error, "ROLLBACK_CLEANUP_UNPROVEN"
-                        )
+            if restored_preparation is not None:
+                cleanup_proven = self._abort_preparation(
+                    restored_preparation,
+                    restored,
+                    source_slot.bundle,
+                    stop_timeout_seconds,
+                    memory_timeout_seconds,
+                    was_started=restored_started or restored_committed,
+                )
+                if not cleanup_proven:
+                    cleanup_code = "ROLLBACK_CLEANUP_UNPROVEN"
             return self._safe_mode(failure.code, safety_error_code=cleanup_code)
 
     @staticmethod
@@ -1582,13 +2248,39 @@ class ModelSwitchController:
             return code
         return fallback
 
+    def _admission_gate_required(self) -> AtomicAdmissionGate:
+        gate = self.admission_gate
+        if not isinstance(gate, AtomicAdmissionGate):
+            raise _TransactionFailure("ADMISSION_GATE_MISSING")
+        return gate
+
+    @staticmethod
+    def _prove_gate_closed(
+        readback: AdmissionGateReadback,
+        transaction_id: str,
+        *,
+        mode: str,
+    ) -> None:
+        if (
+            not isinstance(readback, AdmissionGateReadback)
+            or readback.mode != mode
+            or readback.transaction_id != transaction_id
+            or readback.token is not None
+        ):
+            raise _TransactionFailure("ADMISSION_GATE_READBACK_UNPROVEN")
+
     def _safe_mode(
         self, error_code: str, *, safety_error_code: str | None = None
     ) -> ModelSwitchSnapshot:
         transaction_id = self._transaction_id()
         proof_valid = False
         try:
+            gate = self._admission_gate_required()
+            gate_evidence = gate.enter_safe_mode(transaction_id, error_code)
+            self._prove_gate_closed(gate_evidence, transaction_id, mode="safe_mode")
             evidence = self.maintenance.enter_safe_mode(transaction_id, error_code)
+            gate_readback = gate.readback()
+            self._prove_gate_closed(gate_readback, transaction_id, mode="safe_mode")
             proof_valid = (
                 isinstance(evidence, SafeModeEvidence)
                 and evidence.transaction_id == transaction_id
@@ -1629,23 +2321,30 @@ class ModelSwitchController:
 __all__ = [
     "ActiveRuntimeBundle",
     "AdmissionFenceToken",
+    "AdmissionGateReadback",
     "AdmissionOpenEvidence",
+    "AtomicAdmissionGate",
     "AtomicRuntimeCommitError",
     "AtomicRuntimeSlot",
     "LeaseReleaseEvidence",
     "MemoryReleaseEvidence",
     "ModelSwitchCancellation",
     "ModelSwitchBusyError",
+    "ModelSwitchControlCapabilities",
     "ModelSwitchController",
     "ModelSwitchDisabledError",
     "ModelSwitchError",
+    "ModelSwitchProductionUnavailableError",
     "ModelSwitchSnapshot",
     "ModelSwitchState",
     "ModelSwitchTransition",
     "RuntimeBindingEvidence",
     "RuntimeBundleIncompleteError",
     "RuntimeHealthEvidence",
+    "RuntimePreparationCleanupEvidence",
+    "RuntimePreparationDisposeEvidence",
     "RuntimePublicationFence",
+    "RuntimeRequestLease",
     "RuntimeUnloadEvidence",
     "SafeModeEvidence",
     "StableResidentLeaseAuthority",

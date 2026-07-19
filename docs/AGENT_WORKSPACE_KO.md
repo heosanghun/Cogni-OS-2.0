@@ -72,27 +72,31 @@ revision에는 독립 LICENSE 파일이 없으므로 AkasicDB 소스를 Cogni-OS
    path-loader도 검증 바이트 결합을 증명할 수 없어 비활성이라 answer-bearing RAG에
    연결되지 않는다.
 
-이미지는 첨부 후 한 장을 명시적으로 선택한 다음 한 번의 대화 요청에 전달한다.
-선택된 이미지와 RAG는 같은 요청에서 동시에 자동 활성화되지 않는다. 이미지·오디오는
+이미지는 첨부·미리보기·한 장 명시 선택까지의 UI/API 경계가 구현되어 있다. 선택된
+이미지와 RAG는 같은 요청에서 동시에 자동 활성화되지 않는다. 그러나 선택 이미지를
+실제 모델 답변에 전달하는 production 권한은 현재 없다. 이미지·오디오는
 manifest/processor/고정 스키마 CPU tensor IPC 소스 경계가 있다. 그러나 현재 production
 `Gemma4Processor` path-loader는 검증한 바이트와 실제 parser 입력의 결합을 증명할 수
 없어 fail-closed이며, 현재 실행 권한으로 표시하지 않는다. 비디오는 주입된 processor를
 사용한 이미 디코딩된 bounded CPU RGB frame 전처리 테스트만 있으며, 파일/decoder/IPC/
 model-forward 제품 입력은 구현되어 있지 않다.
 
-개발 장치 actual-model image smoke는 로컬에서 생성한 256×256 PNG의 파란색
+v0.4.0 개발 장치의 historical actual-model image smoke는 로컬에서 생성한
+256×256 PNG의 파란색
 정사각형을 `중앙의 큰 도형은 파란색 정사각형입니다.`라고 답했고 terminal stop과
 application external call 0을 기록했다. 이는 그 한 장의 고정 도형만 검증하며 일반
 시각 추론이나 multimodal VRAM 조건을 증명하지 않는다.
 
 ### 로컬 음성
 
-음성 버튼은 사용자가 눌렀을 때만 브라우저 마이크 권한을 요청한다. 캡처된 음성은
-16 kHz, mono, 16-bit PCM WAV, 최대 30초로 변환·검사한 뒤 현재 검증 모델에
-전달된다. `읽어주기`는 Windows에 설치된 System.Speech 음성을 사용하며 네트워크
-TTS를 호출하지 않는다.
+음성 버튼은 사용자가 눌렀을 때만 브라우저 마이크 권한을 요청한다. 캡처된 음성을
+16 kHz, mono, 16-bit PCM WAV, 최대 30초로 변환·검사하는 UI/API 계약은 구현되어
+있다. 현재 production `Gemma4Processor` loader가 차단되어 있으므로 이 WAV를 resident
+Gemma에 전달하는 STT 권한은 활성화하지 않는다. `읽어주기`는 Windows에 설치된
+System.Speech 음성을 사용하며 네트워크 TTS를 호출하지 않는다.
 
-개발 장치에서 Microsoft Heami Desktop `ko-KR`로 합성한
+v0.4.0 개발 장치의 historical smoke에서 Microsoft Heami Desktop `ko-KR`로
+합성한
 `안녕하세요. 코그니보드 로컬 음성 검증입니다.`를 resident Gemma가 동일하게
 전사해 normalized similarity 1.0, application external call 0을 기록했다. 이는
 단일 합성 문장 smoke일 뿐 다화자 WER, 소음 강건성, 실시간 지연, 접근성 품질을

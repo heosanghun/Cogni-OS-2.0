@@ -1,5 +1,10 @@
 # Cogni-OS 2.0 Genesis v0.4.0 릴리스 노트
 
+> **과거 범위 문서:** 이 문서는 v0.4.0 당시의 관측과 구현을 기록한다. 현재 v0.4.1
+> source는 검증 바이트와 upstream path parser 입력을 결합할 수 없는 ABA 경계 때문에
+> production `Gemma4Processor` construction을 fail-closed한다. 아래 image/audio/STT
+> 관측은 historical evidence이며 현재 answer authority가 아니다.
+
 ## 릴리스 정체성
 
 - 제품 버전: `0.4.0`

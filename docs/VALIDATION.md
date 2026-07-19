@@ -159,6 +159,13 @@ python -m pytest -q `
   tests/test_proposal_review.py
 ```
 
+These tests use injected processors/fake workers for image, audio, and decoded
+video-frame contracts. They do not construct the production
+`Gemma4Processor`: that path-loader is deliberately fail-closed because the
+upstream path API cannot bind parser input to the verified bytes. Consequently
+a passing component run does not grant current image/audio/video answer
+authority or resident-Gemma STT authority.
+
 The historical direct voice and image commands are intentionally not published:
 both can select a default CUDA device and neither validator is in the sole GPU5
 guard allowlist. They must not run on the laboratory server. Current-scope GPU

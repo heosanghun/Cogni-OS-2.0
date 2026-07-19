@@ -1,5 +1,10 @@
 # Cogni-OS 2.0 Genesis v0.4.0 검증 부록
 
+> **과거 범위 문서:** 아래 결과는 v0.4.0 개발 호스트 관측이다. 현재 v0.4.1 source는
+> 검증 바이트와 upstream path parser 입력의 결합을 증명할 수 없어 production
+> `Gemma4Processor` construction을 fail-closed한다. 이 부록은 현재 image/audio/STT
+> answer authority를 부여하지 않는다.
+
 ## 증거 원칙
 
 단위 테스트 통과는 software invariant 증거다. model 품질, 목표 GPU 메모리,

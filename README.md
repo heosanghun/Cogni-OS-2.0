@@ -2,8 +2,9 @@
 
 Cogni-OS 2.0 is an offline-by-default, bounded research runtime for a verified local
 dense Gemma 4 E4B-it artifact. Version 0.4.1 adds a persistent local document
-workspace, provenance-bearing AkasicDB RAG, bounded Gemma image/audio routes,
-decoded-frame-only video preprocessing, local speech input/output, an
+workspace, provenance-bearing AkasicDB RAG, bounded Gemma image/audio protocol
+contracts, decoded-frame-only video preprocessing tests, local speech UI and
+Windows TTS contracts, an
 explicitly opt-in Lens patent/scholarly API connector, and a separate
 request-opt-in Brave official JSON search boundary to the existing
 conversation, Cogni-Core, typed-task, and

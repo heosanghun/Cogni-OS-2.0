@@ -23,6 +23,11 @@
   are available;
 - aligned product, UI, launcher, manual and guard metadata at v0.4.1 while
   retaining every v0.4.0 measurement as historical evidence only.
+- disabled production construction of the path-based `Gemma4Processor` and
+  semantic encoder. Their upstream loaders can reopen verified names, so the
+  bytes consumed by the parser cannot yet be bound to the bytes that were
+  hashed; multimodal preprocessing remains an injected-processor test contract
+  with no current answer authority.
 
 ## 0.4.0 — 2026-07-16
 

@@ -27,7 +27,7 @@ external provider response, or a packaged release.
 flowchart TB
     subgraph UI["Local user boundary"]
         BOARD["CogniBoard desktop UI"]
-        INPUT["Input gateway\ntext · attachment · image · microphone"]
+        INPUT["Input gateway\ntext · attachment · image/mic admission UI"]
         HTTP["Authenticated loopback API"]
         DISPLAY["Conversation · citations · Evidence Rail"]
     end
@@ -37,7 +37,7 @@ flowchart TB
         FACT["Runtime Fact-book + LKG evidence"]
         ATTACH["Persistent attachment catalog\ncontent-addressed blobs · bounded PDF"]
         AKASIC["Pinned AkasicDB adapter\nGraph · Relational · lexical Vector"]
-        VOICE["Local voice gate\ncapture · STT · Windows TTS"]
+        VOICE["Local voice gate\ncapture contract · gated STT · Windows TTS"]
         LENS["Official Lens connector\n4-gate admission"]
         TASK["Typed task authority"]
         BUNDLE["Safe /project bundle\noutput-only · inert"]
@@ -46,7 +46,7 @@ flowchart TB
     end
 
     subgraph CORE["Cogni-Core / single GPU owner"]
-        PRE["Verified instruction preprocessing\nGemma chat template / Gemma4Processor"]
+        PRE["Verified instruction preprocessing\ntext production · multimodal test contract"]
         IPC["Protocol v4\nexactly 4 CPU int64 tensors"]
         GEMMA["Manifest-verified dense Gemma 4 E4B"]
         BIO["BIO-HAMA advisory router"]
@@ -84,9 +84,12 @@ flowchart TB
     AFLOW --> PROPOSAL --> LEDGER
 ```
 
-Solid arrows are locally implemented data paths. Dotted arrows retain their
-explicit gates; their existence is not authority to claim a live Lens result,
-a trained expert, or an applied source patch.
+Solid arrows are locally implemented control or data contracts; they do not by
+themselves grant every modality answer authority. In particular, text is the
+production model path, while image/audio/video preprocessing reaches the same
+shape/IPC boundary only with injected test processors. Dotted arrows retain
+their explicit gates; their existence is not authority to claim a live Lens
+result, a trained expert, or an applied source patch.
 
 ## Instruction preprocessing and tensor IPC
 
@@ -105,9 +108,11 @@ a trained expert, or an applied source patch.
   then refuses production construction. The upstream path loader reopens names,
   so it cannot yet bind parser input to the exact bytes that were hashed; no
   `Gemma4Processor` is published while that ABA boundary remains unproven.
-- Image and 16 kHz mono PCM-WAV inputs are decoded and bounded on the CPU, then
-  passed through `Gemma4Processor.apply_chat_template` with typed image/audio
-  content and `add_generation_prompt=True`.
+- In injected-processor tests, image and 16 kHz mono PCM-WAV inputs are decoded
+  and bounded on the CPU, then passed through a compatible
+  `apply_chat_template` contract with typed image/audio content and
+  `add_generation_prompt=True`. No current production request may construct
+  that processor or enter an answer-bearing model forward.
 - Raw media bytes, paths, PIL objects, NumPy arrays, strings, and JSON never
   cross the model-worker IPC boundary.
 - Video admission is limited to an **already-decoded CPU frame** preprocessing
@@ -118,8 +123,10 @@ a trained expert, or an applied source patch.
 
 ### Protocol v4
 
-Every text, image, or audio generation request crosses the process boundary as
-**exactly four contiguous CPU `torch.int64` tensors**:
+Every admitted text generation request crosses the process boundary as
+**exactly four contiguous CPU `torch.int64` tensors**. Image/audio requests use
+the same protocol only in injected-processor/fake-worker contract tests; the
+production processor gate prevents their admission:
 
 1. header — protocol/opcode, request/job/lease/deadline/decode/seed authority;
 2. `input_ids`;
@@ -144,8 +151,9 @@ compatibility nor integrated answer quality, latency, or VRAM compliance.
 
 1. The controller validates the Fact-book and acquires an inference lease.
 2. The bounded chat history is rendered with the verified instruction
-   template; an optional admitted image or audio bundle uses the same resident
-   model service and session authority.
+   template. The source defines a same-session image/audio bundle contract, but
+   current production admission rejects it before processor construction; only
+   injected tests exercise that branch.
 3. The Gemma feature state feeds BIO-HAMA and `SearchRequestV2`.
 4. CTS uses a fixed 301-node arena, rank-16 limited solver history, bounded
    retrieval, separate policy/critic surfaces, and an explicit MAC budget.

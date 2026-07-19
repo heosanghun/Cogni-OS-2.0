@@ -49,6 +49,9 @@ const VOICE_MAX_SOURCE_RATE = 192000;
 const VOICE_MAX_RECORDED_BYTES = 4 * 1024 * 1024;
 const VOICE_RECORDER_STOP_TIMEOUT_MS = 5000;
 const VOICE_DECODE_TIMEOUT_MS = 5000;
+const VOICE_AUDIO_CONTEXT_CLOSE_TIMEOUT_MS = 250;
+const VOICE_GET_USER_MEDIA_TIMEOUT_MS = 10000;
+const WORKSPACE_CAPABILITY_TIMEOUT_MS = 5000;
 const MAX_TTS_TEXT_CHARS = 2000;
 const MAX_TTS_WAV_BYTES = 8 * 1024 * 1024;
 const MAX_TTS_BASE64_CHARS = Math.ceil(MAX_TTS_WAV_BYTES / 3) * 4;
@@ -302,6 +305,7 @@ const ui = {
   lensSearchResults: [],
   voiceCaptureState: "idle",
   voiceSession: null,
+  voiceGetUserMediaSession: null,
   voiceTranscriptionConfigured: false,
   voiceTranscriptionReady: false,
   voiceTranscriptionAttemptReady: false,
@@ -1449,17 +1453,53 @@ function applyWorkspaceCapabilities(capabilities) {
   return true;
 }
 
-async function requestLatestWorkspaceCapabilities() {
+async function requestLatestWorkspaceCapabilities(options = {}) {
   ui.workspaceCapabilityAbortController?.abort();
   const requestId = ui.workspaceCapabilityRequestId + 1;
   const controller = new AbortController();
+  const externalSignal = options?.signal;
+  const requestedTimeout = options?.timeoutMs;
+  const timeoutMs = Number.isInteger(requestedTimeout)
+    && requestedTimeout >= 10
+    && requestedTimeout <= WORKSPACE_CAPABILITY_TIMEOUT_MS
+    ? requestedTimeout
+    : WORKSPACE_CAPABILITY_TIMEOUT_MS;
+  let timedOut = false;
+  let timeoutId = 0;
+  let controllerAbortHandler = null;
+  let externalAbortHandler = null;
   ui.workspaceCapabilityRequestId = requestId;
   ui.workspaceCapabilityAbortController = controller;
   try {
-    const capabilities = await api("/api/workspace/capabilities", {
-      signal: controller.signal,
+    if (externalSignal) {
+      externalAbortHandler = () => controller.abort();
+      if (externalSignal.aborted) externalAbortHandler();
+      else externalSignal.addEventListener("abort", externalAbortHandler, { once: true });
+    }
+    const abortGate = new Promise((_, reject) => {
+      controllerAbortHandler = () => {
+        const error = new Error(timedOut
+          ? "WORKSPACE_CAPABILITY_TIMEOUT"
+          : "WORKSPACE_CAPABILITY_CANCELLED");
+        error.name = timedOut ? "TimeoutError" : "AbortError";
+        reject(error);
+      };
+      if (controller.signal.aborted) controllerAbortHandler();
+      else controller.signal.addEventListener("abort", controllerAbortHandler, { once: true });
     });
-    if (requestId !== ui.workspaceCapabilityRequestId) {
+    timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    const capabilities = await Promise.race([
+      api("/api/workspace/capabilities", { signal: controller.signal }),
+      abortGate,
+    ]);
+    if (
+      requestId !== ui.workspaceCapabilityRequestId
+      || controller.signal.aborted
+      || externalSignal?.aborted
+    ) {
       return { latest: false, applied: false, requestId };
     }
     return {
@@ -1469,17 +1509,26 @@ async function requestLatestWorkspaceCapabilities() {
     };
   } catch (error) {
     const latest = requestId === ui.workspaceCapabilityRequestId
-      && !controller.signal.aborted;
+      && !controller.signal.aborted
+      && !externalSignal?.aborted
+      && !timedOut;
     return { latest, applied: false, requestId, error };
   } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+    if (controllerAbortHandler) {
+      controller.signal.removeEventListener("abort", controllerAbortHandler);
+    }
+    if (externalSignal && externalAbortHandler) {
+      externalSignal.removeEventListener("abort", externalAbortHandler);
+    }
     if (requestId === ui.workspaceCapabilityRequestId) {
       ui.workspaceCapabilityAbortController = null;
     }
   }
 }
 
-async function refreshWorkspaceCapabilityDisclosure() {
-  const result = await requestLatestWorkspaceCapabilities();
+async function refreshWorkspaceCapabilityDisclosure(options = {}) {
+  const result = await requestLatestWorkspaceCapabilities(options);
   if (!result.latest) return false;
   if (!result.applied) {
     revokeWorkspaceCapabilities();
@@ -1563,6 +1612,7 @@ function updateWorkspaceControlStates() {
       : unavailable
         || voiceComputeBusy
         || ui.voicePlaybackState !== "idle"
+        || Boolean(ui.voiceGetUserMediaSession)
         || !MICROPHONE_CAPTURE_UI_IMPLEMENTED
         || microphone.capture_state !== "browser_get_user_media"
         || microphone.transport_state !== "authenticated_loopback_ready"
@@ -2447,6 +2497,27 @@ function requireActiveVoiceSession(session) {
   if (!voiceSessionActive(session)) throw voiceAbortError();
 }
 
+async function closeVoiceAudioContext(context) {
+  if (!context || context.state === "closed") return;
+  let timeoutId = 0;
+  try {
+    let closePromise;
+    try {
+      closePromise = Promise.resolve(context.close()).catch(() => {});
+    } catch (_) {
+      return;
+    }
+    await Promise.race([
+      closePromise,
+      new Promise((resolve) => {
+        timeoutId = window.setTimeout(resolve, VOICE_AUDIO_CONTEXT_CLOSE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+  }
+}
+
 function releaseVoiceSession(session) {
   if (!session) return;
   clearTimeout(session.limitTimer);
@@ -2464,8 +2535,58 @@ function releaseVoiceSession(session) {
   if (session.stream) {
     session.stream.getTracks().forEach((track) => track.stop());
   }
-  if (session.context && session.context.state !== "closed") {
-    session.context.close().catch(() => {});
+  const context = session.context;
+  session.context = null;
+  if (context) void closeVoiceAudioContext(context);
+}
+
+async function requestVoiceMediaStream(session, constraints, timeoutMs = VOICE_GET_USER_MEDIA_TIMEOUT_MS) {
+  if (ui.voiceGetUserMediaSession) throw new Error("VOICE_GET_USER_MEDIA_PENDING");
+  ui.voiceGetUserMediaSession = session;
+  let timeoutId = 0;
+  let abortHandler = null;
+  const clearFence = () => {
+    if (ui.voiceGetUserMediaSession === session) {
+      ui.voiceGetUserMediaSession = null;
+      updateWorkspaceControlStates();
+    }
+  };
+  let nativeRequest;
+  try {
+    nativeRequest = Promise.resolve(navigator.mediaDevices.getUserMedia(constraints));
+  } catch (error) {
+    clearFence();
+    throw error;
+  }
+  const observedRequest = nativeRequest.then((stream) => {
+    if (
+      session.getUserMediaExpired
+      || !voiceSessionActive(session)
+    ) {
+      stream?.getTracks?.().forEach((track) => track.stop());
+      throw voiceAbortError();
+    }
+    return stream;
+  });
+  observedRequest.then(clearFence, clearFence);
+  const cancelGate = new Promise((_, reject) => {
+    abortHandler = () => reject(voiceAbortError());
+    if (session.abortController.signal.aborted) abortHandler();
+    else session.abortController.signal.addEventListener("abort", abortHandler, { once: true });
+  });
+  const timeoutGate = new Promise((_, reject) => {
+    timeoutId = window.setTimeout(() => {
+      session.getUserMediaExpired = true;
+      reject(new Error("VOICE_GET_USER_MEDIA_TIMEOUT"));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([observedRequest, cancelGate, timeoutGate]);
+  } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+    if (abortHandler) {
+      session.abortController.signal.removeEventListener("abort", abortHandler);
+    }
   }
 }
 
@@ -2646,13 +2767,14 @@ async function decodeVoiceRecording(blob, signal) {
   } finally {
     if (timeoutId) window.clearTimeout(timeoutId);
     if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
-    if (context.state !== "closed") await context.close().catch(() => {});
+    await closeVoiceAudioContext(context);
   }
 }
 
 async function startVoiceCapture() {
   if (
     ui.voiceCaptureState !== "idle"
+    || Boolean(ui.voiceGetUserMediaSession)
     || !ui.voiceTransportReady
     || !ui.voiceBrowserCaptureReady
     || !ui.voiceTranscriptionAttemptReady
@@ -2674,11 +2796,12 @@ async function startVoiceCapture() {
     recorderError: null,
     stopRequested: false,
     transcriptionStarted: false,
+    getUserMediaExpired: false,
   };
   ui.voiceSession = session;
   setVoiceCaptureState("requesting", "버튼을 누른 이 요청에서만 Windows 마이크 권한을 확인합니다.");
   try {
-    session.stream = await navigator.mediaDevices.getUserMedia({
+    session.stream = await requestVoiceMediaStream(session, {
       audio: {
         channelCount: 1,
         echoCancellation: true,
@@ -2702,7 +2825,9 @@ async function startVoiceCapture() {
       session.encodedBytes += event.data.size;
       if (session.encodedBytes > VOICE_MAX_RECORDED_BYTES) {
         session.recorderError = new Error("VOICE_AUDIO_TOO_LARGE");
-        if (ui.voiceCaptureState === "recording") setTimeout(stopVoiceCapture, 0);
+        if (ui.voiceCaptureState === "recording") {
+          setTimeout(() => stopVoiceCapture(session), 0);
+        }
         return;
       }
       session.encodedChunks.push(event.data);
@@ -2711,11 +2836,16 @@ async function startVoiceCapture() {
       session.recorderError = event?.error instanceof Error
         ? event.error
         : new Error("VOICE_RECORDER_FAILED");
-      if (ui.voiceCaptureState === "recording") setTimeout(stopVoiceCapture, 0);
+      if (ui.voiceCaptureState === "recording") {
+        setTimeout(() => stopVoiceCapture(session), 0);
+      }
     };
     session.recorder.start(100);
     session.startedAt = performance.now();
-    session.limitTimer = setTimeout(stopVoiceCapture, VOICE_MAX_SECONDS * 1000);
+    session.limitTimer = setTimeout(
+      () => stopVoiceCapture(session),
+      VOICE_MAX_SECONDS * 1000,
+    );
     session.elapsedTimer = setInterval(() => {
       const elapsed = Math.min(VOICE_MAX_SECONDS, (performance.now() - session.startedAt) / 1000);
       setText("#agent-voice-capture-copy", `${elapsed.toFixed(1)}초 / ${VOICE_MAX_SECONDS}초 · 외부 전송 0`);
@@ -2726,7 +2856,10 @@ async function startVoiceCapture() {
     if (ui.voiceSession === session) ui.voiceSession = null;
     if (session.cancelled) return;
     const denied = error?.name === "NotAllowedError" || error?.name === "SecurityError";
-    const copy = denied
+    const timedOut = error?.message === "VOICE_GET_USER_MEDIA_TIMEOUT";
+    const copy = timedOut
+      ? "마이크 권한 요청 시간이 초과되었습니다. 이전 요청이 정리될 때까지 새 요청을 차단합니다."
+      : denied
       ? "마이크 권한이 허용되지 않았습니다. Windows 개인정보 보호 설정을 확인해 주세요."
       : "로컬 마이크를 시작하지 못했습니다.";
     setVoiceCaptureState("idle", copy);
@@ -2734,9 +2867,9 @@ async function startVoiceCapture() {
   }
 }
 
-async function stopVoiceCapture() {
-  const session = ui.voiceSession;
-  if (!session || ui.voiceCaptureState !== "recording") return;
+async function stopVoiceCapture(expectedSession = ui.voiceSession) {
+  const session = expectedSession;
+  if (!session || ui.voiceSession !== session || ui.voiceCaptureState !== "recording") return;
   setVoiceCaptureState("encoding", "메모리 안에서 16kHz 모노 PCM WAV로 변환합니다.");
   try {
     await stopVoiceRecorder(session);
@@ -2762,7 +2895,10 @@ async function stopVoiceCapture() {
       signal: session.abortController.signal,
     });
     requireActiveVoiceSession(session);
-    const refreshed = await refreshWorkspaceCapabilityDisclosure();
+    const refreshed = await refreshWorkspaceCapabilityDisclosure({
+      signal: session.abortController.signal,
+      timeoutMs: WORKSPACE_CAPABILITY_TIMEOUT_MS,
+    });
     requireActiveVoiceSession(session);
     if (!refreshed || !ui.voiceTranscriptionReady) {
       throw new Error("LOCAL_STT_INFERENCE_UNVERIFIED");
@@ -2804,7 +2940,7 @@ function cancelVoiceCapture() {
 }
 
 function toggleVoiceCapture() {
-  if (ui.voiceCaptureState === "recording") stopVoiceCapture();
+  if (ui.voiceCaptureState === "recording") stopVoiceCapture(ui.voiceSession);
   else if (ui.voiceCaptureState === "idle") startVoiceCapture();
 }
 

@@ -1002,6 +1002,9 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertEqual(request_flow.count('api("/api/workspace/capabilities"'), 1)
         self.assertIn("ui.workspaceCapabilityAbortController?.abort()", request_flow)
         self.assertIn("requestId !== ui.workspaceCapabilityRequestId", request_flow)
+        self.assertIn("externalSignal?.aborted", request_flow)
+        self.assertIn("await Promise.race([", request_flow)
+        self.assertIn("WORKSPACE_CAPABILITY_TIMEOUT", request_flow)
 
         refresh_start = script.index(
             "async function refreshWorkspaceCapabilityDisclosure"
@@ -1010,7 +1013,9 @@ class TestCogniBoardUI(unittest.TestCase):
             "function updateWorkspaceControlStates", refresh_start
         )
         refresh_flow = script[refresh_start:refresh_end]
-        self.assertEqual(refresh_flow.count("requestLatestWorkspaceCapabilities()"), 1)
+        self.assertEqual(
+            refresh_flow.count("requestLatestWorkspaceCapabilities(options)"), 1
+        )
         self.assertNotIn('api("/api/workspace/capabilities"', refresh_flow)
         self.assertIn('updateExternalCallDisclosure("", null)', refresh_flow)
         self.assertIn("revokeWorkspaceCapabilities();", refresh_flow)
@@ -1029,7 +1034,19 @@ class TestCogniBoardUI(unittest.TestCase):
         )
 
     def test_workspace_capability_refresh_is_latest_request_wins(self) -> None:
-        node = shutil.which("node")
+        bundled_node = (
+            Path.home()
+            / ".cache"
+            / "codex-runtimes"
+            / "codex-primary-runtime"
+            / "dependencies"
+            / "node"
+            / "bin"
+            / "node.exe"
+        )
+        node = shutil.which("node") or (
+            str(bundled_node) if bundled_node.is_file() else None
+        )
         if node is None:
             self.skipTest("Node.js is not installed in this Python test environment")
         script = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -1044,6 +1061,8 @@ class TestCogniBoardUI(unittest.TestCase):
         probe = (
             r"""
 const assert = require("node:assert/strict");
+global.window = { setTimeout, clearTimeout };
+const WORKSPACE_CAPABILITY_TIMEOUT_MS = 1000;
 const ui = {
   workspaceCapabilityRequestId: 0,
   workspaceCapabilityAbortController: null,
@@ -1083,6 +1102,36 @@ function applyWorkspaceCapabilities(payload) {
     { latest: olderResult.latest, applied: olderResult.applied },
     { latest: false, applied: false },
   );
+
+  const external = new AbortController();
+  const cancelled = requestLatestWorkspaceCapabilities({ signal: external.signal, timeoutMs: 1000 });
+  assert.equal(pending.length, 3);
+  external.abort();
+  const cancelledResult = await Promise.race([
+    cancelled,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("cancel remained pending")), 100)),
+  ]);
+  assert.deepEqual(
+    { latest: cancelledResult.latest, applied: cancelledResult.applied },
+    { latest: false, applied: false },
+  );
+  pending[2].resolve({ version: "cancelled-late" });
+  await Promise.resolve();
+  assert.deepEqual(applied, ["new"]);
+
+  const timedOut = requestLatestWorkspaceCapabilities({ timeoutMs: 10 });
+  assert.equal(pending.length, 4);
+  const timeoutResult = await Promise.race([
+    timedOut,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("timeout remained pending")), 200)),
+  ]);
+  assert.deepEqual(
+    { latest: timeoutResult.latest, applied: timeoutResult.applied },
+    { latest: false, applied: false },
+  );
+  pending[3].resolve({ version: "timeout-late" });
+  await Promise.resolve();
+  assert.deepEqual(applied, ["new"]);
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

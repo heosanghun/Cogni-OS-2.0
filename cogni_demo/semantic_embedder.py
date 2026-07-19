@@ -213,30 +213,41 @@ def verify_semantic_embedder_manifest(
 ) -> SemanticEmbedderManifest:
     """Verify a closed-world local embedding model without loading executable code."""
 
+    lexical_root = Path(os.path.abspath(Path(root).expanduser()))
     try:
-        selected_root = Path(root).expanduser().resolve(strict=True)
+        if _is_reparse_or_link(lexical_root):
+            raise SemanticEmbedderError(
+                "SEMANTIC_ARTIFACT_UNSAFE",
+                "semantic artifact root cannot be a link or reparse point",
+            )
+        selected_root = lexical_root.resolve(strict=True)
     except OSError as exc:
         raise SemanticEmbedderError(
             "SEMANTIC_ARTIFACT_UNAVAILABLE", "semantic artifact root is unavailable"
         ) from exc
-    if not selected_root.is_dir() or _is_reparse_or_link(selected_root):
+    if selected_root != lexical_root or not selected_root.is_dir():
         raise SemanticEmbedderError(
             "SEMANTIC_ARTIFACT_UNSAFE",
             "semantic artifact root must be a local directory",
         )
-    selected_manifest = (
+    lexical_manifest = Path(
         selected_root / SEMANTIC_EMBEDDER_MANIFEST
         if manifest_path is None
-        else Path(manifest_path).expanduser()
+        else os.path.abspath(Path(manifest_path).expanduser())
     )
     try:
-        selected_manifest = selected_manifest.resolve(strict=True)
+        if _is_reparse_or_link(lexical_manifest):
+            raise SemanticEmbedderError(
+                "SEMANTIC_MANIFEST_INVALID", "semantic manifest cannot be a link"
+            )
+        selected_manifest = lexical_manifest.resolve(strict=True)
     except OSError as exc:
         raise SemanticEmbedderError(
             "SEMANTIC_MANIFEST_INVALID", "semantic manifest is unavailable"
         ) from exc
     if (
-        selected_manifest.parent != selected_root
+        selected_manifest != lexical_manifest
+        or selected_manifest.parent != selected_root
         or selected_manifest.name != SEMANTIC_EMBEDDER_MANIFEST
     ):
         raise SemanticEmbedderError(

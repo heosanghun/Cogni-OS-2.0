@@ -154,6 +154,21 @@ class TestSemanticEmbedderManifest(unittest.TestCase):
                 verify_semantic_embedder_manifest(root)
             self.assertEqual(raised.exception.code, "SEMANTIC_BACKEND_UNSUPPORTED")
 
+    def test_symlinked_root_is_never_promoted_to_verified_artifact(self) -> None:
+        with TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "model"
+            root.mkdir()
+            _write_manifest(root)
+            linked = parent / "linked-model"
+            try:
+                linked.symlink_to(root, target_is_directory=True)
+            except OSError:
+                self.skipTest("directory symlink creation is unavailable")
+            with self.assertRaises(SemanticEmbedderError) as raised:
+                verify_semantic_embedder_manifest(linked)
+            self.assertEqual(raised.exception.code, "SEMANTIC_ARTIFACT_UNSAFE")
+
 
 class TestLocalSemanticEmbedder(unittest.TestCase):
     def test_encode_is_bounded_normalized_cpu_only_and_not_answer_bearing(self) -> None:

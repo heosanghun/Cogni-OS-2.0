@@ -171,6 +171,45 @@ class TestSemanticEmbedderManifest(unittest.TestCase):
 
 
 class TestLocalSemanticEmbedder(unittest.TestCase):
+    def test_artifact_mutation_after_admission_fails_before_backend_load(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_manifest(root)
+            calls = 0
+
+            def factory(manifest):
+                nonlocal calls
+                calls += 1
+                return _FakeBackend(manifest.dimensions)
+
+            embedder = LocalSemanticEmbedder(root, backend_factory=factory)
+            (root / "model.safetensors").write_bytes(b"changed after admission")
+            with self.assertRaises(SemanticEmbedderError) as raised:
+                embedder.load()
+            self.assertEqual(raised.exception.code, "SEMANTIC_ARTIFACT_DIGEST_MISMATCH")
+            self.assertEqual(calls, 0)
+            self.assertFalse(embedder.loaded)
+
+    def test_artifact_mutation_during_backend_load_closes_candidate(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_manifest(root)
+            created: list[_FakeBackend] = []
+
+            def factory(manifest):
+                backend = _FakeBackend(manifest.dimensions)
+                created.append(backend)
+                (root / "model.safetensors").write_bytes(b"changed during load")
+                return backend
+
+            embedder = LocalSemanticEmbedder(root, backend_factory=factory)
+            with self.assertRaises(SemanticEmbedderError) as raised:
+                embedder.load()
+            self.assertEqual(raised.exception.code, "SEMANTIC_ARTIFACT_DIGEST_MISMATCH")
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+            self.assertFalse(embedder.loaded)
+
     def test_encode_is_bounded_normalized_cpu_only_and_not_answer_bearing(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

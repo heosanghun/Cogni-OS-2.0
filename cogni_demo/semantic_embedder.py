@@ -519,6 +519,18 @@ class LocalSemanticEmbedder:
         with self._lock:
             if self._backend is not None:
                 return
+            # The constructor verification is not sufficient: the operator can
+            # leave a session idle before its first use.  Re-hash the exact
+            # closed-world snapshot immediately before and after the local
+            # loader so a stale or load-time-mutated artifact is never promoted.
+            before = verify_semantic_embedder_manifest(
+                self.manifest.root, self.manifest.path
+            )
+            if before != self.manifest:
+                raise SemanticEmbedderError(
+                    "SEMANTIC_ARTIFACT_CHANGED",
+                    "semantic artifact changed after admission",
+                )
             try:
                 backend = self._backend_factory(self.manifest)
             except SemanticEmbedderError:
@@ -531,9 +543,34 @@ class LocalSemanticEmbedder:
             if not callable(getattr(backend, "encode", None)) or not callable(
                 getattr(backend, "close", None)
             ):
+                try:
+                    close = getattr(backend, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    pass
                 raise SemanticEmbedderError(
                     "SEMANTIC_MODEL_LOAD_FAILED",
                     "semantic embedding backend contract is invalid",
+                )
+            try:
+                after = verify_semantic_embedder_manifest(
+                    self.manifest.root, self.manifest.path
+                )
+            except SemanticEmbedderError:
+                try:
+                    backend.close()
+                except Exception:
+                    pass
+                raise
+            if after != self.manifest:
+                try:
+                    backend.close()
+                except Exception:
+                    pass
+                raise SemanticEmbedderError(
+                    "SEMANTIC_ARTIFACT_CHANGED",
+                    "semantic artifact changed during local model load",
                 )
             self._backend = backend
 

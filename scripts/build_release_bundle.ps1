@@ -740,6 +740,76 @@ function Get-ClosedTreeChecksumLines([string]$TreeRoot) {
     )
 }
 
+function Assert-NoForbiddenPackagedSource([string]$TreeRoot) {
+    # The artifact-only bundle intentionally exports the complete committed
+    # source tree.  Git ignore rules are not a release boundary: a force-added
+    # model, cache, or credential file would otherwise be copied verbatim into
+    # both the source archive and expanded launcher tree.
+    $forbiddenDirectories = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($name in @(
+        '.git', '.cache', '.mypy_cache', '.pytest_cache', '.ruff_cache',
+        '__pycache__', 'build', 'dist', 'node_modules', 'output', 'outputs',
+        'tmp', 'work'
+    )) {
+        [void]$forbiddenDirectories.Add($name)
+    }
+    $forbiddenNames = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($name in @(
+        '.env', '.netrc', '.npmrc', '.pypirc',
+        'credentials', 'credentials.json', 'id_dsa', 'id_ecdsa',
+        'id_ed25519', 'id_rsa', 'secrets.json', 'service-account.json',
+        'token.json'
+    )) {
+        [void]$forbiddenNames.Add($name)
+    }
+    $forbiddenExtensions = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($extension in @(
+        '.bin', '.ckpt', '.gguf', '.h5', '.key', '.onnx', '.p12', '.pem',
+        '.pfx', '.pickle', '.pkl', '.pt', '.pth', '.pyc', '.pyo',
+        '.safetensors'
+    )) {
+        [void]$forbiddenExtensions.Add($extension)
+    }
+
+    foreach ($file in Get-ChildItem -LiteralPath $TreeRoot -Recurse -File -Force) {
+        $relative = Get-SafeRelativePath $TreeRoot $file.FullName
+        $segments = $relative.Split('/')
+        for ($index = 0; $index -lt ($segments.Length - 1); $index += 1) {
+            if ($forbiddenDirectories.Contains($segments[$index])) {
+                throw "Forbidden cache/build directory in packaged source: $relative"
+            }
+        }
+        $leaf = $segments[$segments.Length - 1]
+        if (
+            $forbiddenNames.Contains($leaf) -or
+            $leaf.StartsWith('.env.', [StringComparison]::OrdinalIgnoreCase)
+        ) {
+            throw "Forbidden credential file in packaged source: $relative"
+        }
+        if ($forbiddenExtensions.Contains([IO.Path]::GetExtension($leaf))) {
+            throw "Forbidden model/cache/credential artifact in packaged source: $relative"
+        }
+
+        # Private-key blocks remain forbidden even when hidden behind an
+        # innocent filename.  Keys are small text artifacts; the bounded scan
+        # avoids materialising an arbitrary large source member a second time.
+        if ($file.Length -le 2097152) {
+            $text = [Text.Encoding]::ASCII.GetString(
+                [IO.File]::ReadAllBytes($file.FullName)
+            )
+            if ($text -match '-----BEGIN (?:RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----') {
+                throw "Private key material is forbidden in packaged source: $relative"
+            }
+        }
+    }
+}
+
 function Get-LockedTreeChecksumLines($Handles, $ExpectedLines) {
     $expected = @($ExpectedLines)
     $locked = @($Handles)
@@ -1179,6 +1249,7 @@ try {
     # executing any archived project bytes.  The version and checkpoint trust
     # root are then parsed as inert static data, never imported as Python.
     $archivedTreeChecksums = @(Get-ClosedTreeChecksumLines $source)
+    Assert-NoForbiddenPackagedSource $source
     $sourceChecksumManifestContentSha = Get-CanonicalChecksumDigest $archivedTreeChecksums
     if ($PublishRelease) {
         $sourceReadLocks = @(

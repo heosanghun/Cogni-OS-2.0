@@ -1758,6 +1758,11 @@ exit 0
                     ".pytest_cache",
                     ".ruff_cache",
                     "__pycache__",
+                    "build",
+                    "dist",
+                    "output",
+                    "outputs",
+                    "tmp",
                     "work",
                     "*.pyc",
                 ),
@@ -1823,6 +1828,88 @@ exit 0
                     sha256((output / relative).read_bytes()).hexdigest(),
                 )
             self.assertFalse(powershell_marker.exists())
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows artifact-only build")
+    def test_artifact_only_release_rejects_tracked_models_caches_and_secrets(
+        self,
+    ) -> None:
+        powershell = self._powershell_51_path()
+        git = shutil.which("git")
+        if not powershell.is_file() or git is None:
+            self.skipTest("Windows PowerShell 5.1 and Git are required")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            archive = temporary_root / "source.zip"
+            repository = temporary_root / "repository"
+            output = temporary_root / "artifact"
+            subprocess.run(
+                [
+                    git,
+                    "-C",
+                    str(ROOT),
+                    "archive",
+                    "--format=zip",
+                    f"--output={archive}",
+                    "HEAD",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+            with ZipFile(archive) as source_zip:
+                source_zip.extractall(repository)
+            shutil.copy2(
+                ROOT / "scripts" / "build_release_bundle.ps1",
+                repository / "scripts" / "build_release_bundle.ps1",
+            )
+            (repository / "models").mkdir()
+            (repository / "models" / "model.safetensors").write_bytes(b"weights")
+            (repository / "__pycache__").mkdir()
+            (repository / "__pycache__" / "cache.pyc").write_bytes(b"cache")
+            (repository / ".env.production").write_text(
+                "API_KEY=must-not-ship\n", encoding="utf-8"
+            )
+            for arguments in (
+                ("init", "-q"),
+                ("config", "user.email", "release-regression@example.invalid"),
+                ("config", "user.name", "Release Regression"),
+                ("config", "core.autocrlf", "false"),
+                ("add", "-f", "."),
+                ("commit", "-q", "-m", "forbidden artifact regression"),
+            ):
+                subprocess.run(
+                    [git, "-C", str(repository), *arguments],
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+
+            completed = subprocess.run(
+                [
+                    str(powershell),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(repository / "scripts" / "build_release_bundle.ps1"),
+                    "-OutputDirectory",
+                    str(output),
+                ],
+                cwd=repository,
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=60,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertRegex(
+                completed.stdout + completed.stderr,
+                r"Forbidden (cache/build directory|credential file|model/cache/credential artifact)",
+            )
+            self.assertFalse(output.exists())
 
     @unittest.skipUnless(sys.platform == "win32", "Windows publication gate")
     @unittest.skip(

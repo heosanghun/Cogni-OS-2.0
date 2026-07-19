@@ -288,7 +288,42 @@ The path below is the expected build output only. Do not present it as an
 available current executable until the frozen exact commit has produced the
 binary and its checksum and cold-start smoke have passed.
 
-Build the v0.4.1 launcher from the exact source tree:
+For a complete adjacent-source **artifact-only** candidate, run the frozen
+builder from a clean tracked HEAD. This example hides CUDA, forces Python/Hugging
+Face offline mode, creates a new commit-specific directory, and does not launch
+the generated executable:
+
+```powershell
+$commit = (git rev-parse --verify HEAD).Trim()
+git diff --quiet HEAD --
+if ($LASTEXITCODE -ne 0) { throw 'Tracked worktree differs from HEAD.' }
+git diff --cached --quiet HEAD --
+if ($LASTEXITCODE -ne 0) { throw 'Index differs from HEAD.' }
+
+$env:CUDA_VISIBLE_DEVICES = '-1'
+$env:NVIDIA_VISIBLE_DEVICES = 'void'
+$env:PIP_NO_INDEX = '1'
+$env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
+$env:HF_HUB_OFFLINE = '1'
+$env:TRANSFORMERS_OFFLINE = '1'
+$output = "output\release\Cogni-OS-2-Genesis-v0.4.1-unverified-$($commit.Substring(0, 12))"
+if (Test-Path -LiteralPath $output) { throw 'Choose a new output directory.' }
+
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+  -File scripts\build_release_bundle.ps1 `
+  -Treeish $commit `
+  -OutputDirectory $output
+```
+
+Do **not** add `-PublishRelease`: the protected publication toolchain is an
+external blocker. This command creates an unsigned, explicitly `UNVERIFIED`
+directory containing the launcher, its adjacent expanded source tree, source
+ZIP, wheel, SBOM, notices, build manifest, and checksums. It neither loads model
+weights nor runs the EXE and it does not certify GPU, VRAM, quality, or release
+evidence. `CogniBoard-v0.4.1.exe` is still a bootstrapper, not a standalone
+model executable.
+
+To compile only the low-level launcher during development, use:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_windows_launcher.ps1 `

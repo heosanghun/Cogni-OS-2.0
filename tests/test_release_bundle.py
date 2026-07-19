@@ -1246,6 +1246,21 @@ exit 0
         attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
         self.assertIn("/cogni_core/cts_policy_checkpoint.json -text", attributes)
 
+    def test_readme_documents_full_unverified_adjacent_source_bundle(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for contract in (
+            "build_release_bundle.ps1",
+            "-Treeish $commit",
+            "-OutputDirectory $output",
+            "Do **not** add `-PublishRelease`",
+            "unsigned, explicitly `UNVERIFIED`",
+            "adjacent expanded source tree",
+            "does not certify GPU",
+            "not a standalone",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, readme)
+
     def test_guard_scoped_source_archive_preserves_cmd_bytes_and_omits_generated_artifacts(
         self,
     ) -> None:
@@ -1741,13 +1756,17 @@ exit 0
             temporary_root = Path(temporary)
             repository = temporary_root / "repository"
             output = temporary_root / "artifact"
-            hostile_path = temporary_root / "hostile-path"
+            hostile_path = temporary_root / "private user home leak sentinel"
             hostile_path.mkdir()
             powershell_marker = temporary_root / "path-powershell-executed.txt"
             (hostile_path / "powershell.cmd").write_text(
                 "@echo off\n"
                 f'>>"{powershell_marker}" echo PATH_POWERSHELL_RAN\n'
                 "exit /b 97\n",
+                encoding="utf-8",
+            )
+            (hostile_path / "python.cmd").write_text(
+                f'@echo off\n"{sys.executable}" %*\n',
                 encoding="utf-8",
             )
             shutil.copytree(
@@ -1810,6 +1829,20 @@ exit 0
             manifest = (output / "BUILD_MANIFEST.txt").read_text(encoding="utf-8")
             self.assertIn("artifact_build_status=PASS", manifest)
             self.assertIn("release_evidence_status=UNVERIFIED", manifest)
+            self.assertIn("python_executable_name=python.cmd", manifest)
+            self.assertRegex(
+                manifest,
+                r"(?m)^python_executable_sha256=[0-9a-f]{64}$",
+            )
+            self.assertRegex(manifest, r"(?m)^python_version=Python \d+\.\d+\.\d+.*$")
+            self.assertRegex(manifest, r"(?m)^pip_version=[A-Za-z0-9._+-]+$")
+            self.assertRegex(manifest, r"(?m)^pip_python_version=\d+\.\d+$")
+            self.assertNotIn("python_executable=", manifest)
+            self.assertNotIn(str(hostile_path).casefold(), manifest.casefold())
+            self.assertNotIn(
+                str(Path(sys.executable).parent).casefold(), manifest.casefold()
+            )
+            self.assertNotIn("site-packages", manifest.casefold())
             checksum_records = {}
             for line in (
                 (output / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()

@@ -45,6 +45,7 @@ $pinnedGitHandle = $null
 $powerShellExecutable = $null
 $python = $null
 $gitExecutable = $null
+$pythonExecutableSha = $null
 $gitExecutableSha = $null
 $verifiedSnapshotHandles = [Collections.Generic.List[IO.FileStream]]::new()
 
@@ -317,6 +318,7 @@ if ($PublishRelease) {
             'Policy-approved Python executable'
         $pinnedPythonHandle = $pythonAdmission.Handle
         $python = $pythonAdmission.Path
+        $pythonExecutableSha = $pythonAdmission.Sha256
         $gitAdmission = Open-EarlyPinnedFile `
             $toolchainPolicy['git_path'] $toolchainPolicy['git_sha256'] `
             'Policy-approved Git executable'
@@ -1101,9 +1103,14 @@ function Get-ArchiveEntrySha256([string]$ArchivePath, [string]$EntryName, [strin
 
 $python = Resolve-TrustedEvidenceFile $python 'Python application'
 $gitExecutable = Resolve-TrustedEvidenceFile $gitExecutable 'Git application'
+$pythonExecutableName = [IO.Path]::GetFileName($python)
+if ($pythonExecutableName -cnotmatch '^[A-Za-z0-9._+-]{1,128}$') {
+    throw 'Python application basename is unsafe for release metadata.'
+}
 if ($PublishRelease) {
     if (
         $python -cne $toolchainPolicy.python_path -or
+        $pythonExecutableSha -cne $toolchainPolicy.python_sha256 -or
         $gitExecutable -cne $toolchainPolicy.git_path -or
         $gitExecutableSha -cne $toolchainPolicy.git_sha256
     ) {
@@ -1111,6 +1118,7 @@ if ($PublishRelease) {
     }
 }
 else {
+    $pythonExecutableSha = Get-LowerSha256 $python
     $gitExecutableSha = Get-LowerSha256 $gitExecutable
 }
 $savedGitEnvironment = @{}
@@ -1765,10 +1773,28 @@ try {
         & $python @pythonBuildArguments --version 2>&1 |
             Microsoft.PowerShell.Utility\Out-String
     ).Trim()
-    $pipVersion = (
+    if (
+        $LASTEXITCODE -ne 0 -or
+        $pythonVersion -cnotmatch '^Python [0-9]+\.[0-9]+\.[0-9]+(?:[A-Za-z0-9.+-]{0,32})?$'
+    ) {
+        throw 'Python application returned unsafe or malformed version metadata.'
+    }
+    $pipVersionOutput = (
         & $python @pythonBuildArguments -m pip --version 2>&1 |
             Microsoft.PowerShell.Utility\Out-String
     ).Trim()
+    $pipVersionMatch = [regex]::Match(
+        $pipVersionOutput,
+        '^pip ([A-Za-z0-9][A-Za-z0-9._+-]{0,127}) from .+ \(python ([0-9]+\.[0-9]+)\)$'
+    )
+    if ($LASTEXITCODE -ne 0 -or -not $pipVersionMatch.Success) {
+        throw 'Pip returned unsafe or malformed version metadata.'
+    }
+    $pipVersion = $pipVersionMatch.Groups[1].Value
+    $pipPythonVersion = $pipVersionMatch.Groups[2].Value
+    if ((Get-LowerSha256 $python) -cne $pythonExecutableSha) {
+        throw 'Python application bytes changed during artifact assembly.'
+    }
     $manifestLines = @(
         "release_version=$releaseVersion",
         "commit_oid=$commitOid",
@@ -1782,9 +1808,11 @@ try {
         "expanded_source_file_count=$($expandedTreeChecksums.Count)",
         "artifact_build_status=PASS",
         "release_evidence_status=$releaseEvidenceStatus",
-        "python_executable=$python",
+        "python_executable_name=$pythonExecutableName",
+        "python_executable_sha256=$pythonExecutableSha",
         "python_version=$pythonVersion",
         "pip_version=$pipVersion",
+        "pip_python_version=$pipPythonVersion",
         "source_date_epoch=$commitEpoch"
         "signature_status=unsigned-no-code-signing-certificate-provided"
         "sbom=SBOM.cdx.json"

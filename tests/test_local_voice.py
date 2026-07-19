@@ -11,6 +11,8 @@ import tempfile
 import unittest
 import wave
 
+import torch
+
 from cogni_agent.local_voice import (
     Gemma4ModelSpeechTranscriber,
     LocalVoiceError,
@@ -18,6 +20,7 @@ from cogni_agent.local_voice import (
     VOICE_SAMPLE_RATE,
     validate_voice_wav,
 )
+from cogni_agent.multimodal import _validated_bundle
 
 
 def _wav(
@@ -54,7 +57,14 @@ class _Processor:
         self.calls += 1
         if not content or "전사" not in prompt:
             raise AssertionError("bounded audio prompt was not supplied")
-        return SimpleNamespace(modality="audio", processor_verified=True)
+        output = {
+            "input_ids": torch.ones((1, 4), dtype=torch.int64),
+            "attention_mask": torch.ones((1, 4), dtype=torch.int64),
+            "mm_token_type_ids": torch.zeros((1, 4), dtype=torch.int64),
+            "input_features": torch.ones((1, 4, 8), dtype=torch.float32),
+            "input_features_mask": torch.ones((1, 4), dtype=torch.bool),
+        }
+        return _validated_bundle("audio", content, output, frozenset(output))
 
 
 class _Transcriber:
@@ -182,6 +192,25 @@ class TestLocalVoice(unittest.TestCase):
         self.assertEqual(after["transcription_state"], "configured_unverified")
         self.assertFalse(after["processor"]["probe_passed"])
         self.assertFalse(after["model_inference_attested"])
+
+    def test_public_processor_verified_boolean_cannot_attest_voice_bundle(self) -> None:
+        transcriber = _Transcriber()
+        processor = SimpleNamespace(
+            process_audio_wav=lambda _content, _prompt: SimpleNamespace(
+                modality="audio", processor_verified=True
+            )
+        )
+        service = LocalVoiceService(
+            preprocessor_factory=lambda: processor,
+            transcriber=transcriber,
+        )
+        with self.assertRaises(LocalVoiceError) as caught:
+            service.transcribe_base64(
+                b64encode(_speech_wav()).decode("ascii"), language="ko"
+            )
+        self.assertEqual(caught.exception.code, "LOCAL_AUDIO_PREPROCESS_FAILED")
+        self.assertEqual(transcriber.calls, 0)
+        self.assertFalse(service.capability_payload()["processor"]["probe_passed"])
 
     def test_unverified_or_nonlocal_transcriber_is_rejected(self) -> None:
         for local_only, artifact_verified in ((False, True), (True, False)):

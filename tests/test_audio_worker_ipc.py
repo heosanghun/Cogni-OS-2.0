@@ -14,10 +14,14 @@ from torch import nn
 from cogni_agent.model_service import (
     ModelService,
     RequestLimitError,
+    _audio_bundle_inputs,
     _bind_media_session_digest,
     _session_digest,
 )
-from cogni_agent.multimodal import VerifiedGemma4MultimodalProcessor
+from cogni_agent.multimodal import (
+    MultimodalTensorBundle,
+    VerifiedGemma4MultimodalProcessor,
+)
 from cogni_agent.protocol import (
     AUDIO_FIELD_INPUT_FEATURES,
     AUDIO_FIELD_INPUT_FEATURES_MASK,
@@ -256,6 +260,16 @@ class TestAudioTensorProtocol(unittest.TestCase):
 
 
 class TestResidentAudioGeneration(unittest.TestCase):
+    def test_model_service_rejects_forged_bundle_without_private_provenance(
+        self,
+    ) -> None:
+        forged = object.__new__(MultimodalTensorBundle)
+        object.__setattr__(forged, "_modality", "audio")
+        object.__setattr__(forged, "_content_sha256", "0" * 64)
+        object.__setattr__(forged, "_tensors", ())
+        with self.assertRaisesRegex(RequestLimitError, "verified processor"):
+            _audio_bundle_inputs(forged, max_input_tokens=32)
+
     def test_audio_content_digest_is_bound_into_response_authority(self) -> None:
         session = _session_digest("audio-test")
         first = _bind_media_session_digest(session, "01" * 32)

@@ -10,11 +10,15 @@ from dataclasses import dataclass
 from hashlib import sha256
 from io import BytesIO
 import math
+import os
 from pathlib import Path
+from stat import S_ISLNK, S_ISREG
 import struct
+from threading import Lock
 from types import MappingProxyType
 from typing import Callable, Mapping
 import wave
+from weakref import WeakSet
 
 import torch
 from torch import Tensor
@@ -49,6 +53,7 @@ MAX_VIDEO_OUTPUT_TENSOR_ELEMENTS = 16 * 1024 * 1024
 MAX_VIDEO_SEQUENCE_TOKENS = 8_192
 MAX_VIDEO_OUTPUT_AXIS = 8_192
 MAX_VIDEO_BOUNDARY_PEAK_CPU_BYTES = 384 * 1024 * 1024
+MAX_MULTIMODAL_MANIFEST_BYTES = 1024 * 1024
 
 _IMAGE_KEYS = frozenset(
     {
@@ -85,19 +90,99 @@ class MultimodalPreprocessError(ValueError):
     """A local artifact or input failed before reaching the model worker."""
 
 
-@dataclass(frozen=True, slots=True)
 class MultimodalTensorBundle:
-    modality: str
-    content_sha256: str
-    tensors: tuple[tuple[str, Tensor], ...]
-    processor_verified: bool = True
+    """Opaque processor output whose authority is held by this module.
 
-    def as_mapping(self) -> dict[str, Tensor]:
-        return {name: tensor for name, tensor in self.tensors}
+    The public constructor is intentionally unavailable.  Consumers must use
+    :func:`is_verified_multimodal_bundle` rather than trusting a caller-set
+    boolean, and every public tensor view is an isolated copy.
+    """
+
+    __slots__ = ("_content_sha256", "_modality", "_tensors", "__weakref__")
+
+    def __new__(cls, *_args: object, **_kwargs: object) -> MultimodalTensorBundle:
+        raise TypeError("multimodal tensor bundles are created by the processor")
+
+    def __init_subclass__(cls, **_kwargs: object) -> None:
+        raise TypeError("multimodal tensor bundles cannot be subclassed")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("multimodal tensor bundles are immutable")
+
+    @property
+    def modality(self) -> str:
+        return self._modality
+
+    @property
+    def content_sha256(self) -> str:
+        return self._content_sha256
+
+    @property
+    def tensors(self) -> tuple[tuple[str, Tensor], ...]:
+        return tuple(
+            (name, _isolated_tensor_copy(tensor)) for name, tensor in self._tensors
+        )
+
+    def as_mapping(self) -> Mapping[str, Tensor]:
+        return MappingProxyType(
+            {name: _isolated_tensor_copy(tensor) for name, tensor in self._tensors}
+        )
 
     @property
     def tensor_bytes(self) -> int:
-        return sum(tensor.numel() * tensor.element_size() for _, tensor in self.tensors)
+        return sum(
+            tensor.numel() * tensor.element_size() for _, tensor in self._tensors
+        )
+
+    @property
+    def tensor_elements(self) -> int:
+        return sum(tensor.numel() for _, tensor in self._tensors)
+
+
+_TRUSTED_MULTIMODAL_BUNDLES: WeakSet[MultimodalTensorBundle] = WeakSet()
+_TRUSTED_MULTIMODAL_BUNDLES_LOCK = Lock()
+
+
+def _isolated_tensor_copy(tensor: Tensor) -> Tensor:
+    try:
+        isolated = tensor.detach().clone(memory_format=torch.contiguous_format)
+    except RuntimeError as exc:
+        raise MultimodalPreprocessError(
+            "multimodal tensor snapshot could not be isolated"
+        ) from exc
+    if isolated.data_ptr() == tensor.data_ptr() or not isolated.is_contiguous():
+        raise MultimodalPreprocessError(
+            "multimodal tensor snapshot could not be isolated"
+        )
+    return isolated
+
+
+def _new_multimodal_tensor_bundle(
+    modality: str,
+    content_sha256: str,
+    tensors: tuple[tuple[str, Tensor], ...],
+) -> MultimodalTensorBundle:
+    bundle = object.__new__(MultimodalTensorBundle)
+    object.__setattr__(bundle, "_modality", modality)
+    object.__setattr__(bundle, "_content_sha256", content_sha256)
+    object.__setattr__(bundle, "_tensors", tensors)
+    with _TRUSTED_MULTIMODAL_BUNDLES_LOCK:
+        _TRUSTED_MULTIMODAL_BUNDLES.add(bundle)
+    return bundle
+
+
+def is_verified_multimodal_bundle(
+    bundle: object,
+    *,
+    modality: str | None = None,
+) -> bool:
+    """Return authority held by the private processor factory, never a public flag."""
+
+    if type(bundle) is not MultimodalTensorBundle:
+        return False
+    with _TRUSTED_MULTIMODAL_BUNDLES_LOCK:
+        trusted = bundle in _TRUSTED_MULTIMODAL_BUNDLES
+    return trusted and (modality is None or bundle.modality == modality)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +240,7 @@ class VideoPreprocessResult:
 
     @property
     def output_tensor_elements(self) -> int:
-        return sum(tensor.numel() for _, tensor in self.bundle.tensors)
+        return self.bundle.tensor_elements
 
 
 def _bounded_prompt(prompt: object) -> str:
@@ -171,11 +256,60 @@ def _bounded_prompt(prompt: object) -> str:
     return prompt.strip()
 
 
-def _sha256_file(path: Path) -> str:
+def _path_is_link_or_reparse(path: Path) -> bool:
+    status = path.lstat()
+    reparse_flag = getattr(status, "st_file_attributes", 0) & getattr(
+        os, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+    )
+    return S_ISLNK(status.st_mode) or bool(reparse_flag)
+
+
+def _bounded_regular_file_sha256(path: Path, *, max_bytes: int) -> str:
+    if max_bytes < 1 or _path_is_link_or_reparse(path):
+        raise MultimodalPreprocessError(
+            "manifest must be a bounded regular file without links or reparse points"
+        )
+    before = path.stat(follow_symlinks=False)
+    if not S_ISREG(before.st_mode) or not 1 <= before.st_size <= max_bytes:
+        raise MultimodalPreprocessError(
+            "manifest must be a bounded regular file without links or reparse points"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
     digest = sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+    total = 0
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not S_ISREG(opened.st_mode)
+            or opened.st_size != before.st_size
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise MultimodalPreprocessError("manifest changed before its bounded hash")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while True:
+                chunk = stream.read(min(1024 * 1024, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise MultimodalPreprocessError("manifest exceeds its byte limit")
+                digest.update(chunk)
+        after = os.fstat(descriptor)
+        if after.st_size != before.st_size or total != before.st_size:
+            raise MultimodalPreprocessError("manifest changed during its bounded hash")
+    finally:
+        os.close(descriptor)
+
+    current = path.stat(follow_symlinks=False)
+    if (
+        _path_is_link_or_reparse(path)
+        or not S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino, current.st_size)
+        != (before.st_dev, before.st_ino, before.st_size)
+    ):
+        raise MultimodalPreprocessError("manifest changed during its bounded hash")
     return digest.hexdigest()
 
 
@@ -334,7 +468,7 @@ def _validated_bundle(
         )
     ):
         raise MultimodalPreprocessError("precomputed content digest is invalid")
-    return MultimodalTensorBundle(
+    return _new_multimodal_tensor_bundle(
         modality,
         precomputed_content_sha256 or sha256(content).hexdigest(),
         tuple(sorted(snapshot.items())),
@@ -583,12 +717,49 @@ class VerifiedGemma4MultimodalProcessor:
     loader_binding_status = "UNPROVEN_PATH_LOADER_DISABLED"
 
     def __init__(self, model_root: str | Path, manifest_path: str | Path) -> None:
-        root = Path(model_root).expanduser().resolve(strict=True)
-        manifest = Path(manifest_path).expanduser().resolve(strict=True)
         try:
-            _manifest_digest = _sha256_file(manifest)
+            root = Path(model_root).expanduser().resolve(strict=True)
+            requested_manifest = Path(manifest_path).expanduser()
+            if _path_is_link_or_reparse(requested_manifest):
+                raise MultimodalPreprocessError(
+                    "manifest cannot be a link or reparse point"
+                )
+            requested_before = requested_manifest.stat(follow_symlinks=False)
+            manifest = requested_manifest.resolve(strict=True)
+            requested_after = requested_manifest.stat(follow_symlinks=False)
+            if (
+                _path_is_link_or_reparse(requested_manifest)
+                or not S_ISREG(requested_after.st_mode)
+                or (
+                    requested_after.st_dev,
+                    requested_after.st_ino,
+                    requested_after.st_size,
+                )
+                != (
+                    requested_before.st_dev,
+                    requested_before.st_ino,
+                    requested_before.st_size,
+                )
+            ):
+                raise MultimodalPreprocessError(
+                    "manifest changed while its path was resolved"
+                )
+            manifest_digest = _bounded_regular_file_sha256(
+                manifest,
+                max_bytes=MAX_MULTIMODAL_MANIFEST_BYTES,
+            )
             before = verify_artifact_manifest(root, manifest)
             verify_instruction_tuned_e4b_snapshot(before)
+            if (
+                _bounded_regular_file_sha256(
+                    manifest,
+                    max_bytes=MAX_MULTIMODAL_MANIFEST_BYTES,
+                )
+                != manifest_digest
+            ):
+                raise MultimodalPreprocessError(
+                    "manifest changed while artifacts were verified"
+                )
         except (OSError, ArtifactVerificationError, ValueError) as exc:
             raise MultimodalPreprocessError(
                 "model artifacts failed verification"
@@ -598,7 +769,7 @@ class VerifiedGemma4MultimodalProcessor:
             raise MultimodalPreprocessError(
                 "verified snapshot lacks processor artifacts"
             )
-        del _manifest_digest, before
+        del manifest_digest, before
         # AutoProcessor.from_pretrained() reopens a directory by path.  An
         # attacker able to replace those files can present verified bytes,
         # substitute different bytes while AutoProcessor reads them, then
@@ -846,7 +1017,7 @@ class VerifiedGemma4MultimodalProcessor:
             precomputed_content_sha256=content_sha256,
             schema_validator=_bounded_video_output_schema,
         )
-        output_elements = sum(tensor.numel() for _, tensor in bundle.tensors)
+        output_elements = bundle.tensor_elements
         if output_elements > MAX_VIDEO_OUTPUT_TENSOR_ELEMENTS:
             raise MultimodalPreprocessError(
                 "video output tensor elements exceed their limit"
@@ -868,6 +1039,7 @@ __all__ = [
     "MAX_AUDIO_SECONDS",
     "MAX_BUNDLE_TENSOR_BYTES",
     "MAX_IMAGE_PIXELS",
+    "MAX_MULTIMODAL_MANIFEST_BYTES",
     "MAX_VIDEO_BOUNDARY_PEAK_CPU_BYTES",
     "MAX_VIDEO_DECODED_BYTES",
     "MAX_VIDEO_DURATION_SECONDS",
@@ -886,4 +1058,5 @@ __all__ = [
     "VideoProcessorIdentity",
     "VideoSamplingMetadata",
     "VerifiedGemma4MultimodalProcessor",
+    "is_verified_multimodal_bundle",
 ]

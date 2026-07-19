@@ -26,6 +26,8 @@ import re
 import sys
 import wave
 
+from .multimodal import is_verified_multimodal_bundle
+
 
 MAX_VOICE_WAV_BYTES = 2 * 1024 * 1024
 MAX_VOICE_BASE64_CHARS = ((MAX_VOICE_WAV_BYTES + 2) // 3) * 4
@@ -133,10 +135,8 @@ class Gemma4ModelSpeechTranscriber:
         tensor_bundle: Any,
         language: str,
     ) -> str:
-        if (
-            not isinstance(wav, ValidatedVoiceWav)
-            or getattr(tensor_bundle, "modality", None) != "audio"
-            or getattr(tensor_bundle, "processor_verified", False) is not True
+        if not isinstance(wav, ValidatedVoiceWav) or not is_verified_multimodal_bundle(
+            tensor_bundle, modality="audio"
         ):
             raise LocalVoiceError(
                 "LOCAL_AUDIO_PREPROCESS_FAILED", "verified audio tensors are required"
@@ -649,10 +649,7 @@ class LocalVoiceService:
                 "LOCAL_AUDIO_PREPROCESS_FAILED",
                 "verified local audio preprocessing failed",
             ) from exc
-        if (
-            getattr(tensor_bundle, "modality", None) != "audio"
-            or getattr(tensor_bundle, "processor_verified", False) is not True
-        ):
+        if not is_verified_multimodal_bundle(tensor_bundle, modality="audio"):
             raise LocalVoiceError(
                 "LOCAL_AUDIO_PREPROCESS_FAILED",
                 "audio processor returned an unverified bundle",

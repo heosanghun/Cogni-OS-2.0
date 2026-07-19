@@ -71,6 +71,7 @@ from .multimodal import (
     MultimodalPreprocessError,
     MultimodalTensorBundle,
     VerifiedGemma4MultimodalProcessor,
+    is_verified_multimodal_bundle,
 )
 from . import model_trust as _model_trust
 from .protocol import (
@@ -362,11 +363,7 @@ def _image_bundle_inputs(
     *,
     max_input_tokens: int,
 ) -> tuple[Tensor, Tensor, tuple[tuple[int, Tensor], ...], str]:
-    if (
-        not isinstance(bundle, MultimodalTensorBundle)
-        or bundle.modality != "image"
-        or bundle.processor_verified is not True
-    ):
+    if not is_verified_multimodal_bundle(bundle, modality="image"):
         raise RequestLimitError("image was not produced by the verified processor")
     digest = _validated_digest_hex(bundle.content_sha256, "image content digest")
     mapping = bundle.as_mapping()
@@ -426,11 +423,7 @@ def _audio_bundle_inputs(
     *,
     max_input_tokens: int,
 ) -> tuple[Tensor, Tensor, tuple[tuple[int, Tensor], ...], str]:
-    if (
-        not isinstance(bundle, MultimodalTensorBundle)
-        or bundle.modality != "audio"
-        or bundle.processor_verified is not True
-    ):
+    if not is_verified_multimodal_bundle(bundle, modality="audio"):
         raise RequestLimitError("audio was not produced by the verified processor")
     digest = _validated_digest_hex(bundle.content_sha256, "audio content digest")
     mapping = bundle.as_mapping()

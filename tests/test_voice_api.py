@@ -12,7 +12,10 @@ from unittest.mock import patch
 import unittest
 import wave
 
+import torch
+
 from cogni_agent.local_voice import LocalVoiceError, LocalVoiceService
+from cogni_agent.multimodal import _validated_bundle
 from cogni_demo.server import DemoHTTPServer, _build_local_voice_service
 from tests.test_demo_server import manager_for
 
@@ -36,8 +39,15 @@ class _Workspace:
 
 
 class _Processor:
-    def process_audio_wav(self, _content, _prompt):
-        return SimpleNamespace(modality="audio", processor_verified=True)
+    def process_audio_wav(self, content, _prompt):
+        output = {
+            "input_ids": torch.ones((1, 4), dtype=torch.int64),
+            "attention_mask": torch.ones((1, 4), dtype=torch.int64),
+            "mm_token_type_ids": torch.zeros((1, 4), dtype=torch.int64),
+            "input_features": torch.ones((1, 4, 8), dtype=torch.float32),
+            "input_features_mask": torch.ones((1, 4), dtype=torch.bool),
+        }
+        return _validated_bundle("audio", content, output, frozenset(output))
 
 
 class _Transcriber:

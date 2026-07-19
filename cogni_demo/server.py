@@ -3061,9 +3061,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
     def _revoke_general_web_authority(self) -> None:
         """Revoke the optional connector without holding server lifecycle locks."""
 
-        revoke_general_web = getattr(
-            self.workspace_service, "revoke_general_web", None
-        )
+        revoke_general_web = getattr(self.workspace_service, "revoke_general_web", None)
         if callable(revoke_general_web):
             revoke_general_web()
 
@@ -3836,9 +3834,12 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, payload)
                 return
             if path == "/api/workspace/web/search":
-                if not {"query", "online_opt_in"}.issubset(body) or not set(
-                    body
-                ) <= {"query", "limit", "online_opt_in", "request_id"}:
+                if not {"query", "online_opt_in"}.issubset(body) or not set(body) <= {
+                    "query",
+                    "limit",
+                    "online_opt_in",
+                    "request_id",
+                }:
                     raise WorkspaceCapabilityError(
                         "INVALID_BODY", "web search body fields are invalid"
                     )

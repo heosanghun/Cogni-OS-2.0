@@ -494,9 +494,7 @@ class _Workspace:
         }
         return {"search": search, "indexed": []} if index_in_akasicdb else search
 
-    def search_web(
-        self, query, *, limit=5, session_online_opt_in, request_id=None
-    ):
+    def search_web(self, query, *, limit=5, session_online_opt_in, request_id=None):
         request = {
             "query": query,
             "limit": limit,

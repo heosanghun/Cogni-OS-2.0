@@ -279,6 +279,7 @@ class StandardLibraryGeneralWebTransport:
             tls_context,
         )
         try:
+
             def send_request() -> None:
                 _set_connection_timeout(
                     connection,
@@ -392,8 +393,10 @@ def _resolve_public_addresses(
             break
         except Empty:
             continue
-    if not succeeded or isinstance(raw_addresses, (str, bytes)) or not isinstance(
-        raw_addresses, Sequence
+    if (
+        not succeeded
+        or isinstance(raw_addresses, (str, bytes))
+        or not isinstance(raw_addresses, Sequence)
     ):
         raise GeneralWebTransportError("official search DNS resolution failed")
     if not 1 <= len(raw_addresses) <= MAX_WEB_RESOLVED_ADDRESSES:
@@ -952,9 +955,7 @@ class GeneralWebSearchClient:
             dispatch()
             return True
 
-    def _claim_publication(
-        self, session: GeneralWebSearchSession, epoch: int
-    ) -> None:
+    def _claim_publication(self, session: GeneralWebSearchSession, epoch: int) -> None:
         with self._authority_lock:
             self._require_session_locked(session)
             if session._epoch != epoch or session._wire_epoch != epoch:

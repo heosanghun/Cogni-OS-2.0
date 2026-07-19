@@ -540,9 +540,7 @@ class TestGeneralWebSearch(unittest.TestCase):
             record[field] = reflected_value
             client = GeneralWebSearchClient(
                 _config(),
-                transport=FakeTransport(
-                    _json_response({"web": {"results": [record]}})
-                ),
+                transport=FakeTransport(_json_response({"web": {"results": [record]}})),
                 maximum_retries=0,
             )
             with self.subTest(field=field, reflected=reflected_value[:24]):
@@ -550,9 +548,7 @@ class TestGeneralWebSearch(unittest.TestCase):
                     client.search(
                         client.open_session(online_opt_in=True), "bounded search"
                     )
-                self.assertEqual(
-                    encoded.exception.code, "WEB_SEARCH_RESPONSE_INVALID"
-                )
+                self.assertEqual(encoded.exception.code, "WEB_SEARCH_RESPONSE_INVALID")
                 self.assertIsNone(encoded.exception.__cause__)
 
         too_deep_nonsecret = "%41"
@@ -648,7 +644,9 @@ class TestGeneralWebSearch(unittest.TestCase):
                     cancelled=lambda: False,
                 )
 
-    def test_standard_transport_rejects_nonpublic_dns_and_pins_public_tls_peer(self) -> None:
+    def test_standard_transport_rejects_nonpublic_dns_and_pins_public_tls_peer(
+        self,
+    ) -> None:
         valid_query = "q=bounded&count=1&safesearch=strict"
         for addresses in (
             ("127.0.0.1",),
@@ -667,8 +665,9 @@ class TestGeneralWebSearch(unittest.TestCase):
                 resolver=lambda _host, _port, answer=addresses: answer,
                 connection_factory=forbidden_factory,
             )
-            with self.subTest(addresses=addresses), self.assertRaises(
-                GeneralWebTransportError
+            with (
+                self.subTest(addresses=addresses),
+                self.assertRaises(GeneralWebTransportError),
             ):
                 transport.get(
                     host=BRAVE_SEARCH_API_HOST,
@@ -678,7 +677,7 @@ class TestGeneralWebSearch(unittest.TestCase):
                     timeout_seconds=1.0,
                     maximum_response_bytes=1024,
                     cancelled=lambda: False,
-                    authorize_dispatch=lambda dispatch: (dispatch() or True),
+                    authorize_dispatch=lambda dispatch: dispatch() or True,
                 )
             self.assertEqual(connections, [])
 
@@ -701,7 +700,7 @@ class TestGeneralWebSearch(unittest.TestCase):
             timeout_seconds=1.0,
             maximum_response_bytes=1024,
             cancelled=lambda: False,
-            authorize_dispatch=lambda dispatch: (dispatch() or True),
+            authorize_dispatch=lambda dispatch: dispatch() or True,
         )
         self.assertEqual(response.status, 200)
         self.assertEqual(captured[0][0], BRAVE_SEARCH_API_HOST)
@@ -911,9 +910,7 @@ class TestGeneralWebWorkspaceIntegration(unittest.TestCase):
             self.assertIsInstance(captured[0], WorkspaceCapabilityError)
             self.assertEqual(captured[0].code, "WEB_SEARCH_CANCELLED")
             self.assertIsNone(captured[0].__cause__)
-            self.assertEqual(
-                service.cancel_web_search("b" * 32)["state"], "not_found"
-            )
+            self.assertEqual(service.cancel_web_search("b" * 32)["state"], "not_found")
 
             service.shutdown()
             self.assertEqual(

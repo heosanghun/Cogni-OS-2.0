@@ -607,6 +607,8 @@ proposal-only Self-Harness를 설명한다.
 - [ ] `/project` 결과가 outputs 아래에만 있고 실행되지 않음을 확인
 - [ ] Self-Harness diff 화면에 적용·승인 버튼이 없음을 확인
 
+<!-- PDF_PAGE_BREAK -->
+
 ### 발표 금지 표현
 
 - “RTX 4090 인증 완료” — 해당 장치 반복시험 증거 없이는 금지
@@ -618,8 +620,6 @@ proposal-only Self-Harness를 설명한다.
   경로에 운영자 E2E validator가 있어도 독립 production-runner statement·같은 boundary의
   current raw production E2E 증거 없이는 제품 권한이 아님
 - “AGI·무한 진화 완성” — 검증되지 않은 주장
-
-<!-- PDF_PAGE_BREAK -->
 
 ## 17. 완료 판정
 

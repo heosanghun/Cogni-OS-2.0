@@ -35,6 +35,7 @@ from typing import Any, BinaryIO
 from urllib.parse import parse_qs, urlsplit
 import webbrowser
 
+from cogni_demo.general_web_search import GeneralWebSearchClient
 from cogni_demo.lens_api import LensApiClient
 from cogni_demo.protocol import (
     EVENT_SENTINEL,
@@ -3295,6 +3296,7 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             "/api/workspace/rag/query",
             "/api/workspace/lens/search",
             "/api/workspace/lens/search-and-index",
+            "/api/workspace/web/search",
             "/api/workspace/models/select",
             "/api/workspace/voice/transcribe",
             "/api/workspace/voice/synthesize",
@@ -3768,6 +3770,21 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 )
                 self._json(HTTPStatus.OK, payload)
                 return
+            if path == "/api/workspace/web/search":
+                if set(body) not in (
+                    {"query", "online_opt_in"},
+                    {"query", "limit", "online_opt_in"},
+                ):
+                    raise WorkspaceCapabilityError(
+                        "INVALID_BODY", "web search body fields are invalid"
+                    )
+                payload = workspace.search_web(
+                    body["query"],
+                    limit=body.get("limit", 5),
+                    session_online_opt_in=body["online_opt_in"],
+                )
+                self._json(HTTPStatus.OK, payload)
+                return
             if path == "/api/workspace/models/select":
                 if set(body) != {"model_id"}:
                     raise WorkspaceCapabilityError(
@@ -4078,6 +4095,7 @@ def _build_product_controls(
             akasicdb_path=os.environ.get("COGNI_OS_AKASICDB_DIR") or None,
             web_policy=web_policy_from_environment(os.environ),
             lens_client=LensApiClient.from_environment(os.environ),
+            general_web_client=GeneralWebSearchClient.from_environment(os.environ),
             answer_integration_schema=(
                 RETRIEVAL_EVIDENCE_SCHEMA
                 if AgentManager.RETRIEVAL_EVIDENCE_SCHEMA

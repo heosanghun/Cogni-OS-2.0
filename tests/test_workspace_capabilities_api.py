@@ -302,6 +302,7 @@ class _Workspace:
         ]
         self.queries: list[str] = []
         self.lens_queries: list[dict[str, object]] = []
+        self.web_queries: list[dict[str, object]] = []
         self.source_requests: list[tuple[str, int]] = []
         self.raise_source: WorkspaceCapabilityError | None = None
         self.source_payload: dict[str, object] | None = None
@@ -491,6 +492,25 @@ class _Workspace:
             "external_calls": 1,
         }
         return {"search": search, "indexed": []} if index_in_akasicdb else search
+
+    def search_web(self, query, *, limit=5, session_online_opt_in):
+        request = {
+            "query": query,
+            "limit": limit,
+            "session_online_opt_in": session_online_opt_in,
+        }
+        self.web_queries.append(request)
+        if session_online_opt_in is not True:
+            raise WorkspaceCapabilityError(
+                "WEB_SEARCH_SESSION_OPT_IN_REQUIRED", "private token must not leak"
+            )
+        return {
+            "provider": "Brave Search official API",
+            "query": query,
+            "count": 0,
+            "results": [],
+            "external_calls": 1,
+        }
 
 
 class TestWorkspaceHTTPAPI(unittest.TestCase):
@@ -799,6 +819,35 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
                 },
             ],
         )
+        status, payload = self._post(
+            "/api/workspace/web/search",
+            {"query": "bounded general search", "limit": 3, "online_opt_in": True},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["provider"], "Brave Search official API")
+        self.assertEqual(
+            self.workspace.web_queries,
+            [
+                {
+                    "query": "bounded general search",
+                    "limit": 3,
+                    "session_online_opt_in": True,
+                }
+            ],
+        )
+        status, payload = self._post(
+            "/api/workspace/web/search",
+            {"query": "must remain offline", "online_opt_in": False},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "WEB_SEARCH_SESSION_OPT_IN_REQUIRED")
+        self.assertNotIn("private", json.dumps(payload))
+        status, payload = self._post(
+            "/api/workspace/web/search",
+            {"query": "missing explicit consent"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "INVALID_BODY")
         status, payload = self._post(
             "/api/workspace/models/select", {"model_id": "unknown"}
         )

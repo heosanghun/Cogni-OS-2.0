@@ -39,6 +39,10 @@ from types import ModuleType
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from cogni_demo.general_web_search import (
+    GeneralWebSearchClient,
+    GeneralWebSearchError,
+)
 from cogni_demo.lens_api import (
     LensAkasicBridge,
     LensApiClient,
@@ -2413,6 +2417,7 @@ class WorkspaceCapabilityService:
         akasicdb_path: str | Path | None = None,
         web_policy: WebAccessPolicy | None = None,
         lens_client: LensApiClient | None = None,
+        general_web_client: GeneralWebSearchClient | None = None,
         answer_integration_schema: str | None = None,
     ) -> None:
         root = Path(project_root).resolve(strict=True)
@@ -2430,6 +2435,9 @@ class WorkspaceCapabilityService:
         }
         self.web_policy = web_policy or WebAccessPolicy()
         self.lens_client = lens_client or LensApiClient.from_environment({})
+        self.general_web_client = (
+            general_web_client or GeneralWebSearchClient.from_environment({})
+        )
         if answer_integration_schema not in (None, RAG_ANSWER_INTEGRATION_SCHEMA):
             raise ValueError("answer integration schema is not admitted")
         self.answer_integration_schema = answer_integration_schema
@@ -2681,11 +2689,20 @@ class WorkspaceCapabilityService:
             "lens_to_akasicdb": self.akasicdb is not None,
             "lens_index_lifetime": "process_memory_until_local_index_rebuild",
         }
+        general_web_connector = {
+            **self.general_web_client.capability_payload(),
+            "search_api": True,
+            "citation_links": True,
+            "answer_integration": False,
+            "rag_index_integration": False,
+            "result_urls_fetched": False,
+        }
         web_search.update(
             {
-                "execution": "official_lens_api_only",
+                "execution": "official_json_api_connectors_only",
                 "executor_implemented": True,
                 "official_lens_connector": lens_connector,
+                "general_web_connector": general_web_connector,
             }
         )
         for resource in ("lens_patent_search", "lens_scholarly_search"):
@@ -3759,6 +3776,33 @@ class WorkspaceCapabilityService:
             }
         except LensApiError as exc:
             raise WorkspaceCapabilityError(exc.code, str(exc)) from exc
+
+    def search_web(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        session_online_opt_in: bool,
+    ) -> dict[str, object]:
+        """Run one bounded official-JSON web search under a one-shot consent lease."""
+
+        if not isinstance(session_online_opt_in, bool):
+            raise WorkspaceCapabilityError(
+                "INVALID_WEB_SEARCH_OPT_IN",
+                "web search session opt-in must be boolean",
+            )
+        session = self.general_web_client.open_session(
+            online_opt_in=session_online_opt_in
+        )
+        try:
+            return self.general_web_client.search(
+                session, query, limit=limit
+            ).as_payload()
+        except GeneralWebSearchError as exc:
+            raise WorkspaceCapabilityError(exc.code, str(exc)) from exc
+        finally:
+            # Every loopback request receives only one network-authority lease.
+            session.revoke()
 
     def select_model(self, model_id: str) -> dict[str, object]:
         if not isinstance(model_id, str):

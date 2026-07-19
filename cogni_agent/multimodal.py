@@ -23,6 +23,8 @@ from cogni_os.artifacts import (
     verify_artifact_manifest,
 )
 
+from .model_trust import verify_instruction_tuned_e4b_snapshot
+
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_PIXELS = 16_000_000
@@ -362,12 +364,13 @@ class VerifiedGemma4MultimodalProcessor:
         try:
             manifest_digest_before = _sha256_file(manifest)
             before = verify_artifact_manifest(root, manifest)
-        except (OSError, ArtifactVerificationError) as exc:
+            verify_instruction_tuned_e4b_snapshot(before)
+        except (OSError, ArtifactVerificationError, ValueError) as exc:
             raise MultimodalPreprocessError(
                 "model artifacts failed verification"
             ) from exc
-        names = {path.name for path in before.files}
-        if "processor_config.json" not in names or "tokenizer.json" not in names:
+        relative_names = {name for name, _digest in before.digests}
+        if not {"processor_config.json", "tokenizer.json"}.issubset(relative_names):
             raise MultimodalPreprocessError(
                 "verified snapshot lacks processor artifacts"
             )
@@ -385,8 +388,9 @@ class VerifiedGemma4MultimodalProcessor:
             ) from exc
         try:
             after = verify_artifact_manifest(root, manifest)
+            verify_instruction_tuned_e4b_snapshot(after)
             manifest_digest_after = _sha256_file(manifest)
-        except (OSError, ArtifactVerificationError) as exc:
+        except (OSError, ArtifactVerificationError, ValueError) as exc:
             raise MultimodalPreprocessError(
                 "model artifacts changed during processor load"
             ) from exc

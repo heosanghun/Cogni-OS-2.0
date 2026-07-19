@@ -250,7 +250,10 @@ class TestBoundedVideoProcessor(unittest.TestCase):
                 root=root,
                 files=(processor_path, tokenizer_path),
                 identity=_IDENTITY,
-                digests=(("processor_config.json", "1" * 64),),
+                digests=(
+                    ("processor_config.json", "1" * 64),
+                    ("tokenizer.json", "2" * 64),
+                ),
             )
             with (
                 patch.dict(sys.modules, {"transformers": module}),
@@ -258,6 +261,9 @@ class TestBoundedVideoProcessor(unittest.TestCase):
                     "cogni_agent.multimodal.verify_artifact_manifest",
                     side_effect=(verified, verified),
                 ),
+                patch(
+                    "cogni_agent.multimodal.verify_instruction_tuned_e4b_snapshot"
+                ) as trusted_snapshot,
             ):
                 service = VerifiedGemma4MultimodalProcessor(root, manifest)
 
@@ -269,6 +275,54 @@ class TestBoundedVideoProcessor(unittest.TestCase):
         )
         self.assertEqual(service.artifact_identity, _IDENTITY)
         self.assertEqual(len(service.manifest_sha256), 64)
+        self.assertEqual(trusted_snapshot.call_count, 2)
+
+    def test_constructor_rejects_self_declared_untrusted_snapshot(self) -> None:
+        class Gemma4Processor:
+            pass
+
+        class _AutoProcessor:
+            @classmethod
+            def from_pretrained(cls, _root, **_kwargs):
+                return Gemma4Processor()
+
+        module = ModuleType("transformers")
+        module.AutoProcessor = _AutoProcessor
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "model"
+            root.mkdir()
+            processor_path = root / "processor_config.json"
+            tokenizer_path = root / "tokenizer.json"
+            processor_path.write_text("{}", encoding="utf-8")
+            tokenizer_path.write_text("{}", encoding="utf-8")
+            manifest = Path(directory) / "manifest.toml"
+            manifest.write_text("[files]\n", encoding="utf-8")
+            self_declared = VerifiedArtifactSet(
+                root=root,
+                files=(processor_path, tokenizer_path),
+                identity=ArtifactIdentity(
+                    family="gemma4",
+                    variant="e4b",
+                    role="instruction_tuned",
+                    source="google/gemma-4-E4B-it",
+                    revision="0" * 40,
+                ),
+                digests=(
+                    ("declared/processor_config.json", "1" * 64),
+                    ("declared/tokenizer.json", "2" * 64),
+                ),
+            )
+            with (
+                patch.dict(sys.modules, {"transformers": module}),
+                patch(
+                    "cogni_agent.multimodal.verify_artifact_manifest",
+                    return_value=self_declared,
+                ),
+                self.assertRaisesRegex(
+                    MultimodalPreprocessError, "model artifacts failed verification"
+                ),
+            ):
+                VerifiedGemma4MultimodalProcessor(root, manifest)
 
 
 if __name__ == "__main__":

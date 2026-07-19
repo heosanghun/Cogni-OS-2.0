@@ -1,8 +1,9 @@
-"""Disabled-by-default, lease-safe model runtime switching primitives.
+"""Opt-in, fail-closed model runtime switching primitives.
 
-This module deliberately has no server, API, UI, CUDA, or model-loading wiring.
-It defines the control-plane contract that a future integration must satisfy
-before discovered model candidates can become selectable.
+The controller deliberately has no CUDA query or loader-specific dependency.
+Production wiring supplies a manifest-bound runtime factory and an independent
+memory-release probe; tests can therefore exercise every safety transition
+without touching a physical device.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from hashlib import sha256
 import math
 import re
 import secrets
-from threading import Lock, RLock
+from threading import Event, Lock, RLock
 from time import monotonic
 from typing import Protocol
 
@@ -171,6 +172,85 @@ class LeaseReleaseEvidence:
             raise ValueError("lease release lacks worker-death proof")
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeUnloadEvidence:
+    """Worker-authored acknowledgement for one exact resident unload."""
+
+    binding_id: str
+    model_authority_digest: str
+    lease_epoch: int
+    acknowledged: bool
+
+    def __post_init__(self) -> None:
+        if _BINDING_ID.fullmatch(self.binding_id) is None:
+            raise ValueError("unload binding id is invalid")
+        if _SHA256.fullmatch(self.model_authority_digest) is None:
+            raise ValueError("unload model authority digest is invalid")
+        if (
+            not isinstance(self.lease_epoch, int)
+            or isinstance(self.lease_epoch, bool)
+            or self.lease_epoch <= 0
+        ):
+            raise ValueError("unload lease epoch must be positive")
+        if not isinstance(self.acknowledged, bool):
+            raise TypeError("unload acknowledgement must be bool")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryReleaseEvidence:
+    """Injected-probe evidence that the retired model no longer owns memory."""
+
+    binding_id: str
+    model_authority_digest: str
+    lease_epoch: int
+    released: bool
+
+    def __post_init__(self) -> None:
+        if _BINDING_ID.fullmatch(self.binding_id) is None:
+            raise ValueError("memory-release binding id is invalid")
+        if _SHA256.fullmatch(self.model_authority_digest) is None:
+            raise ValueError("memory-release model authority digest is invalid")
+        if (
+            not isinstance(self.lease_epoch, int)
+            or isinstance(self.lease_epoch, bool)
+            or self.lease_epoch <= 0
+        ):
+            raise ValueError("memory-release lease epoch must be positive")
+        if not isinstance(self.released, bool):
+            raise TypeError("memory-release result must be bool")
+
+
+class ModelSwitchCancellation:
+    """Thread-safe, monotonic cancellation token for one switch request."""
+
+    def __init__(self) -> None:
+        self._event = Event()
+        self._lock = Lock()
+        self._commit_claimed = False
+
+    def cancel(self) -> bool:
+        """Request cancellation unless the atomic commit boundary was claimed."""
+
+        with self._lock:
+            if self._commit_claimed:
+                return False
+            self._event.set()
+            return True
+
+    def claim_commit(self) -> bool:
+        """Atomically arbitrate cancellation against final publication."""
+
+        with self._lock:
+            if self._event.is_set():
+                return False
+            self._commit_claimed = True
+            return True
+
+    @property
+    def requested(self) -> bool:
+        return self._event.is_set()
+
+
 class ModelBindingPort(Protocol):
     def binding_evidence(self) -> RuntimeBindingEvidence: ...
 
@@ -184,7 +264,7 @@ class ResidentRuntimePort(ModelBindingPort, Protocol):
 
     def start(self) -> None: ...
 
-    def stop(self, timeout_seconds: float) -> None: ...
+    def stop(self, timeout_seconds: float) -> RuntimeUnloadEvidence: ...
 
     def healthcheck(self, timeout_seconds: float) -> RuntimeHealthEvidence: ...
 
@@ -200,6 +280,15 @@ class LeaseAuthorityPort(Protocol):
     def max_vram_bytes(self) -> int: ...
 
     def release_evidence(self, lease: GPULease) -> LeaseReleaseEvidence | None: ...
+
+
+class MemoryReleaseProbePort(Protocol):
+    def verify_release(
+        self,
+        bundle: ActiveRuntimeBundle,
+        unload: RuntimeUnloadEvidence,
+        timeout_seconds: float,
+    ) -> MemoryReleaseEvidence: ...
 
 
 class RuntimeBundleFactoryPort(Protocol):
@@ -440,7 +529,7 @@ class _MutableTransaction:
 
 
 class ModelSwitchController:
-    """Synchronous switch transaction; intentionally disabled by default."""
+    """Synchronous, single-flight switch transaction; disabled by default."""
 
     def __init__(
         self,
@@ -449,6 +538,7 @@ class ModelSwitchController:
         maintenance: ModelSwitchMaintenancePort,
         *,
         enabled: bool = False,
+        memory_release_probe: MemoryReleaseProbePort | None = None,
         clock=monotonic,
     ) -> None:
         if not isinstance(slot, AtomicRuntimeSlot):
@@ -457,10 +547,19 @@ class ModelSwitchController:
             raise TypeError("enabled must be bool")
         if not callable(clock):
             raise TypeError("clock must be callable")
+        if memory_release_probe is not None and not callable(
+            getattr(memory_release_probe, "verify_release", None)
+        ):
+            raise TypeError("memory_release_probe must implement verify_release")
+        if enabled and memory_release_probe is None:
+            raise ValueError(
+                "enabled model switching requires an injected memory-release probe"
+            )
         self.slot = slot
         self.factory = factory
         self.maintenance = maintenance
         self.enabled = enabled
+        self.memory_release_probe = memory_release_probe
         self._clock = clock
         self._run_lock = Lock()
         self._state_lock = RLock()
@@ -476,20 +575,27 @@ class ModelSwitchController:
         *,
         drain_timeout_seconds: float = 30.0,
         stop_timeout_seconds: float = 10.0,
+        memory_timeout_seconds: float = 10.0,
         health_timeout_seconds: float = 30.0,
+        cancellation: ModelSwitchCancellation | None = None,
     ) -> ModelSwitchSnapshot:
         if not self.enabled:
             raise ModelSwitchDisabledError(
-                "model switching remains disabled until server integration"
+                "model switching is not explicitly enabled for this runtime"
             )
         if not self._run_lock.acquire(blocking=False):
             raise ModelSwitchBusyError("another model switch is active")
         try:
             self._require_timeout(drain_timeout_seconds, "drain timeout")
             self._require_timeout(stop_timeout_seconds, "stop timeout")
+            self._require_timeout(memory_timeout_seconds, "memory timeout")
             self._require_timeout(health_timeout_seconds, "health timeout")
             if not isinstance(candidate, VerifiedModelSwitchDescriptor):
                 raise TypeError("candidate must be VerifiedModelSwitchDescriptor")
+            if cancellation is not None and not isinstance(
+                cancellation, ModelSwitchCancellation
+            ):
+                raise TypeError("cancellation must be ModelSwitchCancellation or None")
 
             source_slot = self.slot.snapshot()
             source = source_slot.bundle
@@ -500,31 +606,43 @@ class ModelSwitchController:
 
             # Fact-book, validator, voice, harness and resident bindings are all
             # checked before admission is closed or either worker is touched.
-            prepared = self.factory.build(
-                candidate, source.lease_authority, source.lease_profile
-            )
+            try:
+                prepared = self.factory.build(
+                    candidate, source.lease_authority, source.lease_profile
+                )
+            except Exception:
+                # Factory diagnostics may contain host paths or loader secrets.
+                # The public preflight contract exposes only a stable code.
+                raise RuntimeBundleIncompleteError(
+                    "candidate runtime factory failed"
+                ) from None
             self._validate_prepared_bundle(prepared, candidate, source)
 
             transaction = self._begin(source.descriptor, candidate)
             source_retired = False
             candidate_started = False
+            admission_closed = False
             committed_slot: RuntimeSlotSnapshot | None = None
             source_epoch_floor = source.lease_authority.latest_epoch
             try:
+                self._check_cancelled(cancellation)
                 self._call(
                     "ADMISSION_CLOSE_FAILED",
                     self.maintenance.close_admission,
                     transaction.transaction_id,
                 )
+                admission_closed = True
                 self._transition(ModelSwitchState.DRAINING)
+                drain_deadline = self._deadline_after(float(drain_timeout_seconds))
                 drained = self._call(
                     "DRAIN_FAILED",
                     self.maintenance.wait_for_drain,
                     transaction.transaction_id,
-                    float(drain_timeout_seconds),
+                    self._remaining(drain_deadline, "DRAIN_TIMEOUT"),
                 )
-                if drained is not True:
+                if drained is not True or self._expired(drain_deadline):
                     raise _TransactionFailure("DRAIN_TIMEOUT")
+                self._check_cancelled(cancellation)
 
                 self._transition(ModelSwitchState.CHECKPOINTING)
                 self._call(
@@ -534,6 +652,7 @@ class ModelSwitchController:
                     source.descriptor,
                     candidate,
                 )
+                self._check_cancelled(cancellation)
 
                 self._transition(ModelSwitchState.UNLOADING_OLD)
                 observed_slot = self.slot.snapshot()
@@ -544,9 +663,15 @@ class ModelSwitchController:
                     raise _TransactionFailure("ATOMIC_RUNTIME_CHANGED")
                 self._prove_source_consistent(source)
                 old_lease = source.runtime.gpu_lease
+                if not isinstance(old_lease, GPULease):
+                    raise _TransactionFailure("SOURCE_WORKER_NOT_RUNNING")
                 unload_error: Exception | None = None
+                unload: RuntimeUnloadEvidence | None = None
+                stop_deadline = self._deadline_after(float(stop_timeout_seconds))
                 try:
-                    source.runtime.stop(float(stop_timeout_seconds))
+                    unload = source.runtime.stop(
+                        self._remaining(stop_deadline, "OLD_UNLOAD_TIMEOUT")
+                    )
                 except Exception as error:
                     unload_error = error
                 # A stop exception is not liveness evidence.  Prove retirement
@@ -556,24 +681,43 @@ class ModelSwitchController:
                 source_retired = True
                 if unload_error is not None:
                     raise _TransactionFailure("OLD_UNLOAD_FAILED") from unload_error
+                if self._expired(stop_deadline):
+                    raise _TransactionFailure("OLD_UNLOAD_TIMEOUT")
+                self._prove_unload_ack(source, old_lease, unload)
+                self._prove_memory_released(
+                    source,
+                    unload,
+                    float(memory_timeout_seconds),
+                    "SOURCE_MEMORY_RELEASE_UNPROVEN",
+                )
+                self._check_cancelled(cancellation)
 
                 self._transition(ModelSwitchState.LOADING_CANDIDATE)
                 self._require_unleased(source.lease_authority)
                 self._call("CANDIDATE_START_FAILED", prepared.runtime.start)
                 candidate_started = True
                 candidate_lease = self._prove_running(prepared, source_epoch_floor)
+                self._check_cancelled(cancellation)
 
                 self._transition(ModelSwitchState.HEALTHCHECKING)
+                health_deadline = self._deadline_after(float(health_timeout_seconds))
                 health = self._call(
                     "CANDIDATE_HEALTHCHECK_FAILED",
                     prepared.runtime.healthcheck,
-                    float(health_timeout_seconds),
+                    self._remaining(health_deadline, "CANDIDATE_HEALTHCHECK_TIMEOUT"),
                 )
+                if self._expired(health_deadline):
+                    raise _TransactionFailure("CANDIDATE_HEALTHCHECK_TIMEOUT")
                 self._prove_healthy(prepared, candidate_lease, health)
+                self._check_cancelled(cancellation)
 
                 self._transition(ModelSwitchState.COMMITTING)
                 prepared.validate_complete()
+                self._claim_commit(cancellation)
                 committed_slot = self.slot.compare_and_swap(source_slot, prepared)
+                # The cancellation token's commit claim and this CAS form one
+                # publication boundary: later cancellation is rejected, while
+                # a pre-existing request cannot reach the CAS.
                 self._call(
                     "ADMISSION_OPEN_FAILED",
                     self.maintenance.open_admission,
@@ -597,9 +741,11 @@ class ModelSwitchController:
                     source_slot=source_slot,
                     committed_slot=committed_slot,
                     source_retired=source_retired,
+                    admission_closed=admission_closed,
                     candidate=prepared,
                     candidate_started=candidate_started,
                     stop_timeout_seconds=float(stop_timeout_seconds),
+                    memory_timeout_seconds=float(memory_timeout_seconds),
                     health_timeout_seconds=float(health_timeout_seconds),
                 )
         finally:
@@ -614,6 +760,40 @@ class ModelSwitchController:
             or not 0.0 < float(value) <= MAX_SWITCH_TIMEOUT_SECONDS
         ):
             raise ValueError(f"{field} must be finite and bounded")
+
+    def _deadline_after(self, timeout_seconds: float) -> float:
+        now = float(self._clock())
+        if not math.isfinite(now):
+            raise _TransactionFailure("MODEL_SWITCH_CLOCK_INVALID")
+        deadline = now + timeout_seconds
+        if not math.isfinite(deadline):
+            raise _TransactionFailure("MODEL_SWITCH_CLOCK_INVALID")
+        return deadline
+
+    def _remaining(self, deadline: float, code: str) -> float:
+        now = float(self._clock())
+        if not math.isfinite(now):
+            raise _TransactionFailure("MODEL_SWITCH_CLOCK_INVALID")
+        remaining = deadline - now
+        if remaining <= 0.0:
+            raise _TransactionFailure(code)
+        return remaining
+
+    def _expired(self, deadline: float) -> bool:
+        now = float(self._clock())
+        if not math.isfinite(now):
+            raise _TransactionFailure("MODEL_SWITCH_CLOCK_INVALID")
+        return now >= deadline
+
+    @staticmethod
+    def _check_cancelled(cancellation: ModelSwitchCancellation | None) -> None:
+        if cancellation is not None and cancellation.requested:
+            raise _TransactionFailure("MODEL_SWITCH_CANCELLED")
+
+    @staticmethod
+    def _claim_commit(cancellation: ModelSwitchCancellation | None) -> None:
+        if cancellation is not None and not cancellation.claim_commit():
+            raise _TransactionFailure("MODEL_SWITCH_CANCELLED")
 
     def _begin(
         self,
@@ -688,16 +868,15 @@ class ModelSwitchController:
         alive = bundle.runtime.worker_alive
         lease = bundle.runtime.gpu_lease
         active = bundle.lease_authority.active
-        if alive:
-            if lease is None or active != lease:
-                raise RuntimeBundleIncompleteError(
-                    "active worker lacks its exact resident lease"
-                )
-            cls._prove_lease_profile(lease, bundle.lease_profile)
-        elif lease is not None or active is not None:
+        if alive is not True:
             raise RuntimeBundleIncompleteError(
-                "inactive worker has unretired lease authority"
+                "published resident worker is unavailable"
             )
+        if lease is None or active != lease:
+            raise RuntimeBundleIncompleteError(
+                "active worker lacks its exact resident lease"
+            )
+        cls._prove_lease_profile(lease, bundle.lease_profile)
 
     @staticmethod
     def _prove_lease_profile(
@@ -730,6 +909,52 @@ class ModelSwitchController:
             or evidence.worker_death_confirmed is not True
         ):
             raise _TransactionFailure("LEASE_RELEASE_UNPROVEN")
+
+    @staticmethod
+    def _prove_unload_ack(
+        bundle: ActiveRuntimeBundle,
+        prior_lease: GPULease,
+        unload: RuntimeUnloadEvidence | None,
+    ) -> None:
+        if (
+            not isinstance(unload, RuntimeUnloadEvidence)
+            or unload.acknowledged is not True
+            or unload.binding_id != bundle.binding_id
+            or unload.model_authority_digest != bundle.descriptor.authority_digest
+            or unload.lease_epoch != prior_lease.epoch
+        ):
+            raise _TransactionFailure("UNLOAD_ACK_UNPROVEN")
+
+    def _prove_memory_released(
+        self,
+        bundle: ActiveRuntimeBundle,
+        unload: RuntimeUnloadEvidence | None,
+        timeout_seconds: float,
+        failure_code: str,
+    ) -> None:
+        if not isinstance(unload, RuntimeUnloadEvidence):
+            raise _TransactionFailure("UNLOAD_ACK_UNPROVEN")
+        probe = self.memory_release_probe
+        if probe is None:
+            raise _TransactionFailure("MEMORY_RELEASE_PROBE_MISSING")
+        deadline = self._deadline_after(timeout_seconds)
+        evidence = self._call(
+            "MEMORY_RELEASE_PROBE_FAILED",
+            probe.verify_release,
+            bundle,
+            unload,
+            self._remaining(deadline, "MEMORY_RELEASE_PROBE_TIMEOUT"),
+        )
+        if self._expired(deadline):
+            raise _TransactionFailure("MEMORY_RELEASE_PROBE_TIMEOUT")
+        if (
+            not isinstance(evidence, MemoryReleaseEvidence)
+            or evidence.released is not True
+            or evidence.binding_id != bundle.binding_id
+            or evidence.model_authority_digest != bundle.descriptor.authority_digest
+            or evidence.lease_epoch != unload.lease_epoch
+        ):
+            raise _TransactionFailure(failure_code)
 
     @staticmethod
     def _require_unleased(authority: LeaseAuthorityPort) -> None:
@@ -772,9 +997,11 @@ class ModelSwitchController:
         source_slot: RuntimeSlotSnapshot,
         committed_slot: RuntimeSlotSnapshot | None,
         source_retired: bool,
+        admission_closed: bool,
         candidate: ActiveRuntimeBundle,
         candidate_started: bool,
         stop_timeout_seconds: float,
+        memory_timeout_seconds: float,
         health_timeout_seconds: float,
     ) -> ModelSwitchSnapshot:
         with self._state_lock:
@@ -785,6 +1012,13 @@ class ModelSwitchController:
             "WORKER_DEATH_UNPROVEN",
             "LEASE_RELEASE_UNPROVEN",
             "GPU_LEASE_NOT_RELEASED",
+            "UNLOAD_ACK_UNPROVEN",
+            "SOURCE_MEMORY_RELEASE_UNPROVEN",
+            "MEMORY_RELEASE_PROBE_FAILED",
+            "MEMORY_RELEASE_PROBE_TIMEOUT",
+            "MEMORY_RELEASE_PROBE_MISSING",
+            "ADMISSION_CLOSE_FAILED",
+            "SOURCE_WORKER_NOT_RUNNING",
         }:
             return self._safe_mode(failure.code)
         restored: ActiveRuntimeBundle | None = None
@@ -792,12 +1026,24 @@ class ModelSwitchController:
         try:
             candidate_lease = candidate.runtime.gpu_lease
             if candidate_started or candidate.runtime.worker_alive or candidate_lease:
-                self._call(
+                if not isinstance(candidate_lease, GPULease):
+                    raise _TransactionFailure("CANDIDATE_LEASE_UNPROVEN")
+                stop_deadline = self._deadline_after(stop_timeout_seconds)
+                candidate_unload = self._call(
                     "CANDIDATE_RETIRE_FAILED",
                     candidate.runtime.stop,
-                    stop_timeout_seconds,
+                    self._remaining(stop_deadline, "CANDIDATE_RETIRE_TIMEOUT"),
                 )
+                if self._expired(stop_deadline):
+                    raise _TransactionFailure("CANDIDATE_RETIRE_TIMEOUT")
                 self._prove_retired(candidate, candidate_lease)
+                self._prove_unload_ack(candidate, candidate_lease, candidate_unload)
+                self._prove_memory_released(
+                    candidate,
+                    candidate_unload,
+                    memory_timeout_seconds,
+                    "CANDIDATE_MEMORY_RELEASE_UNPROVEN",
+                )
 
             if failure.code in {
                 "ATOMIC_RUNTIME_CHANGED",
@@ -807,11 +1053,12 @@ class ModelSwitchController:
 
             if not source_retired:
                 self._prove_source_consistent(source_slot.bundle)
-                self._call(
-                    "ADMISSION_RESTORE_FAILED",
-                    self.maintenance.open_admission,
-                    self._transaction_id(),
-                )
+                if admission_closed:
+                    self._call(
+                        "ADMISSION_RESTORE_FAILED",
+                        self.maintenance.open_admission,
+                        self._transaction_id(),
+                    )
                 self._transition(ModelSwitchState.ROLLED_BACK)
                 return self._snapshot_required()
 
@@ -887,6 +1134,8 @@ __all__ = [
     "AtomicRuntimeCommitError",
     "AtomicRuntimeSlot",
     "LeaseReleaseEvidence",
+    "MemoryReleaseEvidence",
+    "ModelSwitchCancellation",
     "ModelSwitchBusyError",
     "ModelSwitchController",
     "ModelSwitchDisabledError",
@@ -897,6 +1146,7 @@ __all__ = [
     "RuntimeBindingEvidence",
     "RuntimeBundleIncompleteError",
     "RuntimeHealthEvidence",
+    "RuntimeUnloadEvidence",
     "StableResidentLeaseAuthority",
     "VerifiedModelSwitchDescriptor",
 ]

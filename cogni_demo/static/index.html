@@ -138,9 +138,9 @@
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A3.5 3.5 0 0 1 7.5 2H20v16H7.5A3.5 3.5 0 0 0 4 21.5Zm0 0v16M8 7h8m-8 4h8"/></svg>
                     <span>로컬 RAG</span><small id="agent-rag-status">확인 중</small>
                   </button>
-                  <button class="composer-tool-button" type="button" data-action="workspace-web-search" aria-controls="agent-lens-search-drawer" aria-expanded="false" disabled aria-label="Lens 특허·논문 검색, 정책 확인 중" title="공식 Lens API 실행기와 명시적 온라인 정책이 모두 확인되어야 활성화됩니다.">
+                  <button class="composer-tool-button" type="button" data-action="workspace-web-search" aria-controls="agent-lens-search-drawer" aria-expanded="false" disabled aria-label="외부 검색, 정책 확인 중" title="검증된 공식 API 실행기와 명시적 온라인 정책이 확인되어야 활성화됩니다.">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16.5 16.5 4 4M4 11h14M11 4a11 11 0 0 1 0 14M11 4a11 11 0 0 0 0 14"/></svg>
-                    <span>Lens 검색</span><small id="agent-web-status">확인 중</small>
+                    <span>외부 검색</span><small id="agent-web-status">확인 중</small>
                   </button>
                 </div>
 
@@ -180,9 +180,24 @@
 
               <section class="lens-search-drawer" id="agent-lens-search-drawer" aria-labelledby="agent-lens-search-title" hidden>
                 <div class="lens-search-heading">
-                  <div><small>OFFICIAL API · OPT-IN</small><strong id="agent-lens-search-title">Lens.org 특허·논문 검색</strong></div>
-                  <button class="micro-button" type="button" data-action="workspace-web-close" aria-label="Lens 검색 닫기">닫기</button>
+                  <div><small>OFFICIAL JSON API · PER-REQUEST OPT-IN</small><strong id="agent-lens-search-title">검증된 외부 검색</strong></div>
+                  <button class="micro-button" type="button" data-action="workspace-web-close" aria-label="외부 검색 닫기">닫기</button>
                 </div>
+                <section class="general-web-search-panel" aria-labelledby="agent-general-web-title">
+                  <div class="connector-subheading"><small>GENERAL WEB · BRAVE</small><strong id="agent-general-web-title">일반 웹 검색</strong></div>
+                  <form class="lens-search-form" id="agent-general-web-form">
+                    <label class="lens-query-field"><span>검색어</span><input id="agent-general-web-query" name="query" type="search" minlength="1" maxlength="512" autocomplete="off" spellcheck="false" placeholder="예: on-device AI safety research" required></label>
+                    <label><span>결과 수</span><select id="agent-general-web-limit" name="limit"><option value="5">5</option><option value="10">10</option></select></label>
+                    <label class="lens-index-option general-web-opt-in"><input id="agent-general-web-opt-in" type="checkbox" disabled><span>이번 요청의 외부 HTTPS 호출에 명시적으로 동의</span></label>
+                    <button class="primary-button compact-button" id="agent-general-web-submit" type="button" data-action="workspace-general-web-submit" disabled><span>웹 검색</span></button>
+                    <button class="micro-button danger" id="agent-general-web-cancel" type="button" data-action="workspace-general-web-cancel" disabled>검색 취소</button>
+                  </form>
+                  <p class="lens-search-boundary">기본값은 오프라인이며 동의 체크는 요청 후 즉시 해제됩니다. 고정된 <code>api.search.brave.com</code> 공식 JSON API만 호출하고, 공개 IP로 검증·고정된 TLS 연결만 허용합니다. 결과 링크는 자동으로 가져오지 않습니다.</p>
+                  <p class="lens-search-status" id="agent-general-web-status" role="status" aria-live="polite">검색 대기 · 외부 호출 동의 필요</p>
+                  <ol class="lens-search-results" id="agent-general-web-results" aria-label="일반 웹 검색 결과"></ol>
+                </section>
+                <div class="connector-divider" aria-hidden="true"></div>
+                <div class="connector-subheading"><small>SPECIALIZED EVIDENCE · LENS</small><strong>Lens.org 특허·논문 검색</strong></div>
                 <form class="lens-search-form" id="agent-lens-search-form">
                   <label><span>자료 유형</span><select id="agent-lens-kind" name="kind"><option value="patent">특허</option><option value="scholarly">논문</option></select></label>
                   <label class="lens-query-field"><span>검색어</span><input id="agent-lens-query" name="query" type="search" minlength="1" maxlength="512" autocomplete="off" spellcheck="false" placeholder="예: deep equilibrium model" required></label>

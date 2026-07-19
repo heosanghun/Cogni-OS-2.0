@@ -42,6 +42,7 @@ from urllib.parse import urlsplit
 from cogni_demo.general_web_search import (
     GeneralWebSearchClient,
     GeneralWebSearchError,
+    GeneralWebSearchSession,
 )
 from cogni_demo.lens_api import (
     LensAkasicBridge,
@@ -87,6 +88,8 @@ RAG_EMBEDDING_PROFILE = "stable_sha256_lexical_sketch_v1"
 # Explicit in-process wiring contract; not cryptographic attestation.
 RAG_ANSWER_INTEGRATION_SCHEMA = "cogni.agent.retrieval-evidence.v1"
 MAX_WEB_ALLOWLIST_HOSTS = 32
+MAX_INFLIGHT_WEB_SEARCHES = 8
+_WEB_SEARCH_REQUEST_ID_RE = re.compile(r"[a-f0-9]{32}\Z")
 MAX_LOCAL_MODEL_REGISTRY_ENTRIES = 64
 MAX_LOCAL_MODEL_CANDIDATES = 16
 MAX_LOCAL_MODEL_MANIFEST_BYTES = 128 * 1024
@@ -2456,6 +2459,7 @@ class WorkspaceCapabilityService:
             self.catalog_path, self.storage_root
         )
         self._lock = RLock()
+        self._web_sessions: dict[str, GeneralWebSearchSession] = {}
         self._source_snapshots: dict[tuple[str, int], IndexedSourceSnapshot] = {}
         self._source_generation = 0
         self.akasicdb: AkasicDBAdapter | None = None
@@ -3783,6 +3787,7 @@ class WorkspaceCapabilityService:
         *,
         limit: int = 5,
         session_online_opt_in: bool,
+        request_id: str | None = None,
     ) -> dict[str, object]:
         """Run one bounded official-JSON web search under a one-shot consent lease."""
 
@@ -3791,18 +3796,69 @@ class WorkspaceCapabilityService:
                 "INVALID_WEB_SEARCH_OPT_IN",
                 "web search session opt-in must be boolean",
             )
-        session = self.general_web_client.open_session(
-            online_opt_in=session_online_opt_in
-        )
+        selected_request_id = _web_search_request_id(request_id)
+        with self._lock:
+            if selected_request_id in self._web_sessions:
+                raise WorkspaceCapabilityError(
+                    "WEB_SEARCH_REQUEST_CONFLICT",
+                    "web search request identifier is already active",
+                )
+            if len(self._web_sessions) >= MAX_INFLIGHT_WEB_SEARCHES:
+                raise WorkspaceCapabilityError(
+                    "WEB_SEARCH_BUSY",
+                    "the bounded web search registry is full",
+                )
+            session = self.general_web_client.open_session(
+                online_opt_in=session_online_opt_in
+            )
+            self._web_sessions[selected_request_id] = session
         try:
-            return self.general_web_client.search(
+            payload = self.general_web_client.search(
                 session, query, limit=limit
             ).as_payload()
+            return {**payload, "request_id": selected_request_id}
         except GeneralWebSearchError as exc:
-            raise WorkspaceCapabilityError(exc.code, str(exc)) from exc
+            raise WorkspaceCapabilityError(exc.code, str(exc)) from None
         finally:
             # Every loopback request receives only one network-authority lease.
             session.revoke()
+            with self._lock:
+                if self._web_sessions.get(selected_request_id) is session:
+                    self._web_sessions.pop(selected_request_id, None)
+
+    def cancel_web_search(self, request_id: str) -> dict[str, object]:
+        """Cancel one in-flight lease; publication and cancel share its fence."""
+
+        selected_request_id = _web_search_request_id(request_id)
+        with self._lock:
+            session = self._web_sessions.get(selected_request_id)
+        if session is None:
+            return {
+                "request_id": selected_request_id,
+                "cancelled": False,
+                "state": "not_found",
+            }
+        cancelled = session.cancel()
+        return {
+            "request_id": selected_request_id,
+            "cancelled": cancelled,
+            "state": session.state,
+        }
+
+    def revoke_general_web(self) -> bool:
+        """Close global network authority and abort every registered lease."""
+
+        revoked = self.general_web_client.revoke()
+        with self._lock:
+            sessions = tuple(self._web_sessions.values())
+        for session in sessions:
+            session.revoke()
+        return revoked
+
+    def shutdown(self) -> None:
+        """Revoke optional network authority during server teardown."""
+
+        self.revoke_general_web()
 
     def select_model(self, model_id: str) -> dict[str, object]:
         if not isinstance(model_id, str):
@@ -3819,6 +3875,17 @@ class WorkspaceCapabilityService:
         raise WorkspaceCapabilityError(
             "MODEL_NOT_VERIFIED", "requested model is not in the verified registry"
         )
+
+
+def _web_search_request_id(value: str | None) -> str:
+    if value is None:
+        return secrets.token_hex(16)
+    if not isinstance(value, str) or _WEB_SEARCH_REQUEST_ID_RE.fullmatch(value) is None:
+        raise WorkspaceCapabilityError(
+            "INVALID_WEB_SEARCH_REQUEST_ID",
+            "web search request identifier is invalid",
+        )
+    return value
 
 
 def web_policy_from_environment(environment: Mapping[str, str]) -> WebAccessPolicy:

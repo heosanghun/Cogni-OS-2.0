@@ -205,6 +205,8 @@ class TestCogniBoardUI(unittest.TestCase):
             "/api/workspace/rag/reindex",
             "/api/workspace/lens/search",
             "/api/workspace/lens/search-and-index",
+            "/api/workspace/web/search",
+            "/api/workspace/web/cancel",
             "/api/workspace/models/select",
         ):
             with self.subTest(endpoint=endpoint):
@@ -225,6 +227,11 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("input.maxLength =", script)
         self.assertIn('lens.state !== "ready"', script)
         self.assertIn("official_lens_connector", script)
+        self.assertIn("general_web_connector", script)
+        self.assertIn("lensCalls + generalWebCalls", script)
+        self.assertIn("createGeneralWebRequestId", script)
+        self.assertIn("searchGeneralWeb", script)
+        self.assertIn("cancelGeneralWebSearch", script)
         self.assertIn("renderLensSearchResults", script)
         self.assertIn("verifiedLensUrl", script)
         self.assertIn("LENS_TERMS_REQUIRED", script)
@@ -232,6 +239,9 @@ class TestCogniBoardUI(unittest.TestCase):
         self.assertIn("Data Sourced from The Lens", markup)
         self.assertIn("www.lens.org", markup)
         self.assertIn("about.lens.org/lens-api-terms-of-use/", markup)
+        self.assertIn('id="agent-general-web-opt-in"', markup)
+        self.assertIn('data-action="workspace-general-web-cancel"', markup)
+        self.assertIn("요청 후 즉시 해제", markup)
         self.assertIn("앱 밖의", markup)
         self.assertIn("외부 사이트", script)
         self.assertIn("microphone.runtime_audio_input === true", script)
@@ -987,7 +997,7 @@ class TestCogniBoardUI(unittest.TestCase):
         )
         self.assertIn('setText(\n    "#mission-external-calls",', script)
         lens_start = script.index("async function searchLensOfficialApi")
-        lens_end = script.index("async function selectWorkspaceModel", lens_start)
+        lens_end = script.index("function createGeneralWebRequestId", lens_start)
         lens_flow = script[lens_start:lens_end]
         self.assertEqual(
             lens_flow.count("await refreshWorkspaceCapabilityDisclosure()"), 1

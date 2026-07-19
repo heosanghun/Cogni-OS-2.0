@@ -1622,6 +1622,37 @@ button:disabled {
   font-size: 0.83rem;
 }
 
+.connector-subheading {
+  display: grid;
+  gap: 2px;
+  margin: 8px 0;
+}
+
+.connector-subheading small {
+  color: var(--cyan);
+  font-size: 0.48rem;
+  font-weight: 820;
+  letter-spacing: 0.1em;
+}
+
+.connector-subheading strong {
+  color: var(--text-soft);
+  font-size: 0.72rem;
+}
+
+.connector-divider {
+  height: 1px;
+  margin: 14px 0 10px;
+  background: linear-gradient(90deg, transparent, var(--line-strong), transparent);
+}
+
+.general-web-search-panel {
+  padding: 9px;
+  border: 1px solid rgba(126, 239, 175, 0.2);
+  border-radius: 10px;
+  background: rgba(6, 23, 32, 0.58);
+}
+
 .lens-search-form {
   flex-wrap: wrap;
   gap: 8px;
@@ -1682,6 +1713,10 @@ button:disabled {
   color: var(--dim);
 }
 
+.general-web-opt-in {
+  flex: 1 1 230px;
+}
+
 .lens-search-boundary,
 .lens-search-attribution,
 .lens-search-status {
@@ -1715,7 +1750,8 @@ button:disabled {
   scrollbar-gutter: stable;
 }
 
-.lens-result-card {
+.lens-result-card,
+.general-web-result-card {
   display: grid;
   gap: 5px;
   padding: 9px 10px;
@@ -1724,20 +1760,23 @@ button:disabled {
   background: rgba(12, 28, 45, 0.78);
 }
 
-.lens-result-card > div {
+.lens-result-card > div,
+.general-web-result-card > div {
   display: flex;
   align-items: start;
   justify-content: space-between;
   gap: 10px;
 }
 
-.lens-result-card strong {
+.lens-result-card strong,
+.general-web-result-card strong {
   color: var(--text);
   font-size: 0.67rem;
   line-height: 1.45;
 }
 
-.lens-result-card a {
+.lens-result-card a,
+.general-web-result-card a {
   flex: 0 0 auto;
   color: var(--cyan);
   font-size: 0.56rem;
@@ -1745,14 +1784,17 @@ button:disabled {
 }
 
 .lens-result-card p,
-.lens-result-card small {
+.lens-result-card small,
+.general-web-result-card p,
+.general-web-result-card small {
   margin: 0;
   color: var(--muted);
   font-size: 0.56rem;
   line-height: 1.5;
 }
 
-.lens-result-card small {
+.lens-result-card small,
+.general-web-result-card small {
   color: var(--dim);
 }
 

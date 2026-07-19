@@ -578,13 +578,19 @@ def _shutdown_product_components(
     manager: object,
     evolution_manager: object | None,
     agent_manager: object | None,
+    workspace_service: object | None = None,
     *,
     primary: BaseException | None = None,
 ) -> None:
     """Shut down validation, evolution, and resident-model owners independently."""
 
     callbacks: list[Callable[[], object]] = []
-    for component in (manager, evolution_manager, agent_manager):
+    for component in (
+        workspace_service,
+        manager,
+        evolution_manager,
+        agent_manager,
+    ):
         shutdown = getattr(component, "shutdown", None)
         if callable(shutdown):
             callbacks.append(shutdown)
@@ -2994,6 +3000,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 self.manager,
                 self.evolution_manager,
                 self.agent_manager,
+                self.workspace_service,
             )
         except BaseException as error:
             failure = error
@@ -3297,6 +3304,7 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
             "/api/workspace/lens/search",
             "/api/workspace/lens/search-and-index",
             "/api/workspace/web/search",
+            "/api/workspace/web/cancel",
             "/api/workspace/models/select",
             "/api/workspace/voice/transcribe",
             "/api/workspace/voice/synthesize",
@@ -3771,18 +3779,27 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, payload)
                 return
             if path == "/api/workspace/web/search":
-                if set(body) not in (
-                    {"query", "online_opt_in"},
-                    {"query", "limit", "online_opt_in"},
-                ):
+                if not {"query", "online_opt_in"}.issubset(body) or not set(
+                    body
+                ) <= {"query", "limit", "online_opt_in", "request_id"}:
                     raise WorkspaceCapabilityError(
                         "INVALID_BODY", "web search body fields are invalid"
                     )
-                payload = workspace.search_web(
-                    body["query"],
-                    limit=body.get("limit", 5),
-                    session_online_opt_in=body["online_opt_in"],
-                )
+                search_kwargs: dict[str, object] = {
+                    "limit": body.get("limit", 5),
+                    "session_online_opt_in": body["online_opt_in"],
+                }
+                if "request_id" in body:
+                    search_kwargs["request_id"] = body["request_id"]
+                payload = workspace.search_web(body["query"], **search_kwargs)
+                self._json(HTTPStatus.OK, payload)
+                return
+            if path == "/api/workspace/web/cancel":
+                if set(body) != {"request_id"}:
+                    raise WorkspaceCapabilityError(
+                        "INVALID_BODY", "web search cancel body fields are invalid"
+                    )
+                payload = workspace.cancel_web_search(body["request_id"])
                 self._json(HTTPStatus.OK, payload)
                 return
             if path == "/api/workspace/models/select":
@@ -4771,6 +4788,7 @@ def main(
             manager,
             evolution_manager,
             agent_manager,
+            workspace_service,
             primary=error,
         )
         raise AssertionError("unreachable cleanup path")
@@ -4794,6 +4812,7 @@ def main(
                 manager,
                 evolution_manager,
                 agent_manager,
+                workspace_service,
                 primary=boundary_error,
             )
             raise AssertionError("unreachable cleanup path")
@@ -4812,6 +4831,7 @@ def main(
                     manager,
                     evolution_manager,
                     agent_manager,
+                    workspace_service,
                 )
                 if not args.no_browser:
                     open_graphical_app(existing.bootstrap_url)
@@ -4820,6 +4840,7 @@ def main(
             manager,
             evolution_manager,
             agent_manager,
+            workspace_service,
             primary=error,
         )
         raise AssertionError("unreachable cleanup path")
@@ -4828,6 +4849,7 @@ def main(
             manager,
             evolution_manager,
             agent_manager,
+            workspace_service,
             primary=error,
         )
         raise AssertionError("unreachable cleanup path")

@@ -303,6 +303,7 @@ class _Workspace:
         self.queries: list[str] = []
         self.lens_queries: list[dict[str, object]] = []
         self.web_queries: list[dict[str, object]] = []
+        self.web_cancellations: list[str] = []
         self.source_requests: list[tuple[str, int]] = []
         self.raise_source: WorkspaceCapabilityError | None = None
         self.source_payload: dict[str, object] | None = None
@@ -493,12 +494,16 @@ class _Workspace:
         }
         return {"search": search, "indexed": []} if index_in_akasicdb else search
 
-    def search_web(self, query, *, limit=5, session_online_opt_in):
+    def search_web(
+        self, query, *, limit=5, session_online_opt_in, request_id=None
+    ):
         request = {
             "query": query,
             "limit": limit,
             "session_online_opt_in": session_online_opt_in,
         }
+        if request_id is not None:
+            request["request_id"] = request_id
         self.web_queries.append(request)
         if session_online_opt_in is not True:
             raise WorkspaceCapabilityError(
@@ -510,7 +515,12 @@ class _Workspace:
             "count": 0,
             "results": [],
             "external_calls": 1,
+            "request_id": request_id,
         }
+
+    def cancel_web_search(self, request_id):
+        self.web_cancellations.append(request_id)
+        return {"request_id": request_id, "cancelled": True, "state": "cancelled"}
 
 
 class TestWorkspaceHTTPAPI(unittest.TestCase):
@@ -821,7 +831,12 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         )
         status, payload = self._post(
             "/api/workspace/web/search",
-            {"query": "bounded general search", "limit": 3, "online_opt_in": True},
+            {
+                "query": "bounded general search",
+                "limit": 3,
+                "online_opt_in": True,
+                "request_id": "a" * 32,
+            },
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload["provider"], "Brave Search official API")
@@ -832,9 +847,16 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
                     "query": "bounded general search",
                     "limit": 3,
                     "session_online_opt_in": True,
+                    "request_id": "a" * 32,
                 }
             ],
         )
+        status, payload = self._post(
+            "/api/workspace/web/cancel", {"request_id": "a" * 32}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["cancelled"])
+        self.assertEqual(self.workspace.web_cancellations, ["a" * 32])
         status, payload = self._post(
             "/api/workspace/web/search",
             {"query": "must remain offline", "online_opt_in": False},

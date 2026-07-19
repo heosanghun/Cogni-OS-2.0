@@ -21,12 +21,14 @@ from hashlib import sha256
 import http.client
 import ipaddress
 import json
+from queue import Empty, Queue
 import re
+import socket
 import ssl
-from threading import BoundedSemaphore, Event, RLock
+from threading import BoundedSemaphore, Event, RLock, Thread
 import time
-from typing import Any, Protocol
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from typing import Any, Protocol, Sequence
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 
 BRAVE_SEARCH_PROVIDER_ID = "brave"
@@ -40,6 +42,7 @@ MAX_WEB_QUERY_BYTES = 4 * 1024
 MAX_WEB_RESULTS = 10
 MAX_WEB_REQUEST_TARGET_BYTES = 8 * 1024
 MAX_WEB_RESPONSE_BYTES = 1024 * 1024
+MIN_WEB_TOKEN_CHARS = 16
 MAX_WEB_TOKEN_CHARS = 4 * 1024
 MAX_WEB_JSON_DEPTH = 24
 MAX_WEB_JSON_NODES = 20_000
@@ -50,6 +53,7 @@ DEFAULT_WEB_TIMEOUT_SECONDS = 8.0
 MAX_WEB_TIMEOUT_SECONDS = 20.0
 MAX_WEB_RETRIES = 1
 MAX_WEB_RETRY_DELAY_SECONDS = 0.5
+MAX_WEB_RESOLVED_ADDRESSES = 16
 
 _RETRIABLE_STATUS = frozenset({429, 502, 503, 504})
 _HOST_RE = re.compile(
@@ -95,11 +99,91 @@ class GeneralWebTransport(Protocol):
         timeout_seconds: float,
         maximum_response_bytes: int,
         cancelled: Callable[[], bool],
+        authorize_dispatch: Callable[[Callable[[], None]], bool] | None = None,
     ) -> GeneralWebHttpResponse: ...
+
+
+class GeneralWebResolver(Protocol):
+    """Resolve the fixed API hostname without granting URL-selection authority."""
+
+    def __call__(self, host: str, port: int) -> Sequence[str]: ...
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to one admitted IP while authenticating the fixed DNS hostname."""
+
+    def __init__(
+        self,
+        host: str,
+        pinned_ip: str,
+        *,
+        port: int,
+        timeout: float,
+        context: ssl.SSLContext,
+    ) -> None:
+        super().__init__(host, port=port, timeout=timeout, context=context)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        # No proxy/tunnel is admitted.  The TCP peer is the literal IP returned
+        # by the validated resolver, while TLS SNI and certificate hostname
+        # verification remain bound to ``self.host`` (api.search.brave.com).
+        raw_socket = socket.create_connection(
+            (self._pinned_ip, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        try:
+            raw_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.sock = self._context.wrap_socket(
+                raw_socket,
+                server_hostname=self.host,
+            )
+        except BaseException:
+            raw_socket.close()
+            raise
+
+
+def _system_resolver(host: str, port: int) -> tuple[str, ...]:
+    records = socket.getaddrinfo(
+        host,
+        port,
+        family=socket.AF_UNSPEC,
+        type=socket.SOCK_STREAM,
+        proto=socket.IPPROTO_TCP,
+    )
+    return tuple(record[4][0] for record in records)
+
+
+def _default_connection_factory(
+    host: str,
+    pinned_ip: str,
+    timeout_seconds: float,
+    context: ssl.SSLContext,
+) -> _PinnedHTTPSConnection:
+    return _PinnedHTTPSConnection(
+        host,
+        pinned_ip,
+        port=443,
+        timeout=timeout_seconds,
+        context=context,
+    )
 
 
 class StandardLibraryGeneralWebTransport:
     """TLS-validating fixed-destination transport that never follows redirects."""
+
+    def __init__(
+        self,
+        *,
+        resolver: GeneralWebResolver | None = None,
+        connection_factory: Callable[[str, str, float, ssl.SSLContext], Any]
+        | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+    ) -> None:
+        self._resolver = resolver or _system_resolver
+        self._connection_factory = connection_factory or _default_connection_factory
+        self._monotonic = monotonic_clock or time.monotonic
 
     def get(
         self,
@@ -111,34 +195,68 @@ class StandardLibraryGeneralWebTransport:
         timeout_seconds: float,
         maximum_response_bytes: int,
         cancelled: Callable[[], bool],
+        authorize_dispatch: Callable[[Callable[[], None]], bool] | None = None,
     ) -> GeneralWebHttpResponse:
         _validate_transport_contract(host, path, query_string)
         if cancelled():
             raise GeneralWebTransportError("request cancelled before transport")
-        connection = http.client.HTTPSConnection(
-            BRAVE_SEARCH_API_HOST,
+        deadline = self._monotonic() + float(timeout_seconds)
+        addresses = _resolve_public_addresses(
+            self._resolver,
+            host=BRAVE_SEARCH_API_HOST,
             port=443,
-            timeout=timeout_seconds,
-            context=ssl.create_default_context(),
+            deadline=deadline,
+            monotonic_clock=self._monotonic,
+            cancelled=cancelled,
+        )
+        remaining = _transport_remaining(deadline, self._monotonic, cancelled)
+        tls_context = ssl.create_default_context()
+        # ``create_default_context`` currently enables both checks, but assert
+        # the invariant explicitly so a custom runtime cannot silently weaken it.
+        tls_context.check_hostname = True
+        tls_context.verify_mode = ssl.CERT_REQUIRED
+        connection = self._connection_factory(
+            BRAVE_SEARCH_API_HOST,
+            addresses[0],
+            remaining,
+            tls_context,
         )
         try:
-            connection.request(
-                "GET", f"{BRAVE_SEARCH_API_PATH}?{query_string}", headers=dict(headers)
+            def send_request() -> None:
+                _set_connection_timeout(
+                    connection,
+                    _transport_remaining(deadline, self._monotonic, cancelled),
+                )
+                connection.request(
+                    "GET",
+                    f"{BRAVE_SEARCH_API_PATH}?{query_string}",
+                    headers=dict(headers),
+                )
+
+            if authorize_dispatch is None or not authorize_dispatch(send_request):
+                raise GeneralWebTransportError(
+                    "request authority was revoked before dispatch"
+                )
+            _set_connection_timeout(
+                connection,
+                _transport_remaining(deadline, self._monotonic, cancelled),
             )
             response = connection.getresponse()
             content_length = response.getheader("Content-Length")
             if content_length is not None:
                 try:
                     declared_length = int(content_length)
-                except ValueError as exc:
-                    raise GeneralWebTransportError("invalid content length") from exc
+                except ValueError:
+                    raise GeneralWebTransportError("invalid content length") from None
                 if not 0 <= declared_length <= maximum_response_bytes:
                     raise GeneralWebTransportError("response exceeds byte limit")
             chunks: list[bytes] = []
             received = 0
             while True:
-                if cancelled():
-                    raise GeneralWebTransportError("request cancelled while reading")
+                _set_connection_timeout(
+                    connection,
+                    _transport_remaining(deadline, self._monotonic, cancelled),
+                )
                 chunk = response.read(
                     min(64 * 1024, maximum_response_bytes + 1 - received)
                 )
@@ -160,12 +278,103 @@ class StandardLibraryGeneralWebTransport:
             )
         except GeneralWebTransportError:
             raise
-        except (OSError, TimeoutError, http.client.HTTPException, ssl.SSLError) as exc:
+        except (OSError, TimeoutError, http.client.HTTPException, ssl.SSLError):
             raise GeneralWebTransportError(
                 "official search HTTPS request failed"
-            ) from exc
+            ) from None
         finally:
             connection.close()
+
+
+def _resolve_public_addresses(
+    resolver: GeneralWebResolver,
+    *,
+    host: str,
+    port: int,
+    deadline: float,
+    monotonic_clock: Callable[[], float],
+    cancelled: Callable[[], bool],
+) -> tuple[str, ...]:
+    """Resolve once and reject the complete answer if any address is non-public."""
+
+    result_queue: Queue[tuple[bool, object]] = Queue(maxsize=1)
+
+    def resolve() -> None:
+        try:
+            result: tuple[bool, object] = (True, resolver(host, port))
+        except BaseException:  # Resolver diagnostics are an untrusted boundary.
+            result = (False, None)
+        try:
+            result_queue.put_nowait(result)
+        except Exception:
+            return
+
+    Thread(target=resolve, name="cogni-web-dns", daemon=True).start()
+    while True:
+        if cancelled():
+            raise GeneralWebTransportError("request cancelled during resolution")
+        remaining = deadline - monotonic_clock()
+        if remaining <= 0.0:
+            raise GeneralWebTransportError("official search DNS deadline exceeded")
+        try:
+            succeeded, raw_addresses = result_queue.get(timeout=min(remaining, 0.05))
+            break
+        except Empty:
+            continue
+    if not succeeded or isinstance(raw_addresses, (str, bytes)) or not isinstance(
+        raw_addresses, Sequence
+    ):
+        raise GeneralWebTransportError("official search DNS resolution failed")
+    if not 1 <= len(raw_addresses) <= MAX_WEB_RESOLVED_ADDRESSES:
+        raise GeneralWebTransportError("official search DNS answer is outside bounds")
+    normalized: set[str] = set()
+    for raw_address in raw_addresses:
+        if not isinstance(raw_address, str):
+            raise GeneralWebTransportError("official search DNS answer is invalid")
+        try:
+            address = ipaddress.ip_address(raw_address)
+        except ValueError:
+            raise GeneralWebTransportError(
+                "official search DNS answer is invalid"
+            ) from None
+        if (
+            not address.is_global
+            or address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_reserved
+            or address.is_unspecified
+        ):
+            raise GeneralWebTransportError(
+                "official search DNS answer contains a non-public address"
+            )
+        normalized.add(address.compressed)
+    if not normalized:
+        raise GeneralWebTransportError("official search DNS answer is empty")
+    return tuple(sorted(normalized))
+
+
+def _transport_remaining(
+    deadline: float,
+    monotonic_clock: Callable[[], float],
+    cancelled: Callable[[], bool],
+) -> float:
+    if cancelled():
+        raise GeneralWebTransportError("request cancelled")
+    remaining = deadline - monotonic_clock()
+    if remaining <= 0.0:
+        raise GeneralWebTransportError("official search request deadline exceeded")
+    return remaining
+
+
+def _set_connection_timeout(connection: object, timeout_seconds: float) -> None:
+    sock = getattr(connection, "sock", None)
+    setter = getattr(sock, "settimeout", None)
+    if callable(setter):
+        setter(timeout_seconds)
+    if hasattr(connection, "timeout"):
+        connection.timeout = timeout_seconds
 
 
 class GeneralWebSearchConfig:
@@ -206,8 +415,10 @@ class GeneralWebSearchConfig:
         if not isinstance(terms_accepted, bool):
             raise TypeError("terms_accepted must be bool")
         selected_token = token.strip()
-        if len(selected_token) > MAX_WEB_TOKEN_CHARS or any(
-            character in selected_token for character in "\r\n\0"
+        if token and (
+            token != selected_token
+            or not MIN_WEB_TOKEN_CHARS <= len(selected_token) <= MAX_WEB_TOKEN_CHARS
+            or any(not 33 <= ord(character) <= 126 for character in selected_token)
         ):
             raise ValueError("web search token is malformed")
         self.online_mode = online_mode
@@ -303,32 +514,51 @@ class GeneralWebSearchConfig:
 class GeneralWebSearchSession:
     """One explicit online consent lease with terminal cancel/revoke states."""
 
-    __slots__ = ("_owner", "_lock", "_state", "_abort")
+    __slots__ = (
+        "_owner",
+        "_authority_lock",
+        "_state",
+        "_abort",
+        "_epoch",
+        "_wire_epoch",
+    )
 
-    def __init__(self, owner: object, *, online_opt_in: bool) -> None:
+    def __init__(
+        self,
+        owner: object,
+        authority_lock: RLock,
+        *,
+        online_opt_in: bool,
+    ) -> None:
         if not isinstance(online_opt_in, bool):
             raise TypeError("online_opt_in must be bool")
         self._owner = owner
-        self._lock = RLock()
+        self._authority_lock = authority_lock
         self._state = "active" if online_opt_in else "opt_in_required"
         self._abort = Event()
+        self._epoch = 0
+        self._wire_epoch: int | None = None
 
     @property
     def state(self) -> str:
-        with self._lock:
+        with self._authority_lock:
             return self._state
 
     def cancel(self) -> bool:
-        with self._lock:
+        with self._authority_lock:
             if self._state != "active":
                 return False
+            self._epoch += 1
             self._state = "cancelled"
             self._abort.set()
             return True
 
     def revoke(self) -> bool:
-        with self._lock:
+        with self._authority_lock:
+            if self._state == "published":
+                return False
             changed = self._state != "revoked"
+            self._epoch += 1
             self._state = "revoked"
             self._abort.set()
             return changed
@@ -412,6 +642,7 @@ class GeneralWebSearchClient:
         maximum_retries: int = MAX_WEB_RETRIES,
         retry_waiter: Callable[[float, Callable[[], bool]], bool] | None = None,
         clock: Callable[[], datetime] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         if not isinstance(config, GeneralWebSearchConfig):
             raise TypeError("config must be GeneralWebSearchConfig")
@@ -431,9 +662,12 @@ class GeneralWebSearchClient:
         self.maximum_retries = maximum_retries
         self.retry_waiter = retry_waiter or _wait_with_cancellation
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.monotonic = monotonic_clock or time.monotonic
         self._owner = object()
-        self._revoked = Event()
-        self._call_lock = RLock()
+        # Session cancel/revoke, wire dispatch, and response publication all
+        # linearize on this single authority lock and session epoch.
+        self._authority_lock = RLock()
+        self._revoked = False
         self._external_calls = 0
         self._search_gate = BoundedSemaphore(value=1)
 
@@ -445,22 +679,32 @@ class GeneralWebSearchClient:
 
     @property
     def external_calls(self) -> int:
-        with self._call_lock:
+        with self._authority_lock:
             return self._external_calls
 
     def capability_payload(self) -> dict[str, object]:
-        return self.config.public_payload(
-            external_calls=self.external_calls, revoked=self._revoked.is_set()
-        )
+        with self._authority_lock:
+            return self.config.public_payload(
+                external_calls=self._external_calls,
+                revoked=self._revoked,
+            )
 
     def open_session(self, *, online_opt_in: bool) -> GeneralWebSearchSession:
-        return GeneralWebSearchSession(self._owner, online_opt_in=online_opt_in)
+        with self._authority_lock:
+            session = GeneralWebSearchSession(
+                self._owner,
+                self._authority_lock,
+                online_opt_in=online_opt_in,
+            )
+            if self._revoked:
+                session.revoke()
+            return session
 
     def revoke(self) -> bool:
-        with self._call_lock:
-            if self._revoked.is_set():
+        with self._authority_lock:
+            if self._revoked:
                 return False
-            self._revoked.set()
+            self._revoked = True
             return True
 
     def search(
@@ -492,6 +736,7 @@ class GeneralWebSearchClient:
                 "WEB_SEARCH_BUSY", "another bounded web search is already running"
             )
         try:
+            deadline = self.monotonic() + self.timeout_seconds
             self._require_session(session)
             query_string = urlencode(
                 {
@@ -510,10 +755,11 @@ class GeneralWebSearchClient:
                 "X-Subscription-Token": self.config._token,
                 "User-Agent": "Cogni-OS-General-Web-Connector/1",
             }
-            response = self._request_with_retry(
+            response, response_epoch = self._request_with_retry(
                 session,
                 query_string=query_string,
                 headers=headers,
+                deadline=deadline,
             )
             self._require_session(session)
             retrieved_at = _retrieved_at(self.clock)
@@ -524,22 +770,27 @@ class GeneralWebSearchClient:
                 requested_limit=limit,
                 retrieved_at=retrieved_at,
             )
-            # Revocation/cancellation wins even when it races normalization.
-            self._require_session(session)
-            return GeneralWebSearchResponse(
+            result = GeneralWebSearchResponse(
                 query=normalized_query,
                 results=results,
                 retrieved_at=retrieved_at,
                 external_calls=self.external_calls,
             )
+            self._remaining(deadline)
+            # This is the publication linearization point.  A cancellation or
+            # global revoke that wins the same lock first prevents the result;
+            # once publication wins, a later cancel returns False.
+            self._claim_publication(session, response_epoch)
+            return result
         finally:
             self._search_gate.release()
 
     def _require_configured(self) -> None:
-        if self._revoked.is_set():
-            raise GeneralWebSearchError(
-                "WEB_SEARCH_REVOKED", "web search network authority was revoked"
-            )
+        with self._authority_lock:
+            if self._revoked:
+                raise GeneralWebSearchError(
+                    "WEB_SEARCH_REVOKED", "web search network authority was revoked"
+                )
         state = self.config.state
         errors = {
             "disabled_air_gap": (
@@ -568,27 +819,83 @@ class GeneralWebSearchClient:
             raise GeneralWebSearchError(code, message)
 
     def _require_session(self, session: GeneralWebSearchSession) -> None:
+        with self._authority_lock:
+            self._require_session_locked(session)
+
+    def _require_session_locked(self, session: GeneralWebSearchSession) -> None:
         if (
             not isinstance(session, GeneralWebSearchSession)
             or session._owner is not self._owner
+            or session._authority_lock is not self._authority_lock
         ):
             raise GeneralWebSearchError(
                 "WEB_SEARCH_SESSION_INVALID",
                 "web search requires a session issued by this connector",
             )
-        if self._revoked.is_set() or session.state == "revoked":
+        if self._revoked or session._state == "revoked":
             raise GeneralWebSearchError(
                 "WEB_SEARCH_REVOKED", "web search network authority was revoked"
             )
-        if session.state == "cancelled":
+        if session._state == "cancelled":
             raise GeneralWebSearchError(
                 "WEB_SEARCH_CANCELLED", "web search was cancelled"
             )
-        if session.state != "active":
+        if session._state == "published":
+            raise GeneralWebSearchError(
+                "WEB_SEARCH_SESSION_CONSUMED",
+                "web search session authority was already consumed",
+            )
+        if session._state != "active":
             raise GeneralWebSearchError(
                 "WEB_SEARCH_SESSION_OPT_IN_REQUIRED",
                 "web search requires explicit online opt-in for this session",
             )
+
+    def _begin_attempt(self, session: GeneralWebSearchSession) -> int:
+        with self._authority_lock:
+            self._require_session_locked(session)
+            session._epoch += 1
+            session._wire_epoch = None
+            return session._epoch
+
+    def _authorize_dispatch(
+        self,
+        session: GeneralWebSearchSession,
+        epoch: int,
+        dispatch: Callable[[], None],
+    ) -> bool:
+        with self._authority_lock:
+            if (
+                self._revoked
+                or session._owner is not self._owner
+                or session._state != "active"
+                or session._epoch != epoch
+                or session._wire_epoch is not None
+            ):
+                return False
+            session._wire_epoch = epoch
+            self._external_calls += 1
+            # Keep the authority fence held through the actual HTTP request
+            # dispatch.  Therefore cancel/revoke cannot return and then allow
+            # a request to be sent afterward.
+            dispatch()
+            return True
+
+    def _claim_publication(
+        self, session: GeneralWebSearchSession, epoch: int
+    ) -> None:
+        with self._authority_lock:
+            self._require_session_locked(session)
+            if session._epoch != epoch or session._wire_epoch != epoch:
+                raise GeneralWebSearchError(
+                    "WEB_SEARCH_SESSION_INVALID",
+                    "web search response authority fence is invalid",
+                )
+            session._state = "published"
+
+    def _cancelled(self, session: GeneralWebSearchSession) -> bool:
+        with self._authority_lock:
+            return self._revoked or session._state != "active"
 
     def _request_with_retry(
         self,
@@ -596,40 +903,54 @@ class GeneralWebSearchClient:
         *,
         query_string: str,
         headers: Mapping[str, str],
-    ) -> GeneralWebHttpResponse:
+        deadline: float,
+    ) -> tuple[GeneralWebHttpResponse, int]:
         for attempt in range(self.maximum_retries + 1):
             self._require_session(session)
+            attempt_epoch = self._begin_attempt(session)
+            remaining = self._remaining(deadline)
             try:
-                with self._call_lock:
-                    self._external_calls += 1
                 response = self.transport.get(
                     host=BRAVE_SEARCH_API_HOST,
                     path=BRAVE_SEARCH_API_PATH,
                     query_string=query_string,
                     headers=headers,
-                    timeout_seconds=self.timeout_seconds,
+                    timeout_seconds=remaining,
                     maximum_response_bytes=MAX_WEB_RESPONSE_BYTES,
-                    cancelled=lambda: self._revoked.is_set() or session._aborted(),
+                    cancelled=lambda: self._cancelled(session),
+                    authorize_dispatch=lambda dispatch: self._authorize_dispatch(
+                        session, attempt_epoch, dispatch
+                    ),
                 )
-            except GeneralWebTransportError as exc:
+                with self._authority_lock:
+                    if session._wire_epoch != attempt_epoch:
+                        raise GeneralWebTransportError(
+                            "transport bypassed the dispatch authority fence"
+                        )
+                self._remaining(deadline)
+            except GeneralWebTransportError:
                 self._require_session(session)
                 if attempt < self.maximum_retries:
+                    remaining = self._remaining(deadline)
                     if not self.retry_waiter(
-                        MAX_WEB_RETRY_DELAY_SECONDS,
-                        lambda: self._revoked.is_set() or session._aborted(),
+                        min(MAX_WEB_RETRY_DELAY_SECONDS, remaining),
+                        lambda: self._cancelled(session),
                     ):
                         self._require_session(session)
+                    self._remaining(deadline)
                     continue
                 raise GeneralWebSearchError(
                     "WEB_SEARCH_NETWORK_ERROR",
                     "the official search API could not be reached",
-                ) from exc
-            except Exception as exc:  # noqa: BLE001 - transport trust boundary
+                ) from None
+            except GeneralWebSearchError:
+                raise
+            except Exception:  # noqa: BLE001 - transport trust boundary
                 self._require_session(session)
                 raise GeneralWebSearchError(
                     "WEB_SEARCH_NETWORK_ERROR",
                     "the official search API transport failed closed",
-                ) from exc
+                ) from None
             self._require_session(session)
             if (
                 not isinstance(response, GeneralWebHttpResponse)
@@ -648,13 +969,15 @@ class GeneralWebSearchClient:
                     "web search transport returned an invalid response",
                 )
             if response.status == 200:
-                return response
+                return response, attempt_epoch
             if response.status in _RETRIABLE_STATUS and attempt < self.maximum_retries:
                 delay = _retry_delay(response.headers.get("retry-after"))
+                remaining = self._remaining(deadline)
                 if not self.retry_waiter(
-                    delay, lambda: self._revoked.is_set() or session._aborted()
+                    min(delay, remaining), lambda: self._cancelled(session)
                 ):
                     self._require_session(session)
+                self._remaining(deadline)
                 continue
             if response.status in {301, 302, 303, 307, 308}:
                 raise GeneralWebSearchError(
@@ -682,6 +1005,14 @@ class GeneralWebSearchClient:
             )
         raise AssertionError("bounded web search retry loop did not terminate")
 
+    def _remaining(self, deadline: float) -> float:
+        remaining = deadline - self.monotonic()
+        if remaining <= 0.0:
+            raise GeneralWebSearchError(
+                "WEB_SEARCH_TIMEOUT", "web search exceeded its total wall deadline"
+            )
+        return remaining
+
 
 def _validate_transport_contract(host: str, path: str, query_string: str) -> None:
     if host != BRAVE_SEARCH_API_HOST or path != BRAVE_SEARCH_API_PATH:
@@ -700,8 +1031,8 @@ def _validate_transport_contract(host: str, path: str, query_string: str) -> Non
             encoding="utf-8",
             errors="strict",
         )
-    except (UnicodeError, ValueError) as exc:
-        raise GeneralWebTransportError("web search query string is invalid") from exc
+    except (UnicodeError, ValueError):
+        raise GeneralWebTransportError("web search query string is invalid") from None
     fields = {key: value for key, value in pairs}
     if (
         len(pairs) != 3
@@ -754,7 +1085,8 @@ def _decode_response(
         raise GeneralWebSearchError(
             "WEB_SEARCH_RESPONSE_INVALID", "web search response is not JSON"
         )
-    if secret_token and secret_token.encode("utf-8") in response.body:
+    secret_fragments = _secret_fragments(secret_token)
+    if any(fragment.encode("utf-8") in response.body for fragment in secret_fragments):
         raise GeneralWebSearchError(
             "WEB_SEARCH_RESPONSE_INVALID",
             "web search response reflected configured credential material",
@@ -763,16 +1095,50 @@ def _decode_response(
         payload = json.loads(
             response.body.decode("utf-8"), parse_constant=_reject_json_constant
         )
-    except (UnicodeError, ValueError) as exc:
+    except (UnicodeError, ValueError):
         raise GeneralWebSearchError(
             "WEB_SEARCH_RESPONSE_INVALID", "web search response JSON is invalid"
-        ) from exc
+        ) from None
     if not isinstance(payload, dict):
         raise GeneralWebSearchError(
             "WEB_SEARCH_RESPONSE_INVALID", "web search response must be an object"
         )
     _validate_json_shape(payload)
+    if _json_contains_secret(payload, secret_fragments):
+        raise GeneralWebSearchError(
+            "WEB_SEARCH_RESPONSE_INVALID",
+            "web search response reflected configured credential material",
+        )
     return payload
+
+
+def _secret_fragments(secret_token: str) -> frozenset[str]:
+    if not secret_token:
+        return frozenset()
+    return frozenset(
+        {
+            secret_token,
+            quote(secret_token, safe=""),
+            quote(secret_token, safe="", encoding="utf-8", errors="strict"),
+        }
+    )
+
+
+def _json_contains_secret(payload: object, fragments: frozenset[str]) -> bool:
+    if not fragments:
+        return False
+    stack = [payload]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, str):
+            if any(fragment and fragment in value for fragment in fragments):
+                return True
+        elif isinstance(value, dict):
+            stack.extend(value.keys())
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return False
 
 
 def _validate_json_shape(payload: object) -> None:
@@ -887,10 +1253,10 @@ def _canonical_result_url(value: object) -> str:
     try:
         port = parsed.port
         host = (parsed.hostname or "").encode("idna").decode("ascii").casefold()
-    except (UnicodeError, ValueError) as exc:
+    except (UnicodeError, ValueError):
         raise GeneralWebSearchError(
             "WEB_SEARCH_RESPONSE_INVALID", "web search result URL is invalid"
-        ) from exc
+        ) from None
     try:
         ipaddress.ip_address(host)
     except ValueError:
@@ -951,6 +1317,7 @@ __all__ = [
     "BRAVE_SEARCH_PROVIDER",
     "GeneralWebHttpResponse",
     "GeneralWebProvenance",
+    "GeneralWebResolver",
     "GeneralWebSearchClient",
     "GeneralWebSearchConfig",
     "GeneralWebSearchError",
@@ -960,5 +1327,6 @@ __all__ = [
     "GeneralWebTransportError",
     "MAX_WEB_RESPONSE_BYTES",
     "MAX_WEB_RESULTS",
+    "MIN_WEB_TOKEN_CHARS",
     "StandardLibraryGeneralWebTransport",
 ]

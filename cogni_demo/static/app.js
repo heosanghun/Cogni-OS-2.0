@@ -303,6 +303,10 @@ const ui = {
   lensConnectorReady: false,
   lensSearchPending: false,
   lensSearchResults: [],
+  generalWebConnectorReady: false,
+  generalWebSearchPending: false,
+  generalWebRequestId: "",
+  generalWebSearchResults: [],
   voiceCaptureState: "idle",
   voiceSession: null,
   voiceGetUserMediaSession: null,
@@ -1234,6 +1238,8 @@ function revokeWorkspaceCapabilities() {
   ui.imageAttestationSettling = false;
   ui.selectedImageAttachmentId = "";
   ui.lensConnectorReady = false;
+  ui.generalWebConnectorReady = false;
+  ui.generalWebRequestId = "";
   ui.voiceTransportReady = false;
   ui.voiceBrowserCaptureReady = false;
   ui.voiceTranscriptionConfigured = false;
@@ -1279,6 +1285,7 @@ function applyWorkspaceCapabilities(capabilities) {
   const tts = microphone.tts || {};
   const web = capabilities.web_search || {};
   const lens = web.official_lens_connector || {};
+  const generalWeb = web.general_web_connector || {};
   ui.ragBackendReady = rag.state === "local_index_ready";
   ui.ragAnswerIntegrationReady = ui.ragBackendReady
     && rag.answer_integration === true
@@ -1359,36 +1366,45 @@ function applyWorkspaceCapabilities(capabilities) {
   );
   setText("#agent-rag-status", workspaceRagStatusLabel());
   const networkMode = web.mode === "air_gapped" || web.mode === "online_opt_in" ? web.mode : "";
-  const externalCalls = Number.isInteger(lens.external_calls) && lens.external_calls >= 0
+  const lensCalls = Number.isInteger(lens.external_calls) && lens.external_calls >= 0
     ? lens.external_calls
+    : null;
+  const generalWebCalls = Number.isInteger(generalWeb.external_calls) && generalWeb.external_calls >= 0
+    ? generalWeb.external_calls
+    : null;
+  const externalCalls = lensCalls !== null && generalWebCalls !== null
+    ? lensCalls + generalWebCalls
     : null;
   updateExternalCallDisclosure(networkMode, externalCalls);
   ui.lensConnectorReady = WEB_SEARCH_UI_IMPLEMENTED
     && networkMode === "online_opt_in"
     && lens.executor_implemented === true
     && lens.state === "ready";
+  ui.generalWebConnectorReady = WEB_SEARCH_UI_IMPLEMENTED
+    && networkMode === "online_opt_in"
+    && generalWeb.executor_implemented === true
+    && generalWeb.state === "ready_for_session_opt_in";
   const webButton = $('[data-action="workspace-web-search"]');
   if (webButton) {
+    const anySearchReady = ui.lensConnectorReady || ui.generalWebConnectorReady;
     webButton.setAttribute(
       "aria-label",
-      ui.lensConnectorReady
-        ? "공식 Lens API에서 특허와 논문 검색"
-        : "Lens 특허·논문 검색, 정책 또는 자격 증명 필요",
+      anySearchReady
+        ? "검증된 공식 API에서 외부 자료 검색"
+        : "외부 검색, 정책 또는 자격 증명 필요",
     );
-    webButton.title = ui.lensConnectorReady
-      ? "api.lens.org 공식 HTTPS POST 검색만 실행합니다."
-      : lens.state === "credentials_required"
-        ? "COGNI_OS_LENS_API_TOKEN이 필요합니다."
-        : lens.state === "terms_acceptance_required"
-          ? "Lens API 약관 확인 후 COGNI_OS_LENS_TERMS_ACCEPTED=1 설정이 필요합니다."
-        : lens.state === "allowlist_required"
-          ? "COGNI_OS_WEB_ALLOWLIST에 api.lens.org가 필요합니다."
-          : "명시적 온라인 모드가 꺼져 있습니다.";
+    webButton.title = anySearchReady
+      ? "준비된 공식 JSON API만 실행하며 각 요청마다 온라인 동의를 확인합니다."
+      : "명시적 온라인 모드·호스트 허용 목록·API 토큰·약관 동의가 필요합니다.";
   }
   setText(
     "#agent-web-status",
-    ui.lensConnectorReady
-      ? "공식 API"
+    ui.lensConnectorReady && ui.generalWebConnectorReady
+      ? "Lens+웹"
+      : ui.generalWebConnectorReady
+        ? "일반 웹"
+        : ui.lensConnectorReady
+          ? "Lens"
       : lens.state === "credentials_required"
         ? "토큰 필요"
         : lens.state === "terms_acceptance_required"
@@ -1397,6 +1413,11 @@ function applyWorkspaceCapabilities(capabilities) {
           ? "허용 필요"
           : "오프라인",
   );
+  const generalWebOptIn = $("#agent-general-web-opt-in");
+  if (generalWebOptIn) {
+    generalWebOptIn.disabled = !ui.generalWebConnectorReady || ui.generalWebSearchPending;
+    if (generalWebOptIn.disabled) generalWebOptIn.checked = false;
+  }
   const lensIndex = $("#agent-lens-index");
   if (lensIndex) {
     lensIndex.disabled = !ui.ragBackendReady || lens.lens_to_akasicdb !== true;
@@ -1546,6 +1567,7 @@ function updateWorkspaceControlStates() {
   const tts = microphone.tts || {};
   const web = capabilities.web_search || {};
   const lens = web.official_lens_connector || {};
+  const generalWeb = web.general_web_connector || {};
   const agentBusy = AGENT_ACTIVE_STATUSES.has(ui.agentStatus) || ui.agentRequestPending;
   const unavailable = !ui.workspaceCapabilitiesLoaded || ui.workspaceRequestPending || agentBusy;
   const voiceComputeBusy = ACTIVE_STATUSES.has(ui.lastStatus)
@@ -1587,11 +1609,13 @@ function updateWorkspaceControlStates() {
         : "현재 대화에 로컬 AkasicDB 검색을 적용합니다.";
   }
   const webButton = $('[data-action="workspace-web-search"]');
+  const lensSearchUnavailable = !ui.lensConnectorReady || lens.state !== "ready";
+  const generalWebSearchUnavailable = !ui.generalWebConnectorReady
+    || generalWeb.state !== "ready_for_session_opt_in";
   if (webButton) {
     webButton.disabled = unavailable
       || !WEB_SEARCH_UI_IMPLEMENTED
-      || !ui.lensConnectorReady
-      || lens.state !== "ready";
+      || (lensSearchUnavailable && generalWebSearchUnavailable);
   }
   const lensSubmit = $("#agent-lens-submit");
   if (lensSubmit) lensSubmit.disabled = unavailable || !ui.lensConnectorReady || ui.lensSearchPending;
@@ -1602,6 +1626,24 @@ function updateWorkspaceControlStates() {
       || lens.lens_to_akasicdb !== true
       || ui.lensSearchPending;
     if (lensIndex.disabled) lensIndex.checked = false;
+  }
+  const generalWebOptIn = $("#agent-general-web-opt-in");
+  if (generalWebOptIn) {
+    generalWebOptIn.disabled = unavailable
+      || !ui.generalWebConnectorReady
+      || generalWeb.state !== "ready_for_session_opt_in"
+      || ui.generalWebSearchPending;
+    if (generalWebOptIn.disabled) generalWebOptIn.checked = false;
+  }
+  const generalWebSubmit = $("#agent-general-web-submit");
+  if (generalWebSubmit) {
+    generalWebSubmit.disabled = unavailable
+      || !ui.generalWebConnectorReady
+      || ui.generalWebSearchPending;
+  }
+  const generalWebCancel = $("#agent-general-web-cancel");
+  if (generalWebCancel) {
+    generalWebCancel.disabled = !ui.generalWebSearchPending || !ui.generalWebRequestId;
   }
   const microphoneButton = $('[data-action="workspace-microphone"]');
   if (microphoneButton) {
@@ -2173,10 +2215,14 @@ function toggleLensSearchDrawer(forceOpen) {
   const button = $('[data-action="workspace-web-search"]');
   if (!drawer || !button) return;
   const open = typeof forceOpen === "boolean" ? forceOpen : drawer.hidden;
-  if (open && (button.disabled || !ui.lensConnectorReady)) return;
+  if (open && (button.disabled || (!ui.lensConnectorReady && !ui.generalWebConnectorReady))) return;
   drawer.hidden = !open;
   button.setAttribute("aria-expanded", String(open));
-  if (open) $("#agent-lens-query")?.focus();
+  if (open) {
+    (ui.generalWebConnectorReady
+      ? $("#agent-general-web-query")
+      : $("#agent-lens-query"))?.focus();
+  }
 }
 
 function verifiedLensUrl(value, lensId) {
@@ -2267,8 +2313,6 @@ async function searchLensOfficialApi(event) {
     ui.lensSearchResults = results;
     renderLensSearchResults(results);
     const total = Number.isInteger(search?.total) ? Math.max(0, search.total) : results.length;
-    const calls = Number.isInteger(search?.external_calls) ? Math.max(0, search.external_calls) : 0;
-    updateExternalCallDisclosure("online_opt_in", calls);
     setText(
       "#agent-lens-search-status",
       `${total.toLocaleString("ko-KR")}건 중 ${results.length}건 표시${shouldIndex ? " · 출처 포함 AkasicDB 인덱싱 요청 완료" : ""}`,
@@ -2286,6 +2330,150 @@ async function searchLensOfficialApi(event) {
   } finally {
     await refreshWorkspaceCapabilityDisclosure();
     ui.lensSearchPending = false;
+    updateWorkspaceControlStates();
+  }
+}
+
+function createGeneralWebRequestId() {
+  if (!window.crypto?.getRandomValues) return "";
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function verifiedGeneralWebUrl(value) {
+  if (typeof value !== "string" || value.length < 1 || value.length > 2048) return "";
+  try {
+    const parsed = new URL(value);
+    const hostname = parsed.hostname.toLowerCase();
+    const validHostname = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(hostname);
+    return parsed.protocol === "https:"
+      && validHostname
+      && !parsed.username
+      && !parsed.password
+      && (!parsed.port || parsed.port === "443")
+      && !parsed.hash
+      ? parsed.href
+      : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function renderGeneralWebResults(results) {
+  const list = $("#agent-general-web-results");
+  if (!list) return;
+  const fragment = document.createDocumentFragment();
+  const bounded = Array.isArray(results) ? results.slice(0, 10) : [];
+  bounded.forEach((result) => {
+    if (!result || typeof result !== "object") return;
+    const provenance = result.provenance && typeof result.provenance === "object"
+      ? result.provenance
+      : {};
+    const canonicalUrl = verifiedGeneralWebUrl(provenance.canonical_url || result.url);
+    if (!canonicalUrl || provenance.provider !== "Brave Search official API") return;
+    const item = document.createElement("li");
+    item.className = "general-web-result-card";
+    const top = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = typeof result.title === "string" && result.title.trim()
+      ? result.title.slice(0, 512)
+      : "제목 미제공";
+    const link = document.createElement("a");
+    link.href = canonicalUrl;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "출처 열기 · 외부 사이트";
+    link.title = "선택하면 검증된 결과 URL을 앱 밖의 새 탭에서 엽니다.";
+    top.append(title, link);
+    const metadata = document.createElement("small");
+    metadata.textContent = `Brave 공식 API 근거 · ${typeof result.age === "string" ? result.age.slice(0, 128) : "게시 시점 미제공"}`;
+    const description = document.createElement("p");
+    description.textContent = typeof result.description === "string" && result.description.trim()
+      ? result.description.slice(0, 1200)
+      : "설명이 제공되지 않았습니다.";
+    item.append(top, metadata, description);
+    fragment.append(item);
+  });
+  list.replaceChildren(fragment);
+}
+
+async function searchGeneralWeb(event) {
+  event?.preventDefault();
+  if (ui.generalWebSearchPending || !ui.generalWebConnectorReady) return;
+  const queryInput = $("#agent-general-web-query");
+  const limitInput = $("#agent-general-web-limit");
+  const optIn = $("#agent-general-web-opt-in");
+  const query = typeof queryInput?.value === "string" ? queryInput.value.trim() : "";
+  const parsedLimit = Number.parseInt(limitInput?.value || "5", 10);
+  const limit = [5, 10].includes(parsedLimit) ? parsedLimit : 5;
+  if (!query || query.length > 512) {
+    setText("#agent-general-web-status", "검색어를 1~512자로 입력해 주세요.");
+    queryInput?.focus();
+    return;
+  }
+  if (optIn?.checked !== true || optIn.disabled) {
+    setText("#agent-general-web-status", "이번 요청의 외부 HTTPS 호출 동의를 먼저 선택해 주세요.");
+    optIn?.focus();
+    return;
+  }
+  const requestId = createGeneralWebRequestId();
+  if (!requestId) {
+    setText("#agent-general-web-status", "안전한 요청 식별자를 만들 수 없어 검색을 차단했습니다.");
+    return;
+  }
+  ui.generalWebSearchPending = true;
+  ui.generalWebRequestId = requestId;
+  setText("#agent-general-web-status", "공개 IP·TLS 경계를 검증하며 검색 중… 취소할 수 있습니다.");
+  updateWorkspaceControlStates();
+  try {
+    const response = await api("/api/workspace/web/search", {
+      method: "POST",
+      body: { query, limit, online_opt_in: true, request_id: requestId },
+    });
+    if (response?.request_id !== requestId) throw new Error("WEB_SEARCH_RESPONSE_FENCE_INVALID");
+    const results = Array.isArray(response?.results) ? response.results.slice(0, limit) : [];
+    ui.generalWebSearchResults = results;
+    renderGeneralWebResults(results);
+    setText(
+      "#agent-general-web-status",
+      `${results.length}건 표시 · 결과 링크는 자동 조회하지 않았습니다.`,
+    );
+  } catch (error) {
+    ui.generalWebSearchResults = [];
+    renderGeneralWebResults([]);
+    const message = describeApiError(error, "일반 웹 검색을 완료하지 못했습니다.");
+    setText("#agent-general-web-status", message);
+    if (error?.code !== "WEB_SEARCH_CANCELLED") showToast(message, "error");
+  } finally {
+    ui.generalWebSearchPending = false;
+    ui.generalWebRequestId = "";
+    if (optIn) optIn.checked = false;
+    await refreshWorkspaceCapabilityDisclosure();
+    updateWorkspaceControlStates();
+  }
+}
+
+async function cancelGeneralWebSearch() {
+  const requestId = ui.generalWebRequestId;
+  if (!ui.generalWebSearchPending || !/^[a-f0-9]{32}$/.test(requestId)) return;
+  setText("#agent-general-web-status", "검색 권한을 취소하는 중…");
+  const cancelButton = $("#agent-general-web-cancel");
+  if (cancelButton) cancelButton.disabled = true;
+  try {
+    const response = await api("/api/workspace/web/cancel", {
+      method: "POST",
+      body: { request_id: requestId },
+    });
+    setText(
+      "#agent-general-web-status",
+      response?.cancelled === true ? "검색을 취소했습니다." : "검색이 이미 종료되어 취소되지 않았습니다.",
+    );
+  } catch (error) {
+    const message = describeApiError(error, "검색 취소 요청을 완료하지 못했습니다.");
+    setText("#agent-general-web-status", message);
+    showToast(message, "error");
+  } finally {
     updateWorkspaceControlStates();
   }
 }
@@ -4315,6 +4503,9 @@ function bindActions() {
   $('[data-action="workspace-web-close"]')?.addEventListener("click", () => toggleLensSearchDrawer(false));
   $('[data-action="workspace-web-submit"]')?.addEventListener("click", searchLensOfficialApi);
   $("#agent-lens-search-form")?.addEventListener("submit", searchLensOfficialApi);
+  $('[data-action="workspace-general-web-submit"]')?.addEventListener("click", searchGeneralWeb);
+  $('[data-action="workspace-general-web-cancel"]')?.addEventListener("click", cancelGeneralWebSearch);
+  $("#agent-general-web-form")?.addEventListener("submit", searchGeneralWeb);
   $("#agent-model-selector")?.addEventListener("change", selectWorkspaceModel);
   $("#chat-transcript")?.addEventListener("click", (event) => {
     const evidenceTrigger = event.target.closest('[data-action="rag-evidence-open"]');

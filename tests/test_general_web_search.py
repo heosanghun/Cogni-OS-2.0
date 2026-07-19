@@ -1,9 +1,11 @@
 import json
+import ssl
 import unittest
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 import tempfile
+from threading import Event, Thread
 from urllib.parse import parse_qs
 
 from cogni_demo.general_web_search import (
@@ -59,10 +61,17 @@ class FakeTransport:
     def __init__(self, *responses: GeneralWebHttpResponse | BaseException) -> None:
         self.responses = list(responses)
         self.calls: list[dict[str, object]] = []
+        self.before_dispatch = None
         self.before_return = None
 
     def get(self, **kwargs: object) -> GeneralWebHttpResponse:
-        self.calls.append(dict(kwargs))
+        if self.before_dispatch is not None:
+            self.before_dispatch()
+        authorize = kwargs.get("authorize_dispatch")
+        if not callable(authorize) or not authorize(
+            lambda: self.calls.append(dict(kwargs))
+        ):
+            raise GeneralWebTransportError("dispatch rejected")
         if not self.responses:
             raise AssertionError("unexpected general web transport call")
         selected = self.responses.pop(0)
@@ -71,6 +80,44 @@ class FakeTransport:
         if self.before_return is not None:
             self.before_return()
         return selected
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def settimeout(self, value: float) -> None:
+        self.timeouts.append(value)
+
+
+class _FakeProviderResponse:
+    status = 200
+
+    def getheader(self, name: str):
+        return "0" if name == "Content-Length" else None
+
+    def getheaders(self):
+        return (("Content-Type", "application/json"),)
+
+    def read(self, _size: int) -> bytes:
+        return b""
+
+
+class _FakePinnedConnection:
+    def __init__(self) -> None:
+        self.sock = _FakeSocket()
+        self.timeout = 0.0
+        self.requests: list[tuple[str, str, dict[str, str]]] = []
+        self.closed = False
+
+    def request(self, method: str, target: str, *, headers: dict[str, str]) -> None:
+        self.requests.append((method, target, headers))
+
+    def getresponse(self) -> _FakeProviderResponse:
+        return _FakeProviderResponse()
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _result_payload() -> dict[str, object]:
@@ -128,6 +175,10 @@ class TestGeneralWebConfiguration(unittest.TestCase):
     def test_tokens_and_allowlist_entries_cannot_inject_protocol_fields(self) -> None:
         with self.assertRaisesRegex(ValueError, "token is malformed"):
             _config(token="secret\r\nX-Injected: yes")
+        with self.assertRaisesRegex(ValueError, "token is malformed"):
+            _config(token="too-short")
+        with self.assertRaisesRegex(ValueError, "token is malformed"):
+            _config(token="x" * 20 + "\t")
         with self.assertRaisesRegex(ValueError, "invalid hostname"):
             _config(allowlist=("https://api.search.brave.com",))
 
@@ -262,6 +313,32 @@ class TestGeneralWebSearch(unittest.TestCase):
             client.search(session, "bounded search")
         self.assertEqual(raised.exception.code, "WEB_SEARCH_REVOKED")
         self.assertEqual(client.capability_payload()["state"], "revoked")
+
+    def test_cancel_dispatch_and_publication_share_one_epoch_fence(self) -> None:
+        transport = FakeTransport(_json_response(_result_payload()))
+        client = GeneralWebSearchClient(
+            _config(), transport=transport, maximum_retries=0
+        )
+        session = client.open_session(online_opt_in=True)
+        transport.before_dispatch = session.cancel
+        with self.assertRaises(GeneralWebSearchError) as raised:
+            client.search(session, "cancel wins before wire")
+        self.assertEqual(raised.exception.code, "WEB_SEARCH_CANCELLED")
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(client.external_calls, 0)
+
+        transport = FakeTransport(_json_response(_result_payload()))
+        client = GeneralWebSearchClient(
+            _config(), transport=transport, maximum_retries=0
+        )
+        session = client.open_session(online_opt_in=True)
+        response = client.search(session, "publication wins", limit=1)
+        self.assertEqual(len(response.results), 1)
+        self.assertFalse(session.cancel())
+        self.assertEqual(session.state, "published")
+        with self.assertRaises(GeneralWebSearchError) as consumed:
+            client.search(session, "cannot reuse")
+        self.assertEqual(consumed.exception.code, "WEB_SEARCH_SESSION_CONSUMED")
 
     def test_query_result_and_response_bounds_fail_before_publication(self) -> None:
         for query, limit, code in (
@@ -418,6 +495,26 @@ class TestGeneralWebSearch(unittest.TestCase):
         self.assertEqual(raised.exception.code, "WEB_SEARCH_RESPONSE_INVALID")
         self.assertNotIn(TOKEN, str(raised.exception))
 
+        escaped_token = "".join(f"\\u{ord(character):04x}" for character in TOKEN)
+        escaped_body = (
+            '{"web":{"results":[{"title":"'
+            + escaped_token
+            + '","url":"https://example.com/"}]}}'
+        ).encode("ascii")
+        client = GeneralWebSearchClient(
+            _config(),
+            transport=FakeTransport(
+                GeneralWebHttpResponse(
+                    200, {"content-type": "application/json"}, escaped_body
+                )
+            ),
+            maximum_retries=0,
+        )
+        with self.assertRaises(GeneralWebSearchError) as escaped:
+            client.search(client.open_session(online_opt_in=True), "bounded search")
+        self.assertEqual(escaped.exception.code, "WEB_SEARCH_RESPONSE_INVALID")
+        self.assertNotIn(TOKEN, escaped_body.decode("ascii"))
+
     def test_nonstandard_json_and_unexpected_transport_fail_redacted(self) -> None:
         nonstandard = GeneralWebHttpResponse(
             200,
@@ -438,12 +535,29 @@ class TestGeneralWebSearch(unittest.TestCase):
                 {"WEB_SEARCH_RESPONSE_INVALID", "WEB_SEARCH_NETWORK_ERROR"},
             )
             self.assertNotIn(TOKEN, str(raised.exception))
+            self.assertIsNone(raised.exception.__cause__)
 
         client = GeneralWebSearchClient(_config(), transport=FakeTransport())
         with self.assertRaises(GeneralWebSearchError) as raised:
             client.search(client.open_session(online_opt_in=True), f"query {TOKEN}")
         self.assertEqual(raised.exception.code, "WEB_SEARCH_INVALID_QUERY")
         self.assertNotIn(TOKEN, str(raised.exception))
+
+    def test_total_wall_deadline_covers_retries_and_publication(self) -> None:
+        now = [10.0]
+        transport = FakeTransport(_json_response({"web": {"results": []}}))
+        transport.before_return = lambda: now.__setitem__(0, 11.1)
+        client = GeneralWebSearchClient(
+            _config(),
+            transport=transport,
+            timeout_seconds=1.0,
+            maximum_retries=1,
+            monotonic_clock=lambda: now[0],
+        )
+        with self.assertRaises(GeneralWebSearchError) as raised:
+            client.search(client.open_session(online_opt_in=True), "bounded search")
+        self.assertEqual(raised.exception.code, "WEB_SEARCH_TIMEOUT")
+        self.assertEqual(len(transport.calls), 1)
 
     def test_standard_transport_rejects_nonfixed_destinations_preflight(self) -> None:
         transport = StandardLibraryGeneralWebTransport()
@@ -468,6 +582,70 @@ class TestGeneralWebSearch(unittest.TestCase):
                     maximum_response_bytes=1024,
                     cancelled=lambda: False,
                 )
+
+    def test_standard_transport_rejects_nonpublic_dns_and_pins_public_tls_peer(self) -> None:
+        valid_query = "q=bounded&count=1&safesearch=strict"
+        for addresses in (
+            ("127.0.0.1",),
+            ("169.254.10.20",),
+            ("10.0.0.7",),
+            ("fc00::1",),
+            ("93.184.216.34", "127.0.0.1"),
+        ):
+            connections: list[object] = []
+
+            def forbidden_factory(*args):
+                connections.append(args)
+                raise AssertionError("non-public DNS must fail before connect")
+
+            transport = StandardLibraryGeneralWebTransport(
+                resolver=lambda _host, _port, answer=addresses: answer,
+                connection_factory=forbidden_factory,
+            )
+            with self.subTest(addresses=addresses), self.assertRaises(
+                GeneralWebTransportError
+            ):
+                transport.get(
+                    host=BRAVE_SEARCH_API_HOST,
+                    path=BRAVE_SEARCH_API_PATH,
+                    query_string=valid_query,
+                    headers={"Accept": "application/json"},
+                    timeout_seconds=1.0,
+                    maximum_response_bytes=1024,
+                    cancelled=lambda: False,
+                    authorize_dispatch=lambda dispatch: (dispatch() or True),
+                )
+            self.assertEqual(connections, [])
+
+        captured: list[tuple[str, str, float, ssl.SSLContext]] = []
+        connection = _FakePinnedConnection()
+
+        def factory(host, pinned_ip, timeout, context):
+            captured.append((host, pinned_ip, timeout, context))
+            return connection
+
+        transport = StandardLibraryGeneralWebTransport(
+            resolver=lambda _host, _port: ("93.184.216.34",),
+            connection_factory=factory,
+        )
+        response = transport.get(
+            host=BRAVE_SEARCH_API_HOST,
+            path=BRAVE_SEARCH_API_PATH,
+            query_string=valid_query,
+            headers={"Accept": "application/json"},
+            timeout_seconds=1.0,
+            maximum_response_bytes=1024,
+            cancelled=lambda: False,
+            authorize_dispatch=lambda dispatch: (dispatch() or True),
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(captured[0][0], BRAVE_SEARCH_API_HOST)
+        self.assertEqual(captured[0][1], "93.184.216.34")
+        self.assertTrue(captured[0][3].check_hostname)
+        self.assertEqual(captured[0][3].verify_mode, ssl.CERT_REQUIRED)
+        self.assertEqual(connection.requests[0][0], "GET")
+        self.assertTrue(connection.requests[0][1].startswith(BRAVE_SEARCH_API_PATH))
+        self.assertTrue(connection.closed)
 
 
 class TestGeneralWebWorkspaceIntegration(unittest.TestCase):
@@ -532,6 +710,59 @@ class TestGeneralWebWorkspaceIntegration(unittest.TestCase):
                 service.general_web_client.external_calls,
                 0,
             )
+
+    def test_inflight_registry_cancel_and_shutdown_revoke_are_fail_closed(self) -> None:
+        entered = Event()
+        release = Event()
+        transport = FakeTransport(_json_response(_result_payload()))
+
+        def block_return() -> None:
+            entered.set()
+            self.assertTrue(release.wait(2.0))
+
+        transport.before_return = block_return
+        client = GeneralWebSearchClient(
+            _config(), transport=transport, maximum_retries=0
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            service = WorkspaceCapabilityService(
+                Path(temporary), self._model(), general_web_client=client
+            )
+            captured: list[BaseException] = []
+
+            def search() -> None:
+                try:
+                    service.search_web(
+                        "bounded cancel",
+                        session_online_opt_in=True,
+                        request_id="b" * 32,
+                    )
+                except BaseException as error:
+                    captured.append(error)
+
+            worker = Thread(target=search)
+            worker.start()
+            self.assertTrue(entered.wait(1.0))
+            cancellation = service.cancel_web_search("b" * 32)
+            self.assertTrue(cancellation["cancelled"])
+            release.set()
+            worker.join(2.0)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(captured), 1)
+            self.assertIsInstance(captured[0], WorkspaceCapabilityError)
+            self.assertEqual(captured[0].code, "WEB_SEARCH_CANCELLED")
+            self.assertIsNone(captured[0].__cause__)
+            self.assertEqual(
+                service.cancel_web_search("b" * 32)["state"], "not_found"
+            )
+
+            service.shutdown()
+            self.assertEqual(
+                service.general_web_client.capability_payload()["state"], "revoked"
+            )
+            with self.assertRaises(WorkspaceCapabilityError) as invalid:
+                service.cancel_web_search("not-an-id")
+            self.assertEqual(invalid.exception.code, "INVALID_WEB_SEARCH_REQUEST_ID")
 
 
 if __name__ == "__main__":

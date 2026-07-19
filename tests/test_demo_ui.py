@@ -1051,13 +1051,16 @@ class TestCogniBoardUI(unittest.TestCase):
             self.skipTest("Node.js is not installed in this Python test environment")
         script = (STATIC / "app.js").read_text(encoding="utf-8")
         start = script.index("async function requestLatestWorkspaceCapabilities")
-        end = (
+        end = script.index("\n}\n\nfunction updateWorkspaceControlStates", start) + 2
+        request_latest = script[start:end]
+        load_start = script.index("async function loadWorkspaceCapabilities")
+        load_end = (
             script.index(
-                "\n}\n\nasync function refreshWorkspaceCapabilityDisclosure", start
+                "\n}\n\nasync function settleFirstImageAttestation", load_start
             )
             + 2
         )
-        request_latest = script[start:end]
+        load_workspace = script[load_start:load_end]
         probe = (
             r"""
 const assert = require("node:assert/strict");
@@ -1069,6 +1072,9 @@ const ui = {
 };
 const pending = [];
 const applied = [];
+let revoked = 0;
+let externalDisclosureClears = 0;
+let controlUpdates = 0;
 function api(path, options) {
   assert.equal(path, "/api/workspace/capabilities");
   return new Promise((resolve) => pending.push({ resolve, signal: options.signal }));
@@ -1077,8 +1083,18 @@ function applyWorkspaceCapabilities(payload) {
   applied.push(payload.version);
   return true;
 }
+function revokeWorkspaceCapabilities() { revoked += 1; }
+function updateExternalCallDisclosure(origin, record) {
+  assert.equal(origin, "");
+  assert.equal(record, null);
+  externalDisclosureClears += 1;
+}
+function setText() {}
+function updateWorkspaceControlStates() { controlUpdates += 1; }
 """
             + request_latest
+            + "\n"
+            + load_workspace
             + r"""
 
 (async () => {
@@ -1127,9 +1143,36 @@ function applyWorkspaceCapabilities(payload) {
   ]);
   assert.deepEqual(
     { latest: timeoutResult.latest, applied: timeoutResult.applied },
-    { latest: false, applied: false },
+    { latest: true, applied: false },
   );
   pending[3].resolve({ version: "timeout-late" });
+  await Promise.resolve();
+  assert.deepEqual(applied, ["new"]);
+
+  const refreshTimedOut = refreshWorkspaceCapabilityDisclosure({ timeoutMs: 10 });
+  assert.equal(pending.length, 5);
+  const refreshResult = await Promise.race([
+    refreshTimedOut,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("refresh timeout remained pending")), 200)),
+  ]);
+  assert.equal(refreshResult, false);
+  assert.equal(revoked, 1);
+  assert.equal(externalDisclosureClears, 1);
+  assert.equal(controlUpdates, 1);
+  pending[4].resolve({ version: "refresh-timeout-late" });
+  await Promise.resolve();
+  assert.deepEqual(applied, ["new"]);
+
+  const loadTimedOut = loadWorkspaceCapabilities();
+  assert.equal(pending.length, 6);
+  await Promise.race([
+    loadTimedOut,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("load timeout remained pending")), 1200)),
+  ]);
+  assert.equal(revoked, 2);
+  assert.equal(externalDisclosureClears, 2);
+  assert.equal(controlUpdates, 2);
+  pending[5].resolve({ version: "load-timeout-late" });
   await Promise.resolve();
   assert.deepEqual(applied, ["new"]);
 })().catch((error) => {

@@ -79,6 +79,10 @@ class TestVoiceUIContract(unittest.TestCase):
         self.assertIn("setTimeout(() => stopVoiceCapture(session), 0)", script)
         self.assertIn("() => stopVoiceCapture(session)", script)
         self.assertIn(
+            'if (!voiceSessionActive(session) || ui.voiceCaptureState !== "recording") return;',
+            capture,
+        )
+        self.assertIn(
             "async function stopVoiceCapture(expectedSession = ui.voiceSession)", script
         )
         self.assertNotIn("context.resume()", script)
@@ -212,6 +216,57 @@ class FakeRecorder {
 })().catch(error => { console.error(error.stack || error); process.exit(1); });
 """,
             ]
+        )
+        completed = subprocess.run(
+            [str(NODE), "--input-type=module", "--eval", node_source],
+            capture_output=True,
+            check=False,
+            encoding="utf-8",
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    @unittest.skipUnless(NODE, "Node.js is required for deterministic voice race tests")
+    def test_stale_elapsed_tick_is_session_bound(self) -> None:
+        script = (STATIC / "app.js").read_text(encoding="utf-8")
+        capture_start = script.index("async function startVoiceCapture")
+        interval_start = script.index(
+            "session.elapsedTimer = setInterval", capture_start
+        )
+        interval_end = script.index(
+            '    setVoiceCaptureState("recording"', interval_start
+        )
+        interval_source = script[interval_start:interval_end]
+        node_source = (
+            r"""
+const VOICE_MAX_SECONDS = 30;
+const ui = { voiceSession: null, voiceCaptureState: "idle" };
+let queuedTick = null;
+let renderedCopies = 0;
+global.setInterval = (callback) => { queuedTick = callback; return 1; };
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+function voiceSessionActive(candidate) {
+  return Boolean(candidate && !candidate.cancelled && ui.voiceSession === candidate);
+}
+function setText() { renderedCopies += 1; }
+const oldSession = { cancelled: false, startedAt: performance.now() - 1000 };
+const session = oldSession;
+ui.voiceSession = oldSession;
+ui.voiceCaptureState = "recording";
+"""
+            + interval_source
+            + r"""
+assert(typeof queuedTick === "function", "elapsed callback was not registered");
+queuedTick();
+assert(renderedCopies === 1, "active session did not render elapsed copy");
+const newSession = { cancelled: false, startedAt: performance.now() };
+ui.voiceSession = newSession;
+ui.voiceCaptureState = "recording";
+queuedTick();
+assert(renderedCopies === 1, "stale elapsed tick changed the new session UI");
+"""
         )
         completed = subprocess.run(
             [str(NODE), "--input-type=module", "--eval", node_source],

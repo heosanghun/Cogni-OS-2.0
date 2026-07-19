@@ -1509,9 +1509,8 @@ async function requestLatestWorkspaceCapabilities(options = {}) {
     };
   } catch (error) {
     const latest = requestId === ui.workspaceCapabilityRequestId
-      && !controller.signal.aborted
       && !externalSignal?.aborted
-      && !timedOut;
+      && (timedOut || !controller.signal.aborted);
     return { latest, applied: false, requestId, error };
   } finally {
     if (timeoutId) window.clearTimeout(timeoutId);
@@ -2847,6 +2846,7 @@ async function startVoiceCapture() {
       VOICE_MAX_SECONDS * 1000,
     );
     session.elapsedTimer = setInterval(() => {
+      if (!voiceSessionActive(session) || ui.voiceCaptureState !== "recording") return;
       const elapsed = Math.min(VOICE_MAX_SECONDS, (performance.now() - session.startedAt) / 1000);
       setText("#agent-voice-capture-copy", `${elapsed.toFixed(1)}초 / ${VOICE_MAX_SECONDS}초 · 외부 전송 0`);
     }, 250);

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from hashlib import sha256
 import json
 from math import isclose
@@ -9,6 +10,7 @@ import unittest
 
 from cogni_demo.semantic_embedder import (
     LocalSemanticEmbedder,
+    MAX_ARTIFACT_FILES,
     SEMANTIC_EMBEDDER_MANIFEST,
     SEMANTIC_EMBEDDER_SCHEMA,
     SemanticEmbedderError,
@@ -42,11 +44,27 @@ def _write_manifest(
     dimensions: int = 4,
     max_input_chars: int = 128,
     max_batch_size: int = 3,
+    config_overrides: dict[str, object] | None = None,
     overrides: dict[str, object] | None = None,
 ) -> Path:
+    config: dict[str, object] = {
+        "model_type": "bert",
+        "hidden_size": dimensions,
+        "intermediate_size": max(4, dimensions * 2),
+        "num_hidden_layers": 2,
+        "num_attention_heads": 1,
+        "vocab_size": 256,
+        "max_position_embeddings": 128,
+        "type_vocab_size": 2,
+    }
+    if config_overrides:
+        config.update(config_overrides)
     files = {
         "LICENSE": b"Apache License 2.0\n",
-        "config.json": b'{"model_type":"bounded-test"}\n',
+        "config.json": (
+            json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        ),
         "model.safetensors": b"bounded semantic weights fixture\n",
         "tokenizer.json": b'{"version":"1.0"}\n',
     }
@@ -88,6 +106,10 @@ class TestSemanticEmbedderManifest(unittest.TestCase):
             self.assertEqual(verified.dimensions, 4)
             self.assertEqual(verified.license_file, "LICENSE")
             self.assertEqual(len(verified.files), 4)
+            self.assertEqual(verified.model_type, "bert")
+            self.assertEqual(verified.model_max_tokens, 128)
+            self.assertGreater(verified.estimated_parameter_upper_bound, 0)
+            self.assertGreater(verified.estimated_peak_ram_bytes, 0)
             self.assertRegex(verified.manifest_sha256, r"[0-9a-f]{64}")
             self.assertRegex(verified.profile, r"local_semantic_[0-9a-f]{16}_v1")
 
@@ -168,6 +190,38 @@ class TestSemanticEmbedderManifest(unittest.TestCase):
             with self.assertRaises(SemanticEmbedderError) as raised:
                 verify_semantic_embedder_manifest(linked)
             self.assertEqual(raised.exception.code, "SEMANTIC_ARTIFACT_UNSAFE")
+
+    def test_network_root_is_rejected_before_filesystem_access(self) -> None:
+        with self.assertRaises(SemanticEmbedderError) as raised:
+            verify_semantic_embedder_manifest(r"\\semantic-host\model")
+        self.assertEqual(raised.exception.code, "SEMANTIC_ARTIFACT_UNSAFE")
+
+    def test_inventory_file_count_is_bounded_while_enumerating(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_manifest(root)
+            for index in range(MAX_ARTIFACT_FILES):
+                (root / f"extra-{index:03d}.txt").write_text("x", encoding="utf-8")
+            with self.assertRaises(SemanticEmbedderError) as raised:
+                verify_semantic_embedder_manifest(root)
+            self.assertEqual(raised.exception.code, "SEMANTIC_ARTIFACT_TOO_LARGE")
+
+    def test_unbounded_or_dynamic_model_configs_are_rejected(self) -> None:
+        cases = (
+            {"model_type": "custom_remote_encoder"},
+            {"auto_map": {"AutoModel": "remote.CustomModel"}},
+            {"num_hidden_layers": 49},
+        )
+        for config_overrides in cases:
+            with self.subTest(config_overrides=config_overrides):
+                with TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    _write_manifest(root, config_overrides=config_overrides)
+                    with self.assertRaises(SemanticEmbedderError) as raised:
+                        verify_semantic_embedder_manifest(root)
+                    self.assertEqual(
+                        raised.exception.code, "SEMANTIC_MODEL_CONFIG_UNSAFE"
+                    )
 
 
 class TestLocalSemanticEmbedder(unittest.TestCase):
@@ -278,6 +332,30 @@ class TestLocalSemanticEmbedder(unittest.TestCase):
             with self.assertRaises(SemanticEmbedderError):
                 embedder.encode("not a sequence of documents")
             self.assertEqual(calls, 0)
+
+    def test_batch_bound_is_checked_before_sequence_copy(self) -> None:
+        class _ExplosiveSequence(Sequence[str]):
+            reads = 0
+
+            def __len__(self) -> int:
+                return 4
+
+            def __getitem__(self, _index: int) -> str:
+                self.reads += 1
+                raise AssertionError("oversized sequence must not be copied")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_manifest(root, max_batch_size=3)
+            embedder = LocalSemanticEmbedder(
+                root, backend_factory=lambda manifest: _FakeBackend(manifest.dimensions)
+            )
+            texts = _ExplosiveSequence()
+            with self.assertRaises(SemanticEmbedderError) as raised:
+                embedder.encode(texts)
+            self.assertEqual(raised.exception.code, "SEMANTIC_BATCH_LIMIT")
+            self.assertEqual(texts.reads, 0)
+            self.assertFalse(embedder.loaded)
 
     def test_invalid_output_shape_nan_zero_norm_and_backend_failure_fail_closed(
         self,

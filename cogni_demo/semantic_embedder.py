@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 from threading import RLock
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 
 SEMANTIC_EMBEDDER_SCHEMA = "cogni.semantic-embedder.v1"
@@ -25,15 +25,58 @@ SEMANTIC_EMBEDDER_MANIFEST = "semantic-embedder.manifest.json"
 TRANSFORMERS_MEAN_POOL_BACKEND = "transformers_mean_pool_v1"
 MAX_MANIFEST_BYTES = 128 * 1024
 MAX_ARTIFACT_FILES = 128
+MAX_ARTIFACT_DIRECTORIES = 64
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024
+MAX_MODEL_CONFIG_BYTES = 1024 * 1024
 MAX_EMBEDDING_DIMENSIONS = 8_192
 MAX_EMBEDDING_BATCH = 16
 MAX_EMBEDDING_INPUT_CHARS = 16_384
+MAX_SEMANTIC_MODEL_PARAMETERS = 250_000_000
+MAX_SEMANTIC_ESTIMATED_PEAK_RAM_BYTES = 4 * 1024 * 1024 * 1024
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 _SPDX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+-]{0,63}\Z")
 _REVISION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{6,127}\Z")
 _WINDOWS_REPARSE_POINT = 0x0400
+_SAFE_MODEL_FIELDS = {
+    "bert": (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+    ),
+    "deberta-v2": (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+    ),
+    "modernbert": (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+    ),
+    "mpnet": (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+    ),
+    "roberta": (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+    ),
+    "xlm-roberta": (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+    ),
+    "distilbert": ("dim", "hidden_dim", "n_layers", "n_heads"),
+}
 
 
 class SemanticEmbedderError(RuntimeError):
@@ -69,6 +112,10 @@ class SemanticEmbedderManifest:
     license_file: str
     files: tuple[tuple[str, str], ...]
     total_artifact_bytes: int
+    model_type: str
+    model_max_tokens: int
+    estimated_parameter_upper_bound: int
+    estimated_peak_ram_bytes: int
 
     @property
     def profile(self) -> str:
@@ -87,6 +134,11 @@ class SemanticEmbedderManifest:
             "manifest_sha256": self.manifest_sha256,
             "artifact_files": len(self.files),
             "artifact_bytes": self.total_artifact_bytes,
+            "model_type": self.model_type,
+            "model_max_tokens": self.model_max_tokens,
+            "estimated_parameter_upper_bound": (self.estimated_parameter_upper_bound),
+            "estimated_peak_ram_bytes": self.estimated_peak_ram_bytes,
+            "resource_policy": "bounded_transformer_encoder_v1",
             "artifact_verified": True,
             "device": "cpu",
             "vram_bytes": 0,
@@ -101,6 +153,35 @@ class SemanticEmbedderManifest:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    mode: int
+    links: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservedFile:
+    path: Path
+    identity: _FileIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class _SafeModelConfig:
+    model_type: str
+    hidden_size: int
+    intermediate_size: int
+    layers: int
+    attention_heads: int
+    vocabulary_size: int
+    max_tokens: int
+    estimated_parameter_upper_bound: int
+
+
 def _is_reparse_or_link(path: Path) -> bool:
     try:
         metadata = path.lstat()
@@ -110,6 +191,188 @@ def _is_reparse_or_link(path: Path) -> bool:
         ) from exc
     attributes = int(getattr(metadata, "st_file_attributes", 0))
     return stat.S_ISLNK(metadata.st_mode) or bool(attributes & _WINDOWS_REPARSE_POINT)
+
+
+def _identity(metadata: os.stat_result) -> _FileIdentity:
+    return _FileIdentity(
+        device=int(metadata.st_dev),
+        inode=int(metadata.st_ino),
+        mode=int(metadata.st_mode),
+        links=int(metadata.st_nlink),
+        size=int(metadata.st_size),
+        modified_ns=int(metadata.st_mtime_ns),
+        changed_ns=int(metadata.st_ctime_ns),
+    )
+
+
+def _object_identity(value: _FileIdentity) -> tuple[int, int, int, int]:
+    return (value.device, value.inode, value.mode, value.links)
+
+
+def _reject_network_root(value: str | Path) -> None:
+    raw = os.fspath(Path(value).expanduser())
+    normalized = raw.replace("/", "\\")
+    drive = Path(raw).drive.replace("/", "\\")
+    if normalized.startswith("\\\\") or drive.startswith("\\\\"):
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_UNSAFE",
+            "semantic artifact root cannot be a UNC or network path",
+        )
+
+
+def _regular_path_identity(
+    path: Path,
+    *,
+    code: str,
+    label: str,
+) -> _FileIdentity:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise SemanticEmbedderError(code, f"{label} is unavailable") from exc
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or bool(attributes & _WINDOWS_REPARSE_POINT)
+        or not stat.S_ISREG(metadata.st_mode)
+    ):
+        raise SemanticEmbedderError(code, f"{label} must be a local regular file")
+    return _identity(metadata)
+
+
+def _assert_canonical_artifact_path(root: Path, path: Path, *, label: str) -> None:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_UNAVAILABLE", f"{label} is unavailable"
+        ) from exc
+    if resolved != path or not resolved.is_relative_to(root):
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_UNSAFE", f"{label} escaped the semantic root"
+        )
+
+
+def _read_bounded_regular_file(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    code: str,
+    label: str,
+    expected_identity: _FileIdentity | None = None,
+) -> tuple[bytes, _FileIdentity]:
+    before = _regular_path_identity(path, code=code, label=label)
+    if expected_identity is not None and before != expected_identity:
+        raise SemanticEmbedderError(code, f"{label} changed before it was opened")
+    if not 1 <= before.size <= maximum_bytes:
+        raise SemanticEmbedderError(code, f"{label} exceeds its byte limit")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        opened = _identity(os.fstat(descriptor))
+        if (
+            not stat.S_ISREG(opened.mode)
+            or _object_identity(opened) != _object_identity(before)
+            or opened.size != before.size
+        ):
+            raise SemanticEmbedderError(code, f"{label} changed while being opened")
+        output = bytearray()
+        while len(output) <= maximum_bytes:
+            remaining = maximum_bytes + 1 - len(output)
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            output.extend(chunk)
+        if len(output) > maximum_bytes or len(output) != before.size:
+            raise SemanticEmbedderError(code, f"{label} changed while being read")
+        after = _identity(os.fstat(descriptor))
+    except SemanticEmbedderError:
+        raise
+    except OSError as exc:
+        raise SemanticEmbedderError(code, f"{label} could not be read") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    path_after = _regular_path_identity(path, code=code, label=label)
+    if after != opened or path_after != before:
+        raise SemanticEmbedderError(code, f"{label} changed while being read")
+    return bytes(output), before
+
+
+def _hash_bounded_regular_file(
+    root: Path,
+    observed: _ObservedFile,
+    *,
+    maximum_bytes: int,
+) -> tuple[str, int]:
+    path = observed.path
+    _assert_canonical_artifact_path(root, path, label="semantic artifact file")
+    before = _regular_path_identity(
+        path,
+        code="SEMANTIC_ARTIFACT_UNAVAILABLE",
+        label="semantic artifact file",
+    )
+    if before != observed.identity:
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_CHANGED",
+            "semantic artifact changed after inventory",
+        )
+    if not 1 <= before.size <= maximum_bytes:
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_TOO_LARGE",
+            "semantic artifact exceeds the remaining byte limit",
+        )
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        opened = _identity(os.fstat(descriptor))
+        if (
+            not stat.S_ISREG(opened.mode)
+            or _object_identity(opened) != _object_identity(before)
+            or opened.size != before.size
+        ):
+            raise SemanticEmbedderError(
+                "SEMANTIC_ARTIFACT_CHANGED",
+                "semantic artifact changed while being opened",
+            )
+        digest = sha256()
+        consumed = 0
+        while consumed <= maximum_bytes:
+            remaining = maximum_bytes + 1 - consumed
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            consumed += len(chunk)
+            digest.update(chunk)
+        if consumed > maximum_bytes or consumed != before.size:
+            raise SemanticEmbedderError(
+                "SEMANTIC_ARTIFACT_CHANGED",
+                "semantic artifact grew or shrank while being hashed",
+            )
+        after = _identity(os.fstat(descriptor))
+    except SemanticEmbedderError:
+        raise
+    except OSError as exc:
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_UNAVAILABLE",
+            "semantic artifact could not be hashed",
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    path_after = _regular_path_identity(
+        path,
+        code="SEMANTIC_ARTIFACT_UNAVAILABLE",
+        label="semantic artifact file",
+    )
+    if after != opened or path_after != before:
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_CHANGED",
+            "semantic artifact changed while being hashed",
+        )
+    return digest.hexdigest(), consumed
 
 
 def _safe_relative_file(value: object, *, label: str) -> str:
@@ -143,68 +406,266 @@ def _bounded_int(value: object, *, minimum: int, maximum: int, label: str) -> in
     return value
 
 
-def _read_manifest(path: Path) -> tuple[dict[str, object], bytes]:
+def _strict_json_object(
+    raw: bytes,
+    *,
+    code: str,
+    label: str,
+) -> dict[str, object]:
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        output: dict[str, object] = {}
+        for key, value in pairs:
+            if key in output:
+                raise SemanticEmbedderError(code, f"{label} contains duplicate keys")
+            output[key] = value
+        return output
+
+    def reject_constant(_value: str) -> object:
+        raise SemanticEmbedderError(code, f"{label} contains a non-finite number")
+
     try:
-        if _is_reparse_or_link(path) or not path.is_file():
-            raise SemanticEmbedderError(
-                "SEMANTIC_MANIFEST_INVALID", "semantic manifest must be a regular file"
-            )
-        size = path.stat().st_size
-        if not 1 <= size <= MAX_MANIFEST_BYTES:
-            raise SemanticEmbedderError(
-                "SEMANTIC_MANIFEST_INVALID", "semantic manifest size is invalid"
-            )
-        raw = path.read_bytes()
-        payload = json.loads(raw.decode("utf-8"))
+        payload = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
     except SemanticEmbedderError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise SemanticEmbedderError(
-            "SEMANTIC_MANIFEST_INVALID", "semantic manifest could not be decoded"
-        ) from exc
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise SemanticEmbedderError(code, f"{label} could not be decoded") from exc
     if not isinstance(payload, dict):
-        raise SemanticEmbedderError(
-            "SEMANTIC_MANIFEST_INVALID", "semantic manifest must be an object"
+        raise SemanticEmbedderError(code, f"{label} must be an object")
+    return payload
+
+
+def _read_manifest(
+    path: Path,
+) -> tuple[dict[str, object], bytes, _FileIdentity]:
+    try:
+        raw, identity = _read_bounded_regular_file(
+            path,
+            maximum_bytes=MAX_MANIFEST_BYTES,
+            code="SEMANTIC_MANIFEST_INVALID",
+            label="semantic manifest",
         )
-    return payload, raw
+    except SemanticEmbedderError:
+        raise
+    except OSError as exc:
+        raise SemanticEmbedderError(
+            "SEMANTIC_MANIFEST_INVALID", "semantic manifest could not be read"
+        ) from exc
+    payload = _strict_json_object(
+        raw,
+        code="SEMANTIC_MANIFEST_INVALID",
+        label="semantic manifest",
+    )
+    return payload, raw, identity
 
 
-def _inventory_regular_files(root: Path) -> dict[str, Path]:
-    observed: dict[str, Path] = {}
-    pending = [root]
+def _directory_identity(path: Path) -> _FileIdentity:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_UNAVAILABLE",
+            "semantic artifact directory could not be inspected",
+        ) from exc
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or bool(attributes & _WINDOWS_REPARSE_POINT)
+        or not stat.S_ISDIR(metadata.st_mode)
+    ):
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_UNSAFE",
+            "semantic artifact directories must be local regular directories",
+        )
+    return _identity(metadata)
+
+
+def _inventory_regular_files(root: Path) -> dict[str, _ObservedFile]:
+    observed: dict[str, _ObservedFile] = {}
+    root_identity = _directory_identity(root)
+    pending = [(root, root_identity)]
+    directory_count = 1
     while pending:
-        directory = pending.pop()
+        directory, expected_directory_identity = pending.pop()
+        before_directory = _directory_identity(directory)
+        if before_directory != expected_directory_identity:
+            raise SemanticEmbedderError(
+                "SEMANTIC_ARTIFACT_CHANGED",
+                "semantic artifact directory changed during inventory",
+            )
         try:
-            entries = tuple(os.scandir(directory))
+            entries = os.scandir(directory)
         except OSError as exc:
             raise SemanticEmbedderError(
                 "SEMANTIC_ARTIFACT_UNAVAILABLE",
                 "semantic artifact directory could not be inventoried",
             ) from exc
-        for entry in entries:
-            candidate = Path(entry.path)
-            if _is_reparse_or_link(candidate):
-                raise SemanticEmbedderError(
-                    "SEMANTIC_ARTIFACT_UNSAFE",
-                    "semantic artifact cannot contain links or reparse points",
-                )
-            relative = candidate.relative_to(root).as_posix()
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    pending.append(candidate)
-                elif entry.is_file(follow_symlinks=False):
-                    observed[relative] = candidate
-                else:
-                    raise SemanticEmbedderError(
-                        "SEMANTIC_ARTIFACT_UNSAFE",
-                        "semantic artifact contains an unsupported filesystem entry",
-                    )
-            except OSError as exc:
-                raise SemanticEmbedderError(
-                    "SEMANTIC_ARTIFACT_UNAVAILABLE",
-                    "semantic artifact changed during inventory",
-                ) from exc
+        try:
+            with entries:
+                for entry in entries:
+                    candidate = Path(entry.path)
+                    try:
+                        # Windows DirEntry.stat() can report zeroed inode/device/link
+                        # values. Path.lstat() preserves the identity used by the
+                        # subsequent no-follow open/fstat checks.
+                        metadata = candidate.lstat()
+                    except OSError as exc:
+                        raise SemanticEmbedderError(
+                            "SEMANTIC_ARTIFACT_UNAVAILABLE",
+                            "semantic artifact changed during inventory",
+                        ) from exc
+                    attributes = int(getattr(metadata, "st_file_attributes", 0))
+                    if stat.S_ISLNK(metadata.st_mode) or bool(
+                        attributes & _WINDOWS_REPARSE_POINT
+                    ):
+                        raise SemanticEmbedderError(
+                            "SEMANTIC_ARTIFACT_UNSAFE",
+                            "semantic artifact cannot contain links or reparse points",
+                        )
+                    identity = _identity(metadata)
+                    relative = candidate.relative_to(root).as_posix()
+                    if stat.S_ISDIR(metadata.st_mode):
+                        directory_count += 1
+                        if directory_count > MAX_ARTIFACT_DIRECTORIES:
+                            raise SemanticEmbedderError(
+                                "SEMANTIC_ARTIFACT_TOO_LARGE",
+                                "semantic artifact exceeds its directory limit",
+                            )
+                        pending.append((candidate, identity))
+                    elif stat.S_ISREG(metadata.st_mode):
+                        if relative in observed:
+                            raise SemanticEmbedderError(
+                                "SEMANTIC_ARTIFACT_UNSAFE",
+                                "semantic artifact contains a duplicate path",
+                            )
+                        if len(observed) >= MAX_ARTIFACT_FILES + 1:
+                            raise SemanticEmbedderError(
+                                "SEMANTIC_ARTIFACT_TOO_LARGE",
+                                "semantic artifact exceeds its file inventory limit",
+                            )
+                        observed[relative] = _ObservedFile(candidate, identity)
+                    else:
+                        raise SemanticEmbedderError(
+                            "SEMANTIC_ARTIFACT_UNSAFE",
+                            "semantic artifact contains an unsupported filesystem entry",
+                        )
+        except SemanticEmbedderError:
+            raise
+        except OSError as exc:
+            raise SemanticEmbedderError(
+                "SEMANTIC_ARTIFACT_UNAVAILABLE",
+                "semantic artifact changed during inventory",
+            ) from exc
+        after_directory = _directory_identity(directory)
+        if after_directory != before_directory:
+            raise SemanticEmbedderError(
+                "SEMANTIC_ARTIFACT_CHANGED",
+                "semantic artifact directory changed during inventory",
+            )
     return observed
+
+
+def _config_int(
+    payload: Mapping[str, object],
+    key: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = payload.get(key)
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not minimum <= value <= maximum
+    ):
+        raise SemanticEmbedderError(
+            "SEMANTIC_MODEL_CONFIG_UNSAFE",
+            f"semantic model config field {key} is outside its bound",
+        )
+    return value
+
+
+def _safe_model_config(raw: bytes, *, dimensions: int) -> _SafeModelConfig:
+    payload = _strict_json_object(
+        raw,
+        code="SEMANTIC_MODEL_CONFIG_UNSAFE",
+        label="semantic model config",
+    )
+    model_type = payload.get("model_type")
+    if not isinstance(model_type, str) or model_type not in _SAFE_MODEL_FIELDS:
+        raise SemanticEmbedderError(
+            "SEMANTIC_MODEL_CONFIG_UNSAFE",
+            "semantic model type is not in the bounded encoder allowlist",
+        )
+    if any(
+        key in payload
+        for key in ("auto_map", "custom_pipelines", "quantization_config")
+    ):
+        raise SemanticEmbedderError(
+            "SEMANTIC_MODEL_CONFIG_UNSAFE",
+            "semantic model config requests an unsupported dynamic runtime",
+        )
+    hidden_key, intermediate_key, layers_key, heads_key = _SAFE_MODEL_FIELDS[model_type]
+    hidden_size = _config_int(
+        payload, hidden_key, minimum=2, maximum=MAX_EMBEDDING_DIMENSIONS
+    )
+    intermediate_size = _config_int(
+        payload, intermediate_key, minimum=hidden_size, maximum=32_768
+    )
+    layers = _config_int(payload, layers_key, minimum=1, maximum=48)
+    attention_heads = _config_int(payload, heads_key, minimum=1, maximum=128)
+    vocabulary_size = _config_int(payload, "vocab_size", minimum=128, maximum=500_000)
+    max_tokens = _config_int(
+        payload, "max_position_embeddings", minimum=32, maximum=8_192
+    )
+    type_vocabulary_size = payload.get("type_vocab_size", 1)
+    if (
+        not isinstance(type_vocabulary_size, int)
+        or isinstance(type_vocabulary_size, bool)
+        or not 1 <= type_vocabulary_size <= 32
+    ):
+        raise SemanticEmbedderError(
+            "SEMANTIC_MODEL_CONFIG_UNSAFE",
+            "semantic model type vocabulary is outside its bound",
+        )
+    if hidden_size != dimensions or hidden_size % attention_heads:
+        raise SemanticEmbedderError(
+            "SEMANTIC_MODEL_CONFIG_UNSAFE",
+            "semantic model dimensions or attention geometry do not match",
+        )
+
+    embedding_parameters = (
+        vocabulary_size * hidden_size
+        + max_tokens * hidden_size
+        + type_vocabulary_size * hidden_size
+        + hidden_size * hidden_size
+    )
+    per_layer_parameters = (
+        4 * hidden_size * hidden_size
+        + 2 * hidden_size * intermediate_size
+        + 16 * hidden_size
+        + intermediate_size
+    )
+    raw_upper_bound = embedding_parameters + layers * per_layer_parameters
+    estimated_parameter_upper_bound = (raw_upper_bound * 5 + 3) // 4
+    if estimated_parameter_upper_bound > MAX_SEMANTIC_MODEL_PARAMETERS:
+        raise SemanticEmbedderError(
+            "SEMANTIC_MODEL_CONFIG_UNSAFE",
+            "semantic model estimated parameter count exceeds its limit",
+        )
+    return _SafeModelConfig(
+        model_type=model_type,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        layers=layers,
+        attention_heads=attention_heads,
+        vocabulary_size=vocabulary_size,
+        max_tokens=max_tokens,
+        estimated_parameter_upper_bound=estimated_parameter_upper_bound,
+    )
 
 
 def verify_semantic_embedder_manifest(
@@ -213,6 +674,7 @@ def verify_semantic_embedder_manifest(
 ) -> SemanticEmbedderManifest:
     """Verify a closed-world local embedding model without loading executable code."""
 
+    _reject_network_root(root)
     lexical_root = Path(os.path.abspath(Path(root).expanduser()))
     try:
         if _is_reparse_or_link(lexical_root):
@@ -235,6 +697,8 @@ def verify_semantic_embedder_manifest(
         if manifest_path is None
         else os.path.abspath(Path(manifest_path).expanduser())
     )
+    if manifest_path is not None:
+        _reject_network_root(manifest_path)
     try:
         if _is_reparse_or_link(lexical_manifest):
             raise SemanticEmbedderError(
@@ -255,7 +719,7 @@ def verify_semantic_embedder_manifest(
             "semantic manifest must be the fixed root manifest",
         )
 
-    payload, raw_manifest = _read_manifest(selected_manifest)
+    payload, raw_manifest, manifest_identity = _read_manifest(selected_manifest)
     expected_keys = {
         "schema",
         "model_id",
@@ -349,9 +813,15 @@ def verify_semantic_embedder_manifest(
         )
 
     observed = _inventory_regular_files(selected_root)
+    observed_manifest = observed.get(SEMANTIC_EMBEDDER_MANIFEST)
+    if observed_manifest is None or observed_manifest.identity != manifest_identity:
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_CHANGED",
+            "semantic manifest changed before artifact inventory completed",
+        )
     observed_without_manifest = {
-        name: path
-        for name, path in observed.items()
+        name: observed_file
+        for name, observed_file in observed.items()
         if name != SEMANTIC_EMBEDDER_MANIFEST
     }
     if set(observed_without_manifest) != set(files_payload):
@@ -361,38 +831,65 @@ def verify_semantic_embedder_manifest(
         )
     total_bytes = 0
     for name, expected_digest in files:
-        candidate = observed_without_manifest[name]
-        try:
-            size = candidate.stat().st_size
-        except OSError as exc:
-            raise SemanticEmbedderError(
-                "SEMANTIC_ARTIFACT_UNAVAILABLE",
-                "semantic artifact changed during hashing",
-            ) from exc
-        if size <= 0:
-            raise SemanticEmbedderError(
-                "SEMANTIC_ARTIFACT_INVALID", "semantic artifact file is empty"
-            )
+        remaining = MAX_ARTIFACT_BYTES - total_bytes
+        actual_digest, size = _hash_bounded_regular_file(
+            selected_root,
+            observed_without_manifest[name],
+            maximum_bytes=remaining,
+        )
         total_bytes += size
-        if total_bytes > MAX_ARTIFACT_BYTES:
-            raise SemanticEmbedderError(
-                "SEMANTIC_ARTIFACT_TOO_LARGE",
-                "semantic artifact exceeds the byte limit",
-            )
-        digest = sha256()
-        try:
-            with candidate.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError as exc:
-            raise SemanticEmbedderError(
-                "SEMANTIC_ARTIFACT_UNAVAILABLE", "semantic artifact could not be hashed"
-            ) from exc
-        if digest.hexdigest() != expected_digest:
+        if actual_digest != expected_digest:
             raise SemanticEmbedderError(
                 "SEMANTIC_ARTIFACT_DIGEST_MISMATCH",
                 "semantic artifact digest does not match its manifest",
             )
+
+    config_observed = observed_without_manifest["config.json"]
+    config_raw, _config_identity = _read_bounded_regular_file(
+        config_observed.path,
+        maximum_bytes=MAX_MODEL_CONFIG_BYTES,
+        code="SEMANTIC_MODEL_CONFIG_UNSAFE",
+        label="semantic model config",
+        expected_identity=config_observed.identity,
+    )
+    if sha256(config_raw).hexdigest() != files_payload["config.json"]:
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_CHANGED",
+            "semantic model config changed after artifact hashing",
+        )
+    safe_config = _safe_model_config(config_raw, dimensions=dimensions)
+    activation_upper_bound = max_batch_size * safe_config.max_tokens * dimensions * 16
+    estimated_peak_ram_bytes = (
+        total_bytes
+        + safe_config.estimated_parameter_upper_bound * 8
+        + activation_upper_bound
+    )
+    if estimated_peak_ram_bytes > MAX_SEMANTIC_ESTIMATED_PEAK_RAM_BYTES:
+        raise SemanticEmbedderError(
+            "SEMANTIC_MODEL_CONFIG_UNSAFE",
+            "semantic model estimated peak CPU RAM exceeds its limit",
+        )
+
+    final_payload, final_raw, final_manifest_identity = _read_manifest(
+        selected_manifest
+    )
+    if (
+        final_raw != raw_manifest
+        or final_payload != payload
+        or final_manifest_identity != manifest_identity
+    ):
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_CHANGED",
+            "semantic manifest changed during verification",
+        )
+    final_observed = _inventory_regular_files(selected_root)
+    if {name: value.identity for name, value in final_observed.items()} != {
+        name: value.identity for name, value in observed.items()
+    }:
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_CHANGED",
+            "semantic artifact inventory changed during verification",
+        )
     return SemanticEmbedderManifest(
         root=selected_root,
         path=selected_manifest,
@@ -407,6 +904,10 @@ def verify_semantic_embedder_manifest(
         license_file=license_file,
         files=tuple(sorted(files)),
         total_artifact_bytes=total_bytes,
+        model_type=safe_config.model_type,
+        model_max_tokens=safe_config.max_tokens,
+        estimated_parameter_upper_bound=(safe_config.estimated_parameter_upper_bound),
+        estimated_peak_ram_bytes=estimated_peak_ram_bytes,
     )
 
 
@@ -456,7 +957,7 @@ class TransformersMeanPoolBackend:
                 list(texts),
                 padding=True,
                 truncation=True,
-                max_length=min(4096, self._manifest.max_input_chars),
+                max_length=self._manifest.model_max_tokens,
                 return_tensors="pt",
             )
             cpu_encoded = {
@@ -592,10 +1093,26 @@ class LocalSemanticEmbedder:
             raise SemanticEmbedderError(
                 "SEMANTIC_INPUT_INVALID", "semantic input must be a text sequence"
             )
-        bounded = tuple(texts)
-        if not 1 <= len(bounded) <= self.manifest.max_batch_size:
+        try:
+            batch_size = len(texts)
+        except Exception as exc:  # noqa: BLE001 - caller-owned sequence boundary
+            raise SemanticEmbedderError(
+                "SEMANTIC_INPUT_INVALID", "semantic input length is unavailable"
+            ) from exc
+        if not 1 <= batch_size <= self.manifest.max_batch_size:
             raise SemanticEmbedderError(
                 "SEMANTIC_BATCH_LIMIT", "semantic batch exceeds the manifest bound"
+            )
+        try:
+            bounded = tuple(texts[index] for index in range(batch_size))
+            stable_size = len(texts)
+        except Exception as exc:  # noqa: BLE001 - caller-owned sequence boundary
+            raise SemanticEmbedderError(
+                "SEMANTIC_INPUT_INVALID", "semantic input changed while being copied"
+            ) from exc
+        if stable_size != batch_size or len(bounded) != batch_size:
+            raise SemanticEmbedderError(
+                "SEMANTIC_INPUT_INVALID", "semantic input changed while being copied"
             )
         for text in bounded:
             if (
@@ -662,9 +1179,14 @@ class LocalSemanticEmbedder:
 __all__ = [
     "LocalSemanticEmbedder",
     "MAX_ARTIFACT_BYTES",
+    "MAX_ARTIFACT_DIRECTORIES",
+    "MAX_ARTIFACT_FILES",
     "MAX_EMBEDDING_BATCH",
     "MAX_EMBEDDING_DIMENSIONS",
     "MAX_EMBEDDING_INPUT_CHARS",
+    "MAX_MODEL_CONFIG_BYTES",
+    "MAX_SEMANTIC_ESTIMATED_PEAK_RAM_BYTES",
+    "MAX_SEMANTIC_MODEL_PARAMETERS",
     "SEMANTIC_EMBEDDER_MANIFEST",
     "SEMANTIC_EMBEDDER_SCHEMA",
     "SemanticEmbedderError",

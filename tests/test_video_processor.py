@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -65,6 +66,7 @@ class TestBoundedVideoProcessor(unittest.TestCase):
         service.processor = processor if processor is not None else Gemma4Processor()
         service.artifact_identity = identity
         service.manifest_sha256 = "a" * 64
+        service._trusted_snapshot_verified = True
         return service
 
     def _process(self, service: VerifiedGemma4MultimodalProcessor, **kwargs):
@@ -92,8 +94,15 @@ class TestBoundedVideoProcessor(unittest.TestCase):
         self.assertGreater(result.tensor_bytes, 0)
         self.assertFalse(result.processor_identity.actual_model_inference)
         self.assertFalse(result.processor_identity.vram_measured)
+        self.assertFalse(result.processor_identity.processor_call_wall_time_bounded)
         self.assertTrue(result.processor_identity.local_files_only)
         self.assertFalse(result.processor_identity.trust_remote_code)
+        self.assertGreater(result.estimated_peak_cpu_bytes, result.tensor_bytes)
+        self.assertEqual(result.cpu_allocation_status, "PARTIAL_BOUNDARY_ACCOUNTING")
+        self.assertEqual(
+            result.processor_call_wall_time_status,
+            "PARTIAL_UNBOUNDED_SYNCHRONOUS_PROCESSOR_CALL",
+        )
         conversation, options = service.processor.calls[0]
         media = conversation[0]["content"][0]
         self.assertEqual(media["type"], "video")
@@ -115,9 +124,14 @@ class TestBoundedVideoProcessor(unittest.TestCase):
             service,
             frames=(_frame(1), _frame(2), _frame(4)),
         ).bundle.content_sha256
+        metadata_changed = self._process(
+            service,
+            duration_seconds=math.nextafter(1.0, 2.0),
+        ).bundle.content_sha256
 
         self.assertEqual(first, second)
         self.assertNotEqual(first, changed)
+        self.assertNotEqual(first, metadata_changed)
 
     def test_frame_count_dimensions_and_aggregate_limits_fail_closed(self) -> None:
         service = self._service()
@@ -193,7 +207,10 @@ class TestBoundedVideoProcessor(unittest.TestCase):
                 return {
                     "input_ids": torch.ones((1, 1), dtype=torch.int64),
                     "attention_mask": torch.ones((1, 1), dtype=torch.int64),
-                    "pixel_values": torch.tensor([[float("nan")]]),
+                    "mm_token_type_ids": torch.ones((1, 1), dtype=torch.int64),
+                    "pixel_values": torch.full(
+                        (1, 3, 1, 1), float("nan"), dtype=torch.float32
+                    ),
                 }
 
         processor = type("Gemma4Processor", (_NonFinite,), {})()
@@ -202,6 +219,63 @@ class TestBoundedVideoProcessor(unittest.TestCase):
 
         with patch("cogni_agent.multimodal.MAX_VIDEO_OUTPUT_TENSOR_ELEMENTS", 4):
             with self.assertRaisesRegex(MultimodalPreprocessError, "output tensor"):
+                self._process(self._service())
+
+    def test_field_specific_dtype_rank_and_shape_contracts_fail_closed(self) -> None:
+        mutations = (
+            (
+                "input_ids dtype",
+                lambda output: output.__setitem__(
+                    "input_ids", torch.ones((1, 4), dtype=torch.float32)
+                ),
+            ),
+            (
+                "attention shape",
+                lambda output: output.__setitem__(
+                    "attention_mask", torch.ones((1, 3), dtype=torch.int64)
+                ),
+            ),
+            (
+                "pixel dtype",
+                lambda output: output.__setitem__(
+                    "pixel_values_videos",
+                    torch.ones((1, 3, 2, 2, 3), dtype=torch.int64),
+                ),
+            ),
+            (
+                "ambiguous pixel fields",
+                lambda output: output.__setitem__(
+                    "pixel_values", torch.ones((1, 3, 2, 2), dtype=torch.float32)
+                ),
+            ),
+            (
+                "position dtype",
+                lambda output: output.__setitem__(
+                    "video_position_ids", torch.zeros((1, 3, 2), dtype=torch.float32)
+                ),
+            ),
+        )
+
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+
+                class _InvalidField(_Gemma4ProcessorBase):
+                    def apply_chat_template(self, conversation, **kwargs):
+                        output = super().apply_chat_template(conversation, **kwargs)
+                        mutate(output)
+                        return output
+
+                processor = type("Gemma4Processor", (_InvalidField,), {})()
+                with self.assertRaisesRegex(
+                    MultimodalPreprocessError, "dtype|shape|schema"
+                ):
+                    self._process(self._service(processor=processor))
+
+    def test_boundary_peak_cpu_estimate_is_capped(self) -> None:
+        with patch("cogni_agent.multimodal.MAX_VIDEO_BOUNDARY_PEAK_CPU_BYTES", 600):
+            with self.assertRaisesRegex(
+                MultimodalPreprocessError, "CPU allocation estimate"
+            ):
                 self._process(self._service())
 
     def test_wrong_manifest_and_unsupported_processor_fail_closed(self) -> None:
@@ -274,6 +348,7 @@ class TestBoundedVideoProcessor(unittest.TestCase):
             {"local_files_only": True, "trust_remote_code": False},
         )
         self.assertEqual(service.artifact_identity, _IDENTITY)
+        self.assertTrue(service._trusted_snapshot_verified)
         self.assertEqual(len(service.manifest_sha256), 64)
         self.assertEqual(trusted_snapshot.call_count, 2)
 

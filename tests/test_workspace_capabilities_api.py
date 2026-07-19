@@ -6,12 +6,21 @@ from http.client import HTTPConnection
 import json
 from pathlib import Path
 import tempfile
-from threading import Thread
+from threading import Event, Thread
+from time import monotonic, sleep
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from cogni_agent.manager import AgentTurnStartError
+import torch
+
+from cogni_agent.manager import (
+    AgentManager,
+    AgentTurnStartError,
+    ImagePublicationEvidence,
+)
+from cogni_agent.model_service import ModelRuntimeIdentity
+from cogni_agent.tools import WorkspaceToolExecutor
 from cogni_demo.server import (
     DemoHTTPServer,
     DemoRequestHandler,
@@ -80,11 +89,107 @@ class _RuntimeIdentity:
 
 
 class _RuntimeService:
-    def __init__(self, identity: _RuntimeIdentity | None) -> None:
+    def __init__(self, identity: object | None) -> None:
         self.identity = identity
 
-    def runtime_identity(self) -> _RuntimeIdentity | None:
+    def runtime_identity(self) -> object | None:
         return self.identity
+
+
+class _ImageTokenizer:
+    eos_token_id = 3
+
+    def decode(self, tokens, **_kwargs):
+        return "".join(chr(value) for value in tokens)
+
+    def apply_chat_template(self, messages, **_kwargs):
+        return "|".join(f"{item['role']}:{item['content']}" for item in messages)
+
+
+class _ProductionPathImageService:
+    def __init__(
+        self,
+        *,
+        entered: Event | None = None,
+        release: Event | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        self.tokenizer = _ImageTokenizer()
+        self.active_request_id = None
+        self.entered = entered
+        self.release = release
+        self.error = error
+        self.identity = ModelRuntimeIdentity(
+            service_nonce="1" * 32,
+            worker_incarnation=1,
+            worker_pid=4321,
+            lease_epoch=7,
+            lease_deadline_ns=99,
+            artifact_digest="a" * 64,
+            model_root="model",
+            manifest_path="manifest",
+            processor_root="model",
+            processor_manifest_path="manifest",
+        )
+
+    def start(self):
+        return self
+
+    def iter_generate_tokens(
+        self,
+        _prompt,
+        *,
+        image_content=None,
+        max_new_tokens,
+        **_kwargs,
+    ):
+        del max_new_tokens
+        self.active_request_id = 1
+        if self.entered is not None:
+            self.entered.set()
+        if self.release is not None and not self.release.wait(2):
+            raise TimeoutError("production image test release timed out")
+        if self.error is not None:
+            raise self.error
+        text = "이미지 중앙에는 파란 원이 선명하게 배치되어 있습니다."
+        tokens = torch.tensor([ord(character) for character in text], dtype=torch.int64)
+        yield SimpleNamespace(
+            request_id=1,
+            token_ids=tokens,
+            generated_total=int(tokens.numel()),
+            final=True,
+            cancelled=False,
+            finish_reason="stop",
+            generation_mode="cogni_core",
+            media_sha256=sha256(image_content).hexdigest(),
+            runtime_identity=self.identity,
+        )
+        self.active_request_id = None
+
+    def cancel(self, _request_id=None):
+        return True
+
+    def stop(self, timeout=10.0):
+        del timeout
+
+
+def _wait_for_agent(manager: AgentManager, timeout: float = 5.0) -> dict[str, object]:
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        snapshot = manager.snapshot()
+        if not manager.is_active:
+            return snapshot
+        sleep(0.01)
+    raise AssertionError("production AgentManager path did not finish")
+
+
+def _wait_for_probe_clear(server: DemoHTTPServer, timeout: float = 5.0) -> None:
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        if server._image_attestation_probe is None:
+            return
+        sleep(0.01)
+    raise AssertionError("first-use image probe did not clear")
 
 
 def _terminal_image_evidence(
@@ -115,11 +220,15 @@ class _Agent:
         self.evidence: tuple[object, ...] = ()
         self.image_content: bytes | None = None
         self.expected_image_runtime_identity: object | None = None
+        self.first_use_gate: object | None = None
+        self.image_publication_authorizer = None
         self.messages: list[str] = []
         self.retrieval_requested = False
         self.shutdown_called = False
         self.reset_calls = 0
         self.cancel_calls = 0
+        self.last_finished_turn = None
+        self.snapshot_event = Event()
 
     @property
     def is_active(self) -> bool:
@@ -133,12 +242,16 @@ class _Agent:
         evidence=(),
         image_content=None,
         expected_image_runtime_identity=None,
+        first_use_gate=None,
+        image_publication_authorizer=None,
         retrieval_requested=False,
     ):
         self.messages.append(_message)
         self.evidence = tuple(evidence)
         self.image_content = image_content
         self.expected_image_runtime_identity = expected_image_runtime_identity
+        self.first_use_gate = first_use_gate
+        self.image_publication_authorizer = image_publication_authorizer
         self.retrieval_requested = retrieval_requested
         return "turn-rag"
 
@@ -146,7 +259,16 @@ class _Agent:
         self.cancel_calls += 1
 
     def snapshot(self):
-        return {"status": "ready", "seq": 1, "conversation": []}
+        return {
+            "status": "ready",
+            "seq": 1,
+            "conversation": [],
+            "last_finished_turn": self.last_finished_turn,
+        }
+
+    def wait_snapshot(self, _after, timeout=1.0):
+        self.snapshot_event.wait(timeout)
+        return self.snapshot()
 
     def stop_model(self):
         return None
@@ -400,6 +522,17 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
         self.assets_context.cleanup()
+
+    def _install_production_agent(
+        self, service: _ProductionPathImageService
+    ) -> AgentManager:
+        manager = AgentManager(
+            service,
+            WorkspaceToolExecutor(Path(self.assets_context.name), timeout_seconds=5),
+        )
+        manager.availability_check = self.server._agent_compute_available
+        self.server.agent_manager = manager
+        return manager
 
     def _connection(self) -> HTTPConnection:
         return HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
@@ -951,9 +1084,7 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
                     self.assertIsNone(self.server._image_attestation)
                     self.assertIsNone(self.server._image_attestation_probe)
 
-    def test_image_probe_reset_fence_and_watcher_start_failure_fail_closed(
-        self,
-    ) -> None:
+    def test_image_probe_reset_fence_and_synchronous_publication_gate(self) -> None:
         self.assertEqual(
             self.server._image_attestation_watch_seconds(
                 SimpleNamespace(
@@ -971,6 +1102,307 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
         self.assertEqual(self.agent.reset_calls, 0)
         self.server._image_attestation_probe = None
 
+        with patch.object(
+            self.server,
+            "image_to_model_integration_status",
+            return_value=_configured_unverified_image_status(),
+        ):
+            turn_id, is_probe = self.server.start_image_agent_turn("describe", b"image")
+
+        self.assertEqual(turn_id, "turn-rag")
+        self.assertTrue(is_probe)
+        self.assertIsNotNone(self.agent.first_use_gate)
+        self.assertTrue(self.agent.first_use_gate.wait_authorized(0.0))
+        self.assertTrue(callable(self.agent.image_publication_authorizer))
+        self.assertIsNotNone(self.server._image_attestation_probe)
+        self.assertEqual(self.server._image_attestation_probe.turn_id, turn_id)
+        self.assertIsNotNone(self.server._image_attestation_thread)
+        self.assertTrue(self.server._image_attestation_thread.is_alive())
+        cleanup_thread = self.server._image_attestation_thread
+        self.assertEqual(self.agent.cancel_calls, 0)
+        self.agent.last_finished_turn = {"turn_id": turn_id, "status": "cancelled"}
+        self.agent.snapshot_event.set()
+        _wait_for_probe_clear(self.server)
+        cleanup_thread.join(timeout=2)
+        self.assertFalse(cleanup_thread.is_alive())
+
+    def test_first_use_publication_authorizer_is_current_worker_bound(self) -> None:
+        image = b"immutable-image"
+        identity = _RuntimeIdentity()
+        with patch.object(
+            self.server,
+            "image_to_model_integration_status",
+            return_value=_configured_unverified_image_status(),
+        ):
+            turn_id, is_probe = self.server.start_image_agent_turn("describe", image)
+        self.assertTrue(is_probe)
+        cleanup_thread = self.server._image_attestation_thread
+        self.assertIsNotNone(cleanup_thread)
+        evidence = ImagePublicationEvidence(
+            turn_id=turn_id,
+            finish_reason="stop",
+            generation_mode="cogni_core_image",
+            truncated=False,
+            generated_tokens=3,
+            terminal_evidence=_terminal_image_evidence(
+                identity,
+                sha256(image).hexdigest(),
+            ),
+        )
+
+        with patch.object(
+            self.server,
+            "_configured_image_model_service",
+            return_value=_RuntimeService(identity),
+        ):
+            self.agent.image_publication_authorizer(evidence)
+        self.agent.snapshot_event.set()
+        cleanup_thread.join(timeout=2)
+
+        self.assertIsNone(self.server._image_attestation_probe)
+        self.assertFalse(cleanup_thread.is_alive())
+        self.assertIsNotNone(self.server._image_attestation)
+        self.assertEqual(self.server._image_attestation.turn_id, turn_id)
+        self.assertEqual(
+            self.server._image_attestation.image_sha256,
+            sha256(image).hexdigest(),
+        )
+
+    def test_first_use_publication_authorizer_rejects_worker_swap(self) -> None:
+        image = b"immutable-image"
+        admitted = _RuntimeIdentity()
+        successor = _RuntimeIdentity(worker_incarnation=2)
+        with patch.object(
+            self.server,
+            "image_to_model_integration_status",
+            return_value=_configured_unverified_image_status(),
+        ):
+            turn_id, is_probe = self.server.start_image_agent_turn("describe", image)
+        self.assertTrue(is_probe)
+        cleanup_thread = self.server._image_attestation_thread
+        self.assertIsNotNone(cleanup_thread)
+        evidence = ImagePublicationEvidence(
+            turn_id=turn_id,
+            finish_reason="stop",
+            generation_mode="cogni_core_image",
+            truncated=False,
+            generated_tokens=3,
+            terminal_evidence=_terminal_image_evidence(
+                admitted,
+                sha256(image).hexdigest(),
+            ),
+        )
+
+        with patch.object(
+            self.server,
+            "_configured_image_model_service",
+            return_value=_RuntimeService(successor),
+        ):
+            with self.assertRaisesRegex(
+                ImageModelUnavailableError,
+                "not attested",
+            ):
+                self.agent.image_publication_authorizer(evidence)
+        self.agent.snapshot_event.set()
+        cleanup_thread.join(timeout=2)
+
+        self.assertIsNone(self.server._image_attestation_probe)
+        self.assertFalse(cleanup_thread.is_alive())
+        self.assertIsNone(self.server._image_attestation)
+
+    def test_probe_cleanup_malformed_snapshot_blocks_late_authority(self) -> None:
+        image = b"immutable-image"
+        identity = _RuntimeIdentity()
+        malformed = {"seq": "invalid", "last_finished_turn": None}
+        with (
+            patch.object(
+                self.server,
+                "image_to_model_integration_status",
+                return_value=_configured_unverified_image_status(),
+            ),
+            patch.object(self.agent, "snapshot", return_value=malformed),
+        ):
+            turn_id, is_probe = self.server.start_image_agent_turn("describe", image)
+            _wait_for_probe_clear(self.server)
+        self.assertTrue(is_probe)
+        evidence = ImagePublicationEvidence(
+            turn_id=turn_id,
+            finish_reason="stop",
+            generation_mode="cogni_core_image",
+            truncated=False,
+            generated_tokens=3,
+            terminal_evidence=_terminal_image_evidence(
+                identity,
+                sha256(image).hexdigest(),
+            ),
+        )
+
+        with patch.object(
+            self.server,
+            "_configured_image_model_service",
+            return_value=_RuntimeService(identity),
+        ):
+            with self.assertRaisesRegex(
+                ImageModelUnavailableError,
+                "not attested",
+            ):
+                self.agent.image_publication_authorizer(evidence)
+
+        self.assertIsNone(self.server._image_attestation_probe)
+        self.assertIsNone(self.server._image_attestation_thread)
+        self.assertIsNone(self.server._image_attestation)
+
+    def test_probe_cleanup_deadline_blocks_late_authority(self) -> None:
+        image = b"immutable-image"
+        identity = _RuntimeIdentity()
+        with (
+            patch.object(
+                self.server,
+                "image_to_model_integration_status",
+                return_value=_configured_unverified_image_status(),
+            ),
+            patch.object(
+                self.server,
+                "_image_attestation_watch_seconds",
+                return_value=0.0,
+            ),
+        ):
+            turn_id, is_probe = self.server.start_image_agent_turn("describe", image)
+            _wait_for_probe_clear(self.server)
+        self.assertTrue(is_probe)
+        evidence = ImagePublicationEvidence(
+            turn_id=turn_id,
+            finish_reason="stop",
+            generation_mode="cogni_core_image",
+            truncated=False,
+            generated_tokens=3,
+            terminal_evidence=_terminal_image_evidence(
+                identity,
+                sha256(image).hexdigest(),
+            ),
+        )
+
+        with patch.object(
+            self.server,
+            "_configured_image_model_service",
+            return_value=_RuntimeService(identity),
+        ):
+            with self.assertRaisesRegex(
+                ImageModelUnavailableError,
+                "not attested",
+            ):
+                self.agent.image_publication_authorizer(evidence)
+
+        self.assertIsNone(self.server._image_attestation_probe)
+        self.assertIsNone(self.server._image_attestation_thread)
+        self.assertIsNone(self.server._image_attestation)
+
+    def test_production_agent_first_use_probe_does_not_self_block(self) -> None:
+        image = b"immutable-image"
+        service = _ProductionPathImageService()
+        manager = self._install_production_agent(service)
+
+        with (
+            patch.object(
+                self.server,
+                "image_to_model_integration_status",
+                return_value=_configured_unverified_image_status(),
+            ),
+            patch.object(
+                self.server,
+                "_configured_image_model_service",
+                return_value=_RuntimeService(service.identity),
+            ),
+        ):
+            turn_id, is_probe = self.server.start_image_agent_turn(
+                "이미지를 설명해 주세요.", image
+            )
+            state = _wait_for_agent(manager)
+
+        self.assertTrue(is_probe)
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(state["last_finished_turn"]["turn_id"], turn_id)
+        self.assertIsNone(self.server._image_probe_admission_owner)
+        self.assertIsNone(self.server._image_attestation_probe)
+        self.assertIsNotNone(self.server._image_attestation)
+
+    def test_production_agent_gate_timeout_cleans_exact_probe(self) -> None:
+        service = _ProductionPathImageService()
+        manager = self._install_production_agent(service)
+        original_start = self.server._start_first_use_image_turn_locked
+
+        def start_after_gate_timeout(*args, **kwargs):
+            turn_id = original_start(*args, **kwargs)
+            state = _wait_for_agent(manager)
+            self.assertEqual(state["status"], "cancelled")
+            return turn_id
+
+        with (
+            patch.object(
+                self.server,
+                "image_to_model_integration_status",
+                return_value=_configured_unverified_image_status(),
+            ),
+            patch.object(
+                self.server,
+                "_start_first_use_image_turn_locked",
+                side_effect=start_after_gate_timeout,
+            ),
+            patch("cogni_agent.manager.FIRST_USE_TURN_GATE_SECONDS", 0.0),
+        ):
+            with self.assertRaisesRegex(
+                ImageModelUnavailableError,
+                "execution gate could not be released",
+            ):
+                self.server.start_image_agent_turn("describe", b"image")
+
+        _wait_for_probe_clear(self.server)
+        self.assertIsNone(self.server._image_probe_admission_owner)
+        self.assertIsNone(self.server._image_attestation_thread)
+        self.assertIsNone(self.server._image_attestation)
+
+    def test_production_agent_cancel_cleans_exact_probe_without_authority(self) -> None:
+        entered = Event()
+        release = Event()
+        service = _ProductionPathImageService(entered=entered, release=release)
+        manager = self._install_production_agent(service)
+
+        with patch.object(
+            self.server,
+            "image_to_model_integration_status",
+            return_value=_configured_unverified_image_status(),
+        ):
+            self.server.start_image_agent_turn("describe", b"image")
+        self.assertTrue(entered.wait(2))
+        manager.cancel()
+        release.set()
+        state = _wait_for_agent(manager)
+        _wait_for_probe_clear(self.server)
+
+        self.assertEqual(state["status"], "cancelled")
+        self.assertIsNone(self.server._image_attestation)
+        self.assertIsNone(self.server._image_attestation_thread)
+
+    def test_production_agent_backend_failure_cleans_exact_probe(self) -> None:
+        service = _ProductionPathImageService(error=RuntimeError("backend failed"))
+        manager = self._install_production_agent(service)
+
+        with patch.object(
+            self.server,
+            "image_to_model_integration_status",
+            return_value=_configured_unverified_image_status(),
+        ):
+            self.server.start_image_agent_turn("describe", b"image")
+        state = _wait_for_agent(manager)
+        _wait_for_probe_clear(self.server)
+
+        self.assertEqual(state["status"], "failed")
+        self.assertIsNone(self.server._image_attestation)
+        self.assertIsNone(self.server._image_attestation_thread)
+
+    def test_first_use_probe_cleanup_watcher_start_failure_is_fail_closed(
+        self,
+    ) -> None:
         with (
             patch.object(
                 self.server,
@@ -980,12 +1412,67 @@ class TestWorkspaceHTTPAPI(unittest.TestCase):
             patch("cogni_demo.server.Thread.start", side_effect=RuntimeError("boom")),
         ):
             with self.assertRaisesRegex(
-                ImageModelUnavailableError, "watcher could not start"
+                ImageModelUnavailableError,
+                "cleanup watcher could not start",
             ):
                 self.server.start_image_agent_turn("describe", b"image")
+
+        self.assertEqual(self.agent.cancel_calls, 1)
+        self.assertFalse(self.agent.first_use_gate.wait_authorized(0.0))
+        self.assertIsNone(self.server._image_probe_admission_owner)
         self.assertIsNone(self.server._image_attestation_probe)
         self.assertIsNone(self.server._image_attestation_thread)
-        self.assertEqual(self.agent.cancel_calls, 1)
+
+    def test_fence_change_cancels_without_holding_image_lock(self) -> None:
+        foreign_probe = _ImageProbe(
+            "foreign-turn",
+            "f" * 64,
+            "2026-07-19T00:00:00+00:00",
+        )
+        observations: list[bool] = []
+        lock_threads: list[Thread] = []
+
+        def replace_fence(*_args, **_kwargs):
+            with self.server._image_attestation_lock:
+                self.server._image_attestation_probe = foreign_probe
+            return "turn-rag"
+
+        def observe_cancel_lock_order() -> None:
+            acquired = Event()
+
+            def acquire_image_lock() -> None:
+                with self.server._image_attestation_lock:
+                    acquired.set()
+
+            thread = Thread(target=acquire_image_lock)
+            lock_threads.append(thread)
+            thread.start()
+            observations.append(acquired.wait(0.5))
+
+        with (
+            patch.object(
+                self.server,
+                "image_to_model_integration_status",
+                return_value=_configured_unverified_image_status(),
+            ),
+            patch.object(
+                self.server,
+                "_start_first_use_image_turn_locked",
+                side_effect=replace_fence,
+            ),
+            patch.object(self.agent, "cancel", side_effect=observe_cancel_lock_order),
+        ):
+            with self.assertRaisesRegex(
+                ImageModelUnavailableError,
+                "fence changed",
+            ):
+                self.server.start_image_agent_turn("describe", b"image")
+
+        for thread in lock_threads:
+            thread.join(timeout=2)
+        self.assertEqual(observations, [True])
+        self.assertIsNone(self.server._image_probe_admission_owner)
+        self.server._image_attestation_probe = None
 
     def test_public_image_start_requires_ready_exact_attestation(self) -> None:
         image = b"immutable-image"

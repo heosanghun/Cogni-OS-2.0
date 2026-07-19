@@ -6,7 +6,7 @@ from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from hashlib import sha256
@@ -2033,6 +2033,7 @@ class DemoHTTPServer(ThreadingHTTPServer):
         self._image_attestation: _CurrentProcessImageAttestation | None = None
         self._image_attestation_probe: _ImageAttestationProbe | None = None
         self._image_attestation_thread: Thread | None = None
+        self._image_probe_admission_owner: int | None = None
         self._watchdog_stop = Event()
         self._watchdog_thread: Thread | None = None
         self._last_state_poll = monotonic()
@@ -2428,6 +2429,9 @@ class DemoHTTPServer(ThreadingHTTPServer):
         self,
         message: str,
         image_content: bytes,
+        *,
+        first_use_gate: object,
+        image_publication_authorizer: Callable[[object], None],
     ) -> str:
         """Start only the private configured-unverified attestation turn."""
 
@@ -2435,6 +2439,8 @@ class DemoHTTPServer(ThreadingHTTPServer):
             message,
             "chat",
             image_content=image_content,
+            first_use_gate=first_use_gate,
+            image_publication_authorizer=image_publication_authorizer,
         )
 
     def start_image_agent_turn(
@@ -2476,69 +2482,180 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 raise ImageModelUnavailableError(
                     "image model is not configured for first-use attestation"
                 )
-            turn_id = self._start_first_use_image_turn_locked(
-                message,
-                image_content,
-            )
-            probe = _ImageAttestationProbe(
-                turn_id=turn_id,
+            from cogni_agent.manager import FirstUseTurnGate
+
+            gate = FirstUseTurnGate()
+            pending_probe = _ImageAttestationProbe(
+                turn_id="pending-" + secrets.token_hex(12),
                 image_sha256=sha256(image_content).hexdigest(),
                 started_at=datetime.now(timezone.utc).isoformat(),
             )
+            admission_owner = get_ident()
             with self._image_attestation_lock:
-                self._image_attestation_probe = probe
-            thread = Thread(
-                target=self._watch_first_image_attestation,
+                self._image_attestation_probe = pending_probe
+                self._image_attestation_thread = None
+                self._image_probe_admission_owner = admission_owner
+            bound_probe: list[_ImageAttestationProbe | None] = [None]
+
+            def authorize_publication(evidence: object) -> None:
+                probe = bound_probe[0]
+                if probe is None:
+                    raise ImageModelUnavailableError(
+                        "first-use image publication was not bound to its turn"
+                    )
+                self._authorize_first_image_publication(probe, evidence)
+
+            try:
+                turn_id = self._start_first_use_image_turn_locked(
+                    message,
+                    image_content,
+                    first_use_gate=gate,
+                    image_publication_authorizer=authorize_publication,
+                )
+            except BaseException:
+                gate.deny()
+                with self._image_attestation_lock:
+                    if self._image_attestation_probe == pending_probe:
+                        self._image_attestation_probe = None
+                        self._image_attestation_thread = None
+                raise
+            finally:
+                with self._image_attestation_lock:
+                    if self._image_probe_admission_owner == admission_owner:
+                        self._image_probe_admission_owner = None
+            probe = replace(pending_probe, turn_id=turn_id)
+            bound_probe[0] = probe
+            with self._image_attestation_lock:
+                fence_changed = self._image_attestation_probe != pending_probe
+                if not fence_changed:
+                    self._image_attestation_probe = probe
+            if fence_changed:
+                try:
+                    self.agent_manager.cancel()
+                except Exception:
+                    pass
+                finally:
+                    gate.deny()
+                raise ImageModelUnavailableError(
+                    "first-use image attestation fence changed before execution"
+                )
+            cleanup_thread = Thread(
+                target=self._watch_first_image_probe_cleanup,
                 args=(probe,),
-                name=f"cogni-image-attestation-{turn_id[:8]}",
+                name=f"cogni-image-probe-cleanup-{turn_id[:8]}",
                 daemon=True,
             )
             with self._image_attestation_lock:
-                self._image_attestation_thread = thread
+                if self._image_attestation_probe == probe:
+                    self._image_attestation_thread = cleanup_thread
             try:
-                thread.start()
-            except BaseException as exc:
-                # The image turn has already been admitted, so it cannot be
-                # rolled back here.  Remove the unpublished probe fence so a
-                # failed watcher launch cannot block all later compute forever;
-                # this turn remains unverified and cannot mint an attestation.
+                cleanup_thread.start()
+            except Exception as exc:
+                gate.deny()
+                try:
+                    self.agent_manager.cancel()
+                except Exception:
+                    pass
                 with self._image_attestation_lock:
                     if self._image_attestation_probe == probe:
                         self._image_attestation_probe = None
                         self._image_attestation_thread = None
+                raise ImageModelUnavailableError(
+                    "image probe cleanup watcher could not start"
+                ) from exc
+            if not gate.allow():
                 try:
                     self.agent_manager.cancel()
-                except (AttributeError, RuntimeError, TypeError, ValueError):
+                except Exception:
+                    # The bounded manager gate may already have timed out and
+                    # completed cancellation before the server can release it.
+                    # Cleanup and the public error must remain deterministic.
                     pass
+                finally:
+                    gate.deny()
+                    with self._image_attestation_lock:
+                        if self._image_attestation_probe == probe:
+                            self._image_attestation_probe = None
+                            self._image_attestation_thread = None
+                        if self._image_probe_admission_owner == admission_owner:
+                            self._image_probe_admission_owner = None
                 raise ImageModelUnavailableError(
-                    "image attestation watcher could not start"
-                ) from exc
+                    "first-use image execution gate could not be released"
+                )
             return turn_id, True
 
-    def _watch_first_image_attestation(self, probe: _ImageAttestationProbe) -> None:
-        """Publish only after the exact image turn reaches a trusted terminal state."""
+    def _authorize_first_image_publication(
+        self,
+        probe: _ImageAttestationProbe,
+        evidence: object,
+    ) -> None:
+        """Mint current-process authority synchronously before answer publication."""
+
+        from cogni_agent.manager import ImagePublicationEvidence
+
+        if not isinstance(evidence, ImagePublicationEvidence):
+            raise ImageModelUnavailableError(
+                "first-use image publication evidence is invalid"
+            )
+        self._finish_first_image_attestation(
+            probe,
+            {
+                "turn_id": evidence.turn_id,
+                "status": "succeeded",
+                "completion": {
+                    "state": "complete",
+                    "finish_reason": evidence.finish_reason,
+                    "generation_mode": evidence.generation_mode,
+                    "truncated": evidence.truncated,
+                    "generated_tokens": evidence.generated_tokens,
+                    "image_attestation": evidence.terminal_evidence,
+                },
+            },
+        )
+        with self._image_attestation_lock:
+            attestation = self._image_attestation
+        if (
+            attestation is None
+            or attestation.turn_id != probe.turn_id
+            or attestation.image_sha256 != probe.image_sha256
+        ):
+            raise ImageModelUnavailableError(
+                "first-use image publication was not attested"
+            )
+
+    def _watch_first_image_probe_cleanup(self, probe: _ImageAttestationProbe) -> None:
+        """Clear only a stale exact-turn probe; never mint publication authority."""
 
         agent = self.agent_manager
         deadline = monotonic() + self._image_attestation_watch_seconds(agent)
-        finished: dict[str, object] | None = None
         try:
-            while monotonic() < deadline:
-                snapshot = agent.snapshot()
-                candidate = snapshot.get("last_finished_turn")
-                if (
-                    isinstance(candidate, dict)
-                    and candidate.get("turn_id") == probe.turn_id
-                ):
-                    finished = candidate
-                    break
-                after = snapshot.get("seq")
-                if not isinstance(after, int) or isinstance(after, bool) or after < 0:
-                    break
-                agent.wait_snapshot(after, timeout=min(1.0, deadline - monotonic()))
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            finished = None
-        with self._compute_lock:
-            self._finish_first_image_attestation(probe, finished)
+            try:
+                while monotonic() < deadline:
+                    with self._image_attestation_lock:
+                        if self._image_attestation_probe != probe:
+                            return
+                    snapshot = agent.snapshot()
+                    candidate = snapshot.get("last_finished_turn")
+                    if (
+                        isinstance(candidate, dict)
+                        and candidate.get("turn_id") == probe.turn_id
+                    ):
+                        break
+                    after = snapshot.get("seq")
+                    if (
+                        not isinstance(after, int)
+                        or isinstance(after, bool)
+                        or after < 0
+                    ):
+                        break
+                    agent.wait_snapshot(after, timeout=min(1.0, deadline - monotonic()))
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+        finally:
+            with self._image_attestation_lock:
+                if self._image_attestation_probe == probe:
+                    self._image_attestation_probe = None
+                    self._image_attestation_thread = None
 
     @staticmethod
     def _image_attestation_watch_seconds(agent: object) -> float:
@@ -2756,10 +2873,16 @@ class DemoHTTPServer(ThreadingHTTPServer):
         )
 
     def _agent_compute_available(self) -> bool:
+        caller = get_ident()
+        with self._image_attestation_lock:
+            image_probe_available = bool(
+                self._image_attestation_probe is None
+                or self._image_probe_admission_owner == caller
+            )
         return (
             not self.manager.is_active
             and not self._evolution_active()
-            and not self._image_probe_active()
+            and image_probe_available
         )
 
     def _evolution_compute_available(self) -> bool:

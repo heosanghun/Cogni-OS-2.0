@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from time import monotonic, sleep
 import tempfile
 from types import SimpleNamespace
@@ -20,6 +20,9 @@ from cogni_agent.manager import (
     AgentBusyError,
     AgentManager,
     AgentTurnStartError,
+    FirstUseTurnGate,
+    ImagePublicationEvidence,
+    NoActiveAgentTurnError,
     RetrievalEvidence,
     RetrievalProvenance,
     safe_quality_fallback,
@@ -214,10 +217,19 @@ class _RotatingImageScriptedService(_ImageScriptedService):
 
 
 class _BlockingSecondImageScriptedService(_RotatingImageScriptedService):
-    def __init__(self, plans, identities, second_entered: Event, release: Event):
+    def __init__(
+        self,
+        plans,
+        identities,
+        second_entered: Event,
+        release: Event,
+        *,
+        block_call: int = 2,
+    ):
         super().__init__(plans, identities)
         self.second_entered = second_entered
         self.release = release
+        self.block_call = block_call
 
     def iter_generate_tokens(
         self,
@@ -232,7 +244,7 @@ class _BlockingSecondImageScriptedService(_RotatingImageScriptedService):
         total_timeout=None,
         sampling_seed=None,
     ):
-        if len(self.expected_runtime_identities) == 1:
+        if len(self.expected_runtime_identities) == self.block_call - 1:
             self.second_entered.set()
             if not self.release.wait(2):
                 raise TimeoutError("second image attempt test release timed out")
@@ -566,6 +578,275 @@ class TestAgentManager(unittest.TestCase):
         serialized = str(state["conversation"])
         self.assertNotIn(question + "\n[턴 종료]", serialized)
         self.assertNotIn("두 번째 작업자의 문장", serialized)
+
+    def test_image_quality_continuation_remains_private_until_final_authority(
+        self,
+    ) -> None:
+        question = "이미지에서 무엇이 보이나요?"
+        image = b"immutable-image"
+        admitted = _ImageScriptedService([]).runtime_identity
+        successor = replace(admitted, worker_incarnation=2)
+        second_entered = Event()
+        release = Event()
+        service = _BlockingSecondImageScriptedService(
+            [
+                ("도구 결과를 확인하지 못했을 때 AI가", "stop"),
+                ("도구 결과를 확인하지 못했을 때 AI가", "stop"),
+                ("도구 결과를 확인하지 못했을 때 AI가", "stop"),
+                ("후속 작업자의 후보는 공개되면 안 됩니다.", "stop"),
+            ],
+            [admitted, admitted, admitted, successor],
+            second_entered,
+            release,
+            block_call=4,
+        )
+        manager = self.manager(service, max_generation_attempts=4)
+
+        try:
+            manager.start_turn(
+                question,
+                image_content=image,
+                expected_image_runtime_identity=admitted,
+            )
+            self.assertTrue(second_entered.wait(2))
+            assistant = [
+                item
+                for item in manager.snapshot()["conversation"]
+                if item.get("role") == "assistant"
+            ]
+            self.assertEqual(len(assistant), 1)
+            self.assertEqual(assistant[0]["content"], "")
+        finally:
+            release.set()
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "failed")
+        self.assertFalse(
+            any(item.get("role") == "assistant" for item in state["conversation"])
+        )
+
+    def test_first_use_gate_denial_prevents_model_execution_and_publication(
+        self,
+    ) -> None:
+        service = _ImageScriptedService([("이 답변은 실행되지 않아야 합니다.", "stop")])
+        manager = self.manager(service)
+        gate = FirstUseTurnGate()
+        authorized: list[ImagePublicationEvidence] = []
+
+        manager.start_turn(
+            "이미지를 설명해 주세요.",
+            image_content=b"immutable-image",
+            first_use_gate=gate,
+            image_publication_authorizer=authorized.append,
+        )
+        gate.deny()
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "cancelled")
+        self.assertFalse(service.started)
+        self.assertEqual(service.prompts, [])
+        self.assertEqual(authorized, [])
+        self.assertFalse(
+            any(item.get("role") == "assistant" for item in state["conversation"])
+        )
+
+    def test_first_use_gate_timeout_atomically_denies_late_allow(self) -> None:
+        gate = FirstUseTurnGate()
+
+        self.assertFalse(gate.wait_authorized(0.0))
+        self.assertFalse(gate.allow())
+        self.assertFalse(gate.deny())
+        self.assertFalse(gate.wait_authorized(0.0))
+
+        allowed = FirstUseTurnGate()
+        self.assertTrue(allowed.allow())
+        self.assertTrue(allowed.wait_authorized(0.0))
+        self.assertFalse(allowed.deny())
+
+    def test_first_use_gate_allow_timeout_race_has_one_immutable_decision(
+        self,
+    ) -> None:
+        for _ in range(32):
+            gate = FirstUseTurnGate()
+            start = Event()
+            results: dict[str, bool] = {}
+
+            def wait_for_gate() -> None:
+                start.wait()
+                results["wait"] = gate.wait_authorized(0.0005)
+
+            def allow_gate() -> None:
+                start.wait()
+                results["allow"] = gate.allow()
+
+            waiter = Thread(target=wait_for_gate)
+            allower = Thread(target=allow_gate)
+            waiter.start()
+            allower.start()
+            start.set()
+            waiter.join(timeout=2)
+            allower.join(timeout=2)
+
+            self.assertFalse(waiter.is_alive())
+            self.assertFalse(allower.is_alive())
+            self.assertEqual(results["wait"], results["allow"])
+            self.assertFalse(gate.allow())
+            self.assertFalse(gate.deny())
+            self.assertEqual(gate.wait_authorized(0.0), results["wait"])
+
+    def test_first_use_authorizer_runs_before_the_only_answer_publication(
+        self,
+    ) -> None:
+        image = b"immutable-image"
+        service = _ImageScriptedService(
+            [("사진 속 파란 원은 중앙에 선명하게 배치되어 있습니다.", "stop")]
+        )
+        manager = self.manager(service)
+        gate = FirstUseTurnGate()
+        observed: list[ImagePublicationEvidence] = []
+
+        def authorize(evidence: ImagePublicationEvidence) -> None:
+            assistants = [
+                item
+                for item in manager.snapshot()["conversation"]
+                if item.get("role") == "assistant"
+            ]
+            self.assertEqual(len(assistants), 1)
+            self.assertEqual(assistants[0]["content"], "")
+            observed.append(evidence)
+
+        turn_id = manager.start_turn(
+            "사진을 자연스럽게 설명해 주세요.",
+            image_content=image,
+            first_use_gate=gate,
+            image_publication_authorizer=authorize,
+        )
+        gate.allow()
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0].turn_id, turn_id)
+        self.assertEqual(observed[0].generation_mode, "cogni_core_image")
+        self.assertEqual(
+            observed[0].terminal_evidence["image_sha256"],
+            sha256(image).hexdigest(),
+        )
+        assistants = [
+            item for item in state["conversation"] if item.get("role") == "assistant"
+        ]
+        self.assertEqual(len(assistants), 1)
+        self.assertFalse(assistants[0]["streaming"])
+
+    def test_first_use_authorizer_failure_keeps_answer_unpublished(self) -> None:
+        service = _ImageScriptedService(
+            [("사진 속 파란 원은 중앙에 선명하게 배치되어 있습니다.", "stop")]
+        )
+        manager = self.manager(service)
+        gate = FirstUseTurnGate()
+
+        def reject(_evidence: ImagePublicationEvidence) -> None:
+            raise ModelServiceError("first-use publication rejected")
+
+        manager.start_turn(
+            "사진을 자연스럽게 설명해 주세요.",
+            image_content=b"immutable-image",
+            first_use_gate=gate,
+            image_publication_authorizer=reject,
+        )
+        gate.allow()
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["completion"]["state"], "failed")
+        self.assertFalse(
+            any(item.get("role") == "assistant" for item in state["conversation"])
+        )
+
+    def test_cancel_before_publication_claim_skips_authorizer_and_commit(self) -> None:
+        image = b"immutable-image"
+        entered = Event()
+        release = Event()
+
+        def block_quality_sink(_code: str, _message: str) -> None:
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("quality sink test release timed out")
+
+        service = _ImageScriptedService([("", "stop")])
+        manager = self.manager(
+            service,
+            max_generation_attempts=1,
+            failure_sink=block_quality_sink,
+        )
+        gate = FirstUseTurnGate()
+        authorized: list[ImagePublicationEvidence] = []
+        manager.start_turn(
+            "이미지를 설명해 주세요.",
+            image_content=image,
+            first_use_gate=gate,
+            image_publication_authorizer=authorized.append,
+        )
+        gate.allow()
+        self.assertTrue(entered.wait(2))
+
+        manager.cancel()
+        release.set()
+        state = _wait(manager)
+
+        self.assertEqual(state["status"], "cancelled")
+        self.assertEqual(authorized, [])
+        self.assertFalse(
+            any(item.get("role") == "assistant" for item in state["conversation"])
+        )
+        self.assertEqual(
+            manager.conversations.snapshot(manager.session_id).as_messages(),
+            (),
+        )
+
+    def test_cancel_after_publication_claim_is_rejected_as_too_late(self) -> None:
+        entered = Event()
+        release = Event()
+        cancel_done = Event()
+        cancel_errors: list[BaseException] = []
+        service = _ImageScriptedService(
+            [("사진 속 파란 원은 중앙에 선명하게 배치되어 있습니다.", "stop")]
+        )
+        manager = self.manager(service)
+        gate = FirstUseTurnGate()
+
+        def authorize(_evidence: ImagePublicationEvidence) -> None:
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("publication claim test release timed out")
+
+        def cancel_turn() -> None:
+            try:
+                manager.cancel()
+            except BaseException as exc:
+                cancel_errors.append(exc)
+            finally:
+                cancel_done.set()
+
+        manager.start_turn(
+            "사진을 자연스럽게 설명해 주세요.",
+            image_content=b"immutable-image",
+            first_use_gate=gate,
+            image_publication_authorizer=authorize,
+        )
+        gate.allow()
+        self.assertTrue(entered.wait(2))
+        cancel_thread = Thread(target=cancel_turn, daemon=True)
+        cancel_thread.start()
+        self.assertFalse(cancel_done.wait(0.05))
+        release.set()
+        state = _wait(manager)
+        cancel_thread.join(timeout=2)
+
+        self.assertEqual(state["status"], "succeeded")
+        self.assertTrue(cancel_done.is_set())
+        self.assertEqual(len(cancel_errors), 1)
+        self.assertIsInstance(cancel_errors[0], NoActiveAgentTurnError)
 
     def test_turn_thread_start_failure_rolls_back_pending_state(self) -> None:
         manager = self.manager()

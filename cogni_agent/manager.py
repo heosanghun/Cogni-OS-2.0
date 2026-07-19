@@ -94,6 +94,7 @@ HARD_MAX_CONTINUATIONS = 2
 HARD_MAX_GENERATION_ATTEMPTS = 4
 HARD_MAX_DECODE_SECONDS = 120.0
 HARD_MAX_QUALITY_REPAIRS = 2
+FIRST_USE_TURN_GATE_SECONDS = 5.0
 INTERACTIVE_MAX_INPUT_TOKENS = 2_048
 DEFAULT_SHORT_RESPONSE_TOKENS = 96
 DEFAULT_DETAILED_RESPONSE_TOKENS = 256
@@ -650,6 +651,39 @@ class AgentTurnStartError(RuntimeError):
     """Raised after a turn admission is rolled back before its thread starts."""
 
 
+class FirstUseTurnGate:
+    """One-shot authorization gate for a server-observed first image turn."""
+
+    def __init__(self) -> None:
+        self._ready = Event()
+        self._lock = RLock()
+        self._authorized: bool | None = None
+
+    def allow(self) -> bool:
+        return self._resolve(True)
+
+    def deny(self) -> bool:
+        return self._resolve(False)
+
+    def _resolve(self, authorized: bool) -> bool:
+        with self._lock:
+            if self._authorized is not None:
+                return False
+            self._authorized = authorized
+            self._ready.set()
+            return True
+
+    def wait_authorized(self, timeout: float) -> bool:
+        if not self._ready.wait(timeout):
+            with self._lock:
+                if self._authorized is None:
+                    self._authorized = False
+                    self._ready.set()
+                return self._authorized is True
+        with self._lock:
+            return self._authorized is True
+
+
 class NoActiveAgentTurnError(RuntimeError):
     pass
 
@@ -681,6 +715,36 @@ FailureSink = Callable[[str, str], None]
 EvolutionSnapshot = Callable[[], Mapping[str, Any]]
 AvailabilityCheck = Callable[[], bool]
 TurnFinish = tuple[str, str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePublicationEvidence:
+    turn_id: str
+    finish_reason: str
+    generation_mode: str
+    truncated: bool
+    generated_tokens: int
+    terminal_evidence: dict[str, Any]
+
+
+ImagePublicationAuthorizer = Callable[[ImagePublicationEvidence], None]
+
+
+@dataclass(frozen=True, slots=True)
+class _ChatPublication:
+    message_id: str
+    response: str
+    finish_reason: str
+    continuations: int
+    truncated: bool
+    generated_tokens: int
+    generation_mode: str
+    sources: tuple[dict[str, Any], ...]
+    image_attestation: dict[str, Any] | None
+    image_publication_authorizer: ImagePublicationAuthorizer | None
+
+
+TurnOutcome = TurnFinish | _ChatPublication | None
 
 _UI_CAPABILITY_NAMES = (
     "aflow",
@@ -805,6 +869,7 @@ class AgentManager:
         self._model_excluded_exchanges: deque[tuple[str, str]] = deque(maxlen=24)
         self._active_turn: str | None = None
         self._active_user_sequence: int | None = None
+        self._publication_claimed_turn: str | None = None
         self._last_finished_turn: dict[str, Any] | None = None
         self._cancel_event = Event()
         self._thread: Thread | None = None
@@ -866,6 +931,8 @@ class AgentManager:
         evidence: tuple[RetrievalEvidence, ...] = (),
         image_content: bytes | None = None,
         expected_image_runtime_identity: ModelRuntimeIdentity | None = None,
+        first_use_gate: FirstUseTurnGate | None = None,
+        image_publication_authorizer: ImagePublicationAuthorizer | None = None,
         retrieval_requested: bool = False,
     ) -> str:
         text = self._validate_message(message)
@@ -883,6 +950,27 @@ class AgentManager:
             )
         if expected_image_runtime_identity is not None and bounded_image is None:
             raise ValueError("expected image runtime identity requires image content")
+        if first_use_gate is not None and not isinstance(
+            first_use_gate, FirstUseTurnGate
+        ):
+            raise TypeError("first_use_gate must be a FirstUseTurnGate or None")
+        if first_use_gate is not None and bounded_image is None:
+            raise ValueError("first-use gate requires image content")
+        if image_publication_authorizer is not None and not callable(
+            image_publication_authorizer
+        ):
+            raise TypeError("image_publication_authorizer must be callable or None")
+        if (first_use_gate is None) != (image_publication_authorizer is None):
+            raise ValueError(
+                "first-use gate and image publication authorizer must be paired"
+            )
+        if (
+            image_publication_authorizer is not None
+            and expected_image_runtime_identity is not None
+        ):
+            raise ValueError(
+                "first-use publication authority cannot replace a ready runtime pin"
+            )
         retrieval_requested = retrieval_requested or bool(bounded_evidence)
         if mode == "task" and retrieval_requested:
             raise ValueError("retrieval evidence is available only in chat mode")
@@ -920,6 +1008,7 @@ class AgentManager:
             user_sequence = self.conversations.begin_user_turn(self.session_id, text)
             self._active_turn = turn_id
             self._active_user_sequence = user_sequence
+            self._publication_claimed_turn = None
             self._cancel_event = Event()
             self._error = None
             self._completion = self._completion_state(state="pending")
@@ -936,6 +1025,8 @@ class AgentManager:
                     bounded_evidence,
                     bounded_image,
                     expected_image_runtime_identity,
+                    first_use_gate,
+                    image_publication_authorizer,
                     retrieval_requested,
                 ),
                 name=f"cogni-agent-{turn_id[:8]}",
@@ -950,6 +1041,7 @@ class AgentManager:
                     self._messages.pop()
                 self._active_turn = None
                 self._active_user_sequence = None
+                self._publication_claimed_turn = None
                 self._thread = None
                 self._cancel_event = Event()
                 self._error = None
@@ -963,6 +1055,10 @@ class AgentManager:
 
     def cancel(self) -> None:
         with self._condition:
+            if self._publication_claimed_turn is not None:
+                raise NoActiveAgentTurnError(
+                    "the agent turn has already claimed final publication"
+                )
             if self._status not in ACTIVE_AGENT_STATUSES:
                 raise NoActiveAgentTurnError("there is no active agent turn")
             self._cancel_event.set()
@@ -978,6 +1074,7 @@ class AgentManager:
             self._messages.clear()
             self._model_excluded_exchanges.clear()
             self._last_finished_turn = None
+            self._publication_claimed_turn = None
             self._error = None
             self._completion = self._completion_state()
             self._transition_locked("ready", "ready", 100)
@@ -1008,14 +1105,23 @@ class AgentManager:
         evidence: tuple[RetrievalEvidence, ...],
         image_content: bytes | None,
         expected_image_runtime_identity: ModelRuntimeIdentity | None,
+        first_use_gate: FirstUseTurnGate | None,
+        image_publication_authorizer: ImagePublicationAuthorizer | None,
         retrieval_requested: bool,
     ) -> None:
         try:
+            if first_use_gate is not None:
+                if not first_use_gate.wait_authorized(FIRST_USE_TURN_GATE_SECONDS):
+                    raise GenerationCancelled("first-use image turn was not authorized")
+                if self._cancel_event.is_set():
+                    raise GenerationCancelled(
+                        "first-use image turn was cancelled before execution"
+                    )
             with self.rhythm.inference_slot():
                 if mode == "task":
-                    finish = self._run_task(turn_id, user_sequence, message)
+                    outcome = self._run_task(turn_id, user_sequence, message)
                 else:
-                    finish = self._run_chat(
+                    outcome = self._run_chat(
                         turn_id,
                         user_sequence,
                         message,
@@ -1025,15 +1131,77 @@ class AgentManager:
                         expected_image_runtime_identity=(
                             expected_image_runtime_identity
                         ),
+                        image_publication_authorizer=(image_publication_authorizer),
                         retrieval_requested=retrieval_requested,
                     )
-            if finish is not None:
+            if isinstance(outcome, _ChatPublication):
+                self._publish_chat_turn(turn_id, user_sequence, outcome)
+            elif outcome is not None:
                 with self._condition:
-                    self._finish_locked(turn_id, *finish)
+                    self._finish_locked(turn_id, *outcome)
         except GenerationCancelled:
             self._finish_cancelled(turn_id, user_sequence)
         except BaseException as exc:
             self._finish_failed(turn_id, user_sequence, exc)
+
+    def _publish_chat_turn(
+        self,
+        turn_id: str,
+        user_sequence: int,
+        publication: _ChatPublication,
+    ) -> None:
+        """Atomically claim cancellation, authority, commit, and UI publication."""
+
+        with self._condition:
+            if self._active_turn != turn_id or self._cancel_event.is_set():
+                raise GenerationCancelled("generation cancelled before publication")
+            self._publication_claimed_turn = turn_id
+            authorizer = publication.image_publication_authorizer
+            if authorizer is not None:
+                terminal_evidence = publication.image_attestation
+                if terminal_evidence is None:
+                    raise ModelServiceError(
+                        "first-use image publication lacked terminal evidence"
+                    )
+                authorizer(
+                    ImagePublicationEvidence(
+                        turn_id=turn_id,
+                        finish_reason=publication.finish_reason,
+                        generation_mode=publication.generation_mode,
+                        truncated=publication.truncated,
+                        generated_tokens=publication.generated_tokens,
+                        terminal_evidence=deepcopy(terminal_evidence),
+                    )
+                )
+            self.conversations.commit_assistant_turn(
+                self.session_id,
+                user_sequence,
+                publication.response,
+            )
+            final_stage = "truncated" if publication.truncated else "complete"
+            self._update_message(
+                publication.message_id,
+                publication.response,
+                streaming=False,
+                finish_reason=publication.finish_reason,
+                continuations=publication.continuations,
+                truncated=publication.truncated,
+                generated_tokens=publication.generated_tokens,
+                generation_mode=publication.generation_mode,
+                sources=publication.sources,
+            )
+            self._completion = self._completion_state(
+                state=final_stage,
+                finish_reason=publication.finish_reason,
+                continuations=publication.continuations,
+                truncated=publication.truncated,
+                generated_tokens=publication.generated_tokens,
+                generation_mode=publication.generation_mode,
+                sources=publication.sources,
+                image_attestation=publication.image_attestation,
+            )
+            self._core = self._core_state()
+            self._finish_locked(turn_id, "succeeded", final_stage, 100)
 
     def _run_task(
         self, turn_id: str, user_sequence: int, message: str
@@ -1077,8 +1245,9 @@ class AgentManager:
         evidence: tuple[RetrievalEvidence, ...],
         image_content: bytes | None,
         expected_image_runtime_identity: ModelRuntimeIdentity | None,
+        image_publication_authorizer: ImagePublicationAuthorizer | None,
         retrieval_requested: bool,
-    ) -> TurnFinish | None:
+    ) -> TurnOutcome:
         if retrieval_requested and not evidence:
             return self._run_retrieval_no_evidence_answer(
                 turn_id,
@@ -1822,16 +1991,17 @@ class AgentManager:
                         user_context_override=user_context_override,
                     )
                 )
-                with self._condition:
-                    self._update_message(
-                        message_id,
-                        "" if evidence else response,
-                        streaming=True,
-                        finish_reason=None,
-                        continuations=continuations,
-                        truncated=False,
-                        generated_tokens=total_generated,
-                    )
+                if image_content is None:
+                    with self._condition:
+                        self._update_message(
+                            message_id,
+                            "" if evidence else response,
+                            streaming=True,
+                            finish_reason=None,
+                            continuations=continuations,
+                            truncated=False,
+                            generated_tokens=total_generated,
+                        )
             else:
                 prompt = self._build_continuation_prompt(
                     response,
@@ -1998,34 +2168,18 @@ class AgentManager:
             and published_image_attestation is None
         ):
             raise ModelServiceError("image completion lacked terminal worker evidence")
-        self.conversations.commit_assistant_turn(
-            self.session_id, user_sequence, response
+        return _ChatPublication(
+            message_id=message_id,
+            response=response,
+            finish_reason=finish_reason,
+            continuations=continuations,
+            truncated=truncated,
+            generated_tokens=total_generated,
+            generation_mode=generation_mode,
+            sources=published_sources,
+            image_attestation=published_image_attestation,
+            image_publication_authorizer=image_publication_authorizer,
         )
-        final_stage = "truncated" if truncated else "complete"
-        with self._condition:
-            self._update_message(
-                message_id,
-                response,
-                streaming=False,
-                finish_reason=finish_reason,
-                continuations=continuations,
-                truncated=truncated,
-                generated_tokens=total_generated,
-                generation_mode=generation_mode,
-                sources=published_sources,
-            )
-            self._completion = self._completion_state(
-                state=final_stage,
-                finish_reason=finish_reason,
-                continuations=continuations,
-                truncated=truncated,
-                generated_tokens=total_generated,
-                generation_mode=generation_mode,
-                sources=published_sources,
-                image_attestation=published_image_attestation,
-            )
-            self._core = self._core_state()
-        return "succeeded", final_stage, 100
 
     def _run_retrieval_quality_fallback(
         self,
@@ -3318,6 +3472,8 @@ class AgentManager:
         }
         self._active_turn = None
         self._active_user_sequence = None
+        if self._publication_claimed_turn == turn_id:
+            self._publication_claimed_turn = None
         self._transition_locked(status, stage, progress)
 
     def _transition_locked(self, status: str, stage: str, progress: int) -> None:
@@ -3798,6 +3954,8 @@ __all__ = [
     "AgentBusyError",
     "AgentManager",
     "AgentTurnStartError",
+    "FirstUseTurnGate",
+    "ImagePublicationEvidence",
     "NoActiveAgentTurnError",
     "RetrievalEvidence",
     "SYSTEM_PROMPT",

@@ -516,6 +516,70 @@ class TestGeneralWebSearch(unittest.TestCase):
         self.assertEqual(escaped.exception.code, "WEB_SEARCH_RESPONSE_INVALID")
         self.assertNotIn(TOKEN, escaped_body.decode("ascii"))
 
+        percent_encoded = "".join(f"%{ord(character):02x}" for character in TOKEN)
+        double_encoded = percent_encoded.replace("%", "%25")
+        triple_mixed = double_encoded.replace("%", "%25", 3)
+        fullwidth_case_variant = "".join(
+            chr(ord(character.swapcase()) + 0xFEE0)
+            if character.isascii() and character.isalnum()
+            else character
+            for character in TOKEN
+        )
+        reflected_variants = (
+            ("title", percent_encoded),
+            ("description", double_encoded),
+            ("title", fullwidth_case_variant),
+            ("url", f"https://example.com/?credential={triple_mixed}"),
+        )
+        for field, reflected_value in reflected_variants:
+            record = {
+                "title": "bounded title",
+                "description": "bounded description",
+                "url": "https://example.com/",
+            }
+            record[field] = reflected_value
+            client = GeneralWebSearchClient(
+                _config(),
+                transport=FakeTransport(
+                    _json_response({"web": {"results": [record]}})
+                ),
+                maximum_retries=0,
+            )
+            with self.subTest(field=field, reflected=reflected_value[:24]):
+                with self.assertRaises(GeneralWebSearchError) as encoded:
+                    client.search(
+                        client.open_session(online_opt_in=True), "bounded search"
+                    )
+                self.assertEqual(
+                    encoded.exception.code, "WEB_SEARCH_RESPONSE_INVALID"
+                )
+                self.assertIsNone(encoded.exception.__cause__)
+
+        too_deep_nonsecret = "%41"
+        for _ in range(6):
+            too_deep_nonsecret = too_deep_nonsecret.replace("%", "%25")
+        client = GeneralWebSearchClient(
+            _config(),
+            transport=FakeTransport(
+                _json_response(
+                    {
+                        "web": {
+                            "results": [
+                                {
+                                    "title": too_deep_nonsecret,
+                                    "url": "https://example.com/",
+                                }
+                            ]
+                        }
+                    }
+                )
+            ),
+            maximum_retries=0,
+        )
+        with self.assertRaises(GeneralWebSearchError) as deep:
+            client.search(client.open_session(online_opt_in=True), "bounded search")
+        self.assertEqual(deep.exception.code, "WEB_SEARCH_RESPONSE_INVALID")
+
     def test_nonstandard_json_and_unexpected_transport_fail_redacted(self) -> None:
         nonstandard = GeneralWebHttpResponse(
             200,

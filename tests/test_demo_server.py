@@ -2004,6 +2004,89 @@ class TestDemoApplicationLifecycle(unittest.TestCase):
             finally:
                 super(DemoHTTPServer, server).server_close()
 
+    def test_shutdown_synchronously_revokes_web_and_closes_workspace_posts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            assets = Path(temporary)
+            for name in ("index.html", "app.css", "app.js"):
+                (assets / name).write_text(name, encoding="utf-8")
+            manager = Mock()
+            workspace = Mock()
+            server = DemoHTTPServer(
+                manager,
+                assets,
+                workspace_service=workspace,
+                port=0,
+                watchdog_timeout=None,
+            )
+            lifecycle_probe_finished = Event()
+
+            def revoke_with_lock_probe() -> bool:
+                # request_shutdown must not hold lifecycle while it waits for
+                # the connector's authority fence.  A second thread can acquire
+                # lifecycle and observe the already-published shutdown state.
+                def probe() -> None:
+                    try:
+                        server._require_admission_open()
+                    except demo_server.ComputeBusyError:
+                        pass
+                    lifecycle_probe_finished.set()
+
+                probe_thread = Thread(target=probe)
+                probe_thread.start()
+                self.assertTrue(lifecycle_probe_finished.wait(timeout=1.0))
+                probe_thread.join(timeout=1.0)
+                self.assertFalse(probe_thread.is_alive())
+                return True
+
+            workspace.revoke_general_web.side_effect = revoke_with_lock_probe
+            failed_thread = Mock()
+            failed_thread.start.side_effect = RuntimeError("thread start failed")
+            try:
+                with patch("cogni_demo.server.Thread", return_value=failed_thread):
+                    with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+                        server.request_shutdown()
+                self.assertTrue(server._shutdown_requested)
+                workspace.revoke_general_web.assert_called_once_with()
+                self.assertTrue(lifecycle_probe_finished.is_set())
+                self.assertIsNone(server._transport_shutdown_thread)
+
+                handler = object.__new__(demo_server.DemoRequestHandler)
+                handler.server = server
+                responses: list[tuple[int, object]] = []
+                handler._json = lambda status, payload: responses.append(
+                    (int(status), payload)
+                )
+                handler._json_error = lambda status, code: responses.append(
+                    (int(status), code)
+                )
+                rejected_posts = (
+                    (
+                        "/api/workspace/web/search",
+                        {
+                            "query": "must remain revoked",
+                            "online_opt_in": True,
+                            "request_id": "a" * 32,
+                        },
+                    ),
+                    ("/api/workspace/web/cancel", {"request_id": "a" * 32}),
+                    (
+                        "/api/workspace/attachments/delete",
+                        {"attachment_id": "b" * 24},
+                    ),
+                )
+                for path, body in rejected_posts:
+                    with self.subTest(path=path):
+                        responses.clear()
+                        handler._workspace_post(path, body)
+                        self.assertEqual(responses, [(409, "COMPUTE_BUSY")])
+                workspace.search_web.assert_not_called()
+                workspace.cancel_web_search.assert_not_called()
+                workspace.delete_attachment.assert_not_called()
+            finally:
+                super(DemoHTTPServer, server).server_close()
+
     def test_shutdown_transition_serializes_after_each_admitted_start(self) -> None:
         for route in ("validation", "agent", "evolution"):
             with self.subTest(route=route), tempfile.TemporaryDirectory() as temporary:

@@ -2902,14 +2902,34 @@ class DemoHTTPServer(ThreadingHTTPServer):
     def request_shutdown(self) -> None:
         """Close admission immediately and trigger transport shutdown once."""
 
+        # Publish shutdown admission first, then release lifecycle before
+        # taking the web connector's independent authority lock.  Search
+        # dispatch never takes lifecycle, so this ordering cannot form a lock
+        # cycle with an in-flight request.
         with self._component_shutdown_condition:
             self._shutdown_requested = True
             self._watchdog_stop.set()
+
+        authority_failure: BaseException | None = None
+        try:
+            # This is synchronous by design: request_shutdown must not return
+            # while a newly scheduled workspace request can still acquire web
+            # authority.  It also remains revoked if Thread.start later fails.
+            self._revoke_general_web_authority()
+        except BaseException as error:
+            authority_failure = error
+
+        with self._component_shutdown_condition:
             if self._transport_shutdown_thread is not None:
+                if authority_failure is not None:
+                    raise authority_failure
                 return
 
             def stop() -> None:
-                _run_best_effort_cleanup((self.shutdown_components, self.shutdown))
+                _run_best_effort_cleanup(
+                    (self.shutdown_components, self.shutdown),
+                    primary=authority_failure,
+                )
 
             thread = Thread(
                 target=stop,
@@ -2921,9 +2941,14 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 # Publish and start under one short lifecycle critical section.
                 # The child only waits for this lock; it never owns compute yet.
                 thread.start()
-            except BaseException:
+            except BaseException as start_failure:
                 # Admission stays closed, but a later request may retry transport.
                 self._transport_shutdown_thread = None
+                if authority_failure is not None:
+                    raise BaseExceptionGroup(
+                        _CLEANUP_ERROR_MESSAGE,
+                        [authority_failure, start_failure],
+                    ) from None
                 raise
 
     def server_close(self) -> None:
@@ -2985,17 +3010,13 @@ class DemoHTTPServer(ThreadingHTTPServer):
             return
 
         authority_failure: BaseException | None = None
-        revoke_general_web = getattr(
-            self.workspace_service, "revoke_general_web", None
-        )
-        if callable(revoke_general_web):
-            try:
-                # Network authority closes before waiting for GPU/compute
-                # quiescence.  A busy validation job must never delay web
-                # search cancellation during process shutdown.
-                revoke_general_web()
-            except BaseException as error:
-                authority_failure = error
+        try:
+            # Network authority closes before waiting for GPU/compute
+            # quiescence.  A busy validation job must never delay web search
+            # cancellation during process shutdown.
+            self._revoke_general_web_authority()
+        except BaseException as error:
+            authority_failure = error
 
         acquired_compute = False
         product_cleanup_started = False
@@ -3036,6 +3057,15 @@ class DemoHTTPServer(ThreadingHTTPServer):
                 self._component_shutdown_condition.notify_all()
         if failure is not None:
             raise failure
+
+    def _revoke_general_web_authority(self) -> None:
+        """Revoke the optional connector without holding server lifecycle locks."""
+
+        revoke_general_web = getattr(
+            self.workspace_service, "revoke_general_web", None
+        )
+        if callable(revoke_general_web):
+            revoke_general_web()
 
 
 class DemoRequestHandler(BaseHTTPRequestHandler):
@@ -3702,6 +3732,11 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
 
     def _workspace_post(self, path: str, body: dict[str, Any]) -> None:
         try:
+            # This is the workspace admission linearization point.  A request
+            # that observes shutdown cannot mutate local state or acquire an
+            # optional network session; already-admitted web requests are
+            # stopped by the connector's synchronous revoke/epoch fence.
+            self.server._require_admission_open()
             if path == "/api/workspace/voice/transcribe":
                 if set(body) not in (
                     {"audio_wav_base64"},

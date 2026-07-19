@@ -28,7 +28,8 @@ import ssl
 from threading import BoundedSemaphore, Event, RLock, Thread
 import time
 from typing import Any, Protocol, Sequence
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+import unicodedata
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 
 BRAVE_SEARCH_PROVIDER_ID = "brave"
@@ -54,6 +55,8 @@ MAX_WEB_TIMEOUT_SECONDS = 20.0
 MAX_WEB_RETRIES = 1
 MAX_WEB_RETRY_DELAY_SECONDS = 0.5
 MAX_WEB_RESOLVED_ADDRESSES = 16
+MAX_WEB_SECRET_DECODE_PASSES = 4
+MAX_WEB_SECRET_CANONICAL_CHARS = 4 * MAX_WEB_RESPONSE_BYTES
 
 _RETRIABLE_STATUS = frozenset({429, 502, 503, 504})
 _HOST_RE = re.compile(
@@ -1153,8 +1156,8 @@ def _decode_response(
         raise GeneralWebSearchError(
             "WEB_SEARCH_RESPONSE_INVALID", "web search response is not JSON"
         )
-    secret_fragments = _secret_fragments(secret_token)
-    if any(fragment.encode("utf-8") in response.body for fragment in secret_fragments):
+    secret_signature = _secret_signature(secret_token)
+    if secret_token and secret_token.encode("utf-8") in response.body:
         raise GeneralWebSearchError(
             "WEB_SEARCH_RESPONSE_INVALID",
             "web search response reflected configured credential material",
@@ -1172,7 +1175,7 @@ def _decode_response(
             "WEB_SEARCH_RESPONSE_INVALID", "web search response must be an object"
         )
     _validate_json_shape(payload)
-    if _json_contains_secret(payload, secret_fragments):
+    if _json_contains_secret(payload, secret_signature):
         raise GeneralWebSearchError(
             "WEB_SEARCH_RESPONSE_INVALID",
             "web search response reflected configured credential material",
@@ -1180,26 +1183,71 @@ def _decode_response(
     return payload
 
 
-def _secret_fragments(secret_token: str) -> frozenset[str]:
+def _secret_signature(secret_token: str) -> str:
     if not secret_token:
-        return frozenset()
-    return frozenset(
-        {
-            secret_token,
-            quote(secret_token, safe=""),
-            quote(secret_token, safe="", encoding="utf-8", errors="strict"),
-        }
+        return ""
+    signature = _normalize_secret_scan_text(secret_token)
+    if signature is None:
+        # Configuration already bounds the token to printable ASCII and 4 KiB;
+        # this branch is defensive if the invariant is ever weakened.
+        raise GeneralWebSearchError(
+            "WEB_SEARCH_RESPONSE_INVALID",
+            "configured credential material exceeds the scan bound",
+        )
+    return signature
+
+
+def _normalize_secret_scan_text(value: str) -> str | None:
+    """Return one bounded Unicode/case canonical form for secret comparison."""
+
+    if len(value) > MAX_WEB_RESPONSE_BYTES:
+        return None
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    if len(normalized) > MAX_WEB_SECRET_CANONICAL_CHARS:
+        return None
+    return normalized
+
+
+def _text_contains_secret(value: str, signature: str) -> bool:
+    """Reject raw, Unicode-equivalent, and nested URL-encoded credentials.
+
+    URL decoding is deliberately capped.  If the text is still transformable
+    after the cap, it is rejected rather than accepted, so adding another
+    ``%25`` layer cannot bypass the detector or create unbounded decode work.
+    """
+
+    current = _normalize_secret_scan_text(value)
+    if current is None:
+        return True
+    for _ in range(MAX_WEB_SECRET_DECODE_PASSES):
+        if signature in current:
+            return True
+        decoded = _normalize_secret_scan_text(
+            unquote(current, encoding="utf-8", errors="replace")
+        )
+        if decoded is None:
+            return True
+        if decoded == current:
+            return False
+        current = decoded
+    if signature in current:
+        return True
+    # A fifth effective transform means the bounded decoder did not reach a
+    # canonical form.  Fail closed instead of accepting deeper encodings.
+    final_probe = _normalize_secret_scan_text(
+        unquote(current, encoding="utf-8", errors="replace")
     )
+    return final_probe is None or final_probe != current
 
 
-def _json_contains_secret(payload: object, fragments: frozenset[str]) -> bool:
-    if not fragments:
+def _json_contains_secret(payload: object, signature: str) -> bool:
+    if not signature:
         return False
     stack = [payload]
     while stack:
         value = stack.pop()
         if isinstance(value, str):
-            if any(fragment and fragment in value for fragment in fragments):
+            if _text_contains_secret(value, signature):
                 return True
         elif isinstance(value, dict):
             stack.extend(value.keys())

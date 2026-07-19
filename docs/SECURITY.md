@@ -63,16 +63,21 @@ and not independently production-attested.
 - retrieved text is normalized into bounded `RetrievalEvidence` with explicit
   provenance before prompt construction. Index presence alone never grants
   answer authority;
-- the current deterministic 256-dimensional lexical vectorizer is not exposed
-  as a trained semantic embedding or source-truth verifier;
-- image/audio preprocessing is manifest-bound and emits only an allowlisted,
-  fixed-schema CPU tensor bundle. Tensor dtype, shape, byte count, modality,
-  job, lease, deadline, artifact, and session identity are rechecked across
-  the worker boundary;
+- the current deterministic 256-dimensional lexical vectorizer remains the only
+  answer-bearing retrieval path. The optional semantic artifact verifier and
+  test encoder keep their production path-loader disabled until parsed bytes can
+  be bound to the verified snapshot, and remain unqualified for answer authority
+  until reviewed artifact and quality/license/poisoning evidence exist;
+- image/audio preprocessing and IPC contracts emit only an allowlisted,
+  fixed-schema CPU tensor bundle in injected-processor tests. The production
+  path-loader is disabled because its parser input is not byte-bound to the
+  verified snapshot. Tensor identity is rechecked across the worker boundary;
 - a selected image has one-turn scope. Audio accepts only mono 16-bit PCM WAV
-  at 16 kHz for at most 30 seconds. Video has no admitted runtime route.
+  at 16 kHz for at most 30 seconds. Video accepts only already-decoded bounded
+  CPU RGB frames for preprocessing; it has no file/decoder/worker/inference
+  route and makes no VRAM claim.
 
-### Voice and opt-in Lens boundary
+### Voice and opt-in external-research boundary
 
 - browser microphone permission is requested only after a user gesture;
   capture, cancel, object-URL cleanup, and authenticated loopback transport are
@@ -88,8 +93,11 @@ and not independently production-attested.
 - the Lens client uses only bounded HTTPS POST to fixed patent/scholarly API
   routes, rejects redirects/host changes and oversized or malformed responses,
   redacts authorization secrets, and records provenance and attribution;
-- no generic web browser/search executor is granted model authority. Lens
-  results reach local RAG only through an explicit search-and-index action.
+- general search, when every operator and request gate is open, is restricted to
+  Brave's fixed official JSON endpoint. HTML scraping, redirects, arbitrary
+  endpoints, and fetching returned result URLs remain prohibited. Neither Lens
+  nor Brave results receive model or RAG authority automatically; Lens reaches
+  local RAG only through an explicit search-and-index action.
 
 ### Numerical and memory safety
 

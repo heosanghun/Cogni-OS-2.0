@@ -99,18 +99,22 @@ a trained expert, or an applied source patch.
   explicit partial-assistant contract rather than replaying the whole answer.
 - EOS/EOT and quarantined control tokens stop decode at token boundaries.
 
-### Image and audio
+### Image, audio, and bounded video preprocessing
 
-- `VerifiedGemma4MultimodalProcessor` loads only from the digest-verified local
-  model snapshot with `local_files_only=True` and
-  `trust_remote_code=False`.
+- `VerifiedGemma4MultimodalProcessor` verifies the closed local snapshot and
+  then refuses production construction. The upstream path loader reopens names,
+  so it cannot yet bind parser input to the exact bytes that were hashed; no
+  `Gemma4Processor` is published while that ABA boundary remains unproven.
 - Image and 16 kHz mono PCM-WAV inputs are decoded and bounded on the CPU, then
   passed through `Gemma4Processor.apply_chat_template` with typed image/audio
   content and `add_generation_prompt=True`.
 - Raw media bytes, paths, PIL objects, NumPy arrays, strings, and JSON never
   cross the model-worker IPC boundary.
-- Video is not admitted. A video token in model metadata is not a runtime video
-  capability.
+- Video admission is limited to an **already-decoded CPU frame** preprocessing
+  boundary. It accepts no file path, URL, encoded container, decoder process, or
+  network source and enforces frame/sampling/duration/pixel/byte/tensor bounds.
+  It is not connected to protocol v4 or an answer-bearing model forward, and it
+  records `actual_model_inference=false` and `vram_measured=false`.
 
 ### Protocol v4
 
@@ -130,10 +134,11 @@ content SHA-256 is bound into the session digest, and stale lease epochs,
 deadline violations, shape/type mismatches, trailing payload, non-finite
 features, and artifact changes fail closed.
 
-The real local `Gemma4Processor` has been CPU-validated for image and audio
-tensor construction. This is **not** evidence that the integrated real model
-forward, answer quality, latency, or VRAM boundary has passed for either
-modality.
+A historical development checkout CPU-validated the local `Gemma4Processor` for
+image/audio tensor construction. The current exact source instead disables the
+unbound production path-loader. Current image/audio/video contracts are tested
+with explicitly admitted test processors only; they prove neither real-processor
+compatibility nor integrated answer quality, latency, or VRAM compliance.
 
 ## Conversation and inference path
 
@@ -188,18 +193,23 @@ flowchart LR
 - The AkasicDB adapter pins the audited upstream revision and invokes its
   GraphStore, RelationalStore, and VectorStore interfaces. The stores are
   process-memory and are rebuilt from the persistent catalog.
-- Current retrieval is a stable SHA-256 lexical sketch with lexical overlap
-  enforcement. It must not be described as a verified semantic embedder.
+- Current answer-bearing retrieval is a stable SHA-256 lexical sketch with
+  lexical overlap enforcement. An optional manifest-bound, CPU-only mean-pool
+  semantic artifact verifier and test-only CPU mean-pool boundary now validate a
+  closed-world layout. Its production path-loader is disabled until parsed bytes
+  can be bound to the verified snapshot, and it reports
+  `quality_attested=false`, `answer_bearing=false`, and `production_ready=false`.
+  No semantic model artifact or independent quality, license, poisoning, or
+  relevance attestation is bundled, so normal RAG remains lexical.
 - Evidence identifies file, chunk, score, physical PDF page, normalized
   page-relative offsets, and excerpt digest. Inline sentence citations and the
   source list open an independent read-only drawer. The schema explicitly calls
   its text a normalized extracted excerpt; it is never presented as raw PDF or
   attachment bytes.
 
-## Official Lens.org connector
+## Opt-in official research connectors
 
-Lens access is the only implemented external-research executor in this
-architecture. It uses fixed official HTTPS POST endpoints and never HTML
+Lens access uses fixed official HTTPS POST endpoints and never HTML
 scraping, browser automation, redirects, or arbitrary URLs. A request is
 admitted only when all four gates pass:
 
@@ -216,8 +226,28 @@ SHA-256, and can pass normalized evidence to the AkasicDB adapter.
 Only mocked transport and local contract tests have passed. No approved token,
 terms/account confirmation, or live Lens response was available for this
 working tree, so patent search, scholarly search, and live Lens-to-AkasicDB
-indexing remain **external blockers**, not completed product evidence. General
-web search is not implemented.
+indexing remain **external blockers**, not completed product evidence.
+
+The separate general-search boundary targets only Brave's official JSON GET
+endpoint at `api.search.brave.com/res/v1/web/search`. It is disabled by default
+and requires operator online mode, the exact provider and host allowlist, a
+bounded environment token, accepted terms, and per-request user opt-in. It does
+not follow redirects, scrape HTML, or fetch returned result URLs; response
+records carry retrieval time and query/source digests. The implementation and
+mocked transport tests do not prove a live subscription, result quality,
+availability, or egress audit.
+
+## Model-switch control boundary
+
+`cogni_demo.model_switch` contains a disabled-by-default control-plane state
+machine for admission close, bounded drain, exact unload acknowledgement,
+injected memory-release proof, candidate health, atomic publication, rollback,
+and safe mode. It has no concrete resident supervisor/factory/memory probe wired
+into the product server, and the UI therefore keeps discovered alternate models
+non-selectable. CPU unit evidence for this primitive is not proof of a real
+GPU/model unload, zero-VRAM postcondition, or production model switch.
+The exact cooperative-only and crash-recovery limits are recorded in
+`docs/MODEL_SWITCH_CONTROL_SAFETY_KO.md`.
 
 ## Voice capture, STT, and TTS gates
 

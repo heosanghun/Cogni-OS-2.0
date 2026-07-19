@@ -97,8 +97,8 @@ class TestMasterAcceptanceChecklist(unittest.TestCase):
             raise AssertionError(f"promotable IDs missing: {sorted(selected - found)}")
         count = len(selected)
         joined = "\n".join(lines) + "\n"
-        old = "COMPLETED 0 / IMPLEMENTED_UNVERIFIED 103"
-        new = f"COMPLETED {count} / IMPLEMENTED_UNVERIFIED {103 - count}"
+        old = "COMPLETED 0 / IMPLEMENTED_UNVERIFIED 105"
+        new = f"COMPLETED {count} / IMPLEMENTED_UNVERIFIED {105 - count}"
         if old not in joined:
             raise AssertionError("status summary fixture is stale")
         return joined.replace(old, new, 1)
@@ -335,9 +335,9 @@ class TestMasterAcceptanceChecklist(unittest.TestCase):
             {
                 "COMPLETED": 0,
                 "EXTERNAL_BLOCKER": 5,
-                "IMPLEMENTED_UNVERIFIED": 103,
-                "NOT_IMPLEMENTED": 4,
-                "PARTIAL": 58,
+                "IMPLEMENTED_UNVERIFIED": 105,
+                "NOT_IMPLEMENTED": 0,
+                "PARTIAL": 60,
             },
         )
         self.assertEqual(report.as_payload()["incomplete_count"], 170)
@@ -373,7 +373,7 @@ class TestMasterAcceptanceChecklist(unittest.TestCase):
     def test_declared_summary_must_match_table(self) -> None:
         text = CHECKLIST.read_text(encoding="utf-8")
         corrupted = text.replace(
-            "IMPLEMENTED_UNVERIFIED 103", "IMPLEMENTED_UNVERIFIED 102", 1
+            "IMPLEMENTED_UNVERIFIED 105", "IMPLEMENTED_UNVERIFIED 104", 1
         )
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checklist.md"
@@ -400,8 +400,8 @@ class TestMasterAcceptanceChecklist(unittest.TestCase):
             promoted.append(line)
         text = "\n".join(promoted) + "\n"
         text = text.replace(
-            "COMPLETED 0 / IMPLEMENTED_UNVERIFIED 103",
-            "COMPLETED 103 / IMPLEMENTED_UNVERIFIED 0",
+            "COMPLETED 0 / IMPLEMENTED_UNVERIFIED 105",
+            "COMPLETED 105 / IMPLEMENTED_UNVERIFIED 0",
             1,
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -417,7 +417,7 @@ class TestMasterAcceptanceChecklist(unittest.TestCase):
             self.assertTrue(fixture["checklist"].is_relative_to(fixture["bundle"]))
             report = self._validate_fixture(fixture)
             self.assertEqual(report.counts["COMPLETED"], 2)
-            self.assertEqual(report.counts["IMPLEMENTED_UNVERIFIED"], 101)
+            self.assertEqual(report.counts["IMPLEMENTED_UNVERIFIED"], 103)
 
     def test_public_api_rejects_caller_constructed_context_object(self) -> None:
         with self.assertRaisesRegex(TypeError, "validation_context"):

@@ -6,9 +6,9 @@
 ## 현재 집계
 
 - 전체 미완료: **170개**
-- 구현됐으나 승인 증거 미결합: **103개**
-- 코드/제품 경로 미구현: **4개**
-- 부분 구현 또는 검증 잔여: **58개**
+- 구현됐으나 승인 증거 미결합: **105개**
+- 코드/제품 경로 미구현: **0개**
+- 부분 구현 또는 검증 잔여: **60개**
 - 외부 장치·토큰·아티팩트 차단: **5개**
 
 ## 구현됐으나 승인 증거 미결합
@@ -85,6 +85,8 @@
 | 113 | [ ] | 로컬 모델 자동 발견 | `cogni_demo/workspace_capabilities.py::discover_verified_local_models`, `tests/test_workspace_capabilities.py`; 명시적 absolute registry의 직접 자식만 bounded scan하고 sibling manifest·closed-world layout·고정 E4B-it fingerprint를 검증하며 symlink/reparse/UNC/URL/Hub ID를 차단 | exact-commit CPU attestation과 독립 evidence 결합; 발견 모델은 ID 116 전까지 로드 불가 유지 |
 | 117 | [ ] | 실제 모델과 목표 모델 구분 | artifact/Fact-book/UI evidence rail | live verification 전 과거 모델 수치 재사용 금지 |
 | 118 | [ ] | 웹 검색 기본 OFF | `WebAccessPolicy`, UI capability state, tests | 모든 세션 시작을 offline으로 유지 |
+| 119 | [ ] | 사용자 명시적 online 전환 | composer의 요청별 동의 UI, one-shot session lease, request ID registry, cancel/revoke/publication epoch fence, 종료 전 global revoke와 API/UI 회귀 tests | 승인 credential 환경의 실제 브라우저 cancel/revoke·packet/egress 감사와 exact-commit 독립 attestation |
+| 120 | [ ] | 일반 웹 검색 connector | Brave 공식 JSON GET 고정 endpoint, 공개 IP DNS pin+TLS SNI, redirect/HTML/결과 URL fetch 금지, bounded query/JSON/result·secret reflection 차단·URL/time/query/source provenance와 mocked transport/API/UI tests | 승인 Brave subscription/token의 live 응답·품질/rate-limit·packet/egress·약관 검증 |
 | 126 | [ ] | 검색 query/domain/time 감사 provenance | 고정 host/endpoint, retrieved time, query SHA-256, source-record SHA-256, Lens ID/canonical URL과 secret-redaction tests | token·원문 body 비노출, endpoint/time/query/source digest 계약 유지 |
 | 127 | [ ] | token 없으면 자동 비활성화 | `WebAccessPolicy` capability state와 tests | 토큰 값을 UI/log/prompt에 노출하지 않기 |
 | 128 | [ ] | HTML scraping 금지 | URL/endpoint 정책과 확장 로드맵 | 제품 데이터 경로를 공식 API로만 제한 |
@@ -123,10 +125,6 @@
 
 | ID | 체크 | 요구사항 | 현재 근거 | 완료 승격 조건 |
 |---:|:---:|---|---|---|
-| 85 | [ ] | 비디오 processor 연결 | video token/config 표시는 실행 권한이 아님 | frame/sampling/time/VRAM 상한과 실제 추론 |
-| 100 | [ ] | 검증된 로컬 semantic embedder | 현재 검색은 안정적 lexical projection | 모델 artifact/manifest, 품질·VRAM·라이선스 검증 |
-| 116 | [ ] | 안전한 unload/load 전환 | 단일 worker lifecycle만 존재 | lease drain→unload→memory check→load→rollback E2E |
-| 120 | [ ] | 일반 웹 검색 connector | 정책과 UI 상태만 존재 | 승인 provider, bounded schema, URL/time provenance |
 
 ## 부분 구현·검증 잔여
 
@@ -163,10 +161,12 @@
 | 69 | [ ] | 격리된 실제 patch 실행 | `cogni_flow/kernel_sandbox.py`, `cogni_flow/snapshot.py`, `JournaledHarnessPatcher.evaluate_candidate`; 서버 smoke schema `cogni.kernel-sandbox-integration-smoke.v1`, `assurance=implementation_integration_smoke_only`, `production_attestation=false`, `gpu_measurement=not_performed` | hostile-code production 격리와 daemon/runtime/kernel 경계의 독립 attestation; integration smoke를 production 증명으로 사용 금지 |
 | 70 | [ ] | 후보 회귀·보안 테스트 | OCI snapshot 회귀·health check, forged/expired/stale 승인, cleanup·mount·output·rollback fault tests | 독립 attested production boundary에서 전체 회귀·hostile fault injection |
 | 75 | [ ] | UI가 아닌 실제 자가수정 E2E | 기본 UI는 proposal-only; `cogni_flow/self_harness_e2e.py`의 운영자 전용 immutable evaluation→외부 승인→원자 승격→health→별도 signed rollback append-only chain과 read-only CLI validator, health-fail byte restore/replay/restart 회귀 구현 | 독립 평가자가 서명한 실제 production runner statement와 한 current production boundary에서 생성한 원시 전체 E2E evidence 결합; UI/자동 승격은 계속 금지 |
-| 82 | [ ] | Gemma4Processor 이미지 tensor화 | `cogni_agent/multimodal.py`와 processor tests는 구현; v0.4.0 image JSON은 historical | current manifest-bound E4B-it guard run과 pixel/byte/tensor·finite 증거 |
-| 83 | [ ] | 이미지 tensor를 모델 입력에 연결 | 고정 CPU tensor IPC와 worker/model/manager/server tests는 구현; 과거 blue-square smoke는 current scope 아님 | current exact commit image inference와 ID 86 VRAM gate |
-| 84 | [ ] | 로컬 audio processor 연결 | audio chat-template·고정 CPU tensor IPC·worker/service tests는 구현; 과거 STT smoke는 current scope 아님 | current exact commit E4B-it guard에서 16 kHz mono·finite/shape 검증 |
+| 82 | [ ] | Gemma4Processor 이미지 tensor화 | processor/shape/finite tests는 구현됐지만 current production path-loader는 검증 바이트 결합 미증명으로 fail-closed; v0.4.0 image JSON은 historical | byte-bound loader와 current E4B-it guard run의 pixel/byte/tensor·finite 증거 |
+| 83 | [ ] | 이미지 tensor를 모델 입력에 연결 | 고정 CPU tensor IPC와 injected/fake worker tests는 구현; production processor loader 차단, 과거 blue-square smoke는 current scope 아님 | byte-bound processor, current exact-commit image inference와 ID 86 VRAM gate |
+| 84 | [ ] | 로컬 audio processor 연결 | audio chat-template·고정 CPU tensor IPC tests는 구현; production processor loader 차단, 과거 STT smoke는 current scope 아님 | byte-bound processor와 current E4B-it guard의 16 kHz mono·finite/shape 증거 |
+| 85 | [ ] | 비디오 processor 연결 | 주입 processor의 이미 디코딩된 CPU RGB frame 전처리·격리 경계와 frame/sampling/duration/pixel/byte/tensor 상한, `tests/test_video_processor.py`; production processor/path/URL/decoder/IPC/model-forward는 없음 | byte-bound processor·killable decoder worker·protocol v4 IPC·실제 Gemma video forward·품질/latency/peak VRAM 증거 |
 | 86 | [ ] | 멀티모달 VRAM 경계 검증 | v0.4.0의 고정 이미지·합성 음성 actual-model smoke는 historical PASS이나 current scope가 아니며 peak allocated/reserved VRAM도 기록하지 않음 | image/audio 조합을 current commit에서 16.7 GiB/finite/latency로 실측 |
+| 100 | [ ] | 검증된 로컬 semantic embedder | closed-world manifest·digest·safetensors·resource verifier와 test-only CPU mean-pool 경계; production path-loader는 바이트 결합 미증명으로 차단, 실제 artifact 미번들, `answer_bearing=false` | byte-bound loader와 검토된 artifact·라이선스·poisoning/검색 품질·RAM/latency evidence 후에만 RAG authority 연결 |
 | 103 | [ ] | 마이크 입력 | 브라우저 `getUserMedia`→16 kHz mono WAV→인증 loopback STT 경로와 UI/API contract tests | 실제 Windows 마이크 장치에서 권한·녹음·전사 브라우저 E2E |
 | 104 | [ ] | Windows 마이크 권한 처리 | 클릭 시에만 권한 요청하고 오류/취소 cleanup UI 경로 구현 | 권한 거부·철회·장치 없음·장치 전환을 실제 브라우저에서 검증 |
 | 105 | [ ] | 로컬 STT | 로컬 voice/API tests와 Gemma audio 경로는 구현; v0.4.0 TTS→STT JSON은 historical | current E4B-it GPU5 guard smoke와 다화자·잡음 품질 gate |
@@ -175,7 +175,7 @@
 | 111 | [ ] | 로컬 모델 선택기 | composer selector와 `/api/workspace/models/select`; 현재 worker 모델만 selectable이고 bounded registry의 검증 후보는 non-selectable로 표시 | 발견 후보의 lease-safe worker unload/load·검증 실패 rollback E2E |
 | 114 | [ ] | 모델별 modality 지원 표시 | metadata/Fact-book에는 modality 구성과 active 구분 | 복수 모델 registry 및 실제 processor gate |
 | 115 | [ ] | 모델별 VRAM 요구량 표시 | 목표/과거 실측 표시는 있으나 모델별 현재 실측 registry 없음 | 동일 장치·prompt scope의 current measurement |
-| 119 | [ ] | 사용자 명시적 online 전환 | 권한/allowlist 정책은 구현, 실제 executor 없음 | 세션 opt-in UI·감사 로그·즉시 revoke E2E |
+| 116 | [ ] | 안전한 unload/load 전환 | 기본 OFF atomic admission/generation pin·drain·unload ack·memory proof·two-phase factory·CAS·rollback/safe-mode primitive와 tests; `cooperative_only=true`, crash journal·제품 wiring 없음(`docs/MODEL_SWITCH_CONTROL_SAFETY_KO.md`) | killable worker ports·durable journal·resident supervisor/factory/zero-memory probe를 연결하고 GPU5 unload/load/kill/recovery E2E |
 | 124 | [ ] | Lens ID/DOI/특허 링크 인용 | Lens ID·identifier normalization과 `https://lens.org/<검증 ID>` allowlist, UI link/API tests | 실제 특허·학술 응답에서 DOI/특허 ID/링크 attribution E2E와 provenance drawer 연결 |
 | 125 | [ ] | Lens 결과→AkasicDB 색인 | `LensAkasicBridge`, normalized provenance 문서와 `/search-and-index` mocked E2E tests | 승인 token 실응답의 영속 graph/index·재시작·삭제 provenance E2E |
 | 137 | [ ] | 반응형 layout | breakpoint CSS와 1080p QA | 1366×768, 1920×1080, 4K, 125–200% zoom 시각/키보드 QA |

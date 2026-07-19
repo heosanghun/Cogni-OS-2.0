@@ -3,8 +3,10 @@
 Cogni-OS 2.0 is an offline-by-default, bounded research runtime for a verified local
 dense Gemma 4 E4B-it artifact. Version 0.4.1 adds a persistent local document
 workspace, provenance-bearing AkasicDB RAG, bounded Gemma image/audio routes,
-local speech input/output, and an explicitly opt-in Lens patent/scholarly API
-connector to the existing conversation, Cogni-Core, typed-task, and
+decoded-frame-only video preprocessing, local speech input/output, an
+explicitly opt-in Lens patent/scholarly API connector, and a separate
+request-opt-in Brave official JSON search boundary to the existing
+conversation, Cogni-Core, typed-task, and
 **proposal-only-by-default** Self-Harness boundary. An internal Linux
 `PromotionMode.ATTESTED` path exists for evidence-bound evaluation, external
 signed promotion and signed committed rollback, but it is not enabled by the
@@ -29,10 +31,12 @@ passing component test never upgrades a capability by itself.
 | AFlow/ADAS | `research` | no | attested real evaluator and held-out evidence |
 | Self-Harness | default `proposal_only`; internal `ATTESTED` path unverified | no mutation in the shipped UI/default profile | independent production-runner statement and current raw production E2E evidence |
 | persistent attachments + PDF extraction | `local_verified_path` | only after explicit RAG/image selection | deployment-specific parser and corpus review |
-| AkasicDB RAG | `local_index_ready` when pinned clone verifies | yes, with bounded source provenance | semantic embedder and independent retrieval-quality benchmark |
-| Gemma image/audio tensor IPC | `bounded_runtime_path`; current UI readiness unverified | only after a current-process processor probe and answer-bearing inference attestation | guarded current-scope model run, broad multimodal quality and combined-VRAM evidence |
+| AkasicDB RAG | `local_index_ready` when pinned clone verifies | yes, with bounded lexical source provenance | semantic production path-loader is disabled until verified bytes can be bound to parsing; then artifact/license/quality/poisoning evidence |
+| Gemma image/audio tensor IPC | protocol and injected-processor tests only; production path-loader disabled | no current answer authority | byte-bound processor loader, guarded current-scope model run, broad quality and combined-VRAM evidence |
+| decoded-frame video preprocessing | `partial_non_answer_bearing_boundary`, injected processor only | no | byte-bound processor loader, decoder worker, IPC, real Gemma forward, quality/latency/VRAM evidence |
 | local STT/TTS | `historical_dev_host_observation`; current scope unverified | gated until current guarded evidence | GPU5-guarded current-scope run, multi-speaker WER, noise, language, latency and accessibility study |
 | Lens patent/scholarly search | `opt_in_gated` | only after explicit search/index action | token, terms acceptance, allowlist, live validation and distribution attribution review |
+| Brave general web search | `implemented_unverified`, default off | no automatic model/RAG authority | approved subscription/token, live response, browser cancel/revoke, terms and packet/egress audit |
 
 The runtime Fact-book is the authority for the live process. Evidence records
 are content-addressed and bound to the exact model, code, configuration, and
@@ -233,17 +237,28 @@ Local RAG loads only the audited AkasicDB revision
 module digests before use. Retrieved chunks enter the answer prompt only
 through bounded `RetrievalEvidence`, and the UI shows attachment id, chunk
 index, score, and source metadata. The bundled vectorizer is deterministic and
-bounded; it is **not** represented as a trained semantic embedder.
+bounded; it is **not** represented as a trained semantic embedder. A separate
+closed-world semantic artifact verifier and CPU mean-pool test boundary exists,
+but the production Transformers path-loader is disabled because it cannot prove
+that parsed bytes are the bytes that were hashed. No reviewed model artifact is
+bundled; the capability remains `quality_attested=false`, `answer_bearing=false`,
+and `production_ready=false`.
 
-Image and audio preprocessing use the manifest-bound `Gemma4Processor`, then
-cross the worker boundary as fixed-schema CPU tensors with request/artifact/
-session binding. One explicitly selected image can be used for one turn.
+Image/audio preprocessing and fixed-schema CPU tensor IPC are implemented and
+covered with injected-processor tests. The production `Gemma4Processor`
+constructor currently verifies the manifest and then fails closed: the upstream
+path API reopens filenames, so a verify-load-verify sequence cannot bind parsed
+bytes against an ABA replacement. Consequently this source state has no current
+image/audio answer authority. One explicitly selected image can be used for one
+turn only after a future verified processor admission.
 Browser audio is accepted only as bounded mono 16-bit PCM WAV at 16 kHz and
 at most 30 seconds. A retained v0.4.0 historical development-host smoke transcribed a Korean phrase with
 normalized similarity 1.0 and synthesized it with the installed Microsoft
 Heami `ko-KR` Windows voice, with zero application external calls. This single
-synthetic phrase is not a WER or general speech-quality benchmark. Video input
-is not implemented.
+synthetic phrase is not a WER or general speech-quality benchmark. Video has
+only an already-decoded CPU RGB frame preprocessing boundary with bounded
+sampling/pixel/byte/tensor metadata. It accepts no path, URL, container, decoder,
+worker IPC, or model-forward authority.
 
 A retained v0.4.0 historical actual-model smoke sent a locally generated 256×256 PNG containing
 one blue square through the Cogni-Core image route. The response was
@@ -256,6 +271,14 @@ the official patent or scholarly API only after all four authorization gates
 pass. Results retain Lens provenance and can be explicitly indexed into the
 local AkasicDB adapter. No live Lens query is claimed for this release because
 the release process has no distributable user token or terms acceptance.
+
+General web search is separate from Lens and targets only Brave's fixed official
+JSON GET endpoint. Operator online/provider/host/token/terms gates and a fresh
+per-request user opt-in are all required. DNS answers must be public and are
+pinned to the TLS connection while hostname verification and SNI remain bound to
+`api.search.brave.com`; redirects, HTML scraping, arbitrary URLs, and automatic
+result-link fetching are blocked. Mocked tests do not claim a live subscription,
+search quality, or egress audit.
 
 ## Windows launcher
 

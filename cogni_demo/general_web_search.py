@@ -170,6 +170,54 @@ def _default_connection_factory(
     )
 
 
+class _ResolverGate:
+    """Bound resolver concurrency and permanently fail closed after a stall.
+
+    ``socket.getaddrinfo`` cannot be interrupted portably.  The resolver runs in
+    a daemon thread so the request deadline remains enforceable, but allowing a
+    new thread after every timeout would turn a wedged system resolver into an
+    unbounded process-resource leak.  One lease is therefore admitted at a
+    time.  If its caller times out or is cancelled while that lease is still
+    active, the gate is poisoned for the rest of the process.
+    """
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._active_lease: int | None = None
+        self._next_lease = 0
+        self._poisoned = False
+
+    def claim(self) -> int:
+        with self._lock:
+            if self._poisoned:
+                raise GeneralWebTransportError(
+                    "official search DNS resolver is unavailable"
+                )
+            if self._active_lease is not None:
+                raise GeneralWebTransportError(
+                    "official search DNS resolver is already active"
+                )
+            self._next_lease += 1
+            self._active_lease = self._next_lease
+            return self._next_lease
+
+    def release(self, lease: int) -> None:
+        with self._lock:
+            if self._active_lease == lease:
+                self._active_lease = None
+
+    def poison_if_active(self, lease: int) -> None:
+        with self._lock:
+            # The lease comparison prevents a late caller cancellation from
+            # poisoning a newer lookup that claimed the slot after this worker
+            # had already completed.
+            if self._active_lease == lease:
+                self._poisoned = True
+
+
+_GLOBAL_RESOLVER_GATE = _ResolverGate()
+
+
 class StandardLibraryGeneralWebTransport:
     """TLS-validating fixed-destination transport that never follows redirects."""
 
@@ -180,10 +228,15 @@ class StandardLibraryGeneralWebTransport:
         connection_factory: Callable[[str, str, float, ssl.SSLContext], Any]
         | None = None,
         monotonic_clock: Callable[[], float] | None = None,
+        resolver_gate: _ResolverGate | None = None,
     ) -> None:
         self._resolver = resolver or _system_resolver
         self._connection_factory = connection_factory or _default_connection_factory
         self._monotonic = monotonic_clock or time.monotonic
+        # All production/default transports share one process-wide slot.  The
+        # injectable gate exists only so deterministic tests cannot poison the
+        # production singleton for later cases in the same interpreter.
+        self._resolver_gate = resolver_gate or _GLOBAL_RESOLVER_GATE
 
     def get(
         self,
@@ -208,6 +261,7 @@ class StandardLibraryGeneralWebTransport:
             deadline=deadline,
             monotonic_clock=self._monotonic,
             cancelled=cancelled,
+            resolver_gate=self._resolver_gate,
         )
         remaining = _transport_remaining(deadline, self._monotonic, cancelled)
         tls_context = ssl.create_default_context()
@@ -294,27 +348,41 @@ def _resolve_public_addresses(
     deadline: float,
     monotonic_clock: Callable[[], float],
     cancelled: Callable[[], bool],
+    resolver_gate: _ResolverGate,
 ) -> tuple[str, ...]:
     """Resolve once and reject the complete answer if any address is non-public."""
 
     result_queue: Queue[tuple[bool, object]] = Queue(maxsize=1)
+    lease = resolver_gate.claim()
 
     def resolve() -> None:
         try:
             result: tuple[bool, object] = (True, resolver(host, port))
         except BaseException:  # Resolver diagnostics are an untrusted boundary.
             result = (False, None)
+        # Release before publishing: receipt of a completed lookup must never
+        # leave the global slot looking busy.  A lease id ensures a late timeout
+        # cannot poison a subsequent lookup that acquired the freed slot.
+        resolver_gate.release(lease)
         try:
             result_queue.put_nowait(result)
         except Exception:
             return
 
-    Thread(target=resolve, name="cogni-web-dns", daemon=True).start()
+    try:
+        Thread(target=resolve, name="cogni-web-dns", daemon=True).start()
+    except Exception:
+        resolver_gate.release(lease)
+        raise GeneralWebTransportError(
+            "official search DNS worker failed to start"
+        ) from None
     while True:
         if cancelled():
+            resolver_gate.poison_if_active(lease)
             raise GeneralWebTransportError("request cancelled during resolution")
         remaining = deadline - monotonic_clock()
         if remaining <= 0.0:
+            resolver_gate.poison_if_active(lease)
             raise GeneralWebTransportError("official search DNS deadline exceeded")
         try:
             succeeded, raw_addresses = result_queue.get(timeout=min(remaining, 0.05))

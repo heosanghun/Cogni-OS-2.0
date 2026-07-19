@@ -18,6 +18,7 @@ from cogni_demo.general_web_search import (
     GeneralWebSearchError,
     GeneralWebTransportError,
     StandardLibraryGeneralWebTransport,
+    _ResolverGate,
 )
 from cogni_demo.workspace_capabilities import (
     VerifiedModelMetadata,
@@ -646,6 +647,100 @@ class TestGeneralWebSearch(unittest.TestCase):
         self.assertEqual(connection.requests[0][0], "GET")
         self.assertTrue(connection.requests[0][1].startswith(BRAVE_SEARCH_API_PATH))
         self.assertTrue(connection.closed)
+
+    def test_resolver_gate_bounds_stalled_workers_and_remains_poisoned(self) -> None:
+        valid_query = "q=bounded&count=1&safesearch=strict"
+        gate = _ResolverGate()
+        entered = Event()
+        release = Event()
+        resolver_exited = Event()
+        resolver_calls: list[int] = []
+
+        def blocking_resolver(_host: str, _port: int) -> tuple[str, ...]:
+            resolver_calls.append(1)
+            entered.set()
+            release.wait(timeout=2.0)
+            resolver_exited.set()
+            return ("93.184.216.34",)
+
+        def forbidden_factory(*_args: object) -> object:
+            raise AssertionError("a timed-out resolver must never connect")
+
+        transport = StandardLibraryGeneralWebTransport(
+            resolver=blocking_resolver,
+            connection_factory=forbidden_factory,
+            resolver_gate=gate,
+        )
+        failures: list[BaseException] = []
+
+        def first_request() -> None:
+            try:
+                transport.get(
+                    host=BRAVE_SEARCH_API_HOST,
+                    path=BRAVE_SEARCH_API_PATH,
+                    query_string=valid_query,
+                    headers={"Accept": "application/json"},
+                    timeout_seconds=0.15,
+                    maximum_response_bytes=1024,
+                    cancelled=lambda: False,
+                    authorize_dispatch=lambda dispatch: dispatch() or True,
+                )
+            except BaseException as error:
+                failures.append(error)
+
+        request_thread = Thread(target=first_request)
+        request_thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=1.0))
+            # While the first getaddrinfo-equivalent call is wedged, another
+            # request must fail without creating a second resolver thread.
+            with self.assertRaises(GeneralWebTransportError):
+                transport.get(
+                    host=BRAVE_SEARCH_API_HOST,
+                    path=BRAVE_SEARCH_API_PATH,
+                    query_string=valid_query,
+                    headers={"Accept": "application/json"},
+                    timeout_seconds=0.05,
+                    maximum_response_bytes=1024,
+                    cancelled=lambda: False,
+                    authorize_dispatch=lambda dispatch: dispatch() or True,
+                )
+            self.assertEqual(len(resolver_calls), 1)
+
+            request_thread.join(timeout=1.0)
+            self.assertFalse(request_thread.is_alive())
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(failures[0], GeneralWebTransportError)
+
+            # The timed-out active lease poisons the process gate.  It remains
+            # fail-closed even after the uninterruptible worker eventually exits.
+            with self.assertRaises(GeneralWebTransportError):
+                transport.get(
+                    host=BRAVE_SEARCH_API_HOST,
+                    path=BRAVE_SEARCH_API_PATH,
+                    query_string=valid_query,
+                    headers={"Accept": "application/json"},
+                    timeout_seconds=0.05,
+                    maximum_response_bytes=1024,
+                    cancelled=lambda: False,
+                )
+            self.assertEqual(len(resolver_calls), 1)
+        finally:
+            release.set()
+            request_thread.join(timeout=1.0)
+
+        self.assertTrue(resolver_exited.wait(timeout=1.0))
+        with self.assertRaises(GeneralWebTransportError):
+            transport.get(
+                host=BRAVE_SEARCH_API_HOST,
+                path=BRAVE_SEARCH_API_PATH,
+                query_string=valid_query,
+                headers={"Accept": "application/json"},
+                timeout_seconds=0.05,
+                maximum_response_bytes=1024,
+                cancelled=lambda: False,
+            )
+        self.assertEqual(len(resolver_calls), 1)
 
 
 class TestGeneralWebWorkspaceIntegration(unittest.TestCase):

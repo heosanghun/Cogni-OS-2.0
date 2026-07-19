@@ -12,7 +12,8 @@ from io import BytesIO
 import math
 from pathlib import Path
 import struct
-from typing import Mapping
+from types import MappingProxyType
+from typing import Callable, Mapping
 import wave
 
 import torch
@@ -308,22 +309,22 @@ def _validated_bundle(
     allowed_keys: frozenset[str],
     *,
     precomputed_content_sha256: str | None = None,
+    schema_validator: Callable[[Mapping[object, object]], None] | None = None,
 ) -> MultimodalTensorBundle:
-    if not isinstance(output, Mapping) or not set(output).issubset(allowed_keys):
-        raise MultimodalPreprocessError(
-            "processor returned an unsupported tensor schema"
-        )
+    snapshot = _snapshot_processor_output(modality, output, allowed_keys)
+    if schema_validator is not None:
+        schema_validator(snapshot)
     required = {
         "image": {"input_ids", "attention_mask", "pixel_values"},
         "audio": {"input_ids", "attention_mask", "input_features"},
         "video": {"input_ids", "attention_mask", "mm_token_type_ids"},
     }[modality]
-    if not required.issubset(output):
+    if not required.issubset(snapshot):
         raise MultimodalPreprocessError("processor omitted required modality tensors")
     if modality == "video" and not {
         "pixel_values",
         "pixel_values_videos",
-    }.intersection(output):
+    }.intersection(snapshot):
         raise MultimodalPreprocessError("processor omitted required video features")
     if precomputed_content_sha256 is not None and (
         len(precomputed_content_sha256) != 64
@@ -333,12 +334,60 @@ def _validated_bundle(
         )
     ):
         raise MultimodalPreprocessError("precomputed content digest is invalid")
-    rows: list[tuple[str, Tensor]] = []
+    return MultimodalTensorBundle(
+        modality,
+        precomputed_content_sha256 or sha256(content).hexdigest(),
+        tuple(sorted(snapshot.items())),
+    )
+
+
+def _snapshot_processor_output(
+    modality: str,
+    output: object,
+    allowed_keys: frozenset[str],
+) -> Mapping[str, Tensor]:
+    """Read each output field once and detach it into one immutable clone snapshot."""
+
+    if not isinstance(output, Mapping):
+        raise MultimodalPreprocessError(
+            "processor returned an unsupported tensor schema"
+        )
+    try:
+        iterator = iter(output)
+        names: list[str] = []
+        for _index in range(len(allowed_keys) + 1):
+            try:
+                name = next(iterator)
+            except StopIteration:
+                break
+            if not isinstance(name, str) or name not in allowed_keys or name in names:
+                raise MultimodalPreprocessError(
+                    "processor returned an unsupported tensor schema"
+                )
+            names.append(name)
+        else:
+            raise MultimodalPreprocessError(
+                "processor returned an unsupported tensor schema"
+            )
+    except MultimodalPreprocessError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - processor-owned mapping boundary
+        raise MultimodalPreprocessError(
+            "processor returned an unsupported tensor schema"
+        ) from exc
+
+    rows: dict[str, Tensor] = {}
     total_bytes = 0
-    for name in sorted(output):
-        value = output[name]
+    snapshot_total_bytes = 0
+    for name in names:
+        try:
+            value = output[name]
+        except Exception as exc:  # noqa: BLE001 - processor-owned mapping boundary
+            raise MultimodalPreprocessError(
+                "processor returned an unsupported tensor schema"
+            ) from exc
         if (
-            not isinstance(value, Tensor)
+            type(value) is not Tensor
             or value.device.type != "cpu"
             or value.layout != torch.strided
         ):
@@ -361,20 +410,31 @@ def _validated_bundle(
                 "multimodal tensor bundle exceeds its byte limit"
             )
         try:
-            tensor = value.detach().contiguous()
+            tensor = value.detach().clone(memory_format=torch.contiguous_format)
+            cloned_bytes = tensor.numel() * tensor.element_size()
+            snapshot_total_bytes += cloned_bytes
+            if (
+                cloned_bytes < 1
+                or snapshot_total_bytes > MAX_BUNDLE_TENSOR_BYTES
+                or tensor.data_ptr() == value.data_ptr()
+                or tensor.ndim < 1
+                or batch_shape_required
+                and tensor.shape[0] != 1
+            ):
+                raise MultimodalPreprocessError(
+                    "processor output could not be isolated within its bounds"
+                )
             finite = bool(torch.isfinite(tensor).all())
+        except MultimodalPreprocessError:
+            raise
         except RuntimeError as exc:
             raise MultimodalPreprocessError(
                 "processor returned an unsupported tensor"
             ) from exc
         if not finite:
             raise MultimodalPreprocessError("processor returned non-finite features")
-        rows.append((name, tensor))
-    return MultimodalTensorBundle(
-        modality,
-        precomputed_content_sha256 or sha256(content).hexdigest(),
-        tuple(rows),
-    )
+        rows[name] = tensor
+    return MappingProxyType(rows)
 
 
 def _bounded_video_frames(
@@ -501,13 +561,17 @@ def _bounded_video_frames(
 
 
 class VerifiedGemma4MultimodalProcessor:
-    """Load Gemma4Processor only from a digest-verified local model snapshot."""
+    """Fail-closed production boundary for the currently path-based processor loader."""
+
+    production_loader_enabled = False
+    loader_binding_verified = False
+    loader_binding_status = "UNPROVEN_PATH_LOADER_DISABLED"
 
     def __init__(self, model_root: str | Path, manifest_path: str | Path) -> None:
         root = Path(model_root).expanduser().resolve(strict=True)
         manifest = Path(manifest_path).expanduser().resolve(strict=True)
         try:
-            manifest_digest_before = _sha256_file(manifest)
+            _manifest_digest = _sha256_file(manifest)
             before = verify_artifact_manifest(root, manifest)
             verify_instruction_tuned_e4b_snapshot(before)
         except (OSError, ArtifactVerificationError, ValueError) as exc:
@@ -519,44 +583,17 @@ class VerifiedGemma4MultimodalProcessor:
             raise MultimodalPreprocessError(
                 "verified snapshot lacks processor artifacts"
             )
-        try:
-            from transformers import AutoProcessor
-
-            processor = AutoProcessor.from_pretrained(
-                root,
-                local_files_only=True,
-                trust_remote_code=False,
-            )
-        except Exception as exc:
-            raise MultimodalPreprocessError(
-                "local Gemma 4 processor could not be loaded"
-            ) from exc
-        try:
-            after = verify_artifact_manifest(root, manifest)
-            verify_instruction_tuned_e4b_snapshot(after)
-            manifest_digest_after = _sha256_file(manifest)
-        except (OSError, ArtifactVerificationError, ValueError) as exc:
-            raise MultimodalPreprocessError(
-                "model artifacts changed during processor load"
-            ) from exc
-        if (
-            before.digests != after.digests
-            or before.identity != after.identity
-            or manifest_digest_before != manifest_digest_after
-        ):
-            raise MultimodalPreprocessError(
-                "model artifacts changed during processor load"
-            )
-        if processor.__class__.__name__ != "Gemma4Processor":
-            raise MultimodalPreprocessError(
-                "verified snapshot did not load Gemma4Processor"
-            )
-        self.model_root = root
-        self.manifest_path = manifest
-        self.artifact_identity = before.identity
-        self.manifest_sha256 = manifest_digest_before
-        self.processor = processor
-        self._trusted_snapshot_verified = True
+        del _manifest_digest, before
+        # AutoProcessor.from_pretrained() reopens a directory by path.  An
+        # attacker able to replace those files can present verified bytes,
+        # substitute different bytes while AutoProcessor reads them, then
+        # restore the verified snapshot before a post-load hash (ABA).  No
+        # production processor is created until the parser consumes the exact
+        # verified byte snapshot rather than path names.
+        raise MultimodalPreprocessError(
+            "multimodal processor loading is disabled because verified bytes "
+            "cannot be bound to the path-based loader"
+        )
 
     def _verified_video_identity(self) -> VideoProcessorIdentity:
         identity = getattr(self, "artifact_identity", None)
@@ -786,13 +823,13 @@ class VerifiedGemma4MultimodalProcessor:
             raise MultimodalPreprocessError(
                 "Gemma 4 video preprocessing failed"
             ) from exc
-        _bounded_video_output_schema(output)
         bundle = _validated_bundle(
             "video",
             b"",
             output,
             _VIDEO_KEYS,
             precomputed_content_sha256=content_sha256,
+            schema_validator=_bounded_video_output_schema,
         )
         output_elements = sum(tensor.numel() for _, tensor in bundle.tensors)
         if output_elements > MAX_VIDEO_OUTPUT_TENSOR_ELEMENTS:

@@ -5,8 +5,11 @@ from hashlib import sha256
 import json
 from math import isclose
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
+from types import ModuleType
 import unittest
+from unittest.mock import patch
 
 from cogni_demo.semantic_embedder import (
     LocalSemanticEmbedder,
@@ -223,8 +226,108 @@ class TestSemanticEmbedderManifest(unittest.TestCase):
                         raised.exception.code, "SEMANTIC_MODEL_CONFIG_UNSAFE"
                     )
 
+    def test_windows_case_insensitive_pickle_weight_is_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = _write_manifest(root)
+            unsafe_name = "pytorch_model.BIN"
+            unsafe_content = b"pickle-compatible decoy"
+            (root / unsafe_name).write_bytes(unsafe_content)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["files"][unsafe_name] = sha256(unsafe_content).hexdigest()
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaises(SemanticEmbedderError) as raised:
+                verify_semantic_embedder_manifest(root)
+
+            self.assertEqual(raised.exception.code, "SEMANTIC_ARTIFACT_UNSAFE")
+
+    def test_huge_json_integer_has_a_stable_fail_closed_error(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = _write_manifest(root)
+            raw = manifest.read_text(encoding="utf-8")
+            raw = raw.replace('"dimensions": 4', '"dimensions": ' + "9" * 5_000)
+            manifest.write_text(raw, encoding="utf-8")
+
+            with self.assertRaises(SemanticEmbedderError) as raised:
+                verify_semantic_embedder_manifest(root)
+
+            self.assertEqual(raised.exception.code, "SEMANTIC_MANIFEST_INVALID")
+            self.assertIn("oversized number", str(raised.exception))
+
+    def test_retained_attention_outputs_and_quadratic_ram_are_rejected(self) -> None:
+        for field in ("output_attentions", "output_hidden_states"):
+            with self.subTest(field=field), TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_manifest(root, config_overrides={field: True})
+                with self.assertRaises(SemanticEmbedderError) as raised:
+                    verify_semantic_embedder_manifest(root)
+                self.assertEqual(raised.exception.code, "SEMANTIC_MODEL_CONFIG_UNSAFE")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_manifest(
+                root,
+                dimensions=128,
+                max_batch_size=16,
+                config_overrides={
+                    "hidden_size": 128,
+                    "intermediate_size": 256,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 16,
+                    "max_position_embeddings": 8_192,
+                    "attn_implementation": "eager",
+                },
+            )
+            with self.assertRaises(SemanticEmbedderError) as raised:
+                verify_semantic_embedder_manifest(root)
+            self.assertEqual(raised.exception.code, "SEMANTIC_MODEL_CONFIG_UNSAFE")
+            self.assertIn("peak CPU RAM", str(raised.exception))
+
 
 class TestLocalSemanticEmbedder(unittest.TestCase):
+    def test_production_path_loader_is_disabled_before_transformers_can_read(
+        self,
+    ) -> None:
+        calls: list[Path] = []
+
+        class _AutoLoader:
+            @classmethod
+            def from_pretrained(cls, root, **_kwargs):
+                calls.append(Path(root))
+                raise AssertionError("unbound path loader must never run")
+
+        module = ModuleType("transformers")
+        module.AutoModel = _AutoLoader
+        module.AutoTokenizer = _AutoLoader
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_manifest(root)
+            with patch.dict(sys.modules, {"transformers": module}):
+                embedder = LocalSemanticEmbedder(root)
+                with self.assertRaises(SemanticEmbedderError) as raised:
+                    embedder.load()
+
+            self.assertEqual(raised.exception.code, "SEMANTIC_LOADER_BINDING_UNPROVEN")
+            self.assertEqual(calls, [])
+            status = embedder.status_payload()
+            self.assertFalse(status["loaded"])
+            self.assertFalse(status["semantic_embedding"])
+            self.assertFalse(status["production_backend_enabled"])
+            self.assertEqual(status["backend_mode"], "production_path_loader_disabled")
+
+    def test_unbound_backend_override_requires_explicit_test_admission(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_manifest(root)
+            with self.assertRaises(SemanticEmbedderError) as raised:
+                LocalSemanticEmbedder(
+                    root,
+                    backend_factory=lambda manifest: _FakeBackend(manifest.dimensions),
+                )
+            self.assertEqual(raised.exception.code, "SEMANTIC_TEST_BACKEND_NOT_ENABLED")
+
     def test_artifact_mutation_after_admission_fails_before_backend_load(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -236,7 +339,11 @@ class TestLocalSemanticEmbedder(unittest.TestCase):
                 calls += 1
                 return _FakeBackend(manifest.dimensions)
 
-            embedder = LocalSemanticEmbedder(root, backend_factory=factory)
+            embedder = LocalSemanticEmbedder(
+                root,
+                backend_factory=factory,
+                allow_unbound_test_backend=True,
+            )
             (root / "model.safetensors").write_bytes(b"changed after admission")
             with self.assertRaises(SemanticEmbedderError) as raised:
                 embedder.load()
@@ -256,7 +363,11 @@ class TestLocalSemanticEmbedder(unittest.TestCase):
                 (root / "model.safetensors").write_bytes(b"changed during load")
                 return backend
 
-            embedder = LocalSemanticEmbedder(root, backend_factory=factory)
+            embedder = LocalSemanticEmbedder(
+                root,
+                backend_factory=factory,
+                allow_unbound_test_backend=True,
+            )
             with self.assertRaises(SemanticEmbedderError) as raised:
                 embedder.load()
             self.assertEqual(raised.exception.code, "SEMANTIC_ARTIFACT_DIGEST_MISMATCH")
@@ -275,14 +386,21 @@ class TestLocalSemanticEmbedder(unittest.TestCase):
                 created.append(backend)
                 return backend
 
-            embedder = LocalSemanticEmbedder(root, backend_factory=factory)
+            embedder = LocalSemanticEmbedder(
+                root,
+                backend_factory=factory,
+                allow_unbound_test_backend=True,
+            )
             before = embedder.status_payload()
             self.assertFalse(before["loaded"])
             self.assertEqual(before["device"], "cpu")
             self.assertEqual(before["vram_bytes"], 0)
             self.assertFalse(before["network_access"])
             self.assertTrue(before["artifact_verified"])
-            self.assertTrue(before["semantic_embedding"])
+            self.assertFalse(before["semantic_embedding"])
+            self.assertFalse(before["production_backend_enabled"])
+            self.assertFalse(before["loader_binding_verified"])
+            self.assertTrue(before["test_backend_override"])
             self.assertFalse(before["quality_attested"])
             self.assertFalse(before["answer_bearing"])
             self.assertFalse(before["production_ready"])
@@ -297,6 +415,7 @@ class TestLocalSemanticEmbedder(unittest.TestCase):
                     isclose(sum(value * value for value in vector), 1.0, abs_tol=1e-7)
                 )
             self.assertTrue(embedder.status_payload()["loaded"])
+            self.assertTrue(embedder.status_payload()["semantic_embedding"])
             embedder.unload()
             self.assertTrue(created[0].closed)
             self.assertFalse(embedder.loaded)
@@ -314,7 +433,11 @@ class TestLocalSemanticEmbedder(unittest.TestCase):
                 calls += 1
                 return _FakeBackend(manifest.dimensions)
 
-            embedder = LocalSemanticEmbedder(root, backend_factory=factory)
+            embedder = LocalSemanticEmbedder(
+                root,
+                backend_factory=factory,
+                allow_unbound_test_backend=True,
+            )
             invalid = (
                 (),
                 ("a", "b", "c"),
@@ -348,7 +471,9 @@ class TestLocalSemanticEmbedder(unittest.TestCase):
             root = Path(directory)
             _write_manifest(root, max_batch_size=3)
             embedder = LocalSemanticEmbedder(
-                root, backend_factory=lambda manifest: _FakeBackend(manifest.dimensions)
+                root,
+                backend_factory=lambda manifest: _FakeBackend(manifest.dimensions),
+                allow_unbound_test_backend=True,
             )
             texts = _ExplosiveSequence()
             with self.assertRaises(SemanticEmbedderError) as raised:
@@ -375,6 +500,7 @@ class TestLocalSemanticEmbedder(unittest.TestCase):
                     backend_factory=lambda manifest, output=output: _FakeBackend(
                         manifest.dimensions, output=output
                     ),
+                    allow_unbound_test_backend=True,
                 )
                 with self.assertRaises(SemanticEmbedderError) as raised:
                     embedder.encode(("bounded",))
@@ -387,11 +513,97 @@ class TestLocalSemanticEmbedder(unittest.TestCase):
             def broken_factory(_manifest):
                 raise RuntimeError("sensitive host detail")
 
-            embedder = LocalSemanticEmbedder(root, backend_factory=broken_factory)
+            embedder = LocalSemanticEmbedder(
+                root,
+                backend_factory=broken_factory,
+                allow_unbound_test_backend=True,
+            )
             with self.assertRaises(SemanticEmbedderError) as raised:
                 embedder.encode(("bounded",))
             self.assertEqual(raised.exception.code, "SEMANTIC_MODEL_LOAD_FAILED")
             self.assertNotIn("sensitive", str(raised.exception))
+
+    def test_lying_sequences_are_copied_by_exact_index_without_iteration(self) -> None:
+        class _LyingSequence(Sequence[object]):
+            def __init__(self, declared: int, item: object) -> None:
+                self.declared = declared
+                self.item = item
+                self.iterated = False
+
+            def __len__(self) -> int:
+                return self.declared
+
+            def __getitem__(self, _index: int) -> object:
+                return self.item
+
+            def __iter__(self):
+                self.iterated = True
+                raise AssertionError("untrusted iteration must not be used")
+
+        for malicious_output in (
+            [_LyingSequence(4, 1.0)],
+            _LyingSequence(1, [1.0, 2.0, 3.0, 4.0]),
+        ):
+            with self.subTest(output_type=type(malicious_output).__name__):
+                with TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    _write_manifest(root)
+                    backend = _FakeBackend(4, output=malicious_output)
+                    embedder = LocalSemanticEmbedder(
+                        root,
+                        backend_factory=lambda _manifest, backend=backend: backend,
+                        allow_unbound_test_backend=True,
+                    )
+                    with self.assertRaises(SemanticEmbedderError) as raised:
+                        embedder.encode(("bounded",))
+                    self.assertEqual(raised.exception.code, "SEMANTIC_OUTPUT_INVALID")
+                    liar = (
+                        malicious_output[0]
+                        if isinstance(malicious_output, list)
+                        else malicious_output
+                    )
+                    self.assertFalse(liar.iterated)
+
+        class _IterationLiar(Sequence[float]):
+            def __init__(self) -> None:
+                self.iterated = False
+
+            def __len__(self) -> int:
+                return 4
+
+            def __getitem__(self, index: int) -> float:
+                if not 0 <= index < 4:
+                    raise IndexError(index)
+                return float(index + 1)
+
+            def __iter__(self):
+                self.iterated = True
+                return iter((1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_manifest(root)
+            vector = _IterationLiar()
+            backend = _FakeBackend(4, output=[vector])
+            embedder = LocalSemanticEmbedder(
+                root,
+                backend_factory=lambda _manifest: backend,
+                allow_unbound_test_backend=True,
+            )
+
+            output = embedder.encode(("bounded",))
+
+            self.assertEqual(len(output[0]), 4)
+            self.assertFalse(vector.iterated)
+
+    def test_status_drops_artifact_verification_after_mutation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_manifest(root)
+            embedder = LocalSemanticEmbedder(root)
+            self.assertTrue(embedder.status_payload()["artifact_verified"])
+            (root / "model.safetensors").write_bytes(b"mutated")
+            self.assertFalse(embedder.status_payload()["artifact_verified"])
 
 
 if __name__ == "__main__":

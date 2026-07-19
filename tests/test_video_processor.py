@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 import math
 from pathlib import Path
 import sys
@@ -221,6 +222,67 @@ class TestBoundedVideoProcessor(unittest.TestCase):
             with self.assertRaisesRegex(MultimodalPreprocessError, "output tensor"):
                 self._process(self._service())
 
+    def test_output_mapping_is_read_once_then_validated_as_an_immutable_snapshot(
+        self,
+    ) -> None:
+        trusted = {
+            "input_ids": torch.ones((1, 4), dtype=torch.int64),
+            "attention_mask": torch.ones((1, 4), dtype=torch.int64),
+            "mm_token_type_ids": torch.ones((1, 4), dtype=torch.int64),
+            "pixel_values_videos": torch.ones((1, 3, 2, 2, 3), dtype=torch.float32),
+        }
+
+        class _FlappingMapping(Mapping[str, torch.Tensor]):
+            def __init__(self) -> None:
+                self.reads = {name: 0 for name in trusted}
+
+            def __len__(self) -> int:
+                return len(trusted)
+
+            def __iter__(self) -> Iterator[str]:
+                return iter(trusted)
+
+            def __getitem__(self, name: str) -> torch.Tensor:
+                self.reads[name] += 1
+                if self.reads[name] == 1:
+                    return trusted[name]
+                return torch.full((1, 2, 2), float("nan"), dtype=torch.float32)
+
+        output = _FlappingMapping()
+
+        class _FlappingProcessor(_Gemma4ProcessorBase):
+            def apply_chat_template(self, _conversation, **_kwargs):
+                return output
+
+        processor = type("Gemma4Processor", (_FlappingProcessor,), {})()
+        result = self._process(self._service(processor=processor))
+
+        self.assertEqual(output.reads, {name: 1 for name in trusted})
+        self.assertEqual(result.as_mapping()["input_ids"].dtype, torch.int64)
+        self.assertEqual(tuple(result.as_mapping()["input_ids"].shape), (1, 4))
+
+    def test_returned_bundle_does_not_alias_processor_owned_tensors(self) -> None:
+        class _RetainingProcessor(_Gemma4ProcessorBase):
+            def __init__(self) -> None:
+                super().__init__()
+                self.retained: dict[str, torch.Tensor] = {}
+
+            def apply_chat_template(self, conversation, **kwargs):
+                output = super().apply_chat_template(conversation, **kwargs)
+                self.retained = output
+                return output
+
+        processor = type("Gemma4Processor", (_RetainingProcessor,), {})()
+        result = self._process(self._service(processor=processor))
+        snapshot = result.as_mapping()["pixel_values_videos"]
+        source = processor.retained["pixel_values_videos"]
+        self.assertNotEqual(snapshot.data_ptr(), source.data_ptr())
+
+        source.fill_(float("nan"))
+
+        self.assertTrue(bool(torch.isfinite(snapshot).all()))
+        self.assertTrue(bool((snapshot == 1).all()))
+
     def test_field_specific_dtype_rank_and_shape_contracts_fail_closed(self) -> None:
         mutations = (
             (
@@ -300,13 +362,20 @@ class TestBoundedVideoProcessor(unittest.TestCase):
         with self.assertRaisesRegex(MultimodalPreprocessError, "video capability"):
             self._process(self._service(processor=unsupported))
 
-    def test_snapshot_loader_is_strictly_local_and_manifest_bound(self) -> None:
+    def test_unbound_path_loader_is_disabled_before_an_aba_swap_can_be_read(
+        self,
+    ) -> None:
         calls: list[tuple[Path, dict[str, object]]] = []
 
         class _AutoProcessor:
             @classmethod
             def from_pretrained(cls, root, **kwargs):
                 calls.append((Path(root), kwargs))
+                processor_path = Path(root) / "processor_config.json"
+                trusted = processor_path.read_bytes()
+                processor_path.write_bytes(b"malicious bytes")
+                processor_path.read_bytes()
+                processor_path.write_bytes(trusted)
                 return Gemma4Processor()
 
         module = ModuleType("transformers")
@@ -333,24 +402,21 @@ class TestBoundedVideoProcessor(unittest.TestCase):
                 patch.dict(sys.modules, {"transformers": module}),
                 patch(
                     "cogni_agent.multimodal.verify_artifact_manifest",
-                    side_effect=(verified, verified),
+                    return_value=verified,
                 ),
                 patch(
                     "cogni_agent.multimodal.verify_instruction_tuned_e4b_snapshot"
                 ) as trusted_snapshot,
+                self.assertRaisesRegex(
+                    MultimodalPreprocessError, "verified bytes.*path-based loader"
+                ),
             ):
-                service = VerifiedGemma4MultimodalProcessor(root, manifest)
+                VerifiedGemma4MultimodalProcessor(root, manifest)
 
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], root)
-        self.assertEqual(
-            calls[0][1],
-            {"local_files_only": True, "trust_remote_code": False},
-        )
-        self.assertEqual(service.artifact_identity, _IDENTITY)
-        self.assertTrue(service._trusted_snapshot_verified)
-        self.assertEqual(len(service.manifest_sha256), 64)
-        self.assertEqual(trusted_snapshot.call_count, 2)
+        self.assertEqual(calls, [])
+        self.assertFalse(VerifiedGemma4MultimodalProcessor.production_loader_enabled)
+        self.assertFalse(VerifiedGemma4MultimodalProcessor.loader_binding_verified)
+        self.assertEqual(trusted_snapshot.call_count, 1)
 
     def test_constructor_rejects_self_declared_untrusted_snapshot(self) -> None:
         class Gemma4Processor:

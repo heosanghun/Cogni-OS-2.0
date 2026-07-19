@@ -33,11 +33,19 @@ MAX_EMBEDDING_BATCH = 16
 MAX_EMBEDDING_INPUT_CHARS = 16_384
 MAX_SEMANTIC_MODEL_PARAMETERS = 250_000_000
 MAX_SEMANTIC_ESTIMATED_PEAK_RAM_BYTES = 4 * 1024 * 1024 * 1024
+MAX_JSON_NUMBER_CHARACTERS = 128
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 _SPDX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+-]{0,63}\Z")
 _REVISION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{6,127}\Z")
 _WINDOWS_REPARSE_POINT = 0x0400
+_PICKLE_WEIGHT_RE = re.compile(
+    r"(?:^|/)[^/]+\.(?:bin|pt|pth|pkl|pickle|ckpt|joblib)(?:\.index\.json)?\Z",
+    re.IGNORECASE,
+)
+_SAFETENSORS_SHARD_RE = re.compile(
+    r"model-(?P<index>[0-9]{5})-of-(?P<total>[0-9]{5})\.safetensors\Z"
+)
 _SAFE_MODEL_FIELDS = {
     "bert": (
         "hidden_size",
@@ -115,6 +123,7 @@ class SemanticEmbedderManifest:
     model_type: str
     model_max_tokens: int
     estimated_parameter_upper_bound: int
+    estimated_attention_ram_bytes: int
     estimated_peak_ram_bytes: int
 
     @property
@@ -137,14 +146,17 @@ class SemanticEmbedderManifest:
             "model_type": self.model_type,
             "model_max_tokens": self.model_max_tokens,
             "estimated_parameter_upper_bound": (self.estimated_parameter_upper_bound),
+            "estimated_attention_ram_bytes": self.estimated_attention_ram_bytes,
             "estimated_peak_ram_bytes": self.estimated_peak_ram_bytes,
-            "resource_policy": "bounded_transformer_encoder_v1",
+            "resource_policy": "verified_manifest_unbound_loader_disabled_v2",
             "artifact_verified": True,
             "device": "cpu",
             "vram_bytes": 0,
             "network_access": False,
             "loaded": loaded,
-            "semantic_embedding": True,
+            "semantic_embedding": False,
+            "loader_binding_verified": False,
+            "production_backend_enabled": False,
             "license_spdx_declared": self.license_spdx,
             "license_status": "manifest_declared_unreviewed",
             "quality_attested": False,
@@ -423,15 +435,47 @@ def _strict_json_object(
     def reject_constant(_value: str) -> object:
         raise SemanticEmbedderError(code, f"{label} contains a non-finite number")
 
+    def bounded_integer(value: str) -> int:
+        if len(value) > MAX_JSON_NUMBER_CHARACTERS:
+            raise SemanticEmbedderError(code, f"{label} contains an oversized number")
+        try:
+            return int(value, 10)
+        except (ValueError, OverflowError) as exc:
+            raise SemanticEmbedderError(
+                code, f"{label} contains an invalid number"
+            ) from exc
+
+    def bounded_float(value: str) -> float:
+        if len(value) > MAX_JSON_NUMBER_CHARACTERS:
+            raise SemanticEmbedderError(code, f"{label} contains an oversized number")
+        try:
+            numeric = float(value)
+        except (ValueError, OverflowError) as exc:
+            raise SemanticEmbedderError(
+                code, f"{label} contains an invalid number"
+            ) from exc
+        if not isfinite(numeric):
+            raise SemanticEmbedderError(code, f"{label} contains a non-finite number")
+        return numeric
+
     try:
         payload = json.loads(
             raw.decode("utf-8"),
             object_pairs_hook=reject_duplicates,
             parse_constant=reject_constant,
+            parse_int=bounded_integer,
+            parse_float=bounded_float,
         )
     except SemanticEmbedderError:
         raise
-    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+    except (
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+        OverflowError,
+        MemoryError,
+    ) as exc:
         raise SemanticEmbedderError(code, f"{label} could not be decoded") from exc
     if not isinstance(payload, dict):
         raise SemanticEmbedderError(code, f"{label} must be an object")
@@ -608,6 +652,14 @@ def _safe_model_config(raw: bytes, *, dimensions: int) -> _SafeModelConfig:
             "SEMANTIC_MODEL_CONFIG_UNSAFE",
             "semantic model config requests an unsupported dynamic runtime",
         )
+    if any(
+        payload.get(key, False) is not False
+        for key in ("output_attentions", "output_hidden_states", "use_cache")
+    ):
+        raise SemanticEmbedderError(
+            "SEMANTIC_MODEL_CONFIG_UNSAFE",
+            "semantic model config requests unbounded retained model outputs",
+        )
     hidden_key, intermediate_key, layers_key, heads_key = _SAFE_MODEL_FIELDS[model_type]
     hidden_size = _config_int(
         payload, hidden_key, minimum=2, maximum=MAX_EMBEDDING_DIMENSIONS
@@ -666,6 +718,77 @@ def _safe_model_config(raw: bytes, *, dimensions: int) -> _SafeModelConfig:
         max_tokens=max_tokens,
         estimated_parameter_upper_bound=estimated_parameter_upper_bound,
     )
+
+
+def _verify_weight_layout(manifested_names: set[str]) -> None:
+    """Admit one canonical safetensors layout under Windows path semantics."""
+
+    folded: dict[str, str] = {}
+    for name in manifested_names:
+        casefolded = name.casefold()
+        previous = folded.get(casefolded)
+        if previous is not None and previous != name:
+            raise SemanticEmbedderError(
+                "SEMANTIC_ARTIFACT_UNSAFE",
+                "semantic artifact contains a case-insensitive path collision",
+            )
+        folded[casefolded] = name
+        if _PICKLE_WEIGHT_RE.fullmatch(name) is not None:
+            raise SemanticEmbedderError(
+                "SEMANTIC_ARTIFACT_UNSAFE",
+                "pickle-compatible semantic weights are not admitted",
+            )
+
+    safetensors_names = {
+        name for name in manifested_names if name.casefold().endswith(".safetensors")
+    }
+    index_names = {
+        name
+        for name in manifested_names
+        if name.casefold().endswith(".safetensors.index.json")
+    }
+    if safetensors_names == {"model.safetensors"} and not index_names:
+        return
+    if index_names != {"model.safetensors.index.json"} or not safetensors_names:
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_UNSAFE",
+            "semantic weights must use one canonical safetensors layout",
+        )
+
+    indices: set[int] = set()
+    total: int | None = None
+    for name in safetensors_names:
+        match = _SAFETENSORS_SHARD_RE.fullmatch(name)
+        if match is None:
+            raise SemanticEmbedderError(
+                "SEMANTIC_ARTIFACT_UNSAFE",
+                "semantic safetensors shards must use canonical names",
+            )
+        shard_index = int(match.group("index"))
+        shard_total = int(match.group("total"))
+        if (
+            shard_total < 1
+            or shard_total > MAX_ARTIFACT_FILES
+            or shard_index < 1
+            or shard_index > shard_total
+        ):
+            raise SemanticEmbedderError(
+                "SEMANTIC_ARTIFACT_UNSAFE",
+                "semantic safetensors shard numbering is invalid",
+            )
+        if total is None:
+            total = shard_total
+        if total != shard_total or shard_index in indices:
+            raise SemanticEmbedderError(
+                "SEMANTIC_ARTIFACT_UNSAFE",
+                "semantic safetensors shard layout is inconsistent",
+            )
+        indices.add(shard_index)
+    if total is None or indices != set(range(1, total + 1)):
+        raise SemanticEmbedderError(
+            "SEMANTIC_ARTIFACT_UNSAFE",
+            "semantic safetensors shard layout is incomplete",
+        )
 
 
 def verify_semantic_embedder_manifest(
@@ -799,18 +922,12 @@ def verify_semantic_embedder_manifest(
             "SEMANTIC_LICENSE_UNVERIFIED", "declared license file is not manifested"
         )
     manifested_names = set(files_payload)
-    if not {"config.json", "tokenizer.json"}.issubset(manifested_names) or not any(
-        name.endswith(".safetensors") for name in manifested_names
-    ):
+    if not {"config.json", "tokenizer.json"}.issubset(manifested_names):
         raise SemanticEmbedderError(
             "SEMANTIC_MANIFEST_INVALID",
             "semantic artifact requires config, tokenizer, and safetensors weights",
         )
-    if any(name.endswith((".bin", ".pt", ".pth", ".pkl")) for name in manifested_names):
-        raise SemanticEmbedderError(
-            "SEMANTIC_ARTIFACT_UNSAFE",
-            "pickle-compatible semantic weights are not admitted",
-        )
+    _verify_weight_layout(manifested_names)
 
     observed = _inventory_regular_files(selected_root)
     observed_manifest = observed.get(SEMANTIC_EMBEDDER_MANIFEST)
@@ -859,10 +976,18 @@ def verify_semantic_embedder_manifest(
         )
     safe_config = _safe_model_config(config_raw, dimensions=dimensions)
     activation_upper_bound = max_batch_size * safe_config.max_tokens * dimensions * 16
+    estimated_attention_ram_bytes = (
+        max_batch_size
+        * safe_config.attention_heads
+        * safe_config.max_tokens
+        * safe_config.max_tokens
+        * 8
+    )
     estimated_peak_ram_bytes = (
         total_bytes
         + safe_config.estimated_parameter_upper_bound * 8
         + activation_upper_bound
+        + estimated_attention_ram_bytes
     )
     if estimated_peak_ram_bytes > MAX_SEMANTIC_ESTIMATED_PEAK_RAM_BYTES:
         raise SemanticEmbedderError(
@@ -907,88 +1032,82 @@ def verify_semantic_embedder_manifest(
         model_type=safe_config.model_type,
         model_max_tokens=safe_config.max_tokens,
         estimated_parameter_upper_bound=(safe_config.estimated_parameter_upper_bound),
+        estimated_attention_ram_bytes=estimated_attention_ram_bytes,
         estimated_peak_ram_bytes=estimated_peak_ram_bytes,
     )
 
 
 class TransformersMeanPoolBackend:
-    """CPU-only Hugging Face encoder with network and remote code disabled."""
+    """Disabled path loader until verified bytes can be bound to model parsing."""
 
     def __init__(self, manifest: SemanticEmbedderManifest) -> None:
-        try:
-            import torch
-            from transformers import AutoModel, AutoTokenizer
-        except ImportError as exc:
-            raise SemanticEmbedderError(
-                "SEMANTIC_RUNTIME_UNAVAILABLE",
-                "local transformers embedding runtime is not installed",
-            ) from exc
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                manifest.root,
-                local_files_only=True,
-                trust_remote_code=False,
-            )
-            model = AutoModel.from_pretrained(
-                manifest.root,
-                local_files_only=True,
-                trust_remote_code=False,
-            )
-            model.to("cpu")
-            model.eval()
-        except Exception as exc:  # noqa: BLE001 - third-party local loader boundary
-            raise SemanticEmbedderError(
-                "SEMANTIC_MODEL_LOAD_FAILED",
-                "verified semantic model could not be loaded locally",
-            ) from exc
-        if any(parameter.device.type != "cpu" for parameter in model.parameters()):
-            raise SemanticEmbedderError(
-                "SEMANTIC_DEVICE_POLICY_FAILED", "semantic model must remain on CPU"
-            )
-        self._torch = torch
-        self._tokenizer = tokenizer
-        self._model = model
-        self._manifest = manifest
+        del manifest
+        # Hugging Face's path-based AutoModel/AutoTokenizer APIs reopen files by
+        # name.  A verify-load-verify sequence therefore cannot prove that the
+        # bytes parsed by the loader are the bytes that were hashed (ABA swap).
+        # Keep the production backend unavailable until a descriptor/bytes-bound
+        # loader exists rather than overstating artifact integrity.
+        raise SemanticEmbedderError(
+            "SEMANTIC_LOADER_BINDING_UNPROVEN",
+            "production semantic loading is disabled because verified bytes "
+            "cannot be bound to the path-based model loader",
+        )
 
     def encode(self, texts: tuple[str, ...]) -> Sequence[Sequence[float]]:
-        torch = self._torch
-        try:
-            encoded = self._tokenizer(
-                list(texts),
-                padding=True,
-                truncation=True,
-                max_length=self._manifest.model_max_tokens,
-                return_tensors="pt",
-            )
-            cpu_encoded = {
-                key: value.to("cpu")
-                for key, value in encoded.items()
-                if hasattr(value, "to")
-            }
-            with torch.inference_mode():
-                output = self._model(**cpu_encoded)
-            hidden = getattr(output, "last_hidden_state", None)
-            mask = cpu_encoded.get("attention_mask")
-            if hidden is None or mask is None or hidden.ndim != 3 or mask.ndim != 2:
-                raise ValueError("model did not return a token embedding tensor")
-            weights = mask.unsqueeze(-1).to(dtype=hidden.dtype)
-            denominator = weights.sum(dim=1).clamp_min(1.0)
-            pooled = (hidden * weights).sum(dim=1) / denominator
-            pooled = torch.nn.functional.normalize(pooled.float(), p=2, dim=1)
-            return pooled.cpu().tolist()
-        except SemanticEmbedderError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - third-party inference boundary
-            raise SemanticEmbedderError(
-                "SEMANTIC_INFERENCE_FAILED", "semantic embedding inference failed"
-            ) from exc
+        del texts
+        raise SemanticEmbedderError(
+            "SEMANTIC_LOADER_BINDING_UNPROVEN",
+            "production semantic loading is disabled",
+        )
 
     def close(self) -> None:
-        self._model = None
-        self._tokenizer = None
+        return None
 
 
 BackendFactory = Callable[[SemanticEmbedderManifest], SemanticEncoderBackend]
+
+
+def _exact_sequence_snapshot(
+    value: object,
+    *,
+    expected_length: int,
+    label: str,
+) -> tuple[object, ...]:
+    """Copy exactly N indexed items without trusting caller-controlled iteration."""
+
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise SemanticEmbedderError(
+            "SEMANTIC_OUTPUT_INVALID", f"{label} is not a bounded sequence"
+        )
+    try:
+        if len(value) != expected_length:
+            raise SemanticEmbedderError(
+                "SEMANTIC_OUTPUT_INVALID", f"{label} length is invalid"
+            )
+        snapshot = tuple(value[index] for index in range(expected_length))
+        if len(value) != expected_length:
+            raise SemanticEmbedderError(
+                "SEMANTIC_OUTPUT_INVALID", f"{label} changed while being copied"
+            )
+        try:
+            value[expected_length]
+        except IndexError:
+            pass
+        else:
+            raise SemanticEmbedderError(
+                "SEMANTIC_OUTPUT_INVALID", f"{label} exposes values beyond its length"
+            )
+    except SemanticEmbedderError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - backend-owned sequence boundary
+        raise SemanticEmbedderError(
+            "SEMANTIC_OUTPUT_INVALID", f"{label} could not be copied safely"
+        ) from exc
+    if len(snapshot) != expected_length:
+        raise SemanticEmbedderError(
+            "SEMANTIC_OUTPUT_INVALID", f"{label} length is invalid"
+        )
+    return snapshot
 
 
 class LocalSemanticEmbedder:
@@ -1000,10 +1119,17 @@ class LocalSemanticEmbedder:
         *,
         manifest_path: str | Path | None = None,
         backend_factory: BackendFactory = TransformersMeanPoolBackend,
+        allow_unbound_test_backend: bool = False,
     ) -> None:
         self.manifest = verify_semantic_embedder_manifest(root, manifest_path)
         if not callable(backend_factory):
             raise TypeError("backend_factory must be callable")
+        self._test_backend_override = backend_factory is not TransformersMeanPoolBackend
+        if self._test_backend_override and allow_unbound_test_backend is not True:
+            raise SemanticEmbedderError(
+                "SEMANTIC_TEST_BACKEND_NOT_ENABLED",
+                "an unbound backend override requires explicit test-only admission",
+            )
         self._backend_factory = backend_factory
         self._backend: SemanticEncoderBackend | None = None
         self._lock = RLock()
@@ -1014,12 +1140,34 @@ class LocalSemanticEmbedder:
             return self._backend is not None
 
     def status_payload(self) -> dict[str, object]:
-        return self.manifest.status_payload(loaded=self.loaded)
+        payload = self.manifest.status_payload(loaded=self.loaded)
+        try:
+            artifact_verified = (
+                verify_semantic_embedder_manifest(
+                    self.manifest.root, self.manifest.path
+                )
+                == self.manifest
+            )
+        except SemanticEmbedderError:
+            artifact_verified = False
+        payload.update(
+            {
+                "artifact_verified": artifact_verified,
+                "semantic_embedding": (
+                    self.loaded and artifact_verified and self._test_backend_override
+                ),
+                "backend_mode": (
+                    "explicit_unbound_test_override"
+                    if self._test_backend_override
+                    else "production_path_loader_disabled"
+                ),
+                "test_backend_override": self._test_backend_override,
+            }
+        )
+        return payload
 
     def load(self) -> None:
         with self._lock:
-            if self._backend is not None:
-                return
             # The constructor verification is not sufficient: the operator can
             # leave a session idle before its first use.  Re-hash the exact
             # closed-world snapshot immediately before and after the local
@@ -1032,6 +1180,8 @@ class LocalSemanticEmbedder:
                     "SEMANTIC_ARTIFACT_CHANGED",
                     "semantic artifact changed after admission",
                 )
+            if self._backend is not None:
+                return
             try:
                 backend = self._backend_factory(self.manifest)
             except SemanticEmbedderError:
@@ -1142,21 +1292,20 @@ class LocalSemanticEmbedder:
                 raise SemanticEmbedderError(
                     "SEMANTIC_INFERENCE_FAILED", "semantic embedding inference failed"
                 ) from exc
-        if not isinstance(raw, Sequence) or len(raw) != len(bounded):
-            raise SemanticEmbedderError(
-                "SEMANTIC_OUTPUT_INVALID", "semantic output batch shape is invalid"
-            )
+        batch_output = _exact_sequence_snapshot(
+            raw,
+            expected_length=len(bounded),
+            label="semantic output batch",
+        )
         normalized: list[tuple[float, ...]] = []
-        for vector in raw:
-            if (
-                not isinstance(vector, Sequence)
-                or len(vector) != self.manifest.dimensions
-            ):
-                raise SemanticEmbedderError(
-                    "SEMANTIC_OUTPUT_INVALID", "semantic vector dimensions are invalid"
-                )
+        for vector in batch_output:
+            vector_output = _exact_sequence_snapshot(
+                vector,
+                expected_length=self.manifest.dimensions,
+                label="semantic vector",
+            )
             values: list[float] = []
-            for value in vector:
+            for value in vector_output:
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     raise SemanticEmbedderError(
                         "SEMANTIC_OUTPUT_INVALID", "semantic vector value is invalid"

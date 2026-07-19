@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from .backbone import extract_hidden_states
-from .fp_ewc import spectral_guard_
+from .fp_ewc import verified_spectral_cap_
 
 
 @dataclass(frozen=True)
@@ -165,13 +165,18 @@ class ResidualBottleneckAdapter(nn.Module):
         self.core = nn.Linear(bottleneck_dim, bottleneck_dim, bias=False)
         self.up = nn.Linear(bottleneck_dim, latent_dim, bias=False)
         self.activation = nn.GELU()
+        # An unverified adapter must be an exact identity.  A trained,
+        # digest-verified System 1.5 checkpoint may later replace this zero
+        # projection, but random initialization is never allowed to alter the
+        # authoritative Gemma/CTS latent merely because the feature is idle.
+        nn.init.zeros_(self.up.weight)
         self.c_fire_()
 
     @torch.no_grad()
     def c_fire_(self) -> float:
         """Project the recurrent/square core below its strict safety budget."""
 
-        norm = spectral_guard_(self.core.weight, self.core_operator_norm_budget)
+        norm = verified_spectral_cap_(self.core.weight, self.core_operator_norm_budget)
         if norm >= self.spectral_margin:
             raise RuntimeError("C-FIRE failed to certify the bottleneck core")
         return norm
@@ -181,9 +186,16 @@ class ResidualBottleneckAdapter(nn.Module):
             raise ValueError(
                 f"backbone latent width {latent.shape[-1]} != {self.latent_dim}"
             )
-        # Rule 4: perform the C-FIRE projection immediately before the square
-        # tensor operation.  The matrix is tiny and bounded by construction.
-        self.c_fire_()
+        # Inference is read-only: C-FIRE projection belongs to checkpoint
+        # admission/optimizer commit.  Re-projecting here would silently mutate
+        # the base adapter on every request.  We instead re-certify immediately
+        # before the square tensor operation and fail closed on drift.
+        with torch.no_grad():
+            norm = float(torch.linalg.matrix_norm(self.core.weight.float(), ord=2))
+        if not torch.isfinite(torch.tensor(norm)) or norm > (
+            self.core_operator_norm_budget + 1.0e-6
+        ):
+            raise RuntimeError("adapter core lost its C-FIRE certificate")
         adapted = self.up(
             self.activation(self.core(self.activation(self.down(latent))))
         )

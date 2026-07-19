@@ -7,8 +7,9 @@ from cogni_core.deq import DEQConfig, EquilibriumLayer
 from cogni_core.fast_weights import FastWeightProgrammer
 from cogni_core.fp_ewc import (
     FPEWCRegularizer,
-    estimate_fixed_point_fisher,
-    spectral_guard_,
+    FixedPointFisherConfig,
+    estimate_empirical_fixed_point_fisher,
+    verified_spectral_cap_,
 )
 
 
@@ -53,7 +54,7 @@ class TestExtensions(unittest.TestCase):
         legacy = FastWeightProgrammer(640, rank=1, internal_dim=4)
         self.assertEqual(tuple(legacy(torch.randn(1, 640)).a.shape), (1, 640, 1))
 
-    def test_fp_ewc_anchor_and_spectral_guard(self):
+    def test_fp_ewc_anchor_and_verified_spectral_cap(self):
         layer = torch.nn.Linear(4, 4, bias=False)
         reg = FPEWCRegularizer(strength=2.0)
         grads = {"weight": torch.ones_like(layer.weight)}
@@ -64,11 +65,11 @@ class TestExtensions(unittest.TestCase):
         self.assertGreater(float(reg.penalty(layer.named_parameters()).detach()), 0.0)
         with torch.no_grad():
             layer.weight.mul_(20)
-        self.assertLessEqual(spectral_guard_(layer.weight, 0.9), 0.9001)
+        self.assertLess(verified_spectral_cap_(layer.weight, 0.9), 0.9)
 
-    def test_spectral_guard_preserves_bfloat16_parameters(self):
+    def test_verified_spectral_cap_preserves_bfloat16_parameters(self):
         weight = (torch.eye(4) * 2.0).to(torch.bfloat16)
-        norm = spectral_guard_(weight, 0.9)
+        norm = verified_spectral_cap_(weight, 0.9)
         self.assertEqual(weight.dtype, torch.bfloat16)
         self.assertLess(norm, 0.9)
 
@@ -95,15 +96,26 @@ class TestExtensions(unittest.TestCase):
         z = torch.zeros_like(drive)
         for _ in range(100):
             z = torch.tanh(z @ recurrent.T + drive)
-        fisher = estimate_fixed_point_fisher(
+        estimate = estimate_empirical_fixed_point_fisher(
             f_at_z=lambda state: torch.tanh(state @ recurrent.T + drive),
             z_star=z,
-            log_likelihood_at_z=lambda state: -0.5 * state.square().sum(),
+            log_likelihood_per_sample=lambda state: -0.5 * state.square().sum(dim=1),
             named_parameters=[("recurrent", recurrent)],
+            config=FixedPointFisherConfig(
+                contraction_bound=0.4,
+                fixed_point_tolerance=1.0e-5,
+                adjoint_tolerance=1.0e-5,
+                max_adjoint_iterations=80,
+            ),
+            solver_converged=True,
         )
+        fisher = estimate.fisher
         self.assertEqual(fisher["recurrent"].shape, recurrent.shape)
         self.assertTrue(torch.isfinite(fisher["recurrent"]).all())
         self.assertGreater(float(fisher["recurrent"].sum()), 0.0)
+        self.assertEqual(estimate.n_samples, 1)
+        self.assertLessEqual(estimate.fixed_point_residuals[0], 1.0e-5)
+        self.assertTrue(estimate.adjoint[0].converged)
 
 
 if __name__ == "__main__":

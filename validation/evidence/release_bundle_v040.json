@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "release_version": "0.4.0",
+  "source_commit": "5bcfbb457f998beb47b3788204c25de3af546b32",
+  "verification_bundle": "Cogni-OS-2-Genesis-v0.4.0-verify-20260716",
+  "build_result": "pass",
+  "model_smoke": {
+    "status": "ok",
+    "verified_files": 7,
+    "device": "NVIDIA GeForce RTX 5090 Laptop GPU",
+    "finish_reason": "stop",
+    "quality_gate": "passed",
+    "cuda_worker_cleaned": true
+  },
+  "packaged_launcher_smoke": {
+    "status": "pass",
+    "startup_seconds": 49.924,
+    "launcher_exit_code": 0,
+    "state_http": 200,
+    "capabilities_http": 200,
+    "html_http": 200,
+    "html_bytes": 57870,
+    "attachment_ui": true,
+    "voice_ui": true,
+    "attachment_state": "enabled",
+    "rag_state": "local_index_ready",
+    "image_to_model": true,
+    "authenticated_shutdown": true
+  },
+  "targeted_release_regression": {
+    "passed": 99,
+    "skipped": 1,
+    "subtests_passed": 169
+  },
+  "full_source_regression": {
+    "passed": 891,
+    "skipped": 6,
+    "subtests_passed": 723
+  },
+  "artifacts": {
+    "exe_sha256": "52bda6c9346c34ddb1508a9f214016a58d2b1702d059a2e89e8a412b6d162dfb",
+    "wheel_sha256": "35e33fa07ea782a2565672a65d17924d1e5a9dc39d893eb37d67d2a6bcb0473e",
+    "source_zip_sha256": "32724ebf6bf242146ad53bffeceb2a24eb5a96e783f59ae31e75c11d35e7ab51",
+    "manual_pdf_sha256": "bac2947c55899492c212f78c9a5e36efef3227bc8db0ba82ab8feb83947ad37e",
+    "sbom_sha256": "5013dcb2824251b4255cb7f2cdcb953318bbf7198933d74e65ce8b5f43e06d16",
+    "notices_sha256": "6e97d6f35b09aa160dfa11c24797aa9202d688430917401078a63498c2b53f68"
+  },
+  "sha256_manifest_verified_files": 10,
+  "signature_status": "unsigned-no-code-signing-certificate-provided",
+  "scope_limits": [
+    "The measured device is not the target RTX 4090.",
+    "The build environment is not an independently clean Windows host.",
+    "Unsigned artifacts are not code-signing evidence."
+  ]
+}

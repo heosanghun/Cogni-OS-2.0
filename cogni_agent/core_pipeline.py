@@ -16,7 +16,7 @@ FP-EWC is intentionally absent here because consolidation is evolution-only.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
+from time import monotonic_ns
 from typing import Mapping
 
 import torch
@@ -25,13 +25,24 @@ from torch import Tensor
 from cogni_core.deq import SolverInfo
 from cogni_core.experts import ExpertOutput
 from cogni_core.meta_router import COGNITIVE_STATE_DIM, RoutingDecision
-from cogni_core.search import PolicyValueFn, TensorTransition
+from cogni_core.search import (
+    CertifiedTransitionV2,
+    PolicyValueFn,
+    TensorTransition,
+)
 from cogni_core.swarm import SwarmOutput
 from cogni_os.runtime import (
     FastWeightCompilationResult,
     GenesisRuntime,
     InferenceResult,
+    SearchCollaboratorsV2,
 )
+
+from .protocol import DIGEST_BYTES, NO_DEADLINE_NS, ZERO_ARTIFACT_DIGEST
+
+
+class CoreTurnAuthorityError(RuntimeError):
+    """Raised when a turn's immutable worker capability is no longer valid."""
 
 
 @dataclass(frozen=True)
@@ -64,13 +75,13 @@ class FastWeightActivation:
 class FastWeightCompilationPlan:
     """Compile this turn's converged state for a later conversational turn.
 
-    ``verified_quality`` must be produced by a held-out verifier outside the
-    programmer.  Calibration features are mandatory at this product boundary,
-    even though the lower-level research API permits an uncalibrated session.
+    Held-out quality comes exclusively from the hash-pinned trained artifact,
+    never from the request. ``residual_trace`` is the exact ten-value AQ window
+    from the current certified solve. Calibration features remain mandatory.
     """
 
     session_id: str
-    verified_quality: float
+    residual_trace: Tensor
     calibration_features: Tensor
     calibration_quantile: float = 0.99
 
@@ -87,6 +98,7 @@ class CoreTurnRequest:
 
     inputs: Tensor
     cognitive_state: Tensor
+    swarm_session_id: str
     backbone_args: tuple[Tensor, ...] = ()
     backbone_kwargs: Mapping[str, Tensor] | None = None
     available_modules: Tensor | None = None
@@ -94,6 +106,12 @@ class CoreTurnRequest:
     compile_fast_weight: FastWeightCompilationPlan | None = None
     seed: int | None = None
     estimated_workspace_bytes: int | None = None
+    request_id: int = 1
+    job_id: int = 1
+    lease_epoch: int = 0
+    request_deadline_ns: int = NO_DEADLINE_NS
+    lease_deadline_ns: int = 0
+    artifact_digest: Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -140,8 +158,8 @@ class CoreTurnPipeline:
     def __init__(
         self,
         runtime: GenesisRuntime,
-        transition: TensorTransition,
-        policy_value: PolicyValueFn,
+        transition: TensorTransition | CertifiedTransitionV2,
+        policy_value: PolicyValueFn | SearchCollaboratorsV2,
         *,
         limits: CorePipelineLimits | None = None,
     ) -> None:
@@ -153,13 +171,17 @@ class CoreTurnPipeline:
     def run(self, request: CoreTurnRequest) -> CoreTurnResult:
         prepared = self._validate_request(request)
         cognitive_state, backbone_args, backbone_kwargs = prepared
+        self._validate_live_authority(request)
 
         # Hold one outer day slot across the whole turn. Runtime methods take
         # nested slots for standalone safety; this closes the gaps in which an
         # idle scheduler could otherwise begin evolution between stages.
         with self.runtime.rhythm.inference_slot():
+            routing_input = self._to_module_float(
+                cognitive_state, getattr(self.runtime, "meta_router", None)
+            )
             routing = self.runtime.route_cognitive_state(
-                cognitive_state, request.available_modules
+                routing_input, request.available_modules
             )
             self._validate_routing(routing, cognitive_state.shape[0])
 
@@ -177,6 +199,9 @@ class CoreTurnPipeline:
                     None if activation is None else activation.routing_features
                 ),
             )
+            # A capability may expire during the expensive authoritative solve.
+            # No advisory state or answer-bearing decode may follow expiry.
+            self._validate_live_authority(request)
             observation = self._pool_backbone_state(inference.backbone_state)
 
             # Auxiliary modules observe a detached tensor. This makes it
@@ -185,7 +210,9 @@ class CoreTurnPipeline:
             swarm_input = self._to_module_float(
                 observation.detach(), getattr(self.runtime, "swarm", None)
             )
-            swarm = self.runtime.adapt_stream(swarm_input)
+            swarm = self.runtime.adapt_stream(
+                swarm_input, session_id=request.swarm_session_id
+            )
             self._validate_swarm(swarm, observation.shape[0])
             expert_module = getattr(self.runtime, "experts", None)
             expert_latent = self._to_module_float(swarm.latent.detach(), expert_module)
@@ -194,6 +221,7 @@ class CoreTurnPipeline:
                 expert_latent, expert_input, track_usage=False
             )
             self._validate_experts(experts, observation.shape[0])
+            self._validate_live_authority(request)
 
             compilation = None
             if request.compile_fast_weight is not None:
@@ -278,7 +306,55 @@ class CoreTurnPipeline:
             self._validate_activation(request.fast_weight)
         if request.compile_fast_weight is not None:
             self._validate_compilation_plan(request.compile_fast_weight)
+        self._validate_session_id(request.swarm_session_id)
+        self._validate_authority_schema(request)
         return state, args, kwargs
+
+    @staticmethod
+    def _validate_authority_schema(request: CoreTurnRequest) -> None:
+        for name in ("request_id", "job_id", "request_deadline_ns"):
+            value = getattr(request, name)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 1 <= value <= NO_DEADLINE_NS
+            ):
+                raise ValueError(f"{name} must be a positive signed-63-bit integer")
+        if (
+            not isinstance(request.lease_epoch, int)
+            or isinstance(request.lease_epoch, bool)
+            or not 0 <= request.lease_epoch <= NO_DEADLINE_NS
+        ):
+            raise ValueError("lease_epoch must be a non-negative signed-63-bit integer")
+        if (
+            not isinstance(request.lease_deadline_ns, int)
+            or isinstance(request.lease_deadline_ns, bool)
+            or not 0 <= request.lease_deadline_ns <= NO_DEADLINE_NS
+            or (request.lease_epoch == 0) != (request.lease_deadline_ns == 0)
+        ):
+            raise ValueError("lease epoch/deadline authority is inconsistent")
+        digest = (
+            ZERO_ARTIFACT_DIGEST
+            if request.artifact_digest is None
+            else request.artifact_digest
+        )
+        if (
+            not isinstance(digest, Tensor)
+            or digest.device.type != "cpu"
+            or digest.dtype != torch.int64
+            or digest.shape != (DIGEST_BYTES,)
+            or not digest.is_contiguous()
+            or bool(((digest < 0) | (digest > 255)).any())
+        ):
+            raise ValueError("artifact_digest must be a contiguous 32-byte CPU tensor")
+
+    @staticmethod
+    def _validate_live_authority(request: CoreTurnRequest) -> None:
+        now = monotonic_ns()
+        if now >= request.request_deadline_ns:
+            raise CoreTurnAuthorityError("Core turn request deadline expired")
+        if request.lease_epoch and now >= request.lease_deadline_ns:
+            raise CoreTurnAuthorityError("Core turn GPU lease deadline expired")
 
     def _validate_model_argument(
         self, value: Tensor, label: str, inputs: Tensor
@@ -307,20 +383,22 @@ class CoreTurnPipeline:
             raise RuntimeError(
                 "Fast Weight activation requires admission and calibrated OOD routing"
             )
-        if activation.session_id not in getattr(sessions, "session_ids", ()):
-            raise RuntimeError("Fast Weight session was not admitted by the runtime")
+        # Unknown/expired sessions are a normal same-request fail-closed case:
+        # the runtime records the failed attempt and executes full CTS.
 
     def _validate_compilation_plan(self, plan: FastWeightCompilationPlan) -> None:
         if not isinstance(plan, FastWeightCompilationPlan):
             raise TypeError("compile_fast_weight must be a FastWeightCompilationPlan")
         self._validate_session_id(plan.session_id)
+        residuals = plan.residual_trace
+        self._require_tensor(residuals, "residual_trace")
         if (
-            not isinstance(plan.verified_quality, (int, float))
-            or isinstance(plan.verified_quality, bool)
-            or not math.isfinite(float(plan.verified_quality))
-            or not 0.0 <= float(plan.verified_quality) <= 1.0
+            not torch.is_floating_point(residuals)
+            or residuals.ndim != 1
+            or residuals.numel() != 10
         ):
-            raise ValueError("verified_quality must be finite and in [0, 1]")
+            raise ValueError("residual_trace must contain exactly ten floats")
+        self._require_finite(residuals, "residual_trace")
         features = plan.calibration_features
         self._require_tensor(features, "calibration_features")
         if (
@@ -354,11 +432,12 @@ class CoreTurnPipeline:
 
     @staticmethod
     def _to_module_float(value: Tensor, module: object) -> Tensor:
-        """Cast detached advisory data to its module without touching the answer.
+        """Cast detached control/advisory data to its module without touching the answer.
 
-        Local Gemma commonly emits BF16 while the bounded System-3/4 modules are
-        initialized in FP32.  PyTorch recurrent einsums require an exact dtype
-        match.  The cast is confined to advisory tensors and therefore cannot
+        Local Gemma and its bounded auxiliary modules may use BF16 while the
+        caller-supplied cognitive telemetry is FP32. PyTorch linear/recurrent
+        operators require an exact dtype match. The cast is confined to the
+        detached BIO-HAMA/System-3/System-4 control plane and therefore cannot
         change the authoritative Gemma/CTS state.
         """
 
@@ -370,7 +449,7 @@ class CoreTurnPipeline:
         except (StopIteration, TypeError):
             return value.detach()
         if not torch.is_floating_point(parameter):
-            raise TypeError("advisory module parameters must be floating point")
+            raise TypeError("control-plane module parameters must be floating point")
         return value.detach().to(
             device=parameter.device,
             dtype=parameter.dtype,
@@ -385,6 +464,8 @@ class CoreTurnPipeline:
         self._require_finite(mask, "routing.routing_mask")
 
     def _validate_swarm(self, output: SwarmOutput, batch: int) -> None:
+        if getattr(output, "advisory_only", None) is not True:
+            raise RuntimeError("System-4 output crossed its advisory-only boundary")
         latent = getattr(output, "latent", None)
         self._require_tensor(latent, "swarm.latent")
         if (
@@ -394,6 +475,23 @@ class CoreTurnPipeline:
         ):
             raise ValueError("System-4 latent violates the fixed advisory bound")
         self._require_finite(latent, "swarm.latent")
+        safe = getattr(output, "safe_for_advice", None)
+        converged = getattr(output, "converged", None)
+        for value, label in (
+            (safe, "swarm.safe_for_advice"),
+            (converged, "swarm.converged"),
+        ):
+            self._require_tensor(value, label)
+            if value.ndim != 0 or value.dtype != torch.bool:
+                raise TypeError(f"{label} must be a scalar bool tensor")
+        if bool(safe.detach().cpu()) != bool(converged.detach().cpu()):
+            raise RuntimeError("System-4 safety and convergence telemetry disagree")
+        if not bool(safe.detach().cpu()) and bool(
+            latent.count_nonzero().detach().cpu()
+        ):
+            raise RuntimeError(
+                "unsafe System-4 output exposed a non-zero advisory latent"
+            )
 
     def _validate_experts(self, output: ExpertOutput, batch: int) -> None:
         state = getattr(output, "state", None)
@@ -414,6 +512,11 @@ class CoreTurnPipeline:
             raise RuntimeError(
                 "Fast Weight compilation requires the current converged DEQ evidence"
             )
+        fast_telemetry = getattr(inference, "fast_weight", None)
+        if fast_telemetry is not None and fast_telemetry.activated:
+            raise RuntimeError(
+                "a CTS-bypassed Fast Weight turn cannot compile another session"
+            )
         best_state = getattr(inference.search, "best_state", None)
         self._require_tensor(best_state, "search.best_state")
         if best_state.numel() > self.limits.max_backbone_elements:
@@ -423,7 +526,7 @@ class CoreTurnPipeline:
             plan.session_id,
             best_state.detach(),
             solver_info=info,
-            verified_quality=float(plan.verified_quality),
+            residual_trace=plan.residual_trace,
             calibration_features=plan.calibration_features,
             calibration_quantile=plan.calibration_quantile,
         )
@@ -456,6 +559,7 @@ class CoreTurnPipeline:
 
 
 __all__ = [
+    "CoreTurnAuthorityError",
     "CorePipelineLimits",
     "CoreTurnPipeline",
     "CoreTurnRequest",

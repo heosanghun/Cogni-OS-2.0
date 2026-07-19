@@ -8,6 +8,7 @@ import unittest
 from cogni_demo.protocol import (
     EVENT_SENTINEL,
     EventEmitter,
+    MAX_TRANSITION_RESIDUAL,
     ProtocolError,
     parse_event_line,
     validate_terminal_metrics,
@@ -29,6 +30,25 @@ def valid_metrics() -> dict:
         "transition_converged": True,
         "transition_residual": 0.00390625,
         "transition_used_fallback": False,
+        "cts_protocol_version": "SearchRequestV2",
+        "safe_for_decode": True,
+        "unsafe_silent_fallbacks": 0,
+        "linear_solve_fallbacks": 0,
+        "solver_rank": 16,
+        "solver_history_peak": 16,
+        "solver_failures": 0,
+        "failed_edges": 0,
+        "q_zero_backups": 0,
+        "mac_budget": 1000,
+        "mac_reserved": 900,
+        "act_applied": 301,
+        "trace_digest": "a" * 64,
+        "causal_bridge_answer_bearing": True,
+        "causal_bridge_bias_nonzero": True,
+        "causal_bridge_bias_max": 0.04980469,
+        "conditioned_generated_tokens": 1,
+        "peak_allocated_vram_gib": 14.5,
+        "peak_reserved_vram_gib": 14.856,
         "peak_vram_gib": 14.856,
         "vram_limit_gib": 16.7,
         "finite": True,
@@ -69,8 +89,53 @@ class TestDemoWorkerProtocol(unittest.TestCase):
         bad = valid_metrics()
         bad["peak_vram_gib"] = 16.8
         cases.append(bad)
+        bad = valid_metrics()
+        bad["peak_allocated_vram_gib"] = 15.0
+        bad["peak_reserved_vram_gib"] = 14.9
+        bad["peak_vram_gib"] = 15.0
+        cases.append(bad)
+        bad = valid_metrics()
+        bad["peak_reserved_vram_gib"] = 16.8
+        bad["peak_vram_gib"] = 16.8
+        cases.append(bad)
+        bad = valid_metrics()
+        bad["peak_reserved_vram_gib"] = math.nan
+        cases.append(bad)
+        bad = valid_metrics()
+        bad["peak_vram_gib"] = 14.5
+        cases.append(bad)
+        bad = valid_metrics()
+        bad["causal_bridge_answer_bearing"] = False
+        cases.append(bad)
+        bad = valid_metrics()
+        bad["causal_bridge_bias_max"] = 0.1001
+        cases.append(bad)
         for metrics in cases:
             with self.subTest(metrics=metrics):
+                with self.assertRaises(ProtocolError):
+                    validate_terminal_metrics(metrics)
+
+    def test_transition_residual_certification_boundary(self) -> None:
+        for residual in (0, MAX_TRANSITION_RESIDUAL):
+            with self.subTest(residual=residual):
+                metrics = valid_metrics()
+                metrics["transition_residual"] = residual
+                self.assertEqual(
+                    validate_terminal_metrics(metrics)["transition_residual"],
+                    float(residual),
+                )
+
+        rejected = (
+            math.nextafter(MAX_TRANSITION_RESIDUAL, math.inf),
+            math.nan,
+            math.inf,
+            -math.inf,
+            -math.ulp(0.0),
+        )
+        for residual in rejected:
+            with self.subTest(residual=residual):
+                metrics = valid_metrics()
+                metrics["transition_residual"] = residual
                 with self.assertRaises(ProtocolError):
                     validate_terminal_metrics(metrics)
 
@@ -79,12 +144,12 @@ class TestDemoWorkerProtocol(unittest.TestCase):
             parse_event_line(EVENT_SENTINEL + "{")
         with self.assertRaises(ProtocolError):
             parse_event_line(
-                EVENT_SENTINEL + '{"v":1,"seq":1,"kind":"phase","stage":"verifying",'
+                EVENT_SENTINEL + '{"v":2,"seq":1,"kind":"phase","stage":"verifying",'
                 '"progress":5,"extra":true}'
             )
         with self.assertRaises(ProtocolError):
             parse_event_line(
-                EVENT_SENTINEL + '{"v":1,"v":1,"seq":1,"kind":"phase",'
+                EVENT_SENTINEL + '{"v":2,"v":2,"seq":1,"kind":"phase",'
                 '"stage":"verifying","progress":5}'
             )
 

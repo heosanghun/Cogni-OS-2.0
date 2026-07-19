@@ -9,16 +9,18 @@ from typing import Any, Mapping
 
 
 EVENT_SENTINEL = "@@COGNI_EVENT@@"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_EVENT_LINE_BYTES = 16 * 1024
 MAX_TEXT_LENGTH = 256
 ABSOLUTE_VRAM_LIMIT_GIB = 16.7
+MAX_TRANSITION_RESIDUAL = 0.005
 
 PHASE_STAGES = (
     "verifying",
     "loading_model",
     "building_runtime",
     "running_inference",
+    "validating_decode_bridge",
     "postcheck",
 )
 TERMINAL_STAGE = "complete"
@@ -123,6 +125,25 @@ _REQUIRED_METRICS: dict[str, str] = {
     "transition_converged": "bool",
     "transition_residual": "number",
     "transition_used_fallback": "bool",
+    "cts_protocol_version": "str",
+    "safe_for_decode": "bool",
+    "unsafe_silent_fallbacks": "int",
+    "linear_solve_fallbacks": "int",
+    "solver_rank": "int",
+    "solver_history_peak": "int",
+    "solver_failures": "int",
+    "failed_edges": "int",
+    "q_zero_backups": "int",
+    "mac_budget": "int",
+    "mac_reserved": "int",
+    "act_applied": "int",
+    "trace_digest": "str",
+    "causal_bridge_answer_bearing": "bool",
+    "causal_bridge_bias_nonzero": "bool",
+    "causal_bridge_bias_max": "number",
+    "conditioned_generated_tokens": "int",
+    "peak_allocated_vram_gib": "number",
+    "peak_reserved_vram_gib": "number",
     "peak_vram_gib": "number",
     "vram_limit_gib": "number",
     "finite": "bool",
@@ -174,11 +195,59 @@ def validate_terminal_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
         raise ProtocolError("search allocation telemetry must be positive")
     if not normalized["transition_converged"] or not normalized["finite"]:
         raise ProtocolError("runtime convergence and finiteness are mandatory")
-    if normalized["transition_residual"] < 0:
-        raise ProtocolError("transition residual cannot be negative")
+    residual = normalized["transition_residual"]
+    if not 0 <= residual <= MAX_TRANSITION_RESIDUAL:
+        raise ProtocolError(
+            "transition residual crossed the certified convergence threshold"
+        )
+    if normalized["cts_protocol_version"] != "SearchRequestV2":
+        raise ProtocolError("runtime validation must use certified SearchRequestV2")
+    if (
+        normalized["safe_for_decode"] is not True
+        or normalized["unsafe_silent_fallbacks"] != 0
+        or normalized["linear_solve_fallbacks"] != 0
+        or normalized["transition_used_fallback"] is not False
+    ):
+        raise ProtocolError("CTS V2 decode safety telemetry failed closed")
+    if normalized["solver_rank"] != 16 or not (
+        1 <= normalized["solver_history_peak"] <= 16
+    ):
+        raise ProtocolError("CTS V2 must use bounded rank-16 Broyden history")
+    if (
+        normalized["solver_failures"] < 0
+        or normalized["failed_edges"] != normalized["solver_failures"]
+        or normalized["q_zero_backups"] != normalized["failed_edges"]
+    ):
+        raise ProtocolError("failed CTS edges must receive exactly one Q=0 backup")
+    if not (0 < normalized["mac_reserved"] <= normalized["mac_budget"]):
+        raise ProtocolError("CTS V2 MAC ledger violates its request budget")
+    if normalized["act_applied"] != 301:
+        raise ProtocolError("Depth-100 validation must apply the certified ACT floor")
+    digest = normalized["trace_digest"]
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ProtocolError("CTS V2 trace digest must be lowercase SHA-256 hex")
+    if (
+        not normalized["causal_bridge_answer_bearing"]
+        or not normalized["causal_bridge_bias_nonzero"]
+    ):
+        raise ProtocolError("the causal decode bridge must be active and non-zero")
+    bridge_max = normalized["causal_bridge_bias_max"]
+    if not 0 < bridge_max <= 0.1:
+        raise ProtocolError("causal bridge bias crossed its certified bound")
+    if normalized["conditioned_generated_tokens"] != 1:
+        raise ProtocolError("causal bridge validation must decode exactly one token")
     limit = normalized["vram_limit_gib"]
+    peak_allocated = normalized["peak_allocated_vram_gib"]
+    peak_reserved = normalized["peak_reserved_vram_gib"]
     peak = normalized["peak_vram_gib"]
-    if not 0 < limit <= ABSOLUTE_VRAM_LIMIT_GIB or not 0 <= peak <= limit:
+    if not 0 < limit <= ABSOLUTE_VRAM_LIMIT_GIB:
+        raise ProtocolError("VRAM limit crossed the absolute safety limit")
+    if not (
+        0 <= peak_allocated <= peak_reserved <= limit
+        and peak == max(peak_allocated, peak_reserved)
+    ):
         raise ProtocolError("VRAM telemetry crossed the absolute safety limit")
     return normalized
 
@@ -243,6 +312,7 @@ __all__ = [
     "EVENT_SENTINEL",
     "EventEmitter",
     "MAX_EVENT_LINE_BYTES",
+    "MAX_TRANSITION_RESIDUAL",
     "PHASE_STAGES",
     "PROTOCOL_VERSION",
     "ProtocolError",

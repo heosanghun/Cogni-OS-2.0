@@ -1,0 +1,168 @@
+from __future__ import annotations
+
+import argparse
+from hashlib import sha256
+import json
+from pathlib import Path
+from secrets import token_hex
+import sys
+import tempfile
+
+from cogni_flow.kernel_sandbox import (
+    LinuxOciSandboxRunner,
+    build_kernel_sandbox_evidence_payload,
+)
+
+
+SAFE_COMMAND = ("python", "-I", "/project/check.py")
+TIMEOUT_COMMAND = ("python", "-I", "/project/hang.py")
+
+
+def _arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Validate the Linux OCI candidate sandbox without GPU access."
+    )
+    parser.add_argument("--image", required=True, help="Exact local image@sha256 ref")
+    parser.add_argument("--engine", default="/usr/bin/docker")
+    parser.add_argument("--socket", default="/var/run/docker.sock")
+    return parser.parse_args()
+
+
+def _canonical_daemon_socket(value: str) -> Path:
+    """Resolve the operator socket alias before strict runner validation."""
+
+    return Path(value).resolve(strict=True)
+
+
+def main() -> int:
+    args = _arguments()
+    if not sys.platform.startswith("linux"):
+        raise SystemExit("kernel sandbox validation requires Linux")
+    engine = Path(args.engine).resolve(strict=True)
+    daemon_socket = _canonical_daemon_socket(args.socket)
+    engine_sha256 = sha256(engine.read_bytes()).hexdigest()
+    canary_name = f"cogni-host-canary-{token_hex(12)}"
+    host_canary = Path("/tmp") / canary_name
+    host_canary.write_bytes(b"host-only")
+    try:
+        with tempfile.TemporaryDirectory(prefix="cogni-kernel-sandbox-") as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir(mode=0o755)
+            project.chmod(0o777)
+            writable_probe = project / "writable-probe.txt"
+            writable_probe.write_bytes(b"original")
+            writable_probe.chmod(0o666)
+            (project / "check.py").write_text(
+                "import os\n"
+                "from pathlib import Path\n"
+                "import socket\n"
+                "assert os.geteuid() == 65534\n"
+                "status = {}\n"
+                "for line in Path('/proc/self/status').read_text().splitlines():\n"
+                "    if ':' in line:\n"
+                "        key, value = line.split(':', 1)\n"
+                "        status[key] = value.strip()\n"
+                "assert int(status['CapEff'], 16) == 0\n"
+                "assert status['NoNewPrivs'] == '1'\n"
+                "assert os.environ.get('NVIDIA_VISIBLE_DEVICES') == 'void'\n"
+                "assert os.environ.get('CUDA_VISIBLE_DEVICES') == ''\n"
+                "assert os.environ.get('HIP_VISIBLE_DEVICES') == ''\n"
+                "assert os.environ.get('ROCR_VISIBLE_DEVICES') == ''\n"
+                "mount_options = {}\n"
+                "for line in Path('/proc/self/mountinfo').read_text().splitlines():\n"
+                "    fields = line.split(' ')\n"
+                "    mount_options[fields[4]] = set(fields[5].split(','))\n"
+                "assert 'ro' in mount_options['/']\n"
+                "assert 'ro' in mount_options['/project']\n"
+                "assert Path('/project/writable-probe.txt').read_bytes() == b'original'\n"
+                "for target in (Path('/project/candidate-write'), Path('/project/writable-probe.txt')):\n"
+                "    try:\n"
+                "        target.write_text('forbidden', encoding='ascii')\n"
+                "    except OSError:\n"
+                "        pass\n"
+                "    else:\n"
+                "        raise AssertionError(f'writable boundary: {target}')\n"
+                f"assert not Path('/tmp/{canary_name}').exists()\n"
+                "assert {name for _, name in socket.if_nameindex()} <= {'lo'}\n"
+                "probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                "probe.settimeout(1.0)\n"
+                "try:\n"
+                "    probe.connect(('192.0.2.1', 9))\n"
+                "except OSError:\n"
+                "    pass\n"
+                "else:\n"
+                "    raise AssertionError('network namespace allowed egress')\n"
+                "finally:\n"
+                "    probe.close()\n"
+                "print('KERNEL_SANDBOX_BOUNDARIES=PASS')\n",
+                encoding="utf-8",
+            )
+            (project / "hang.py").write_text(
+                "import subprocess, sys, time\n"
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            for path in project.iterdir():
+                path.chmod(0o644)
+            writable_probe.chmod(0o666)
+            evidence_bytes = build_kernel_sandbox_evidence_payload(
+                runner_id="cogni-linux-oci-v1",
+                engine_path=str(engine),
+                engine_sha256=engine_sha256,
+                daemon_socket=str(daemon_socket),
+                image_reference=args.image,
+                commands=(SAFE_COMMAND, TIMEOUT_COMMAND),
+                max_memory_bytes=1024 * 1024 * 1024,
+                max_pids=64,
+                max_cpus=2.0,
+                tmpfs_bytes=128 * 1024 * 1024,
+            )
+            evidence_path = root / "runner-evidence.json"
+            evidence_path.write_bytes(evidence_bytes)
+            evidence_path.chmod(0o600)
+            runner = LinuxOciSandboxRunner(evidence_path)
+            safe = runner.run(project, SAFE_COMMAND, 30)
+            if not safe.passed or "KERNEL_SANDBOX_BOUNDARIES=PASS" not in safe.output:
+                raise RuntimeError(f"sandbox boundary validation failed: {safe}")
+            timeout = runner.run(project, TIMEOUT_COMMAND, 2)
+            if (
+                timeout.passed
+                or timeout.returncode != 124
+                or getattr(timeout, "cleanup_verified", False) is not True
+            ):
+                raise RuntimeError(f"sandbox timeout validation failed: {timeout}")
+            if getattr(safe, "cleanup_verified", False) is not True:
+                raise RuntimeError("successful sandbox cleanup was not verified")
+            runner.verify_container_absent(safe.container_name)
+            runner.verify_container_absent(timeout.container_name)
+            if not host_canary.is_file() or host_canary.read_bytes() != b"host-only":
+                raise RuntimeError("host canary changed during sandbox execution")
+            if writable_probe.read_bytes() != b"original":
+                raise RuntimeError("read-only project probe changed on the host")
+            report = {
+                "schema": "cogni.kernel-sandbox-integration-smoke.v1",
+                "status": "PASS",
+                "assurance": "implementation_integration_smoke_only",
+                "production_attestation": False,
+                "evidence_sha256": sha256(evidence_bytes).hexdigest(),
+                "engine_sha256": engine_sha256,
+                "image_reference": args.image,
+                "network_request": "none",
+                "network_smoke": "only_loopback_observed",
+                "project_mount_smoke": "read_only",
+                "rootfs_mount_smoke": "read_only",
+                "observed_non_root_uid": 65534,
+                "timeout_returncode": timeout.returncode,
+                "container_cleanup_verified": True,
+                "gpu_measurement": "not_performed",
+            }
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            return 0
+    finally:
+        host_canary.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

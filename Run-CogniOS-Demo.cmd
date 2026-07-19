@@ -7,6 +7,7 @@ for %%I in ("%~dp0.") do set "LAUNCHER_DIR=%%~fI"
 set "PROJECT_ROOT="
 set "PYTHON_EXE="
 set "PYTHON_ARGS="
+set "VALIDATION_ARGS=--validation-profile desktop-ui-only"
 set "EXIT_CODE=1"
 
 if exist "%LAUNCHER_DIR%\cogni_demo\server.py" (
@@ -22,14 +23,18 @@ if defined PROJECT_ROOT goto root_ready
 goto fail_project
 
 :root_ready
-set "MANIFEST=%PROJECT_ROOT%\config\gemma4-e4b.manifest.toml"
+set "MANIFEST=%PROJECT_ROOT%\config\gemma4-e4b-it.manifest.toml"
+set "SERVER_BOOTSTRAP=%PROJECT_ROOT%\scripts\run_cogniboard_server.py"
 if defined COGNI_OS_MODEL_DIR (
     set "MODEL_DIR=%COGNI_OS_MODEL_DIR%"
 ) else (
-    set "MODEL_DIR=C:\Project\cognios\gemma4-e4b"
+    set "MODEL_DIR=C:\Project\cognios\gemma4-e4b-it"
 )
 
+if defined COGNI_OS_VALIDATION_PROFILE if /I not "%COGNI_OS_VALIDATION_PROFILE%"=="desktop-ui-only" goto fail_validation_profile
+
 if not exist "%MANIFEST%" goto fail_manifest
+if not exist "%SERVER_BOOTSTRAP%" goto fail_project
 if not exist "%MODEL_DIR%\" goto fail_model
 
 if defined COGNI_OS_PYTHON (
@@ -88,9 +93,9 @@ if not defined GUI_PYTHON (
 )
 
 if defined GUI_PYTHON (
-    start "" "%GUI_PYTHON%" %GUI_ARGS% -m cogni_demo.server --model "%MODEL_DIR%" --manifest "%MANIFEST%"
+    start "" "%GUI_PYTHON%" %GUI_ARGS% "%SERVER_BOOTSTRAP%" --model "%MODEL_DIR%" --manifest "%MANIFEST%" %VALIDATION_ARGS%
 ) else (
-    start "" /min "%PYTHON_EXE%" %PYTHON_ARGS% -m cogni_demo.server --model "%MODEL_DIR%" --manifest "%MANIFEST%"
+    start "" /min "%PYTHON_EXE%" %PYTHON_ARGS% "%SERVER_BOOTSTRAP%" --model "%MODEL_DIR%" --manifest "%MANIFEST%" %VALIDATION_ARGS%
 )
 set "LAUNCH_EXIT_CODE=%ERRORLEVEL%"
 popd
@@ -117,6 +122,13 @@ echo.
 echo [ERROR] CUDA-enabled PyTorch, Transformers, and CogniBoard are required.
 echo Confirm that the selected Python can access the NVIDIA GPU.
 set "EXIT_CODE=3"
+goto finish
+
+:fail_validation_profile
+echo.
+echo [ERROR] The Windows appliance supports desktop-ui-only only.
+echo Use Run-CogniOS-Server-GPU5.sh on the trusted Linux operator host.
+set "EXIT_CODE=8"
 goto finish
 
 :fail_model

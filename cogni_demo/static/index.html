@@ -32,10 +32,10 @@
       </a>
 
       <div class="topbar-status" aria-label="시스템 상태">
-        <span class="status-pill status-local"><i></i>LOCAL ONLY</span>
-        <span class="status-pill"><span class="status-label">외부 호출</span><b>0</b></span>
+        <span class="status-pill" id="network-mode-pill"><i></i><b id="network-mode-label">NETWORK UNVERIFIED</b></span>
+        <span class="status-pill"><span class="status-label">외부 호출</span><b id="external-call-count">—</b></span>
         <span class="status-pill"><span class="status-label">리듬</span><b id="rhythm-value">INFERENCE</b></span>
-        <span class="status-pill status-runtime" id="runtime-pill"><i></i><b id="runtime-label">READY</b></span>
+        <span class="status-pill status-runtime" id="runtime-pill"><i></i><b id="runtime-label">상태 확인 중</b></span>
       </div>
 
       <div class="topbar-actions">
@@ -82,8 +82,8 @@
 
       <div class="sidebar-foot">
         <span class="mini-kicker">GENESIS BUILD</span>
-        <strong>v0.2.1</strong>
-        <span>Air-gapped research runtime</span>
+        <strong>v0.4.1</strong>
+        <span>Offline-first research runtime</span>
       </div>
     </aside>
 
@@ -114,7 +114,8 @@
               <div class="chat-empty" id="chat-empty">
                 <span class="brand-mark large" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M24 4 40.5 13.5v19L24 42 7.5 32.5v-19Z" class="mark-frame"/><path d="M15 27.5 24 12l9 15.5-9 8Z" class="mark-core"/><circle cx="24" cy="24" r="3.5" class="mark-node"/></svg></span>
                 <strong>무엇을 함께 해결할까요?</strong>
-                <p>일반 대화는 대화 모드로, 프로젝트 파일 조회·검색·테스트·결과 저장은 작업 모드로 요청하세요.</p>
+                <p>일반 대화는 대화 모드로, 프로젝트 파일 조회·검색·결과 저장은 작업 모드로 요청하세요. pytest는 OS 격리 증거가 있는 신뢰 개발자 opt-in에서만 실행됩니다.</p>
+                <button class="chat-empty-action" type="button" data-action="agent-focus" aria-controls="agent-input" disabled>메시지 입력하기</button>
               </div>
             </div>
 
@@ -126,6 +127,98 @@
             </div>
 
             <div class="chat-composer">
+              <div class="composer-commandbar" role="group" aria-label="대화 입력 도구">
+                <div class="composer-tools" role="group" aria-label="첨부와 지식 도구">
+                  <input class="visually-hidden" id="agent-attachment-input" type="file" multiple accept=".txt,.md,.csv,.json,.pdf,.png,.jpg,.jpeg,.webp" aria-describedby="agent-attachment-status" disabled>
+                  <button class="composer-tool-button" type="button" data-action="workspace-attach" aria-controls="agent-attachment-input agent-attachment-tray" disabled aria-label="파일 또는 이미지 첨부, 기능 확인 중" title="로컬 첨부 기능을 확인하고 있습니다.">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                    <span>파일·이미지</span><small id="agent-attachment-status">확인 중</small>
+                  </button>
+                  <button class="composer-tool-button" type="button" data-action="workspace-rag-toggle" aria-controls="agent-attachment-tray" aria-pressed="false" disabled aria-label="로컬 RAG, 기능 확인 중" title="로컬 AkasicDB 인덱스 상태를 확인하고 있습니다.">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A3.5 3.5 0 0 1 7.5 2H20v16H7.5A3.5 3.5 0 0 0 4 21.5Zm0 0v16M8 7h8m-8 4h8"/></svg>
+                    <span>로컬 RAG</span><small id="agent-rag-status">확인 중</small>
+                  </button>
+                  <button class="composer-tool-button" type="button" data-action="workspace-web-search" aria-controls="agent-lens-search-drawer" aria-expanded="false" disabled aria-label="외부 검색, 정책 확인 중" title="검증된 공식 API 실행기와 명시적 온라인 정책이 확인되어야 활성화됩니다.">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16.5 16.5 4 4M4 11h14M11 4a11 11 0 0 1 0 14M11 4a11 11 0 0 0 0 14"/></svg>
+                    <span>외부 검색</span><small id="agent-web-status">확인 중</small>
+                  </button>
+                </div>
+
+                <div class="composer-runtime-tools">
+                  <label class="model-selector" for="agent-model-selector">
+                    <span>로컬 모델</span>
+                    <select id="agent-model-selector" aria-describedby="agent-model-status" disabled>
+                      <option value="">검증 모델 확인 중</option>
+                    </select>
+                    <small id="agent-model-status">확인 중</small>
+                  </label>
+                  <button class="composer-icon-button" type="button" data-action="workspace-microphone" aria-pressed="false" disabled aria-label="음성 입력, 기능 확인 중" title="검증된 로컬 음성 파이프라인이 확인되어야 활성화됩니다.">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-4 0h8"/></svg>
+                    <span>음성</span><small id="agent-microphone-status">확인 중</small>
+                  </button>
+                  <button class="composer-icon-button" type="button" data-action="workspace-tts-play" aria-controls="agent-voice-playback" aria-pressed="false" disabled aria-label="마지막 Cogni Agent 답변 읽어주기, 기능 확인 중" title="검증된 로컬 음성 합성기가 확인되어야 활성화됩니다.">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 9h4l5-4v14l-5-4H5Z"/><path d="M17 9.5a4 4 0 0 1 0 5M19.5 7a7.5 7.5 0 0 1 0 10"/></svg>
+                    <span>읽어주기</span><small id="agent-tts-status">확인 중</small>
+                  </button>
+                </div>
+              </div>
+
+              <div class="voice-capture-panel" id="agent-voice-capture" data-state="idle" role="status" aria-live="polite" aria-atomic="true" hidden>
+                <span class="voice-capture-pulse" aria-hidden="true"></span>
+                <p><strong id="agent-voice-capture-state">대기</strong><small id="agent-voice-capture-copy">마이크 권한은 사용자가 음성 버튼을 누를 때만 요청됩니다.</small></p>
+                <div>
+                  <button class="micro-button" type="button" data-action="workspace-voice-stop" disabled>중지·전사</button>
+                  <button class="micro-button danger" type="button" data-action="workspace-voice-cancel" disabled>취소</button>
+                </div>
+              </div>
+
+              <div class="voice-playback-panel" id="agent-voice-playback" data-state="idle" role="status" aria-live="polite" aria-atomic="true" hidden>
+                <span class="voice-playback-wave" aria-hidden="true"><i></i><i></i><i></i></span>
+                <p><strong id="agent-voice-playback-state">대기</strong><small id="agent-voice-playback-copy">마지막 Cogni Agent 답변을 이 PC의 검증된 음성으로 재생합니다.</small></p>
+                <button class="micro-button" type="button" data-action="workspace-tts-stop" disabled>재생 중지</button>
+              </div>
+
+              <section class="lens-search-drawer" id="agent-lens-search-drawer" aria-labelledby="agent-lens-search-title" hidden>
+                <div class="lens-search-heading">
+                  <div><small>OFFICIAL JSON API · PER-REQUEST OPT-IN</small><strong id="agent-lens-search-title">검증된 외부 검색</strong></div>
+                  <button class="micro-button" type="button" data-action="workspace-web-close" aria-label="외부 검색 닫기">닫기</button>
+                </div>
+                <section class="general-web-search-panel" aria-labelledby="agent-general-web-title">
+                  <div class="connector-subheading"><small>GENERAL WEB · BRAVE</small><strong id="agent-general-web-title">일반 웹 검색</strong></div>
+                  <form class="lens-search-form" id="agent-general-web-form">
+                    <label class="lens-query-field"><span>검색어</span><input id="agent-general-web-query" name="query" type="search" minlength="1" maxlength="512" autocomplete="off" spellcheck="false" placeholder="예: on-device AI safety research" required></label>
+                    <label><span>결과 수</span><select id="agent-general-web-limit" name="limit"><option value="5">5</option><option value="10">10</option></select></label>
+                    <label class="lens-index-option general-web-opt-in"><input id="agent-general-web-opt-in" type="checkbox" disabled><span>이번 요청의 외부 HTTPS 호출에 명시적으로 동의</span></label>
+                    <button class="primary-button compact-button" id="agent-general-web-submit" type="button" data-action="workspace-general-web-submit" disabled><span>웹 검색</span></button>
+                    <button class="micro-button danger" id="agent-general-web-cancel" type="button" data-action="workspace-general-web-cancel" disabled>검색 취소</button>
+                  </form>
+                  <p class="lens-search-boundary">기본값은 오프라인이며 동의 체크는 요청 후 즉시 해제됩니다. 고정된 <code>api.search.brave.com</code> 공식 JSON API만 호출하고, 공개 IP로 검증·고정된 TLS 연결만 허용합니다. 결과 링크는 자동으로 가져오지 않습니다.</p>
+                  <p class="lens-search-status" id="agent-general-web-status" role="status" aria-live="polite">검색 대기 · 외부 호출 동의 필요</p>
+                  <ol class="lens-search-results" id="agent-general-web-results" aria-label="일반 웹 검색 결과"></ol>
+                </section>
+                <div class="connector-divider" aria-hidden="true"></div>
+                <div class="connector-subheading"><small>SPECIALIZED EVIDENCE · LENS</small><strong>Lens.org 특허·논문 검색</strong></div>
+                <form class="lens-search-form" id="agent-lens-search-form">
+                  <label><span>자료 유형</span><select id="agent-lens-kind" name="kind"><option value="patent">특허</option><option value="scholarly">논문</option></select></label>
+                  <label class="lens-query-field"><span>검색어</span><input id="agent-lens-query" name="query" type="search" minlength="1" maxlength="512" autocomplete="off" spellcheck="false" placeholder="예: deep equilibrium model" required></label>
+                  <label><span>결과 수</span><select id="agent-lens-limit" name="limit"><option value="5">5</option><option value="10">10</option><option value="20">20</option></select></label>
+                  <label class="lens-index-option"><input id="agent-lens-index" type="checkbox"><span>검증된 결과를 AkasicDB에 인덱싱</span></label>
+                  <button class="primary-button compact-button" id="agent-lens-submit" type="button" data-action="workspace-web-submit"><span>공식 API 검색</span></button>
+                </form>
+                <p class="lens-search-boundary">기본값은 오프라인입니다. 명시적 온라인 모드·정확한 <code>api.lens.org</code> 허용 목록·Lens API 토큰·이용약관 동의가 모두 있어야 HTTPS POST를 실행합니다. 웹 페이지 스크래핑은 하지 않습니다.</p>
+                <p class="lens-search-attribution"><strong>Data Sourced from The Lens</strong> · 공식 출처 <span>www.lens.org</span> · API 이용약관 <span>about.lens.org/lens-api-terms-of-use/</span>. 기본 오프라인 UI는 외부 링크를 열지 않습니다. 검색 결과의 Lens ID 링크를 선택하면 앱 밖의 <span>lens.org</span> 페이지가 새 탭에서 열립니다. 공식 로고 자산은 이용약관 및 브랜드 자산 사용 승인이 확인되기 전에는 번들하지 않으며, 공개 배포 전 승인된 로고 표기를 완료해야 합니다.</p>
+                <p class="lens-search-status" id="agent-lens-search-status" role="status" aria-live="polite">검색 대기</p>
+                <ol class="lens-search-results" id="agent-lens-search-results" aria-label="Lens 검색 결과"></ol>
+              </section>
+
+              <div class="attachment-tray" id="agent-attachment-tray" aria-label="로컬 첨부 파일" hidden>
+                <div class="attachment-chip-list" id="agent-attachment-list" role="list"></div>
+                <div class="attachment-tray-toolbar">
+                  <p id="agent-attachment-live-status" role="status" aria-live="polite" aria-atomic="true">첨부 파일이 없습니다.</p>
+                  <button type="button" data-action="workspace-rag-reindex" disabled aria-label="첨부 문서 전체 재색인">전체 재색인</button>
+                </div>
+              </div>
+
               <div class="agent-mode-switch" role="group" aria-label="요청 처리 모드">
                 <button class="is-selected" type="button" data-agent-mode="chat" aria-pressed="true" disabled><i></i>대화</button>
                 <button type="button" data-agent-mode="task" aria-pressed="false" disabled><i></i>로컬 작업</button>
@@ -140,28 +233,33 @@
 
           <aside class="agent-side-stack" aria-label="Cogni Agent 실행 상태">
             <article class="agent-runtime-card surface">
-              <div class="card-heading compact"><div><span class="section-kicker">COGNI-CORE ROUTE</span><h2>인지 파이프라인</h2></div><span class="evidence-badge verified" id="agent-core-badge" role="status">대기</span></div>
-              <div class="core-route" aria-label="대화 요청 처리 경로">
-                <div data-agent-module="gemma"><span>01</span><p><strong>Gemma 4 e4b</strong><small>로컬 생성 백본</small></p><b>LOCAL</b></div>
-                <div data-agent-module="router"><span>02</span><p><strong>BIO-HAMA</strong><small>부하·불확실성 라우팅</small></p><b>READY</b></div>
-                <div data-agent-module="swarm"><span>03</span><p><strong>System 4 · 3</strong><small>텐서 결합·전문가 자문</small></p><b>GATED</b></div>
-                <div data-agent-module="cts"><span>04</span><p><strong>DEQ · CTS</strong><small>bounded 숙고 경로</small></p><b>READY</b></div>
-                <div data-agent-module="fast"><span>05</span><p><strong>System 1.5</strong><small>검증된 세션 Fast Weight</small></p><b>GATED</b></div>
+              <div class="card-heading compact"><div><span class="section-kicker">COGNI-CORE ROUTE</span><h2>인지 파이프라인</h2></div><span class="evidence-badge" id="agent-core-badge" role="status">AUTHORITY UNVERIFIED</span></div>
+              <div class="core-route" aria-label="실행 상태와 Fact-book 권한이 분리된 대화 요청 처리 경로">
+                <div data-agent-module="gemma" data-capability-name="gemma4_e4b"><span>01</span><p><strong>Gemma 4 e4b</strong><small>로컬 생성 백본</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
+                <div data-agent-module="router" data-capability-name="bio_hama"><span>02</span><p><strong>BIO-HAMA</strong><small>부하·불확실성 라우팅</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
+                <div data-agent-module="swarm" data-capability-name="system_4"><span>03</span><p><strong>System 4</strong><small>텐서 결합 텔레메트리</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
+                <div data-agent-module="experts" data-capability-name="system_3"><span>04</span><p><strong>System 3</strong><small>전문가 텔레메트리</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
+                <div data-agent-module="cts" data-capability-name="cts_deq"><span>05</span><p><strong>DEQ · CTS</strong><small>bounded 숙고 경로</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
+                <div data-agent-module="fast" data-capability-name="system_1_5"><span>06</span><p><strong>System 1.5</strong><small>세션 Fast Weight 후보</small><em data-capability-authority>UNVERIFIED · OFF</em><em data-capability-evidence>EVIDENCE UNVERIFIED</em></p><b data-execution-status>UNVERIFIED</b></div>
               </div>
-              <div class="agent-core-foot"><span>System 2.5</span><strong>야간 FP-EWC · C-FIRE &lt; 0.95</strong></div>
+              <div class="agent-core-foot" data-capability-name="system_2_5"><span>System 2.5</span><strong data-capability-authority>UNVERIFIED · OFF</strong><em data-capability-evidence>EVIDENCE UNVERIFIED</em></div>
             </article>
 
             <article class="task-policy-card surface">
               <div class="card-heading compact"><div><span class="section-kicker">LOCAL TOOL POLICY</span><h2>작업 권한</h2></div><span class="evidence-badge verified">ALLOWLIST</span></div>
-              <div class="policy-grid"><span>읽기</span><b>프로젝트 내부</b><span>쓰기</span><b>outputs/agent-workspace</b><span>명령</span><b>고정 pytest · git status</b><span>소스 수정</span><b>Self-Harness 전용</b></div>
+              <div class="policy-grid"><span>읽기</span><b>프로젝트 내부</b><span>쓰기</span><b>outputs/agent-workspace</b><span>명령</span><b>git status · pytest 기본 차단</b><span>소스 수정</span><b>금지 · T2 제안만 저장</b></div>
               <p>임의 셸, 네트워크, 경로 탈출, 검증 전 소스 덮어쓰기는 차단됩니다.</p>
             </article>
 
             <article class="evolution-card surface">
-              <div class="card-heading compact"><div><span class="section-kicker">SELF-HARNESS</span><h2>자가 거울치료</h2></div><span class="evidence-badge planned" id="evolution-badge" role="status">감시 중</span></div>
-              <div class="evolution-cycle" aria-label="Self-Harness 진화 단계"><span>실패 수집</span><i>→</i><span>제안</span><i>→</i><span>격리 검증</span><i>→</i><span>승격·롤백</span></div>
-              <dl class="evolution-facts"><div><dt>실패 큐</dt><dd id="evolution-failures">0</dd></div><div><dt>마지막 주기</dt><dd id="evolution-last-run">아직 없음</dd></div><div><dt>격리 실행기</dt><dd id="evolution-sandbox">확인 중</dd></div></dl>
-              <button class="secondary-button full-width" type="button" data-action="evolution-run" aria-controls="evolution-badge" disabled><span data-evolution-label>제안 전용 야간 주기 실행</span></button>
+              <div class="card-heading compact"><div><span class="section-kicker">SELF-HARNESS</span><h2>자가 거울치료</h2></div><span class="evidence-badge planned" id="evolution-badge" role="status">실행 대기</span></div>
+              <p class="capability-disclosure" data-capability-name="self_harness"><strong data-capability-authority>UNVERIFIED · OFF</strong><span data-capability-evidence>EVIDENCE UNVERIFIED</span></p>
+              <div class="evolution-cycle" aria-label="Self-Harness 제안 전용 단계"><span>실패·성공 증거</span><i>→</i><span>K≥3 후보</span><i>→</i><span>정책 검사</span><i>→</i><span>검토 대기</span></div>
+              <dl class="evolution-facts"><div><dt>영속 실패 증거</dt><dd id="evolution-failures">0</dd></div><div><dt>증거 수집률</dt><dd id="evolution-coverage">100%</dd></div><div><dt>검토 대기 후보</dt><dd id="evolution-proposals">0</dd></div><div><dt>자동 승격</dt><dd id="evolution-sandbox">차단</dd></div></dl>
+              <div class="evolution-actions">
+                <button class="secondary-button" type="button" data-action="evolution-review" aria-controls="proposal-review-layer" aria-haspopup="dialog" disabled><span data-evolution-review-label>제안 diff 검토</span></button>
+                <button class="secondary-button" type="button" data-action="evolution-run" aria-controls="evolution-badge" disabled><span data-evolution-label>제안 전용 야간 주기 실행</span></button>
+              </div>
             </article>
           </aside>
         </div>
@@ -182,27 +280,27 @@
               <button class="secondary-button" type="button" data-view-jump="business">사업 가치 보기</button>
             </div>
             <div class="trust-row" aria-label="핵심 신뢰 요소">
-              <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v6c0 5 3.3 8 8 9 4.7-1 8-4 8-9V6Z"/></svg>100% 폐쇄망</span>
-              <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h4l2-5 4 10 2-5h4"/></svg>실제 GPU 측정</span>
+              <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v6c0 5 3.3 8 8 9 4.7-1 8-4 8-9V6Z"/></svg><span id="mission-external-calls">UNVERIFIED · 앱 외부 호출 상태 미검증</span></span>
+              <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h4l2-5 4 10 2-5h4"/></svg>검증 실행 후 GPU 측정</span>
               <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>Fail-closed 안전장치</span>
             </div>
           </article>
 
           <article class="proof-orbit surface" aria-labelledby="proof-orbit-title">
             <div class="card-heading compact">
-              <div><span class="section-kicker">LIVE EVIDENCE</span><h2 id="proof-orbit-title">검증된 실행 스냅샷</h2></div>
-              <span class="evidence-badge measured">내부 실측</span>
+              <div><span class="section-kicker">LIVE EVIDENCE</span><h2 id="proof-orbit-title">현재 프로세스 실행 스냅샷</h2></div>
+              <span class="evidence-badge planned" data-live-evidence-badge>미검증</span>
             </div>
             <div class="orbit-visual" aria-hidden="true">
               <div class="orbit orbit-a"><i></i><i></i><i></i></div>
               <div class="orbit orbit-b"><i></i><i></i></div>
-              <div class="orbit-core"><span>CTS</span><b id="orbit-depth">100</b><small>DEPTH</small></div>
+              <div class="orbit-core"><span>CTS</span><b id="orbit-depth">—</b><small>DEPTH</small></div>
               <div class="orbit-label label-gemma">LOCAL<br>GEMMA 4</div>
               <div class="orbit-label label-deq">DEQ<br>EQUILIBRIUM</div>
               <div class="orbit-label label-cfire">C-FIRE<br>SAFETY</div>
             </div>
             <div class="hardware-row">
-              <div><span>실측 장치</span><strong id="device-name">RTX 5090 Laptop GPU</strong></div>
+              <div><span>실측 장치</span><strong id="device-name">실행 전 미측정</strong></div>
               <div><span>목표 장치</span><strong>RTX 4090 · 24GB</strong></div>
             </div>
           </article>
@@ -210,28 +308,28 @@
 
         <div class="metric-grid" aria-label="핵심 검증 지표">
           <article class="metric-card surface">
-            <div class="metric-top"><span>Peak VRAM</span><span class="evidence-badge measured">실측</span></div>
-            <div class="metric-value"><b id="metric-vram">14.8560</b><small>GiB</small></div>
-            <div class="meter"><progress id="vram-meter" max="16.7" value="14.856" aria-label="VRAM 사용량 14.856 GiB, 상한 16.7 GiB"></progress><span></span></div>
+            <div class="metric-top"><span>Peak VRAM</span><span class="evidence-badge planned" data-live-evidence-badge>미검증</span></div>
+            <div class="metric-value"><b id="metric-vram">—</b><small>GiB</small></div>
+            <div class="meter"><progress id="vram-meter" max="16.7" value="0" aria-label="현재 프로세스 VRAM 검증 전"></progress><span></span></div>
             <div class="metric-foot"><span>방어선</span><strong>16.7 GiB 이하</strong></div>
           </article>
           <article class="metric-card surface">
-            <div class="metric-top"><span>CTS Depth</span><span class="evidence-badge measured">실측</span></div>
-            <div class="metric-value"><b id="metric-depth">100</b><small>/ 100</small></div>
+            <div class="metric-top"><span>CTS Depth</span><span class="evidence-badge planned" data-live-evidence-badge>미검증</span></div>
+            <div class="metric-value"><b id="metric-depth">—</b><small>/ 100</small></div>
             <div class="depth-dots" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-            <div class="metric-foot"><span>고정 arena</span><strong id="metric-nodes">301 nodes</strong></div>
+            <div class="metric-foot"><span>고정 arena</span><strong id="metric-nodes">검증 전</strong></div>
           </article>
           <article class="metric-card surface">
-            <div class="metric-top"><span>DEQ Residual</span><span class="evidence-badge measured">실측</span></div>
-            <div class="metric-value"><b id="metric-residual">0.003906</b><small>final</small></div>
+            <div class="metric-top"><span>DEQ Residual</span><span class="evidence-badge planned" data-live-evidence-badge>미검증</span></div>
+            <div class="metric-value"><b id="metric-residual">—</b><small>max</small></div>
             <div class="threshold-line"><i></i><span>수렴 임계 0.005</span></div>
-            <div class="metric-foot"><span>Fallback</span><strong id="metric-fallback">미사용</strong></div>
+            <div class="metric-foot"><span>Fallback</span><strong id="metric-fallback">미측정</strong></div>
           </article>
           <article class="metric-card surface">
-            <div class="metric-top"><span>Release QA</span><span class="evidence-badge verified">별도 검증</span></div>
-            <div class="metric-value"><b id="metric-tests">178</b><small>tests</small></div>
+            <div class="metric-top"><span>Release QA</span><span class="evidence-badge planned">증거 필요</span></div>
+            <div class="metric-value"><b id="metric-tests">—</b><small>evidence</small></div>
             <div class="test-stack" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
-            <div class="metric-foot"><span>릴리스 스냅샷</span><strong>PASS</strong></div>
+            <div class="metric-foot"><span>릴리스 스냅샷</span><strong>미연결</strong></div>
           </article>
         </div>
 
@@ -265,7 +363,7 @@
             <ol class="phase-list" id="phase-list">
               <li data-phase="verify"><span><i></i></span><div><strong>Artifact integrity</strong><small>로컬 manifest · SHA-256 검증</small></div><b>01</b></li>
               <li data-phase="model_load"><span><i></i></span><div><strong>Local Gemma load</strong><small>원격 코드·Hub 요청 차단</small></div><b>02</b></li>
-              <li data-phase="runtime_build"><span><i></i></span><div><strong>Genesis runtime</strong><small>Fast Weight · System 3/4 · BIO-HAMA</small></div><b>03</b></li>
+              <li data-phase="runtime_build"><span><i></i></span><div><strong>Genesis runtime</strong><small>Gemma/CTS answer path · advisory telemetry · gated overlays</small></div><b>03</b></li>
               <li data-phase="inference"><span><i></i></span><div><strong>DEQ + CTS search</strong><small>고정 301-node arena · Depth 100</small></div><b>04</b></li>
               <li data-phase="postcheck"><span><i></i></span><div><strong>Safety postcheck</strong><small>VRAM · finite · residual · fallback</small></div><b>05</b></li>
             </ol>
@@ -302,10 +400,10 @@
                 <path class="equilibrium-wave" d="M242 210c22-52 44 52 68 0s46 52 68 0"/>
                 <circle class="core-dot" cx="310" cy="210" r="13"/>
               </svg>
-              <div class="reactor-readout"><span>REACHED DEPTH</span><strong id="reactor-depth">100</strong><small>/ 100</small></div>
+              <div class="reactor-readout"><span>REACHED DEPTH</span><strong id="reactor-depth">—</strong><small>/ 100</small></div>
               <div class="reactor-chip chip-left"><span>LATENT</span><b>R<sup>64</sup></b></div>
               <div class="reactor-chip chip-right"><span>ARENA</span><b>301</b></div>
-              <div class="reactor-chip chip-bottom"><span>RESIDUAL</span><b id="reactor-residual">3.906e-3</b></div>
+              <div class="reactor-chip chip-bottom"><span>RESIDUAL</span><b id="reactor-residual">—</b></div>
             </div>
             <p class="visual-disclaimer"><span>시각화</span> 노드 이동은 실행 단계 표현이며, 수치는 검증 프로세스가 반환한 실측값만 표시합니다.</p>
           </article>
@@ -313,15 +411,15 @@
           <article class="telemetry-card surface" aria-labelledby="telemetry-title">
             <div class="card-heading compact"><div><span class="section-kicker">BOUNDARY WATCH</span><h2 id="telemetry-title">안전 경계</h2></div></div>
             <div class="telemetry-block">
-              <div class="telemetry-label"><span>VRAM ALLOCATED</span><b><em id="telemetry-vram">14.8560</em> / 16.7 GiB</b></div>
-              <div class="vram-visual"><progress class="vram-fill" id="telemetry-vram-fill" max="16.7" value="14.856" aria-label="VRAM 사용량 14.856 GiB, 상한 16.7 GiB"></progress><span class="vram-limit">LIMIT</span><div class="vram-grid"></div></div>
+              <div class="telemetry-label"><span>VRAM ALLOCATED</span><b><em id="telemetry-vram">—</em> / 16.7 GiB</b></div>
+              <div class="vram-visual"><progress class="vram-fill" id="telemetry-vram-fill" max="16.7" value="0" aria-label="현재 프로세스 VRAM 검증 전"></progress><span class="vram-limit">LIMIT</span><div class="vram-grid"></div></div>
             </div>
             <dl class="telemetry-list">
-              <div><dt>Contraction</dt><dd>0.40</dd></div>
-              <div><dt>Spectral margin</dt><dd>&lt; 0.95</dd></div>
-              <div><dt>Finite check</dt><dd id="telemetry-finite" class="positive">PASS</dd></div>
-              <div><dt>Fallback</dt><dd id="telemetry-fallback">NOT USED</dd></div>
-              <div><dt>External API</dt><dd class="positive">BLOCKED</dd></div>
+              <div><dt>Contraction</dt><dd>설계 상한 0.40</dd></div>
+              <div><dt>Spectral margin</dt><dd>업데이트 투영 &lt; 0.95</dd></div>
+              <div><dt>Finite check</dt><dd id="telemetry-finite">미측정</dd></div>
+              <div><dt>Fallback</dt><dd id="telemetry-fallback">미측정</dd></div>
+              <div><dt>App external calls</dt><dd id="telemetry-external-calls">UNVERIFIED</dd></div>
             </dl>
             <button class="text-link" type="button" data-action="toggle-log">실행 이벤트 보기 <span>↗</span></button>
           </article>
@@ -335,38 +433,38 @@
 
       <section class="view" id="view-architecture" data-view-panel="architecture" aria-labelledby="architecture-title" hidden>
         <div class="view-heading">
-          <div><span class="section-kicker">AIR-GAPPED ARCHITECTURE</span><h1 id="architecture-title">문장은 경계에서 끝납니다.<br>내부에서는 텐서만 이동합니다.</h1><p>제어 평면과 GPU 인지 코어를 분리하고, 한 시점에 하나의 CUDA 소유자만 허용합니다.</p></div>
-          <span class="evidence-badge verified large">구성 검증</span>
+          <div><span class="section-kicker">AIR-GAPPED ARCHITECTURE</span><h1 id="architecture-title">모델 IPC 경계에서는 텐서가 이동합니다.<br>제어·증거 경계는 타입 계약을 따릅니다.</h1><p>GPU hot path는 bounded tensor protocol을 사용하고, 제어·저장·감사 경로는 bounded typed payload를 사용합니다. 이는 제품 전체의 tensor-only 주장이 아닙니다.</p></div>
+          <span class="evidence-badge large" id="architecture-authority-badge">AUTHORITY UNVERIFIED</span>
         </div>
 
         <article class="architecture-map surface" aria-label="Cogni-OS 시스템 아키텍처">
           <div class="arch-column flow-column">
             <div class="arch-column-title"><span>CPU CONTROL PLANE</span><h2>Cogni-Flow</h2><p>설계 · 운영 · 진화</p></div>
-            <button class="arch-node" type="button" data-node="rhythm"><i class="node-icon">01</i><span><strong>Bio Rhythm</strong><small>Day / Night exclusion</small></span><b>STATE</b></button>
-            <button class="arch-node" type="button" data-node="router"><i class="node-icon">02</i><span><strong>BIO-HAMA</strong><small>인지 부하 메타 라우팅</small></span><b>ROUTE</b></button>
-            <button class="arch-node" type="button" data-node="aflow"><i class="node-icon">03</i><span><strong>AFlow</strong><small>bounded workflow search</small></span><b>PLAN</b></button>
-            <button class="arch-node" type="button" data-node="harness"><i class="node-icon">04</i><span><strong>Self-Harness</strong><small>검증 후 patch promotion</small></span><b>EVOLVE</b></button>
+            <button class="arch-node" type="button" data-node="rhythm"><i class="node-icon">01</i><span><strong>Bio Rhythm</strong><small>Day / Night exclusion</small></span><b>STATE MACHINE</b></button>
+            <button class="arch-node" type="button" data-node="router" data-capability-name="bio_hama" data-execution-module="router"><i class="node-icon">02</i><span><strong>BIO-HAMA</strong><small>인지 부하 메타 라우팅</small></span><b data-execution-status>UNVERIFIED</b></button>
+            <button class="arch-node" type="button" data-node="aflow" data-capability-name="aflow" data-execution-module="aflow"><i class="node-icon">03</i><span><strong>AFlow</strong><small>bounded workflow archive</small></span><b data-execution-status>UNVERIFIED</b></button>
+            <button class="arch-node" type="button" data-node="harness" data-capability-name="self_harness" data-execution-module="harness"><i class="node-icon">04</i><span><strong>Self-Harness</strong><small>evidence-linked proposal ledger</small></span><b data-execution-status>UNVERIFIED</b></button>
           </div>
 
           <div class="arch-boundary">
-            <span class="boundary-label">BOUNDED TENSOR BOUNDARY</span>
+            <span class="boundary-label">MODEL IPC TENSOR BOUNDARY</span>
             <div class="tensor-stream" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
             <div class="protocol-stack"><span>INFER</span><span>PAUSE</span><span>RESUME</span><span>STOP</span></div>
-            <div class="boundary-note"><strong>4× CPU Tensor</strong><small>numeric protocol · timeout · bounded queue</small></div>
+            <div class="boundary-note"><strong>Bounded model IPC</strong><small>tensor hot path · typed control envelope · timeout · bounded queue</small></div>
           </div>
 
           <div class="arch-column core-column">
             <div class="arch-column-title"><span>SINGLE GPU DATA PLANE</span><h2>Cogni-Core</h2><p>지각 · 평형 · 탐색</p></div>
-            <button class="arch-node accent-node" type="button" data-node="gemma"><i class="node-icon">G4</i><span><strong>Local Gemma 4</strong><small>feature backbone · no KV cache</small></span><b>LOAD</b></button>
+            <button class="arch-node accent-node" type="button" data-node="gemma" data-capability-name="gemma4_e4b" data-execution-module="gemma"><i class="node-icon">G4</i><span><strong>Local Gemma 4</strong><small>answer-bearing backbone · no KV cache</small></span><b data-execution-status>UNVERIFIED</b></button>
             <div class="core-cluster">
-              <button type="button" data-node="deq"><strong>DEQ</strong><small>Broyden equilibrium</small></button>
-              <button type="button" data-node="cts"><strong>CTS</strong><small>fixed arena search</small></button>
-              <button type="button" data-node="fast"><strong>Fast Weight</strong><small>bounded overlay</small></button>
-              <button type="button" data-node="swarm"><strong>System 4</strong><small>tensor swarm</small></button>
-              <button type="button" data-node="experts"><strong>System 3</strong><small>sparse experts</small></button>
-              <button type="button" data-node="ewc"><strong>FP-EWC</strong><small>stability guard</small></button>
+              <button type="button" data-node="deq" data-capability-name="cts_deq" data-execution-module="cts"><strong>DEQ</strong><small>Broyden equilibrium</small></button>
+              <button type="button" data-node="cts" data-capability-name="cts_deq" data-execution-module="cts"><strong>CTS</strong><small>fixed arena search</small></button>
+              <button type="button" data-node="fast" data-capability-name="system_1_5" data-execution-module="fast"><strong>Fast Weight</strong><small>gated overlay candidate</small></button>
+              <button type="button" data-node="swarm" data-capability-name="system_4" data-execution-module="swarm"><strong>System 4</strong><small>telemetry-only tensor swarm</small></button>
+              <button type="button" data-node="experts" data-capability-name="system_3" data-execution-module="experts"><strong>System 3</strong><small>telemetry-only experts</small></button>
+              <button type="button" data-node="ewc" data-capability-name="system_2_5" data-execution-module="stability"><strong>FP-EWC</strong><small>night-only update guard</small></button>
             </div>
-            <div class="core-safety"><span>C-FIRE</span><strong>L &lt; 0.95</strong><small>spectral safety projection</small></div>
+            <div class="core-safety"><span>C-FIRE</span><strong>UPDATE PROJECTION</strong><small>target L &lt; 0.95 · not a decoder-wide certificate</small></div>
           </div>
         </article>
 
@@ -374,14 +472,16 @@
           <article class="rhythm-card surface">
             <div class="card-heading compact"><div><span class="section-kicker">BIOLOGICAL RHYTHM</span><h2>추론과 진화는 동시에 실행되지 않습니다</h2></div></div>
             <div class="rhythm-track" aria-label="주간 추론과 야간 진화 상태 전이">
-              <span class="is-active"><i></i>Inference</span><b>→</b><span><i></i>Drain</span><b>→</b><span><i></i>Checkpoint</span><b>→</b><span class="night"><i></i>Evolution</span><b>→</b><span><i></i>Validate</span><b>→</b><span><i></i>Promote / Rollback</span>
+              <span class="is-active"><i></i>Inference</span><b>→</b><span><i></i>Drain</span><b>→</b><span><i></i>Checkpoint</span><b>→</b><span class="night"><i></i>Proposal</span><b>→</b><span><i></i>Policy Check</span><b>→</b><span><i></i>Archive / Review</span>
             </div>
           </article>
           <article class="node-detail surface" id="node-detail" aria-live="polite">
             <span class="section-kicker">SELECT A MODULE</span>
             <h2>안전한 마이크로서비스 경계</h2>
-            <p>GPU 모델은 worker 하나만 소유합니다. 요청과 응답은 고정된 텐서 프로토콜을 통과하며 문자열·JSON은 hot path에 들어가지 않습니다.</p>
-            <div><span>상태</span><strong>IMPLEMENTED + TESTED</strong></div>
+            <p>모델 IPC hot path와 제어·증거 경계는 서로 다른 제한 계약을 사용합니다. 모듈을 선택하면 실행 상태와 Fact-book 권한을 분리해 표시합니다.</p>
+            <div><span>실행</span><strong id="node-detail-execution">UNVERIFIED</strong></div>
+            <div><span>권한</span><strong id="node-detail-authority">UNVERIFIED · OFF</strong></div>
+            <div><span>증거</span><strong id="node-detail-evidence">EVIDENCE UNVERIFIED</strong></div>
           </article>
         </div>
       </section>
@@ -462,9 +562,9 @@
           <article class="evidence-ledger surface" aria-labelledby="ledger-title">
             <div class="card-heading"><div><span class="section-kicker">EVIDENCE LEDGER</span><h2 id="ledger-title">핵심 주장 검증 현황</h2></div></div>
             <div class="ledger-list">
-              <div><span class="ledger-status measured">실측</span><p><strong>Gemma 4 + CTS Depth 100</strong><small>실제 로컬 모델 · 301 node · finite</small></p><b>PASS</b></div>
-              <div><span class="ledger-status measured">실측</span><p><strong id="ledger-vram">Peak VRAM 14.8560 GiB</strong><small>현재 RTX 5090 Laptop · 상한 16.7 GiB</small></p><b>PASS</b></div>
-              <div><span class="ledger-status verified">검증</span><p><strong>회귀 테스트 178개</strong><small>별도 릴리스 스냅샷 · warning-as-error · Ruff · format</small></p><b>PASS</b></div>
+              <div><span class="ledger-status planned" data-live-evidence-status>검증 전</span><p><strong>Gemma 4 + CTS V2 Depth 100</strong><small data-live-cts-copy>현재 프로세스 라이브 검증 대기</small></p><b data-live-evidence-result>PENDING</b></div>
+              <div><span class="ledger-status planned" data-live-evidence-status>검증 전</span><p><strong id="ledger-vram">Peak VRAM — GiB</strong><small data-live-vram-copy>현재 프로세스 라이브 검증 대기 · 상한 16.7 GiB</small></p><b data-live-evidence-result>PENDING</b></div>
+              <div><span class="ledger-status planned">증거</span><p><strong>릴리스 회귀 게이트</strong><small>실행 시점의 별도 증거 스냅샷 · Ruff · 전체 테스트</small></p><b>FACT-BOOK</b></div>
               <div><span class="ledger-status verified">검증</span><p><strong>주·야간 상호 배제</strong><small>inference/evolution state machine</small></p><b>PASS</b></div>
               <div><span class="ledger-status target">목표</span><p><strong>컨텍스트 길이별 메모리 비교</strong><small>추론 깊이와 별도 축 · baseline 공인시험 필요</small></p><b>PENDING</b></div>
               <div><span class="ledger-status target">목표</span><p><strong>System 4 통신 6.3ms</strong><small>RTX 4090 조건 · 공인시험 전</small></p><b>PENDING</b></div>
@@ -498,17 +598,17 @@
 
     <aside class="evidence-rail" aria-labelledby="rail-title">
       <div class="rail-heading"><span class="section-kicker">EVIDENCE RAIL</span><h2 id="rail-title">실행 무결성</h2></div>
-      <div class="rail-seal"><svg viewBox="0 0 84 84" aria-hidden="true"><circle cx="42" cy="42" r="36"/><path class="seal-check" d="m25 43 11 11 24-27"/><path class="seal-fail" d="m29 29 26 26m0-26L29 55"/><rect class="seal-stop" x="30" y="30" width="24" height="24" rx="3"/></svg><span><strong id="rail-verdict">VERIFIED</strong><small id="rail-time">최근 검증 기록</small></span></div>
+      <div class="rail-seal" data-state="ready"><svg viewBox="0 0 84 84" aria-hidden="true"><circle cx="42" cy="42" r="36"/><path class="seal-check" d="m25 43 11 11 24-27"/><path class="seal-fail" d="m29 29 26 26m0-26L29 55"/><rect class="seal-stop" x="30" y="30" width="24" height="24" rx="3"/></svg><span><strong id="rail-verdict">NOT VERIFIED</strong><small id="rail-time">현재 프로세스 검증 전</small></span></div>
       <dl class="rail-details">
         <div><dt>Model</dt><dd>Gemma 4 e4b</dd></div>
-        <div><dt>Manifest</dt><dd id="rail-files">6 files</dd></div>
-        <div><dt>Runtime</dt><dd>Genesis v0.2.1</dd></div>
-        <div><dt>Network</dt><dd class="positive">BLOCKED</dd></div>
+        <div><dt>Manifest</dt><dd id="rail-files">—</dd></div>
+        <div><dt>Runtime</dt><dd>Genesis v0.4.1</dd></div>
+        <div><dt>App external calls</dt><dd id="rail-external-calls">UNVERIFIED</dd></div>
         <div><dt>KV cache</dt><dd>DISABLED</dd></div>
       </dl>
       <div class="rail-divider"></div>
       <div class="rail-proof">
-        <span>측정 환경</span><strong id="rail-device">RTX 5090 Laptop GPU</strong><small>현재 실측은 목표 RTX 4090 결과가 아닙니다.</small>
+        <span>측정 환경</span><strong id="rail-device">실행 전 미측정</strong><small>라이브 검증 전에는 과거 장치 수치를 표시하지 않습니다.</small>
       </div>
       <div class="rail-proof">
         <span>메모리 주장 범위</span><strong>고정 용량 CTS 작업 텐서</strong><small>모델 가중치·로그·외부 데이터까지 포함한 전체 시스템 O(1) 주장이 아닙니다.</small>
@@ -522,6 +622,56 @@
     <span class="tour-count" id="tour-count">01 / 06</span>
     <div><span class="section-kicker" id="tour-kicker">WHY NOW</span><h2 id="tour-title">보안 때문에 AI를 포기하는 시장</h2><p id="tour-copy">국방·신약 고객은 데이터를 클라우드로 보낼 수 없고, 자체 구축은 숨은 비용을 만듭니다.</p></div>
     <div class="tour-actions"><button type="button" data-action="tour-close">종료</button><button type="button" data-action="tour-prev">이전</button><button class="primary-button" type="button" data-action="tour-next">다음 <span>→</span></button></div>
+  </div>
+
+  <div class="attachment-preview-layer" id="attachment-preview-layer" hidden>
+    <section class="attachment-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="attachment-preview-title" aria-describedby="attachment-preview-meta" tabindex="-1">
+      <header>
+        <div><span class="section-kicker">LOCAL ATTACHMENT PREVIEW</span><h2 id="attachment-preview-title">첨부 미리보기</h2></div>
+        <button type="button" data-action="workspace-preview-close" aria-label="첨부 미리보기 닫기">×</button>
+      </header>
+      <div class="attachment-preview-body">
+        <pre id="attachment-preview-text" hidden></pre>
+        <img id="attachment-preview-image" alt="" hidden>
+      </div>
+      <p id="attachment-preview-meta">로컬 파일을 확인하고 있습니다.</p>
+    </section>
+  </div>
+
+  <div class="evidence-drawer-layer" id="evidence-drawer-layer" hidden>
+    <aside class="evidence-drawer" id="evidence-drawer" role="dialog" aria-modal="true" aria-labelledby="evidence-drawer-title" aria-describedby="evidence-drawer-status" tabindex="-1">
+      <header>
+        <div><span class="section-kicker">NORMALIZED EXTRACTED EVIDENCE</span><h2 id="evidence-drawer-title">정규화 추출 근거</h2></div>
+        <button type="button" data-action="rag-evidence-close" aria-label="정규화 추출 근거 닫기">×</button>
+      </header>
+      <p class="evidence-drawer-status" id="evidence-drawer-status" role="status" aria-live="polite" aria-atomic="true">근거를 불러올 준비가 되었습니다.</p>
+      <dl class="evidence-drawer-facts">
+        <div><dt>위치</dt><dd id="evidence-drawer-location">—</dd></div>
+        <div><dt>표현 형식</dt><dd id="evidence-drawer-representation">정규화 추출 발췌 · 원본 첨부 바이트 아님</dd></div>
+        <div><dt>검색 점수</dt><dd id="evidence-drawer-score">—</dd></div>
+        <div><dt>발췌 SHA-256</dt><dd id="evidence-drawer-digest">—</dd></div>
+      </dl>
+      <section class="evidence-drawer-excerpt" aria-labelledby="evidence-drawer-excerpt-title">
+        <h3 id="evidence-drawer-excerpt-title">검증된 정규화 추출 발췌</h3>
+        <pre id="evidence-drawer-excerpt" hidden></pre>
+        <p id="evidence-drawer-empty">근거 위치와 무결성을 확인하고 있습니다.</p>
+      </section>
+      <footer>
+        <span>로컬 첨부 저장소 · 읽기 전용</span>
+        <button type="button" data-action="rag-evidence-close">닫기</button>
+      </footer>
+    </aside>
+  </div>
+  <div class="proposal-review-layer" id="proposal-review-layer" hidden>
+    <section class="proposal-review-dialog" role="dialog" aria-modal="true" aria-labelledby="proposal-review-title" aria-describedby="proposal-review-copy" tabindex="-1">
+      <header>
+        <div><span class="section-kicker">READ-ONLY PROPOSAL REVIEW</span><h2 id="proposal-review-title">Self-Harness 제안 diff</h2></div>
+        <button type="button" data-action="evolution-review-close" aria-label="Self-Harness 제안 검토 닫기">×</button>
+      </header>
+      <p id="proposal-review-copy">현재 소스와 증거 digest가 일치하는 제안만 표시합니다. 이 화면에는 실행·승인·적용 기능이 없습니다.</p>
+      <div class="proposal-review-summary" role="status" aria-live="polite"><strong id="proposal-review-count">0개 제안</strong><span>읽기 전용 · 소스 변경 0</span></div>
+      <div class="proposal-review-list" id="proposal-review-list" aria-live="polite"></div>
+    </section>
   </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden><i></i><span></span></div>

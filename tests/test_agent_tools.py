@@ -31,6 +31,39 @@ class TestToolRequestParsing(unittest.TestCase):
         with self.assertRaises(ToolPolicyError):
             parse_tool_request("/save ../x.md\nunsafe")
 
+    def test_unambiguous_natural_language_compiles_to_the_same_typed_requests(self):
+        cases = {
+            "프로젝트 상태를 보여주세요": ("status", "", "."),
+            "src 폴더의 파일 목록을 보여주세요": ("list", "src", "."),
+            "README.md 파일의 내용을 읽어주세요": ("read", "README.md", "."),
+            'src 안에서 "tensor" 검색해주세요': ("search", "tensor", "src"),
+            "tests/test_x.py 테스트를 실행해주세요": (
+                "test",
+                "tests/test_x.py",
+                ".",
+            ),
+            "show project status": ("status", "", "."),
+            'find "needle" in docs': ("search", "needle", "docs"),
+        }
+        for message, expected in cases.items():
+            with self.subTest(message=message):
+                request = parse_tool_request(message)
+                self.assertIsNotNone(request)
+                self.assertEqual(
+                    (request.operation, request.argument, request.scope), expected
+                )
+
+    def test_ambiguous_or_command_like_natural_language_never_issues_a_task(self):
+        for message in (
+            "알아서 프로젝트를 고쳐줘",
+            "rm -rf 실행해줘",
+            "인터넷에서 찾아줘",
+            "README를 읽고 테스트하고 저장해줘",
+            "PowerShell 명령을 실행해주세요",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(parse_tool_request(message))
+
 
 class TestWorkspaceToolExecutor(unittest.TestCase):
     def setUp(self) -> None:
@@ -63,6 +96,12 @@ class TestWorkspaceToolExecutor(unittest.TestCase):
             (self.root / saved.artifact).read_text(encoding="utf-8"), "verified"
         )
 
+        natural = self.executor.execute(
+            parse_tool_request("src 폴더의 파일 목록을 보여주세요")
+        )
+        self.assertTrue(natural.ok)
+        self.assertIn("demo.py", natural.output)
+
     def test_traversal_binary_and_source_write_are_rejected(self) -> None:
         escaped = self.executor.execute(parse_tool_request("/read ../secret.txt"))
         self.assertFalse(escaped.ok)
@@ -81,6 +120,11 @@ class TestWorkspaceToolExecutor(unittest.TestCase):
             with self.subTest(request=request):
                 result = self.executor.execute(parse_tool_request(request))
                 self.assertFalse(result.ok)
+
+    def test_product_test_execution_is_gated_without_os_attestation(self) -> None:
+        result = self.executor.execute(parse_tool_request("/test"))
+        self.assertFalse(result.ok)
+        self.assertIn("OS-level process-tree and network sandbox", result.output)
 
     def test_symlink_inputs_and_output_roots_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as outside_raw:

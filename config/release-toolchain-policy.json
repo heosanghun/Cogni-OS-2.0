@@ -1,0 +1,15 @@
+{
+  "schema": "cogni.release.toolchain-policy.v2",
+  "status": "unconfigured",
+  "runner_mode": null,
+  "powershell_path": null,
+  "powershell_sha256": null,
+  "python_path": null,
+  "python_sha256": null,
+  "git_path": null,
+  "git_sha256": null,
+  "build_closure_manifest_path": null,
+  "build_closure_manifest_sha256": null,
+  "offline_wheelhouse_manifest_path": null,
+  "offline_wheelhouse_manifest_sha256": null
+}

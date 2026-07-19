@@ -12,7 +12,9 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
+import math
 from threading import RLock
+from time import monotonic
 from typing import Callable, Iterable, Iterator, Mapping
 
 import torch
@@ -21,8 +23,12 @@ from torch import Tensor, nn
 from .fp_ewc import (
     FPEWCRegularizer,
     FisherSnapshot,
+    FixedPointFisherConfig,
+    FixedPointFisherEstimate,
+    estimate_empirical_fixed_point_fisher,
     estimate_fixed_point_fisher,
 )
+from .fast_weight_safety import VerifiedFastWeightAdmission
 
 
 @dataclass(frozen=True)
@@ -198,6 +204,8 @@ class SessionRecord:
     overlays: Mapping[str, LowRankOverlay]
     quality: float
     nbytes: int
+    expires_at: float
+    authorization: VerifiedFastWeightAdmission | None
 
 
 @dataclass(frozen=True)
@@ -214,14 +222,26 @@ class FastWeightSessionCache:
     """LRU cache and exception-safe activation for low-rank sessions.
 
     Sessions are detached and stored on ``storage_device`` (CPU by default),
-    bounding persistent VRAM use.  The cache is bounded by both session count
-    and bytes.  Activating a session installs additive forward hooks and removes
-    them in ``finally``; base weights are not copied, patched, or reassigned.
+    bounding persistent VRAM use.  The cache is bounded by session count, bytes,
+    overlay structures per session, and an absolute (non-sliding) TTL.
+    Activating a session installs additive forward hooks transactionally and
+    removes them in ``finally``; base weights are not copied, patched, or
+    reassigned.
 
     Forward hooks are process-global to each module, so callers must serialize
     different active sessions.  The day/night state machine already imposes
     that execution model; this class detects accidental overlapping activation.
+
+    ``on_sessions_removed`` is an optional bounded control-plane callback for
+    keeping a separate OOD router in sync.  It receives one tuple of removed
+    identifiers after each atomic cache mutation.  The cache is already in its
+    fail-closed state if that callback raises.
     """
+
+    DEFAULT_SESSION_TTL_SECONDS = 15.0 * 60.0
+    MAX_SESSION_TTL_SECONDS = 24.0 * 60.0 * 60.0
+    DEFAULT_MAX_OVERLAYS_PER_SESSION = 8
+    HARD_MAX_OVERLAYS_PER_SESSION = 64
 
     def __init__(
         self,
@@ -230,33 +250,220 @@ class FastWeightSessionCache:
         gate: OverlayAcceptanceGate | None = None,
         max_sessions: int = 8,
         max_bytes: int = 64 * 1024 * 1024,
+        session_ttl_seconds: float = DEFAULT_SESSION_TTL_SECONDS,
+        max_overlays_per_session: int = DEFAULT_MAX_OVERLAYS_PER_SESSION,
         storage_device: torch.device | str = "cpu",
+        clock: Callable[[], float] = monotonic,
+        on_sessions_removed: Callable[[tuple[str, ...]], None] | None = None,
+        feature_enabled: bool = True,
+        trusted_programmer_sha256: str | None = None,
+        allow_unverified_research: bool = False,
     ) -> None:
-        if max_sessions <= 0:
+        if (
+            not isinstance(max_sessions, int)
+            or isinstance(max_sessions, bool)
+            or max_sessions <= 0
+        ):
             raise ValueError("max_sessions must be positive")
-        if max_bytes <= 0:
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or max_bytes <= 0
+        ):
             raise ValueError("max_bytes must be positive")
+        ttl = float(session_ttl_seconds)
+        if not math.isfinite(ttl) or not 0.0 < ttl <= self.MAX_SESSION_TTL_SECONDS:
+            raise ValueError(
+                "session_ttl_seconds must be finite and in "
+                f"(0, {self.MAX_SESSION_TTL_SECONDS}]"
+            )
+        if (
+            not isinstance(max_overlays_per_session, int)
+            or isinstance(max_overlays_per_session, bool)
+            or not 1 <= max_overlays_per_session <= self.HARD_MAX_OVERLAYS_PER_SESSION
+        ):
+            raise ValueError(
+                "max_overlays_per_session must be in "
+                f"[1, {self.HARD_MAX_OVERLAYS_PER_SESSION}]"
+            )
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        if on_sessions_removed is not None and not callable(on_sessions_removed):
+            raise TypeError("on_sessions_removed must be callable or None")
+        if not isinstance(feature_enabled, bool):
+            raise TypeError("feature_enabled must be bool")
+        if not isinstance(allow_unverified_research, bool):
+            raise TypeError("allow_unverified_research must be bool")
+        if trusted_programmer_sha256 is not None:
+            if (
+                not isinstance(trusted_programmer_sha256, str)
+                or len(trusted_programmer_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in trusted_programmer_sha256
+                )
+            ):
+                raise ValueError(
+                    "trusted_programmer_sha256 must be a lowercase SHA-256 digest"
+                )
         self.model = model
         self.gate = gate or OverlayAcceptanceGate()
         self.max_sessions = max_sessions
         self.max_bytes = max_bytes
+        self.session_ttl_seconds = ttl
+        self.max_overlays_per_session = max_overlays_per_session
         self.storage_device = torch.device(storage_device)
+        self._clock = clock
+        self._on_sessions_removed = on_sessions_removed
+        self._feature_enabled = feature_enabled
+        self._trusted_programmer_sha256 = trusted_programmer_sha256
+        self._allow_unverified_research = allow_unverified_research
         self._sessions: OrderedDict[str, SessionRecord] = OrderedDict()
         self._bytes = 0
         self._active_session: str | None = None
         self._lock = RLock()
+        self._last_clock = self._read_clock()
+
+    def _read_clock(self) -> float:
+        value = float(self._clock())
+        if not math.isfinite(value):
+            raise RuntimeError("session clock must return a finite value")
+        return value
+
+    def _now_locked(self) -> float:
+        value = self._read_clock()
+        if value < self._last_clock:
+            raise RuntimeError("session clock moved backwards")
+        self._last_clock = value
+        return value
+
+    @staticmethod
+    def _quality_value(quality: float | Tensor) -> float:
+        if isinstance(quality, Tensor):
+            if quality.numel() == 0:
+                return float("nan")
+            return float(quality.detach().float().mean())
+        return float(quality)
+
+    def _rejection(self, quality: float | Tensor, reason: str) -> AdmissionResult:
+        return AdmissionResult(
+            AcceptanceDecision(False, self._quality_value(quality), 0.0, reason)
+        )
+
+    def _assert_invariants_locked(self) -> None:
+        if not 0 <= len(self._sessions) <= self.max_sessions:
+            raise RuntimeError("fast-weight session-count invariant failed")
+        measured = sum(record.nbytes for record in self._sessions.values())
+        if measured != self._bytes or not 0 <= self._bytes <= self.max_bytes:
+            raise RuntimeError("fast-weight byte-accounting invariant failed")
+        if (
+            self._active_session is not None
+            and self._active_session not in self._sessions
+        ):
+            raise RuntimeError("active fast-weight session is missing from the cache")
+        for record in self._sessions.values():
+            if not math.isfinite(record.expires_at):
+                raise RuntimeError("fast-weight session expiry must be finite")
+            if len(record.overlays) > self.max_overlays_per_session:
+                raise RuntimeError("fast-weight structure-count invariant failed")
+            if not self._allow_unverified_research and (
+                self._trusted_programmer_sha256 is None
+                or record.authorization is None
+                or not record.authorization.valid_for(self._trusted_programmer_sha256)
+            ):
+                raise RuntimeError("fast-weight session authorization invariant failed")
+
+    def _notify_removed_locked(self, removed: tuple[str, ...]) -> None:
+        if removed and self._on_sessions_removed is not None:
+            self._on_sessions_removed(removed)
+
+    def _purge_expired_locked(self, now: float | None = None) -> tuple[str, ...]:
+        timestamp = self._now_locked() if now is None else now
+        removed: list[str] = []
+        for session_id, record in tuple(self._sessions.items()):
+            if session_id == self._active_session or record.expires_at > timestamp:
+                continue
+            self._sessions.pop(session_id)
+            self._bytes -= record.nbytes
+            removed.append(session_id)
+        result = tuple(removed)
+        self._assert_invariants_locked()
+        self._notify_removed_locked(result)
+        return result
+
+    def _clear_locked(self) -> tuple[str, ...]:
+        removed = tuple(self._sessions)
+        self._sessions.clear()
+        self._bytes = 0
+        self._assert_invariants_locked()
+        self._notify_removed_locked(removed)
+        return removed
+
+    @property
+    def feature_enabled(self) -> bool:
+        with self._lock:
+            return self._feature_enabled
 
     @property
     def total_bytes(self) -> int:
-        return self._bytes
+        with self._lock:
+            self._purge_expired_locked()
+            return self._bytes
 
     @property
     def session_ids(self) -> tuple[str, ...]:
         """Session IDs in LRU-to-MRU order."""
-        return tuple(self._sessions)
+        with self._lock:
+            self._purge_expired_locked()
+            return tuple(self._sessions)
 
     def __len__(self) -> int:
-        return len(self._sessions)
+        with self._lock:
+            self._purge_expired_locked()
+            return len(self._sessions)
+
+    def purge_expired(self) -> tuple[str, ...]:
+        """Remove every expired inactive session in LRU order."""
+
+        with self._lock:
+            return self._purge_expired_locked()
+
+    def flush(self) -> tuple[str, ...]:
+        """Atomically discard all sessions while keeping the feature state."""
+
+        with self._lock:
+            if self._active_session is not None:
+                raise RuntimeError("cannot flush while a fast-weight session is active")
+            return self._clear_locked()
+
+    def feature_off(self) -> tuple[str, ...]:
+        """Fail closed and atomically discard all temporary overlays."""
+
+        with self._lock:
+            if self._active_session is not None:
+                raise RuntimeError(
+                    "cannot disable Fast Weight while a session is active"
+                )
+            self._feature_enabled = False
+            removed = self._clear_locked()
+            self._assert_invariants_locked()
+            return removed
+
+    def feature_on(self) -> None:
+        """Re-enable admission after an explicit control-plane decision."""
+
+        with self._lock:
+            if self._active_session is not None:
+                raise RuntimeError("cannot enable Fast Weight during activation")
+            if (
+                self._trusted_programmer_sha256 is None
+                and not self._allow_unverified_research
+            ):
+                raise RuntimeError(
+                    "cannot enable Fast Weight without a verified programmer checkpoint"
+                )
+            self._feature_enabled = True
+            self._assert_invariants_locked()
 
     def admit(
         self,
@@ -264,11 +471,34 @@ class FastWeightSessionCache:
         overlays: Mapping[str, LowRankOverlay],
         *,
         quality: float | Tensor,
+        authorization: VerifiedFastWeightAdmission | None = None,
     ) -> AdmissionResult:
         """Validate and cache one session, evicting least-recently-used entries."""
 
         if not session_id:
             raise ValueError("session_id must be non-empty")
+        with self._lock:
+            if not self._feature_enabled:
+                return self._rejection(quality, "fast-weight feature disabled")
+            if (
+                not self._allow_unverified_research
+                and self._trusted_programmer_sha256 is None
+            ):
+                return self._rejection(
+                    quality, "verified programmer checkpoint missing"
+                )
+            if not self._allow_unverified_research and (
+                not isinstance(authorization, VerifiedFastWeightAdmission)
+                or not authorization.valid_for(self._trusted_programmer_sha256)
+            ):
+                return self._rejection(
+                    quality, "verified AQ authorization missing or invalid"
+                )
+            if self._active_session is not None:
+                raise RuntimeError("cannot admit while a fast-weight session is active")
+            self._purge_expired_locked()
+        if len(overlays) > self.max_overlays_per_session:
+            return self._rejection(quality, "overlay structure budget exceeded")
         modules = dict(self.model.named_modules())
         base_weights: dict[str, Tensor] = {}
         stored: dict[str, LowRankOverlay] = {}
@@ -302,7 +532,26 @@ class FastWeightSessionCache:
             return AdmissionResult(rejected)
 
         evicted: list[str] = []
+        removed_during_admission: list[str] = []
         with self._lock:
+            if not self._feature_enabled:
+                return self._rejection(quality, "fast-weight feature disabled")
+            if not self._allow_unverified_research and (
+                self._trusted_programmer_sha256 is None
+                or authorization is None
+                or not authorization.valid_for(self._trusted_programmer_sha256)
+            ):
+                return self._rejection(
+                    quality, "verified AQ authorization missing or invalid"
+                )
+            if self._active_session is not None:
+                raise RuntimeError("cannot admit while a fast-weight session is active")
+            expired = self._purge_expired_locked()
+            evicted.extend(expired)
+            now = self._now_locked()
+            expires_at = now + self.session_ttl_seconds
+            if not math.isfinite(expires_at):
+                raise RuntimeError("fast-weight session expiry overflowed")
             previous = self._sessions.pop(session_id, None)
             if previous is not None:
                 self._bytes -= previous.nbytes
@@ -313,28 +562,57 @@ class FastWeightSessionCache:
                 old_id, old = self._sessions.popitem(last=False)
                 self._bytes -= old.nbytes
                 evicted.append(old_id)
-            record = SessionRecord(session_id, stored, decision.quality, size)
+                removed_during_admission.append(old_id)
+            record = SessionRecord(
+                session_id,
+                stored,
+                decision.quality,
+                size,
+                expires_at,
+                authorization,
+            )
             self._sessions[session_id] = record
             self._bytes += size
+            self._assert_invariants_locked()
+            self._notify_removed_locked(tuple(removed_during_admission))
         return AdmissionResult(decision, tuple(evicted))
 
     def discard(self, session_id: str) -> bool:
         with self._lock:
+            self._purge_expired_locked()
             if self._active_session == session_id:
                 raise RuntimeError("cannot discard an active fast-weight session")
             record = self._sessions.pop(session_id, None)
             if record is None:
                 return False
             self._bytes -= record.nbytes
+            self._assert_invariants_locked()
+            self._notify_removed_locked((session_id,))
             return True
 
     def get(self, session_id: str) -> SessionRecord:
         with self._lock:
+            if not self._feature_enabled:
+                raise RuntimeError("Fast Weight feature is disabled")
+            self._purge_expired_locked()
             try:
                 record = self._sessions.pop(session_id)
             except KeyError as exc:
                 raise KeyError(f"unknown fast-weight session: {session_id!r}") from exc
             self._sessions[session_id] = record
+            if not self._allow_unverified_research and (
+                self._trusted_programmer_sha256 is None
+                or record.authorization is None
+                or not record.authorization.valid_for(self._trusted_programmer_sha256)
+            ):
+                self._sessions.pop(session_id, None)
+                self._bytes -= record.nbytes
+                self._assert_invariants_locked()
+                self._notify_removed_locked((session_id,))
+                raise RuntimeError(
+                    "Fast Weight session authorization is no longer valid"
+                )
+            self._assert_invariants_locked()
             return record
 
     @staticmethod
@@ -360,27 +638,74 @@ class FastWeightSessionCache:
     def activate(self, session_id: str) -> Iterator[SessionRecord]:
         """Temporarily apply a cached overlay and always remove it on exit."""
 
+        handles = []
         with self._lock:
+            if not self._feature_enabled:
+                raise RuntimeError("Fast Weight feature is disabled")
+            self._purge_expired_locked()
             if self._active_session is not None:
                 raise RuntimeError(
                     f"fast-weight session {self._active_session!r} is already active"
                 )
-            record = self.get(session_id)
+            try:
+                record = self._sessions.pop(session_id)
+            except KeyError as exc:
+                raise KeyError(f"unknown fast-weight session: {session_id!r}") from exc
+            self._sessions[session_id] = record
+            if not self._allow_unverified_research and (
+                self._trusted_programmer_sha256 is None
+                or record.authorization is None
+                or not record.authorization.valid_for(self._trusted_programmer_sha256)
+            ):
+                self._sessions.pop(session_id, None)
+                self._bytes -= record.nbytes
+                self._assert_invariants_locked()
+                self._notify_removed_locked((session_id,))
+                raise RuntimeError(
+                    "Fast Weight session authorization is no longer valid"
+                )
             modules = dict(self.model.named_modules())
-            handles = [
-                modules[name].register_forward_hook(self._hook_for(overlay))
-                for name, overlay in record.overlays.items()
-            ]
+            targets: list[tuple[nn.Linear, LowRankOverlay]] = []
+            for name, overlay in record.overlays.items():
+                module = modules.get(name)
+                if not isinstance(module, nn.Linear):
+                    raise RuntimeError(
+                        f"cached overlay target is no longer an nn.Linear: {name!r}"
+                    )
+                targets.append((module, overlay))
+            try:
+                for module, overlay in targets:
+                    handles.append(
+                        module.register_forward_hook(self._hook_for(overlay))
+                    )
+            except BaseException:
+                for handle in reversed(handles):
+                    handle.remove()
+                handles.clear()
+                self._assert_invariants_locked()
+                raise
             self._active_session = session_id
+            self._assert_invariants_locked()
         try:
             yield record
         finally:
             # Remove in reverse registration order in case future hooks depend
             # on ordering. RemovableHandle.remove() is idempotent.
+            cleanup_error: BaseException | None = None
             for handle in reversed(handles):
-                handle.remove()
+                try:
+                    handle.remove()
+                except BaseException as exc:  # pragma: no cover - PyTorch handle fault
+                    if cleanup_error is None:
+                        cleanup_error = exc
             with self._lock:
                 self._active_session = None
+                self._purge_expired_locked()
+                self._assert_invariants_locked()
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    "failed to remove a Fast Weight hook"
+                ) from cleanup_error
 
 
 @dataclass(frozen=True)
@@ -411,9 +736,14 @@ class FixedPointDomainLifecycle:
             raise ValueError("spectral_margin must lie in (0, 1)")
         if max_domains is not None and max_domains <= 0:
             raise ValueError("max_domains must be positive when specified")
-        self.regularizer = FPEWCRegularizer(strength=strength)
+        # The lifecycle owns domain-count merging so its DomainRecord list and
+        # the sample-weighted Fisher snapshots are updated in one transaction.
+        self.regularizer = FPEWCRegularizer(
+            strength=strength,
+            max_domains=FPEWCRegularizer.HARD_MAX_DOMAINS,
+        )
         self.spectral_margin = spectral_margin
-        self.max_domains = max_domains
+        self.max_domains = 16 if max_domains is None else max_domains
         self.domains: list[DomainRecord] = []
 
     @property
@@ -456,7 +786,7 @@ class FixedPointDomainLifecycle:
         if not scores:
             raise ValueError("no Fisher entries matched the supplied parameters")
 
-        self.regularizer.consolidate(params, scores)
+        self.regularizer.consolidate(params, scores, n_samples=n_samples)
         snapshot = self.regularizer.snapshots[-1]
         self.domains.append(DomainRecord(domain_id, n_samples))
         self._enforce_domain_budget()
@@ -487,6 +817,39 @@ class FixedPointDomainLifecycle:
         )
         return self.consolidate(domain_id, params, fisher, n_samples=n_samples)
 
+    def estimate_empirical_and_consolidate(
+        self,
+        domain_id: str,
+        *,
+        f_at_z: Callable[[Tensor], Tensor],
+        z_star: Tensor,
+        log_likelihood_per_sample: Callable[[Tensor], Tensor],
+        named_parameters: Iterable[tuple[str, nn.Parameter]],
+        config: FixedPointFisherConfig,
+        solver_converged: bool,
+    ) -> tuple[FixedPointFisherEstimate, FisherSnapshot]:
+        """Use the typed per-sample empirical fixed-point Fisher authority."""
+
+        if not domain_id:
+            raise ValueError("domain_id must be non-empty")
+        params = list(named_parameters)
+        estimate = estimate_empirical_fixed_point_fisher(
+            f_at_z=f_at_z,
+            z_star=z_star,
+            log_likelihood_per_sample=log_likelihood_per_sample,
+            named_parameters=params,
+            config=config,
+            solver_converged=solver_converged,
+        )
+        snapshot = self.regularizer.consolidate_fisher(
+            params,
+            estimate.fisher,
+            n_samples=estimate.n_samples,
+        )
+        self.domains.append(DomainRecord(domain_id, estimate.n_samples))
+        self._enforce_domain_budget()
+        return estimate, snapshot
+
     def penalty(self, named_parameters: Iterable[tuple[str, nn.Parameter]]) -> Tensor:
         return self.regularizer.penalty(named_parameters)
 
@@ -498,28 +861,8 @@ class FixedPointDomainLifecycle:
         Fisher-weighted mean.  The dropped term is constant in theta.
         """
 
-        if self.max_domains is None:
-            return
         while len(self.regularizer.snapshots) > self.max_domains:
-            first, second = self.regularizer.snapshots[:2]
-            fisher: dict[str, Tensor] = {}
-            anchor: dict[str, Tensor] = {}
-            for name in first.fisher.keys() | second.fisher.keys():
-                f1 = first.fisher.get(name)
-                f2 = second.fisher.get(name)
-                a1 = first.anchor.get(name)
-                a2 = second.anchor.get(name)
-                if f1 is None or a1 is None:
-                    fisher[name], anchor[name] = f2.clone(), a2.clone()  # type: ignore[union-attr]
-                elif f2 is None or a2 is None:
-                    fisher[name], anchor[name] = f1.clone(), a1.clone()
-                else:
-                    total = f1 + f2
-                    safe = total.clamp_min(torch.finfo(total.dtype).eps)
-                    fisher[name] = total
-                    anchor[name] = (f1 * a1 + f2 * a2) / safe
-            merged = FisherSnapshot(fisher=fisher, anchor=anchor)
-            self.regularizer.snapshots[:2] = [merged]
+            self.regularizer.merge_oldest()
             first_domain, second_domain = self.domains[:2]
             self.domains[:2] = [
                 DomainRecord(

@@ -12,8 +12,14 @@ from unittest.mock import patch
 
 import torch
 
-from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError
+from cogni_agent.manager import AgentBusyError, NoActiveAgentTurnError, SYSTEM_PROMPT
+from cogni_agent.tools import MAX_PROJECT_COMMAND_BYTES
+from cogni_agent.model_service import (
+    TRUSTED_GEMMA4_E4B_IT_DIGESTS,
+    TRUSTED_GEMMA4_E4B_IT_REVISION,
+)
 from cogni_demo.server import (
+    ComputeBusyError,
     DemoHTTPServer,
     EvolutionController,
     JobAlreadyRunningError,
@@ -23,7 +29,11 @@ from cogni_demo.server import (
 from cogni_flow.cycle import EvolutionReport
 from cogni_flow.harness import FailureTrace
 from cogni_flow.production import BoundedLogDB, PromotionMode
+from cogni_flow.proposal_review import ProposalReviewError
+from cogni_flow.rhythm import RhythmController
 from cogni_flow.scheduler import ScheduleDecision, ScheduleTick
+from cogni_os.gpu_lease import GPULeaseManager
+from cogni_os.artifacts import ArtifactIdentity, VerifiedArtifactSet
 from tests.test_demo_server import manager_for, wait_for_terminal
 
 
@@ -101,6 +111,7 @@ class _FakeEvolutionManager:
         self.sequence = 0
         self.shutdown_called = False
         self.availability_check = None
+        self.review_requests = 0
 
     @property
     def is_active(self) -> bool:
@@ -123,6 +134,17 @@ class _FakeEvolutionManager:
         self.sequence += 1
         return "evolution-1"
 
+    def proposal_review(self) -> dict[str, object]:
+        self.review_requests += 1
+        return {
+            "schema_version": 1,
+            "mode": "proposal_only_read_only",
+            "items": [],
+            "count": 0,
+            "mutation_endpoint": False,
+            "execution_endpoint": False,
+        }
+
     def shutdown(self) -> None:
         self.active = False
         self.shutdown_called = True
@@ -135,11 +157,76 @@ class _PatchTokenizer:
 
 class _PatchService:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, int]] = []
+        self.calls: list[tuple[str, int, str]] = []
 
-    def generate(self, prompt: str, *, max_new_tokens: int):
-        self.calls.append((prompt, max_new_tokens))
+    def generate(self, prompt: str, *, max_new_tokens: int, decode_mode: str):
+        self.calls.append((prompt, max_new_tokens, decode_mode))
         return SimpleNamespace(token_ids=torch.tensor([3, 4], dtype=torch.int64))
+
+
+class _ProductTokenizer:
+    eos_token_id = 3
+
+    def __call__(self, text, **_kwargs):
+        return {"input_ids": torch.tensor([[len(text)]], dtype=torch.int64)}
+
+    def decode(self, _tokens, **_kwargs):
+        return "local"
+
+    def apply_chat_template(self, messages, **_kwargs):
+        return "|".join(item["content"] for item in messages)
+
+
+class _ProductService:
+    def __init__(self) -> None:
+        self.tokenizer = _ProductTokenizer()
+        self.active_request_id = None
+        self.stop_calls = 0
+
+    def start(self):
+        return self
+
+    def iter_generate_tokens(self, _prompt, *, max_new_tokens):
+        del max_new_tokens
+        if False:
+            yield None
+
+    def generate(self, _prompt, *, max_new_tokens):
+        del max_new_tokens
+        return SimpleNamespace(token_ids=torch.tensor([1], dtype=torch.int64))
+
+    def cancel(self, _request_id=None):
+        return False
+
+    def stop(self, timeout=10.0):
+        del timeout
+        self.stop_calls += 1
+
+
+class _ProductHarness:
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+        self.status = SimpleNamespace(
+            promotion_mode=PromotionMode.PROPOSAL_ONLY,
+            promotion_enabled=False,
+            blocked_reason="proposal only",
+            pending_proposals=0,
+            running=True,
+        )
+
+    def start(self):
+        self.started = True
+        return self
+
+    def stop(self):
+        self.stopped = True
+
+    def tick(self):
+        return ScheduleTick(ScheduleDecision.NOT_IDLE, 0.0)
+
+    def capture_exception(self, *_args, **_kwargs):
+        return None
 
 
 class _HarnessFixture:
@@ -150,6 +237,8 @@ class _HarnessFixture:
             promotion_enabled=False,
             blocked_reason="proposal only",
             pending_proposals=0,
+            unreviewable_proposals=2,
+            proposal_integrity_errors=(("a" * 64, "replacement blob is missing"),),
             running=True,
         )
         self.stopped = False
@@ -267,6 +356,114 @@ class TestAgentHTTPControlPlane(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(state["conversation"], [])
 
+    def test_project_command_uses_bounded_task_envelope_not_chat_limit(self) -> None:
+        project_message = "/project\n" + json.dumps(
+            {
+                "schema_version": 1,
+                "project": "http-poc",
+                "files": [
+                    {"path": "main.txt", "content": "x" * (70 * 1024)},
+                    {"path": "README.md", "content": "bounded multi-file PoC\n"},
+                ],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.assertGreater(len(project_message), 64 * 1024)
+
+        status, state = self._post(
+            "/api/agent/chat",
+            {"message": project_message, "mode": "task", "rag": False},
+        )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(state["turn_id"], "turn-1")
+        self.assertEqual(self.agent.messages[-1]["content"], project_message)
+
+    def test_project_command_http_admission_enforces_mode_and_bundle_bounds(
+        self,
+    ) -> None:
+        valid_payload = {
+            "schema_version": 1,
+            "project": "bounded-poc",
+            "files": [{"path": "main.txt", "content": "safe"}],
+        }
+        project_message = "/project\n" + json.dumps(
+            valid_payload, separators=(",", ":")
+        )
+        for body in (
+            {"message": project_message, "mode": "chat"},
+            {"message": project_message, "mode": "task", "rag": True},
+            {"message": "x" * 4097, "mode": "task"},
+        ):
+            with self.subTest(body=body):
+                status, payload = self._post("/api/agent/chat", body)
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["code"], "INVALID_BODY")
+
+        status, payload = self._post(
+            "/api/agent/chat",
+            {"message": "x" * (70 * 1024), "mode": "chat"},
+        )
+        self.assertEqual(status, 413)
+        self.assertEqual(payload["error"]["code"], "BODY_TOO_LARGE")
+
+        oversized_bundle = dict(valid_payload)
+        oversized_bundle["files"] = [
+            {"path": "main.txt", "content": "x" * (256 * 1024 + 1)}
+        ]
+        status, payload = self._post(
+            "/api/agent/chat",
+            {
+                "message": "/project\n"
+                + json.dumps(oversized_bundle, separators=(",", ":")),
+                "mode": "task",
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "INVALID_BODY")
+
+        command_over_limit = (
+            "/project\n{"
+            + (" " * MAX_PROJECT_COMMAND_BYTES)
+            + '"schema_version":1,"project":"p","files":'
+            '[{"path":"a.txt","content":"x"}]}'
+        )
+        status, payload = self._post(
+            "/api/agent/chat",
+            {"message": command_over_limit, "mode": "task"},
+        )
+        self.assertEqual(status, 413)
+        self.assertEqual(payload["error"]["code"], "BODY_TOO_LARGE")
+
+    def test_proposal_review_is_authenticated_exact_read_only_get(self) -> None:
+        status, payload = self._get("/api/evolution/proposals")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["mode"], "proposal_only_read_only")
+        self.assertFalse(payload["mutation_endpoint"])
+        self.assertFalse(payload["execution_endpoint"])
+        self.assertEqual(self.evolution.review_requests, 1)
+
+        status, payload = self._get("/api/evolution/proposals?apply=true")
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"]["code"], "NOT_FOUND")
+        status, payload = self._post("/api/evolution/proposals", {})
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"]["code"], "NOT_FOUND")
+        self.assertEqual(self.evolution.review_requests, 1)
+
+        with patch.object(
+            self.evolution,
+            "proposal_review",
+            side_effect=ProposalReviewError("C:/private/source.py changed"),
+        ):
+            status, payload = self._get("/api/evolution/proposals")
+        self.assertEqual(status, 409)
+        self.assertEqual(
+            payload,
+            {"error": {"code": "PROPOSAL_REVIEW_INTEGRITY_FAILED"}},
+        )
+
     def test_validator_agent_and_evolution_have_one_compute_owner(self) -> None:
         status, _payload = self._post("/api/run", {})
         self.assertEqual(status, 202)
@@ -290,6 +487,7 @@ class TestAgentHTTPControlPlane(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(state["job_id"], "evolution-1")
         self.assertTrue(self.evolution.is_active)
+        self.assertEqual(self.agent.model_stops, 2)
 
         status, _payload = self._post(
             "/api/agent/chat", {"message": "진화 중에는 차단"}
@@ -310,9 +508,99 @@ class TestAgentHTTPControlPlane(unittest.TestCase):
         self.server.shutdown_components()
         self.assertTrue(self.agent.shutdown_called)
         self.assertTrue(self.evolution.shutdown_called)
+        with self.assertRaisesRegex(ComputeBusyError, "shutting down"):
+            self.server.start_agent_turn("closed", "chat")
 
 
 class TestEvolutionAndPatchServiceIntegration(unittest.TestCase):
+    def test_evolution_cleanup_failure_is_terminal_failed_not_complete(self) -> None:
+        harness = _ProductHarness()
+
+        def fail_cleanup() -> None:
+            raise RuntimeError("worker still owns GPU")
+
+        controller = EvolutionController(harness, worker_cleanup=fail_cleanup)
+        controller.start()
+        deadline = monotonic() + 2.0
+        while controller.is_active and monotonic() < deadline:
+            sleep(0.01)
+
+        state = controller.snapshot()
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["error"]["code"], "RuntimeError")
+        self.assertIn("worker still owns GPU", state["error"]["message"])
+        controller.worker_cleanup = None
+        controller.shutdown()
+
+    def test_product_controls_share_one_gpu_authority_and_rhythm(self) -> None:
+        from cogni_agent.conversation_fastpath import ConversationFastPath
+        from tests.test_agent_quality_integration import _factbook
+
+        validator = manager_for("success")
+        leases = GPULeaseManager()
+        rhythm = RhythmController()
+        service = _ProductService()
+        harness = _ProductHarness()
+        facts = _factbook()
+
+        with (
+            patch(
+                "cogni_demo.server.verify_artifact_manifest",
+                return_value=VerifiedArtifactSet(
+                    root=Path("local-model"),
+                    files=(),
+                    identity=ArtifactIdentity(
+                        family="gemma4",
+                        variant="e4b",
+                        role="instruction_tuned",
+                        source="google/gemma-4-E4B-it",
+                        revision=TRUSTED_GEMMA4_E4B_IT_REVISION,
+                    ),
+                    digests=TRUSTED_GEMMA4_E4B_IT_DIGESTS,
+                ),
+            ),
+            patch(
+                "cogni_os.factbook.build_runtime_factbook_from_verified",
+                return_value=facts,
+            ),
+            patch(
+                "cogni_agent.model_service.ModelService.for_local_gemma",
+                return_value=service,
+            ) as service_factory,
+            patch(
+                "cogni_flow.production.build_production_self_harness",
+                return_value=harness,
+            ) as harness_factory,
+        ):
+            agent, evolution = _build_product_controls(
+                Path.cwd(),
+                "local-model",
+                "manifest.toml",
+                validator,
+                gpu_lease_manager=leases,
+                rhythm=rhythm,
+            )
+
+        service_options = service_factory.call_args.kwargs
+        self.assertIs(service_options["gpu_lease_manager"], leases)
+        self.assertEqual(service_options["gpu_lease_vram_bytes"], leases.max_vram_bytes)
+        purpose = service_options["gpu_lease_purpose"]
+        self.assertEqual(purpose(), "inference")
+        rhythm.enter_evolution(lambda: None)
+        self.assertEqual(purpose(), "evolution")
+        rhythm.resume_inference("test complete")
+        self.assertIs(agent.rhythm, rhythm)
+        self.assertEqual(agent.system_prompt, SYSTEM_PROMPT)
+        self.assertNotIn("[Runtime Fact-book:", agent.system_prompt)
+        self.assertIsInstance(agent.conversation_fast_path, ConversationFastPath)
+        self.assertIs(harness_factory.call_args.kwargs["rhythm"], rhythm)
+        self.assertIs(evolution.worker_cleanup.__self__, service)
+        self.assertTrue(harness.started)
+
+        evolution.shutdown()
+        agent.shutdown()
+        self.assertGreaterEqual(service.stop_calls, 2)
+
     def test_product_controls_fail_before_model_creation_on_manifest_error(
         self,
     ) -> None:
@@ -340,7 +628,7 @@ class TestEvolutionAndPatchServiceIntegration(unittest.TestCase):
         )
 
         self.assertTrue(torch.equal(output, torch.tensor([[1, 2, 3, 4]])))
-        self.assertEqual(service.calls, [("bounded repair prompt", 2)])
+        self.assertEqual(service.calls, [("bounded repair prompt", 2, "strict")])
         with self.assertRaises(ValueError):
             model.generate(
                 input_ids=torch.tensor([[1, 2]]),
@@ -372,6 +660,12 @@ class TestEvolutionAndPatchServiceIntegration(unittest.TestCase):
             controller = EvolutionController(harness)
 
             self.assertEqual(controller.snapshot()["failures"], 2)
+            self.assertTrue(controller.snapshot()["integrity_degraded"])
+            self.assertEqual(controller.snapshot()["unreviewable_proposals"], 2)
+            self.assertEqual(
+                controller.snapshot()["proposal_integrity_errors"][0]["proposal_id"],
+                "a" * 64,
+            )
             controller.start()
             deadline = monotonic() + 2.0
             while controller.is_active and monotonic() < deadline:

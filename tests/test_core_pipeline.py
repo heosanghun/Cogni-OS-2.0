@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from types import SimpleNamespace
 import unittest
+from time import monotonic_ns
 
 import torch
 from torch import Tensor
@@ -77,16 +78,19 @@ class _FakeRuntime:
         self.calls.append("cts_deq")
         self.infer_kwargs = dict(kwargs)
         session_id = kwargs.get("session_id")
+        admitted = session_id in self.sessions.session_ids
         return SimpleNamespace(
             backbone_state=self.answer_state.clone(),
             search=SimpleNamespace(best_state=self.answer_state.clone()),
-            session_id=session_id,
+            session_id=session_id if admitted else None,
             ood=None,
+            fast_weight=SimpleNamespace(activated=bool(admitted)),
         )
 
-    def adapt_stream(self, observations: Tensor):
+    def adapt_stream(self, observations: Tensor, *, session_id: str):
         self.calls.append("system4")
         self.swarm_observation = observations.clone()
+        self.swarm_session_id = session_id
         batch = observations.shape[0]
         latent = observations.new_full((batch, 3), 7.0)
         return SimpleNamespace(
@@ -95,6 +99,9 @@ class _FakeRuntime:
             regime=observations.new_zeros((), dtype=torch.long),
             residual=observations.new_zeros(batch),
             iterations=observations.new_tensor(2, dtype=torch.long),
+            converged=observations.new_tensor(True, dtype=torch.bool),
+            safe_for_advice=observations.new_tensor(True, dtype=torch.bool),
+            advisory_only=True,
         )
 
     def expert_step(
@@ -130,13 +137,21 @@ class _MixedPrecisionRuntime(_FakeRuntime):
     def __init__(self) -> None:
         super().__init__()
         self.answer_state = self.answer_state.to(torch.bfloat16)
+        self.meta_router = torch.nn.Linear(5, 5).double()
         self.swarm = torch.nn.Linear(4, 4).double()
         self.experts = torch.nn.Linear(4, 4).double()
 
-    def adapt_stream(self, observations: Tensor):
+    def route_cognitive_state(
+        self, state: Tensor, available_mask: Tensor | None = None
+    ) -> _Routing:
+        if state.dtype != torch.float64:
+            raise AssertionError("BIO-HAMA input was not cast to its parameter dtype")
+        return super().route_cognitive_state(state, available_mask)
+
+    def adapt_stream(self, observations: Tensor, *, session_id: str):
         if observations.dtype != torch.float64:
             raise AssertionError("System4 input was not cast to its parameter dtype")
-        return super().adapt_stream(observations)
+        return super().adapt_stream(observations, session_id=session_id)
 
     def expert_step(
         self, z: Tensor, x: Tensor, *, track_usage: bool = True
@@ -154,6 +169,7 @@ def _request(**overrides: object) -> CoreTurnRequest:
     values: dict[str, object] = {
         "inputs": torch.tensor([[1, 2]], dtype=torch.long),
         "cognitive_state": torch.tensor([[0.2, 0.0, 0.5, 0.1, 0.3]]),
+        "swarm_session_id": "test-session",
         "backbone_kwargs": {"attention_mask": torch.ones(1, 2, dtype=torch.long)},
         "estimated_workspace_bytes": 1024,
         "seed": 5,
@@ -170,6 +186,7 @@ class TestCoreTurnPipeline(unittest.TestCase):
         result = pipeline.run(_request())
 
         self.assertEqual(runtime.calls, ["bio_hama", "cts_deq", "system4", "system3"])
+        self.assertEqual(runtime.swarm_session_id, "test-session")
         self.assertNotIn("fp_ewc", runtime.calls)
         self.assertTrue(
             torch.equal(result.inference.backbone_state, runtime.answer_state)
@@ -214,20 +231,21 @@ class TestCoreTurnPipeline(unittest.TestCase):
 
         self.assertEqual(result.inference.backbone_state.dtype, torch.bfloat16)
         self.assertEqual(result.pooled_observation.dtype, torch.bfloat16)
+        self.assertEqual(runtime.routed_state.dtype, torch.float64)
         self.assertEqual(result.telemetry.swarm.latent.dtype, torch.float64)
         self.assertEqual(result.telemetry.experts.state.dtype, torch.float64)
 
-    def test_fast_weight_requires_explicit_ood_features_and_compiles_for_next_turn(
+    def test_full_cts_turn_compiles_verified_fast_weight_for_next_turn(
         self,
     ) -> None:
         runtime = _FakeRuntime()
         transition = _Transition()
-        features = torch.tensor([[0.8, 0.2]])
         calibration = torch.tensor([[1.0, 0.0], [0.99, 0.01], [0.98, 0.02]])
         request = _request(
-            fast_weight=FastWeightActivation("verified_session", features),
             compile_fast_weight=FastWeightCompilationPlan(
-                "next_session", 0.93, calibration
+                "next_session",
+                torch.tensor([0.1 * (0.5**index) for index in range(10)]),
+                calibration,
             ),
         )
 
@@ -243,19 +261,32 @@ class TestCoreTurnPipeline(unittest.TestCase):
                 "fast_weight_compile",
             ],
         )
-        self.assertEqual(runtime.infer_kwargs["session_id"], "verified_session")
-        self.assertIs(runtime.infer_kwargs["routing_features"], features)
+        self.assertIsNone(runtime.infer_kwargs["session_id"])
+        self.assertIsNone(runtime.infer_kwargs["routing_features"])
         self.assertEqual(runtime.compile_session_id, "next_session")
         self.assertTrue(torch.equal(runtime.compile_state, runtime.answer_state))
         self.assertIs(runtime.compile_kwargs["solver_info"], transition.last_info)
-        self.assertEqual(runtime.compile_kwargs["verified_quality"], 0.93)
+        self.assertEqual(runtime.compile_kwargs["residual_trace"].numel(), 10)
         self.assertIs(runtime.compile_kwargs["calibration_features"], calibration)
         self.assertTrue(result.telemetry.fast_weight_compilation.accepted)
+
+    def test_admitted_fast_weight_activation_reaches_runtime_with_ood_features(self):
+        runtime = _FakeRuntime()
+        features = torch.tensor([[0.8, 0.2]])
+        result = CoreTurnPipeline(runtime, _Transition(), _policy).run(
+            _request(fast_weight=FastWeightActivation("verified_session", features))
+        )
+        self.assertEqual(result.inference.session_id, "verified_session")
+        self.assertEqual(runtime.infer_kwargs["session_id"], "verified_session")
+        self.assertIs(runtime.infer_kwargs["routing_features"], features)
+        self.assertIsNone(result.telemetry.fast_weight_compilation)
 
     def test_nonconverged_transition_cannot_compile_fast_weight(self) -> None:
         runtime = _FakeRuntime()
         plan = FastWeightCompilationPlan(
-            "future", 0.9, torch.tensor([[1.0, 0.0], [0.9, 0.1]])
+            "future",
+            torch.tensor([0.1 * (0.5**index) for index in range(10)]),
+            torch.tensor([[1.0, 0.0], [0.9, 0.1]]),
         )
         pipeline = CoreTurnPipeline(runtime, _Transition(converged=False), _policy)
 
@@ -273,6 +304,7 @@ class TestCoreTurnPipeline(unittest.TestCase):
             ),
             _request(backbone_kwargs={"attention_mask": "not-a-tensor"}),
             _request(fast_weight=FastWeightActivation("unsafe/session", torch.ones(2))),
+            _request(swarm_session_id="unsafe/session"),
         )
         for request in bad_requests:
             with self.subTest(request=request):
@@ -284,17 +316,33 @@ class TestCoreTurnPipeline(unittest.TestCase):
                     pipeline.run(request)
                 self.assertEqual(runtime.calls, [])
 
-    def test_unadmitted_fast_weight_session_fails_before_day_slot(self) -> None:
+    def test_expired_request_and_lease_deadlines_fail_before_runtime_work(self) -> None:
+        cases = (
+            _request(request_deadline_ns=monotonic_ns() - 1),
+            _request(
+                lease_epoch=7,
+                lease_deadline_ns=monotonic_ns() - 1,
+            ),
+        )
+        for request in cases:
+            with self.subTest(request=request):
+                runtime = _FakeRuntime()
+                pipeline = CoreTurnPipeline(runtime, _Transition(), _policy)
+                with self.assertRaisesRegex(RuntimeError, "deadline expired"):
+                    pipeline.run(request)
+                self.assertEqual(runtime.calls, [])
+
+    def test_unadmitted_fast_weight_session_falls_back_in_same_day_slot(self) -> None:
         runtime = _FakeRuntime()
         request = _request(
             fast_weight=FastWeightActivation("unknown_session", torch.ones(1, 2))
         )
 
-        with self.assertRaisesRegex(RuntimeError, "not admitted"):
-            CoreTurnPipeline(runtime, _Transition(), _policy).run(request)
+        result = CoreTurnPipeline(runtime, _Transition(), _policy).run(request)
 
-        self.assertEqual(runtime.calls, [])
-        self.assertEqual(runtime.rhythm.max_active_requests, 0)
+        self.assertIn("cts_deq", runtime.calls)
+        self.assertIsNone(result.inference.session_id)
+        self.assertEqual(runtime.rhythm.max_active_requests, 1)
 
 
 class TestGenesisExpertAdvisoryMode(unittest.TestCase):

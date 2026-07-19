@@ -1,8 +1,14 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from cogni_core.resources import MAX_VRAM_GIB, ResourceBudgetExceeded, VRAMGuard
+from cogni_core.resources import (
+    MAX_VRAM_GIB,
+    MemorySnapshot,
+    ResourceBudgetExceeded,
+    VRAMGuard,
+)
 
 
 class TestVRAMGuard(unittest.TestCase):
@@ -19,6 +25,21 @@ class TestVRAMGuard(unittest.TestCase):
         self.assertFalse(guard.enabled)
         with guard.enforce(10**12):
             pass
+
+    def test_cuda_admission_releases_unused_cache_then_rechecks_free_memory(self):
+        guard = VRAMGuard(1.0, "cuda")
+        snapshot = MemorySnapshot(128, 900, 128, 2 * 1024**3)
+        with (
+            patch("cogni_core.resources.torch.cuda.is_available", return_value=True),
+            patch.object(guard, "snapshot", return_value=snapshot),
+            patch(
+                "cogni_core.resources.torch.cuda.mem_get_info",
+                side_effect=((0, 2 * 1024**3), (1024, 2 * 1024**3)),
+            ),
+            patch("cogni_core.resources.torch.cuda.empty_cache") as empty_cache,
+        ):
+            guard.admit(512)
+        empty_cache.assert_called_once_with()
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_cuda_admission_rejects_impossible_request(self):

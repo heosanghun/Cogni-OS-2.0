@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import math
 from typing import Callable, ClassVar, Protocol, runtime_checkable
 
 import torch
 from torch import Tensor
 
 from .deq import (
+    BroydenWarmStart,
     ContractivityError,
     SolverInfo,
     _broyden_inverse,
     _damped_fixed_point,
+    limited_broyden_solve,
     normalized_residual,
 )
 
@@ -1056,15 +1060,1452 @@ class BoundedPUCTSearch:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SearchControlsV2:
+    """Four bounded learned controls consumed by certified CTS V2."""
+
+    exploration: float
+    tolerance: float
+    policy_temperature: float
+    act_simulations: int
+
+    def __post_init__(self) -> None:
+        numeric = (int, float)
+        if (
+            not isinstance(self.exploration, numeric)
+            or isinstance(self.exploration, bool)
+            or not math.isfinite(float(self.exploration))
+            or not 0.0 <= float(self.exploration) <= 8.0
+        ):
+            raise ValueError("exploration must be in [0, 8]")
+        if (
+            not isinstance(self.tolerance, numeric)
+            or isinstance(self.tolerance, bool)
+            or not math.isfinite(float(self.tolerance))
+            or not 0.0 < float(self.tolerance) <= 0.1
+        ):
+            raise ValueError("tolerance must be in (0, 0.1]")
+        if (
+            not isinstance(self.policy_temperature, numeric)
+            or isinstance(self.policy_temperature, bool)
+            or not math.isfinite(float(self.policy_temperature))
+            or not 0.0 < float(self.policy_temperature) <= 10.0
+        ):
+            raise ValueError("policy_temperature must be in (0, 10]")
+        if (
+            not isinstance(self.act_simulations, int)
+            or isinstance(self.act_simulations, bool)
+            or self.act_simulations < 1
+        ):
+            raise ValueError("act_simulations must be a positive integer")
+
+
+class ActionPolicyV2(Protocol):
+    def __call__(self, state: Tensor) -> Tensor: ...
+
+
+class CriticV2(Protocol):
+    def __call__(self, state: Tensor) -> Tensor: ...
+
+
+class MetaControllerV2(Protocol):
+    def __call__(self, root: Tensor) -> SearchControlsV2: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SearchRequestV2:
+    root: Tensor
+    mac_budget: int
+    seed: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.root, Tensor):
+            raise TypeError("root must be a tensor")
+        if (
+            not isinstance(self.mac_budget, int)
+            or isinstance(self.mac_budget, bool)
+            or self.mac_budget < 1
+        ):
+            raise ValueError("mac_budget must be a positive integer")
+        if self.seed is not None and (
+            not isinstance(self.seed, int)
+            or isinstance(self.seed, bool)
+            or not 0 <= self.seed < 2**63
+        ):
+            raise ValueError("seed must be an integer in [0, 2**63)")
+
+
+@dataclass(frozen=True, slots=True)
+class CertifiedPUCTConfigV2:
+    """Hard production geometry and callback MAC certificates for CTS V2."""
+
+    width: int = 3
+    max_nodes: int = 301
+    max_depth: int = 100
+    simulations: int = 301
+    discount: float = 1.0
+    seed: int = 0
+    retrieval_k: int = 3
+    retrieval_min_depth: int = 10
+    retrieval_mix: float = 0.10
+    retrieval_temperature: float = 1.0
+    meta_policy_macs: int = 1
+    action_policy_macs: int = 1
+    critic_macs: int = 1
+    retrieval_macs: int = 1
+    transition_macs: int = 1
+
+    def __post_init__(self) -> None:
+        if self.width != 3:
+            raise ValueError("certified CTS V2 requires width=3")
+        if self.max_nodes != 301:
+            raise ValueError("certified CTS V2 requires max_nodes=301")
+        if self.retrieval_k != 3:
+            raise ValueError("certified CTS V2 requires semantic top-3")
+        if self.retrieval_min_depth != 10:
+            raise ValueError("certified CTS V2 requires retrieval_min_depth=10")
+        if (
+            not isinstance(self.max_depth, int)
+            or isinstance(self.max_depth, bool)
+            or self.max_depth < 1
+            or self.max_depth > 300
+            or not isinstance(self.simulations, int)
+            or isinstance(self.simulations, bool)
+            or self.simulations < 1
+        ):
+            raise ValueError(
+                "max_depth must be in [1, 300] and simulations must be positive"
+            )
+        if (
+            not isinstance(self.seed, int)
+            or isinstance(self.seed, bool)
+            or not 0 <= self.seed < 2**63
+        ):
+            raise ValueError("seed must be an integer in [0, 2**63)")
+        if not 0.0 <= self.discount <= 1.0:
+            raise ValueError("discount must be in [0, 1]")
+        if not 0.0 <= self.retrieval_mix <= 1.0:
+            raise ValueError("retrieval_mix must be in [0, 1]")
+        if self.retrieval_temperature <= 0.0:
+            raise ValueError("retrieval_temperature must be positive")
+        for name in (
+            "meta_policy_macs",
+            "action_policy_macs",
+            "critic_macs",
+            "retrieval_macs",
+            "transition_macs",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+
+
+class MacBudgetLedger:
+    """Fixed-category worst-case MAC reservation ledger."""
+
+    __slots__ = (
+        "budget",
+        "reserved",
+        "meta_policy",
+        "action_policy",
+        "critic",
+        "retrieval",
+        "transition",
+        "exhausted",
+    )
+
+    _CATEGORIES = {
+        "meta_policy",
+        "action_policy",
+        "critic",
+        "retrieval",
+        "transition",
+    }
+
+    def __init__(self, budget: int) -> None:
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
+            raise ValueError("MAC budget must be a positive integer")
+        self.budget = budget
+        self.reserved = 0
+        self.meta_policy = 0
+        self.action_policy = 0
+        self.critic = 0
+        self.retrieval = 0
+        self.transition = 0
+        self.exhausted = False
+
+    def reserve(self, category: str, amount: int) -> bool:
+        if category not in self._CATEGORIES:
+            raise ValueError("unsupported MAC category")
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount < 0:
+            raise ValueError("MAC reservation must be a non-negative integer")
+        if self.exhausted or self.reserved + amount > self.budget:
+            self.exhausted = True
+            return False
+        self.reserved += amount
+        setattr(self, category, getattr(self, category) + amount)
+        return True
+
+    def reserve_policy_critic(self, policy_macs: int, critic_macs: int) -> bool:
+        for amount in (policy_macs, critic_macs):
+            if not isinstance(amount, int) or isinstance(amount, bool) or amount < 0:
+                raise ValueError("policy and critic MACs must be non-negative integers")
+        total = policy_macs + critic_macs
+        if self.exhausted or self.reserved + total > self.budget:
+            self.exhausted = True
+            return False
+        self.reserved += total
+        self.action_policy += policy_macs
+        self.critic += critic_macs
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class CertifiedTransitionBatchV2:
+    states: Tensor
+    success: Tensor
+    residuals: Tensor
+    iterations: Tensor
+    linear_solve_fallbacks: Tensor
+    warm_used: Tensor
+    warm_rejected: Tensor
+    warm_starts: tuple[BroydenWarmStart | None, ...]
+
+
+@runtime_checkable
+class CertifiedTransitionV2(Protocol):
+    __cogni_tensor_transition__: bool
+    __cogni_deq_transition__: bool
+    __cogni_stateless__: bool
+    __cogni_uses_kv_cache__: bool
+    __cogni_broyden_solver__: bool
+    width: int
+    rank: int
+    operator_id: str
+
+    def __call__(
+        self,
+        parent: Tensor,
+        actions: Tensor,
+        *,
+        tolerance: float,
+        warm_start: BroydenWarmStart | None,
+    ) -> CertifiedTransitionBatchV2: ...
+
+
+def validate_certified_transition_v2(transition: object) -> None:
+    required = {
+        "__cogni_tensor_transition__": True,
+        "__cogni_deq_transition__": True,
+        "__cogni_stateless__": True,
+        "__cogni_uses_kv_cache__": False,
+        "__cogni_broyden_solver__": True,
+    }
+    invalid = [
+        name
+        for name, expected in required.items()
+        if getattr(transition, name, None) is not expected
+    ]
+    if invalid:
+        raise TransitionContractError(
+            "certified CTS V2 rejected transition markers: " + ", ".join(invalid)
+        )
+    if getattr(transition, "width", None) != 3:
+        raise TransitionContractError("certified transition must use width=3")
+    if getattr(transition, "rank", None) != 16:
+        raise TransitionContractError("certified transition must use rank=16")
+    operator_id = getattr(transition, "operator_id", None)
+    if not isinstance(operator_id, str) or not operator_id:
+        raise TransitionContractError("certified transition requires operator_id")
+
+
+class CertifiedBroydenTransitionV2:
+    """Per-action rank-16 solver with typed failure and warm diagnostics."""
+
+    __cogni_tensor_transition__: ClassVar[bool] = True
+    __cogni_deq_transition__: ClassVar[bool] = True
+    __cogni_stateless__: ClassVar[bool] = True
+    __cogni_uses_kv_cache__: ClassVar[bool] = False
+    __cogni_broyden_solver__: ClassVar[bool] = True
+    width: ClassVar[int] = 3
+    rank: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        *,
+        contraction: float = 0.4,
+        spectral_margin: float = 0.95,
+        action_scale: float = 1.0e-3,
+        max_iter: int = 32,
+        operator_id: str = "certified-broyden-v2",
+    ) -> None:
+        if not 0.0 <= contraction < spectral_margin < 1.0:
+            raise ContractivityError(
+                "certified transition requires contraction < spectral margin < 1"
+            )
+        if action_scale < 0.0:
+            raise ValueError("action_scale cannot be negative")
+        if not isinstance(max_iter, int) or isinstance(max_iter, bool) or max_iter < 17:
+            raise ValueError("rank-16 transition requires max_iter >= 17")
+        if not isinstance(operator_id, str) or not operator_id:
+            raise ValueError("operator_id must be non-empty text")
+        self.contraction = float(contraction)
+        self.spectral_margin = float(spectral_margin)
+        self.action_scale = float(action_scale)
+        self.max_iter = max_iter
+        self.operator_id = operator_id
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        parent: Tensor,
+        actions: Tensor,
+        *,
+        tolerance: float,
+        warm_start: BroydenWarmStart | None,
+    ) -> CertifiedTransitionBatchV2:
+        if (
+            not isinstance(parent, Tensor)
+            or parent.ndim < 1
+            or not parent.is_floating_point()
+            or not bool(torch.isfinite(parent).all())
+        ):
+            raise ValueError("parent must be a finite floating tensor")
+        if tuple(actions.shape) != (3,) or actions.dtype != torch.int64:
+            raise ValueError("actions must have int64 shape [3]")
+        if actions.device != parent.device:
+            raise ValueError("actions and parent must share one device")
+        if not torch.equal(
+            actions, torch.arange(3, device=parent.device, dtype=torch.int64)
+        ):
+            raise ValueError("certified actions must be exactly arange(3)")
+
+        action_values = actions.to(dtype=parent.dtype)
+        centered = action_values - action_values.mean()
+        states = torch.empty(
+            (3, *parent.shape), device=parent.device, dtype=parent.dtype
+        )
+        success = torch.zeros(3, dtype=torch.bool)
+        residuals = torch.full((3,), float("inf"), dtype=torch.float32)
+        iterations = torch.zeros(3, dtype=torch.int64)
+        linear_fallbacks = torch.zeros(3, dtype=torch.int64)
+        warm_used = torch.zeros(3, dtype=torch.bool)
+        warm_rejected = torch.zeros(3, dtype=torch.int64)
+        capsules: list[BroydenWarmStart | None] = []
+
+        for action in range(3):
+            drive = parent + self.action_scale * centered[action]
+
+            def residual(z: Tensor, fixed_drive: Tensor = drive) -> Tensor:
+                return torch.tanh(self.contraction * z + fixed_drive) - z
+
+            result = limited_broyden_solve(
+                residual,
+                torch.zeros_like(parent),
+                tolerance=float(tolerance),
+                max_iter=self.max_iter,
+                rank=16,
+                operator_id=self.operator_id,
+                warm_start=warm_start,
+            )
+            iterations[action] = result.iterations
+            residuals[action] = (
+                result.residual if math.isfinite(result.residual) else float("inf")
+            )
+            linear_fallbacks[action] = result.linear_solve_fallbacks
+            warm_used[action] = result.warm_used
+            warm_rejected[action] = result.warm_rejected
+            valid = (
+                result.converged
+                and tuple(result.state.shape) == tuple(parent.shape)
+                and result.state.dtype == parent.dtype
+                and result.state.device == parent.device
+                and bool(torch.isfinite(result.state).all())
+            )
+            if valid:
+                states[action].copy_(result.state)
+                success[action] = True
+                capsules.append(result.warm_start)
+            else:
+                # Typed numerical failure uses the finite parent state. Search
+                # records Q=0 and never allocates this edge as a child node.
+                states[action].copy_(parent)
+                capsules.append(None)
+        return CertifiedTransitionBatchV2(
+            states=states,
+            success=success,
+            residuals=residuals,
+            iterations=iterations,
+            linear_solve_fallbacks=linear_fallbacks,
+            warm_used=warm_used,
+            warm_rejected=warm_rejected,
+            warm_starts=tuple(capsules),
+        )
+
+
+class FixedCapacityTreeRetriever:
+    """Stable whole-tree top-3 over successful rows in a shared 301-node arena."""
+
+    def __init__(self, shared_state_arena: Tensor) -> None:
+        if (
+            not isinstance(shared_state_arena, Tensor)
+            or shared_state_arena.ndim < 2
+            or shared_state_arena.shape[0] != 301
+            or not shared_state_arena.is_floating_point()
+        ):
+            raise ValueError("shared_state_arena must be floating [301, ...]")
+        self.shared_state_arena = shared_state_arena
+        self.capacity = 301
+        self.retrieval_k = 3
+        self.feature_dim = int(shared_state_arena.shape[-1])
+        self._keys = torch.zeros(
+            (301, self.feature_dim),
+            device=shared_state_arena.device,
+            dtype=torch.float32,
+        )
+        self._successful = torch.zeros(
+            301, device=shared_state_arena.device, dtype=torch.bool
+        )
+        self._candidate_mask = torch.zeros_like(self._successful)
+        self._slots = torch.arange(301, device=shared_state_arena.device)
+
+    @staticmethod
+    def _key(state: Tensor) -> Tensor:
+        flat = state.detach().reshape(-1, state.shape[-1]).to(torch.float32)
+        pooled = flat.mean(dim=0)
+        return pooled / pooled.norm().clamp_min(1.0e-8)
+
+    @torch.no_grad()
+    def add(self, node: int, state: Tensor, *, success: bool) -> None:
+        if not 0 <= int(node) < 301:
+            raise IndexError("tree retrieval node is outside the arena")
+        row = self.shared_state_arena[int(node)]
+        if state.data_ptr() != row.data_ptr() or tuple(state.shape) != tuple(row.shape):
+            raise ValueError("retriever state must be the exact shared arena row")
+        if state.device != self.shared_state_arena.device:
+            raise ValueError("retriever state changed device")
+        if success:
+            if not bool(torch.isfinite(state).all()):
+                raise ValueError("successful retrieval state must be finite")
+            self._keys[int(node)].copy_(self._key(state))
+            self._successful[int(node)] = True
+        else:
+            self._keys[int(node)].zero_()
+            self._successful[int(node)] = False
+
+    @torch.no_grad()
+    def retrieve(self, query: Tensor, *, current_node: int) -> AncestorBatch:
+        if tuple(query.shape) != tuple(self.shared_state_arena.shape[1:]):
+            raise ValueError("tree retrieval query shape differs from arena row")
+        if query.device != self.shared_state_arena.device:
+            raise ValueError("tree retrieval query changed device")
+        if not bool(torch.isfinite(query).all()):
+            raise ValueError("tree retrieval query must be finite")
+        if not 0 <= int(current_node) < 301:
+            raise IndexError("current_node is outside the arena")
+
+        self._candidate_mask.copy_(self._successful)
+        self._candidate_mask[int(current_node)] = False
+        query_key = self._key(query)
+        similarities = self._keys @ query_key
+        floor = torch.finfo(similarities.dtype).min
+        similarities = torch.where(
+            self._candidate_mask, similarities, torch.full_like(similarities, floor)
+        )
+        order = torch.argsort(similarities, descending=True, stable=True)[:3]
+        valid = self._candidate_mask.index_select(0, order)
+        selected = self.shared_state_arena.index_select(0, order)
+        result = AncestorBatch(
+            states=torch.where(
+                valid.view((3,) + (1,) * query.ndim),
+                selected,
+                torch.zeros_like(selected),
+            ).to(dtype=query.dtype),
+            scores=torch.where(
+                valid,
+                similarities.index_select(0, order),
+                torch.full((3,), float("-inf"), device=query.device),
+            ),
+            handles=torch.where(
+                valid.to(device="cpu"),
+                order.to(device="cpu", dtype=torch.int64),
+                torch.full((3,), -1, dtype=torch.int64),
+            ),
+            valid=valid,
+        )
+        return result
+
+    @property
+    def successful_nodes(self) -> int:
+        return int(self._successful.sum())
+
+    def memory_bytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (
+                self._keys,
+                self._successful,
+                self._candidate_mask,
+                self._slots,
+            )
+        )
+
+
+class _CertifiedTreeBuffersV2:
+    FAILED_CHILD = -2
+    RANK = 16
+
+    def __init__(self, root: Tensor) -> None:
+        self.capacity = 301
+        self.width = 3
+        self.states = torch.empty(
+            (301, *root.shape), device=root.device, dtype=root.dtype
+        )
+        self.states[0].copy_(root.detach())
+        self.parents = torch.full((301,), -1, dtype=torch.int64)
+        self.depths = torch.zeros(301, dtype=torch.int32)
+        self.children = torch.full((301, 3), -1, dtype=torch.int64)
+        self.edge_failed = torch.zeros((301, 3), dtype=torch.bool)
+        self.priors = torch.zeros((301, 3), dtype=torch.float32)
+        self.action_visits = torch.zeros((301, 3), dtype=torch.int64)
+        self.action_value_sums = torch.zeros((301, 3), dtype=torch.float32)
+        self.node_visits = torch.zeros(301, dtype=torch.int64)
+        self.expanded = torch.zeros(301, dtype=torch.bool)
+        self.terminal = torch.zeros(301, dtype=torch.bool)
+        self.path_nodes = torch.full((301,), -1, dtype=torch.int64)
+        self.path_actions = torch.full((301,), -1, dtype=torch.int64)
+        self.actions = torch.arange(3, device=root.device, dtype=torch.int64)
+        # Every successful node can retain one parent rank-16 capsule without
+        # allocating in proportion to requested logical depth.
+        self.warm_x = torch.zeros(
+            (301, 17, *root.shape), device=root.device, dtype=root.dtype
+        )
+        self.warm_f = torch.zeros_like(self.warm_x)
+        self.warm_counts = torch.zeros(301, dtype=torch.int16)
+        self.warm_valid = torch.zeros(301, dtype=torch.bool)
+        self.node_count = 1
+
+    def can_expand_full_width(self) -> bool:
+        return self.node_count + 3 <= 301
+
+    def add_child(
+        self,
+        parent: int,
+        action: int,
+        state: Tensor,
+        warm_start: BroydenWarmStart,
+    ) -> int:
+        if self.node_count >= 301:
+            raise RuntimeError("certified tree arena is full")
+        node = self.node_count
+        self.node_count += 1
+        self.states[node].copy_(state.detach())
+        self.parents[node] = parent
+        self.depths[node] = int(self.depths[parent]) + 1
+        self.children[parent, action] = node
+        self._store_warm(node, warm_start)
+        return node
+
+    def mark_failed(self, parent: int, action: int) -> None:
+        self.children[parent, action] = self.FAILED_CHILD
+        self.edge_failed[parent, action] = True
+        # The failed edge receives exactly one explicit Q=0 observation and is
+        # masked from every future selection.
+        self.action_visits[parent, action] = 1
+        self.action_value_sums[parent, action] = 0.0
+
+    def _store_warm(self, node: int, capsule: BroydenWarmStart) -> None:
+        if capsule.rank != 16:
+            raise ValueError("child warm capsule rank must equal 16")
+        count = capsule.history_size
+        if count > 17:
+            raise ValueError("child warm capsule exceeded rank-16 history")
+        if (
+            tuple(capsule.state.shape) != tuple(self.states[node].shape)
+            or tuple(capsule.x_history.shape) != (count, *self.states[node].shape)
+            or tuple(capsule.f_history.shape) != (count, *self.states[node].shape)
+            or capsule.state.dtype != self.states.dtype
+            or capsule.state.device != self.states.device
+        ):
+            raise ValueError("child warm capsule violates arena shape/device/dtype")
+        self.warm_x[node].zero_()
+        self.warm_f[node].zero_()
+        if count:
+            self.warm_x[node, :count].copy_(capsule.x_history)
+            self.warm_f[node, :count].copy_(capsule.f_history)
+        self.warm_counts[node] = count
+        self.warm_valid[node] = True
+
+    def warm_start(self, node: int, operator_id: str) -> BroydenWarmStart | None:
+        if not bool(self.warm_valid[node]):
+            return None
+        count = int(self.warm_counts[node])
+        return BroydenWarmStart(
+            state=self.states[node],
+            x_history=self.warm_x[node, :count],
+            f_history=self.warm_f[node, :count],
+            rank=16,
+            operator_id=operator_id,
+        )
+
+    def memory_bytes(self) -> int:
+        tensors = (
+            self.states,
+            self.parents,
+            self.depths,
+            self.children,
+            self.edge_failed,
+            self.priors,
+            self.action_visits,
+            self.action_value_sums,
+            self.node_visits,
+            self.expanded,
+            self.terminal,
+            self.path_nodes,
+            self.path_actions,
+            self.actions,
+            self.warm_x,
+            self.warm_f,
+            self.warm_counts,
+            self.warm_valid,
+        )
+        return sum(t.numel() * t.element_size() for t in tensors)
+
+
+@dataclass(frozen=True, slots=True)
+class SearchTelemetryV2:
+    simulations_requested: int
+    simulations_completed: int
+    act_requested: int
+    act_applied: int
+    act_clamped: bool
+    nodes_used: int
+    node_capacity: int
+    max_depth_reached: int
+    capacity_exhausted: bool
+    frontier_rollouts: int
+    retrieval_queries: int
+    retrieval_hits: int
+    solver_calls: int
+    solver_rank: int
+    solver_history_peak: int
+    solver_successes: int
+    solver_failures: int
+    solver_iterations_total: int
+    solver_iterations_max: int
+    solver_residual_max: float
+    linear_solve_fallbacks: int
+    warm_used: int
+    warm_rejected: int
+    failed_edges: int
+    q_zero_backups: int
+    all_fail_terminals: int
+    mac_budget: int
+    mac_reserved: int
+    mac_budget_exhausted: bool
+    mac_meta_policy: int
+    mac_action_policy: int
+    mac_critic: int
+    mac_retrieval: int
+    mac_transition: int
+    allocated_bytes: int
+    trace_digest: str
+    unsafe_silent_fallbacks: int
+    safe_for_decode: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PUCTResultV2:
+    best_state: Tensor
+    best_action: Tensor
+    best_path: Tensor
+    root_visit_counts: Tensor
+    root_q_values: Tensor
+    root_priors: Tensor
+    telemetry: SearchTelemetryV2
+
+
+class BoundedPUCTSearchV2:
+    """Certified width-3 CTS with fixed storage and explicit failure states.
+
+    This path intentionally lives beside :class:`BoundedPUCTSearch`.  It does
+    not change the legacy API: callers opt into the stricter contracts by
+    constructing a :class:`SearchRequestV2` and supplying the four bounded
+    collaborators.  The policy and controller surfaces are protocols only;
+    the search kernel has no dependency on a concrete learned-policy module.
+    """
+
+    def __init__(self, config: CertifiedPUCTConfigV2 | None = None) -> None:
+        self.config = config or CertifiedPUCTConfigV2()
+
+    def estimated_preallocated_bytes(self, root: Tensor) -> int:
+        """Return exact persistent tensor bytes, independent of max depth."""
+
+        self._validate_root(root)
+        nodes = 301
+        state_bytes = root.numel() * root.element_size()
+        # states + two [nodes, rank + 1, *state] warm-history banks
+        tree_state_bytes = nodes * state_bytes * (1 + 2 * 17)
+        # See _CertifiedTreeBuffersV2.memory_bytes().  All terms other than
+        # the state/warm banks are fixed per node, plus one action vector.
+        tree_metadata_bytes = 116 * nodes + 3 * 8
+        # Retriever keys, two masks, and stable slot indices.
+        retriever_bytes = nodes * (4 * int(root.shape[-1]) + 10)
+        # One non-tree frontier state and one worst-case rank-16 warm capsule
+        # let a saturated 301-node arena continue certified transitions without
+        # allocating another tree node. Its continuation is committed to the
+        # trace digest; no fictitious tree handles are materialized.
+        frontier_bytes = state_bytes * (2 + 2 * 17)
+        return tree_state_bytes + tree_metadata_bytes + retriever_bytes + frontier_bytes
+
+    @staticmethod
+    def _validate_root(root: Tensor) -> None:
+        if not isinstance(root, Tensor):
+            raise TypeError("root must be a tensor")
+        if root.ndim < 1 or root.numel() == 0:
+            raise ValueError("root must be a non-empty latent tensor")
+        if not root.is_floating_point():
+            raise TypeError("root latent state must be floating point")
+        if not bool(torch.isfinite(root).all()):
+            raise ValueError("root latent state must be finite")
+
+    @staticmethod
+    def _call_meta_controller(
+        controller: MetaControllerV2, root: Tensor
+    ) -> SearchControlsV2:
+        version = root._version
+        controls = controller(root)
+        if root._version != version:
+            raise RuntimeError("meta controller mutated the root tensor")
+        if not isinstance(controls, SearchControlsV2):
+            raise TypeError("meta controller must return SearchControlsV2")
+        return controls
+
+    @staticmethod
+    def _call_policy_critic(
+        action_policy: ActionPolicyV2,
+        critic: CriticV2,
+        state: Tensor,
+        *,
+        temperature: float,
+    ) -> tuple[Tensor, float]:
+        version = state._version
+        logits = action_policy(state)
+        if state._version != version:
+            raise RuntimeError("action policy mutated its input tensor")
+        version = state._version
+        value = critic(state)
+        if state._version != version:
+            raise RuntimeError("critic mutated its input tensor")
+        if not isinstance(logits, Tensor) or not isinstance(value, Tensor):
+            raise TypeError("action policy and critic outputs must be tensors")
+        if not logits.is_floating_point() or not value.is_floating_point():
+            raise TypeError("action policy and critic outputs must be floating point")
+        if tuple(logits.shape) != (3,):
+            raise ValueError("action policy logits must have shape [3]")
+        if logits.device != state.device:
+            raise ValueError("action policy logits changed device")
+        if value.numel() != 1:
+            raise ValueError("critic output must be scalar")
+        if value.device != state.device:
+            raise ValueError("critic output changed device")
+        if not bool(torch.isfinite(logits).all()) or not bool(
+            torch.isfinite(value).all()
+        ):
+            raise ValueError("action policy and critic outputs must be finite")
+        priors = torch.softmax(
+            logits.detach().to(device="cpu", dtype=torch.float32) / float(temperature),
+            dim=0,
+        )
+        return priors, float(value.detach().to(device="cpu", dtype=torch.float32))
+
+    @staticmethod
+    def _validate_warm_capsule(
+        capsule: BroydenWarmStart,
+        state: Tensor,
+        *,
+        operator_id: str,
+    ) -> None:
+        if not isinstance(capsule, BroydenWarmStart):
+            raise TypeError("successful action requires BroydenWarmStart")
+        count = capsule.history_size
+        if capsule.rank != 16 or capsule.operator_id != operator_id:
+            raise ValueError("warm capsule rank/operator certificate changed")
+        if (
+            tuple(capsule.state.shape) != tuple(state.shape)
+            or tuple(capsule.x_history.shape) != (count, *state.shape)
+            or tuple(capsule.f_history.shape) != (count, *state.shape)
+            or count > 17
+        ):
+            raise ValueError("warm capsule exceeded fixed rank-16 geometry")
+        tensors = (capsule.state, capsule.x_history, capsule.f_history)
+        if any(value.dtype != state.dtype for value in tensors):
+            raise ValueError("warm capsule changed dtype")
+        if any(value.device != state.device for value in tensors):
+            raise ValueError("warm capsule changed device")
+        if any(value.layout != torch.strided for value in tensors):
+            raise ValueError("warm capsule must use strided tensor storage")
+        if any(not bool(torch.isfinite(value).all()) for value in tensors):
+            raise ValueError("warm capsule contains non-finite values")
+        if not torch.equal(capsule.state, state):
+            raise ValueError("warm capsule state differs from transition state")
+
+    @classmethod
+    def _validate_transition_batch(
+        cls,
+        batch: CertifiedTransitionBatchV2,
+        parent: Tensor,
+        *,
+        tolerance: float,
+        operator_id: str,
+    ) -> None:
+        if not isinstance(batch, CertifiedTransitionBatchV2):
+            raise TypeError(
+                "certified transition must return CertifiedTransitionBatchV2"
+            )
+        if tuple(batch.states.shape) != (3, *parent.shape):
+            raise ValueError("transition states must have shape [3, *parent.shape]")
+        if batch.states.dtype != parent.dtype or batch.states.device != parent.device:
+            raise ValueError("transition states must preserve parent dtype and device")
+        if not bool(torch.isfinite(batch.states).all()):
+            raise ValueError("transition states must be finite")
+
+        tensor_contracts = (
+            (batch.success, torch.bool, "success"),
+            (batch.residuals, torch.float32, "residuals"),
+            (batch.iterations, torch.int64, "iterations"),
+            (
+                batch.linear_solve_fallbacks,
+                torch.int64,
+                "linear_solve_fallbacks",
+            ),
+            (batch.warm_used, torch.bool, "warm_used"),
+            (batch.warm_rejected, torch.int64, "warm_rejected"),
+        )
+        for value, dtype, name in tensor_contracts:
+            if not isinstance(value, Tensor):
+                raise TypeError(f"transition {name} must be a tensor")
+            if tuple(value.shape) != (3,) or value.dtype != dtype:
+                raise ValueError(f"transition {name} has an invalid shape or dtype")
+            if value.device.type != "cpu":
+                raise ValueError(f"transition {name} diagnostics must stay on CPU")
+        if not isinstance(batch.warm_starts, tuple) or len(batch.warm_starts) != 3:
+            raise ValueError("transition warm_starts must contain three entries")
+        if bool((batch.iterations < 0).any()):
+            raise ValueError("transition iterations cannot be negative")
+        if bool(torch.isnan(batch.residuals).any()) or bool(
+            (batch.residuals < 0).any()
+        ):
+            raise ValueError("transition residuals must be non-negative or infinity")
+        if bool((batch.linear_solve_fallbacks < 0).any()):
+            raise ValueError("linear solve fallback counts cannot be negative")
+        if bool(((batch.warm_rejected < 0) | (batch.warm_rejected > 1)).any()):
+            raise ValueError("warm rejection counts must be zero or one")
+        if bool((batch.warm_used & (batch.warm_rejected > 0)).any()):
+            raise ValueError("a warm solve cannot be both used and rejected")
+
+        for action in range(3):
+            succeeded = bool(batch.success[action])
+            residual = float(batch.residuals[action])
+            capsule = batch.warm_starts[action]
+            if succeeded:
+                if not torch.isfinite(batch.residuals[action]) or residual > tolerance:
+                    raise ValueError(
+                        "successful transition action lacks a certified residual"
+                    )
+                if capsule is None:
+                    raise ValueError("successful transition action lacks warm state")
+                cls._validate_warm_capsule(
+                    capsule,
+                    batch.states[action],
+                    operator_id=operator_id,
+                )
+            else:
+                if capsule is not None:
+                    raise ValueError("failed transition action retained warm state")
+                if not torch.equal(batch.states[action], parent):
+                    raise ValueError(
+                        "failed transition action must return parent state"
+                    )
+
+    @staticmethod
+    def _backup(
+        tree: _CertifiedTreeBuffersV2,
+        path_length: int,
+        value: float,
+        discount: float,
+    ) -> None:
+        for position in range(path_length):
+            tree.node_visits[int(tree.path_nodes[position])] += 1
+        backed_value = float(value)
+        for position in range(path_length - 2, -1, -1):
+            parent = int(tree.path_nodes[position])
+            action = int(tree.path_actions[position])
+            tree.action_visits[parent, action] += 1
+            tree.action_value_sums[parent, action] += backed_value
+            backed_value *= float(discount)
+
+    @staticmethod
+    def _best_selectable_action(tree: _CertifiedTreeBuffersV2, node: int) -> int:
+        selectable = tree.children[node] >= 0
+        if not bool(selectable.any()):
+            return -1
+        visits = tree.action_visits[node].clone()
+        visits[~selectable] = -1
+        if int(visits.max()) > 0:
+            return int(torch.argmax(visits))
+        priors = tree.priors[node].clone()
+        priors[~selectable] = torch.finfo(priors.dtype).min
+        return int(torch.argmax(priors))
+
+    @staticmethod
+    def _select_best_path(tree: _CertifiedTreeBuffersV2) -> tuple[list[int], int]:
+        path = [0]
+        node = 0
+        while bool(tree.expanded[node]) and len(path) < tree.capacity:
+            action = BoundedPUCTSearchV2._best_selectable_action(tree, node)
+            if action < 0:
+                break
+            child = int(tree.children[node, action])
+            if child < 0:
+                break
+            path.append(child)
+            node = child
+        return path, node
+
+    @staticmethod
+    def _make_telemetry(
+        *,
+        cfg: CertifiedPUCTConfigV2,
+        controls: SearchControlsV2 | None,
+        effective_simulations: int,
+        completed: int,
+        tree: _CertifiedTreeBuffersV2,
+        retriever: FixedCapacityTreeRetriever,
+        ledger: MacBudgetLedger,
+        capacity_exhausted: bool,
+        frontier_rollouts: int,
+        frontier_depth: int,
+        frontier_workspace_bytes: int,
+        retrieval_queries: int,
+        retrieval_hits: int,
+        solver_calls: int,
+        solver_history_peak: int,
+        solver_successes: int,
+        solver_iterations_total: int,
+        solver_iterations_max: int,
+        solver_residual_max: float,
+        linear_solve_fallbacks: int,
+        warm_used: int,
+        warm_rejected: int,
+        failed_edges: int,
+        q_zero_backups: int,
+        all_fail_terminals: int,
+        digest: str,
+        safe_for_decode: bool,
+    ) -> SearchTelemetryV2:
+        act_requested = controls.act_simulations if controls is not None else 0
+        return SearchTelemetryV2(
+            simulations_requested=cfg.simulations,
+            simulations_completed=completed,
+            act_requested=act_requested,
+            act_applied=effective_simulations,
+            act_clamped=controls is not None and act_requested > cfg.simulations,
+            nodes_used=tree.node_count,
+            node_capacity=tree.capacity,
+            max_depth_reached=max(
+                int(tree.depths[: tree.node_count].max()), frontier_depth
+            ),
+            capacity_exhausted=capacity_exhausted,
+            frontier_rollouts=frontier_rollouts,
+            retrieval_queries=retrieval_queries,
+            retrieval_hits=retrieval_hits,
+            solver_calls=solver_calls,
+            solver_rank=16,
+            solver_history_peak=solver_history_peak,
+            solver_successes=solver_successes,
+            solver_failures=solver_calls - solver_successes,
+            solver_iterations_total=solver_iterations_total,
+            solver_iterations_max=solver_iterations_max,
+            solver_residual_max=solver_residual_max,
+            linear_solve_fallbacks=linear_solve_fallbacks,
+            warm_used=warm_used,
+            warm_rejected=warm_rejected,
+            failed_edges=failed_edges,
+            q_zero_backups=q_zero_backups,
+            all_fail_terminals=all_fail_terminals,
+            mac_budget=ledger.budget,
+            mac_reserved=ledger.reserved,
+            mac_budget_exhausted=ledger.exhausted,
+            mac_meta_policy=ledger.meta_policy,
+            mac_action_policy=ledger.action_policy,
+            mac_critic=ledger.critic,
+            mac_retrieval=ledger.retrieval,
+            mac_transition=ledger.transition,
+            allocated_bytes=(
+                tree.memory_bytes()
+                + retriever.memory_bytes()
+                + frontier_workspace_bytes
+            ),
+            trace_digest=digest,
+            unsafe_silent_fallbacks=0,
+            safe_for_decode=safe_for_decode,
+        )
+
+    @torch.no_grad()
+    def search(
+        self,
+        request: SearchRequestV2,
+        transition: CertifiedTransitionV2,
+        action_policy: ActionPolicyV2,
+        critic: CriticV2,
+        meta_controller: MetaControllerV2,
+    ) -> PUCTResultV2:
+        """Run certified search, reserving every callback's worst-case MACs."""
+
+        if not isinstance(request, SearchRequestV2):
+            raise TypeError("request must be SearchRequestV2")
+        root = request.root
+        self._validate_root(root)
+        validate_certified_transition_v2(transition)
+        if (
+            not callable(action_policy)
+            or not callable(critic)
+            or not callable(meta_controller)
+        ):
+            raise TypeError("policy, critic, and meta controller must be callable")
+
+        cfg = self.config
+        tree = _CertifiedTreeBuffersV2(root.detach())
+        retriever = FixedCapacityTreeRetriever(tree.states)
+        retriever.add(0, tree.states[0], success=True)
+        ledger = MacBudgetLedger(request.mac_budget)
+        seed = cfg.seed if request.seed is None else request.seed
+        trace = hashlib.sha256(f"cts-v2|{seed}|{tuple(root.shape)}".encode())
+
+        controls: SearchControlsV2 | None = None
+        effective_simulations = 0
+        completed = 0
+        capacity_exhausted = False
+        frontier_rollouts = 0
+        retrieval_queries = 0
+        retrieval_hits = 0
+        solver_calls = 0
+        solver_history_peak = 0
+        solver_successes = 0
+        solver_iterations_total = 0
+        solver_iterations_max = 0
+        solver_residual_max = 0.0
+        linear_solve_fallbacks = 0
+        warm_used = 0
+        warm_rejected = 0
+        failed_edges = 0
+        q_zero_backups = 0
+        all_fail_terminals = 0
+        frontier_state = torch.empty_like(root)
+        frontier_warm: BroydenWarmStart | None = None
+        frontier_active = False
+        frontier_has_state = False
+        frontier_depth = 0
+        frontier_anchor_node = 0
+        frontier_anchor_path_length = 1
+        frontier_workspace_bytes = root.numel() * root.element_size() * (2 + 2 * 17)
+
+        if ledger.reserve("meta_policy", cfg.meta_policy_macs):
+            controls = self._call_meta_controller(meta_controller, root)
+            effective_simulations = min(cfg.simulations, controls.act_simulations)
+
+        budget_stopped = controls is None
+        for simulation in range(effective_simulations):
+            if budget_stopped:
+                break
+            if frontier_active:
+                if frontier_depth >= cfg.max_depth:
+                    break
+                policy_state = frontier_state
+                if frontier_depth >= cfg.retrieval_min_depth:
+                    if not ledger.reserve("retrieval", cfg.retrieval_macs):
+                        budget_stopped = True
+                        break
+                    ancestors = retriever.retrieve(
+                        frontier_state,
+                        current_node=frontier_anchor_node,
+                    )
+                    retrieval_queries += 1
+                    retrieval_hits += int(ancestors.valid.sum())
+                    policy_state = ancestors.blend(
+                        frontier_state,
+                        cfg.retrieval_mix,
+                        cfg.retrieval_temperature,
+                    )
+                if not ledger.reserve_policy_critic(
+                    cfg.action_policy_macs, cfg.critic_macs
+                ):
+                    budget_stopped = True
+                    break
+                priors, leaf_value = self._call_policy_critic(
+                    action_policy,
+                    critic,
+                    policy_state,
+                    temperature=controls.policy_temperature,
+                )
+                if not ledger.reserve("transition", cfg.transition_macs):
+                    budget_stopped = True
+                    break
+                input_version = policy_state._version
+                batch = transition(
+                    policy_state,
+                    tree.actions,
+                    tolerance=controls.tolerance,
+                    warm_start=frontier_warm,
+                )
+                if policy_state._version != input_version:
+                    raise RuntimeError("certified transition mutated its input")
+                self._validate_transition_batch(
+                    batch,
+                    policy_state,
+                    tolerance=controls.tolerance,
+                    operator_id=getattr(transition, "operator_id"),
+                )
+                solver_calls += 3
+                solver_history_peak = max(
+                    solver_history_peak,
+                    max(
+                        (
+                            max(0, capsule.history_size - 1)
+                            for capsule in batch.warm_starts
+                            if capsule is not None
+                        ),
+                        default=0,
+                    ),
+                )
+                success_count = int(batch.success.sum())
+                solver_successes += success_count
+                solver_iterations_total += int(batch.iterations.sum())
+                solver_iterations_max = max(
+                    solver_iterations_max, int(batch.iterations.max())
+                )
+                finite_residuals = batch.residuals[torch.isfinite(batch.residuals)]
+                if finite_residuals.numel():
+                    solver_residual_max = max(
+                        solver_residual_max, float(finite_residuals.max())
+                    )
+                linear_solve_fallbacks += int(batch.linear_solve_fallbacks.sum())
+                warm_used += int(batch.warm_used.sum())
+                warm_rejected += int(batch.warm_rejected.sum())
+                failed_count = 3 - success_count
+                failed_edges += failed_count
+                q_zero_backups += failed_count
+                frontier_rollouts += 1
+                if success_count == 0:
+                    all_fail_terminals += 1
+                    self._backup(
+                        tree,
+                        frontier_anchor_path_length,
+                        0.0,
+                        cfg.discount,
+                    )
+                    completed += 1
+                    frontier_active = False
+                    trace.update(
+                        f"|{simulation}:frontier:{frontier_depth}:all-failed".encode()
+                    )
+                    break
+                masked_priors = priors.clone()
+                masked_priors[~batch.success] = torch.finfo(masked_priors.dtype).min
+                action = int(torch.argmax(masked_priors))
+                capsule = batch.warm_starts[action]
+                assert capsule is not None
+                frontier_state.copy_(batch.states[action])
+                frontier_warm = capsule
+                frontier_depth += 1
+                frontier_has_state = True
+                self._backup(
+                    tree,
+                    frontier_anchor_path_length,
+                    leaf_value,
+                    cfg.discount,
+                )
+                completed += 1
+                trace.update(
+                    (
+                        f"|{simulation}:frontier:{frontier_depth}:{action}:"
+                        f"{batch.success.to(torch.int8).tolist()}:"
+                        f"{batch.iterations.tolist()}:"
+                        f"{batch.residuals.tolist()}"
+                    ).encode()
+                )
+                continue
+            path_length = 1
+            node = 0
+            tree.path_nodes[0] = 0
+
+            while bool(tree.expanded[node]) and not bool(tree.terminal[node]):
+                if int(tree.depths[node]) >= cfg.max_depth:
+                    break
+                selectable = tree.children[node] >= 0
+                if not bool(selectable.any()):
+                    tree.terminal[node] = True
+                    break
+                scores = puct_scores(
+                    tree.priors[node],
+                    tree.action_visits[node],
+                    tree.action_value_sums[node],
+                    tree.node_visits[node],
+                    controls.exploration,
+                )
+                scores[~selectable] = torch.finfo(scores.dtype).min
+                action = int(torch.argmax(scores))
+                child = int(tree.children[node, action])
+                if child < 0:
+                    raise RuntimeError("certified selection chose a masked edge")
+                if path_length >= tree.capacity:
+                    raise RuntimeError("certified path exceeded the fixed arena")
+                tree.path_actions[path_length - 1] = action
+                tree.path_nodes[path_length] = child
+                path_length += 1
+                node = child
+
+            # Explicit terminal states are backed up as zero without invoking
+            # another learned callback or silently inventing a child state.
+            if bool(tree.terminal[node]):
+                self._backup(tree, path_length, 0.0, cfg.discount)
+                completed += 1
+                trace.update(f"|{simulation}:{node}:terminal".encode())
+                continue
+
+            leaf_state = tree.states[node]
+            policy_state = leaf_state
+            depth = int(tree.depths[node])
+            if depth >= cfg.retrieval_min_depth:
+                if not ledger.reserve("retrieval", cfg.retrieval_macs):
+                    budget_stopped = True
+                    break
+                ancestors = retriever.retrieve(leaf_state, current_node=node)
+                retrieval_queries += 1
+                retrieval_hits += int(ancestors.valid.sum())
+                policy_state = ancestors.blend(
+                    leaf_state,
+                    cfg.retrieval_mix,
+                    cfg.retrieval_temperature,
+                )
+
+            if not ledger.reserve_policy_critic(
+                cfg.action_policy_macs, cfg.critic_macs
+            ):
+                budget_stopped = True
+                break
+            priors, leaf_value = self._call_policy_critic(
+                action_policy,
+                critic,
+                policy_state,
+                temperature=controls.policy_temperature,
+            )
+
+            backed_value = leaf_value
+            succeeded = torch.zeros(3, dtype=torch.bool)
+            iteration_snapshot = torch.zeros(3, dtype=torch.int64)
+            residual_snapshot = torch.full((3,), float("inf"), dtype=torch.float32)
+            if depth < cfg.max_depth and not bool(tree.expanded[node]):
+                if tree.can_expand_full_width():
+                    if not ledger.reserve("transition", cfg.transition_macs):
+                        # The already-obtained critic value remains a valid
+                        # bounded rollout. No callback occurs after denial.
+                        budget_stopped = True
+                        frontier_rollouts += 1
+                    else:
+                        input_version = policy_state._version
+                        batch = transition(
+                            policy_state,
+                            tree.actions,
+                            tolerance=controls.tolerance,
+                            warm_start=tree.warm_start(
+                                node, getattr(transition, "operator_id")
+                            ),
+                        )
+                        if policy_state._version != input_version:
+                            raise RuntimeError("certified transition mutated its input")
+                        self._validate_transition_batch(
+                            batch,
+                            policy_state,
+                            tolerance=controls.tolerance,
+                            operator_id=getattr(transition, "operator_id"),
+                        )
+                        succeeded.copy_(batch.success)
+                        iteration_snapshot.copy_(batch.iterations)
+                        residual_snapshot.copy_(batch.residuals)
+                        solver_calls += 3
+                        solver_history_peak = max(
+                            solver_history_peak,
+                            max(
+                                (
+                                    max(0, capsule.history_size - 1)
+                                    for capsule in batch.warm_starts
+                                    if capsule is not None
+                                ),
+                                default=0,
+                            ),
+                        )
+                        success_count = int(batch.success.sum())
+                        solver_successes += success_count
+                        solver_iterations_total += int(batch.iterations.sum())
+                        solver_iterations_max = max(
+                            solver_iterations_max, int(batch.iterations.max())
+                        )
+                        finite_residuals = batch.residuals[
+                            torch.isfinite(batch.residuals)
+                        ]
+                        if finite_residuals.numel():
+                            solver_residual_max = max(
+                                solver_residual_max, float(finite_residuals.max())
+                            )
+                        linear_solve_fallbacks += int(
+                            batch.linear_solve_fallbacks.sum()
+                        )
+                        warm_used += int(batch.warm_used.sum())
+                        warm_rejected += int(batch.warm_rejected.sum())
+
+                        masked_priors = priors * batch.success.to(torch.float32)
+                        prior_total = float(masked_priors.sum())
+                        if prior_total > 0.0:
+                            masked_priors /= prior_total
+                        elif success_count > 0:
+                            masked_priors.copy_(
+                                batch.success.to(torch.float32) / success_count
+                            )
+                        tree.priors[node].copy_(masked_priors)
+                        for action in range(3):
+                            if bool(batch.success[action]):
+                                capsule = batch.warm_starts[action]
+                                assert capsule is not None
+                                child = tree.add_child(
+                                    node, action, batch.states[action], capsule
+                                )
+                                retriever.add(child, tree.states[child], success=True)
+                            else:
+                                tree.mark_failed(node, action)
+                                failed_edges += 1
+                                q_zero_backups += 1
+                        tree.expanded[node] = True
+                        if success_count == 0:
+                            tree.terminal[node] = True
+                            all_fail_terminals += 1
+                            backed_value = 0.0
+                else:
+                    capacity_exhausted = True
+                    frontier_rollouts += 1
+                    # Preserve the selected learned frontier in one fixed
+                    # scratch row. Subsequent simulations continue one
+                    # certified width-3 transition at a time and commit only
+                    # the chosen learned action to the trace, never to the
+                    # saturated 301-node arena.
+                    frontier_state.copy_(policy_state)
+                    frontier_warm = tree.warm_start(
+                        node, getattr(transition, "operator_id")
+                    )
+                    frontier_active = True
+                    frontier_has_state = True
+                    frontier_depth = depth
+                    frontier_anchor_node = node
+                    frontier_anchor_path_length = path_length
+            elif not bool(tree.expanded[node]):
+                frontier_rollouts += 1
+
+            self._backup(tree, path_length, backed_value, cfg.discount)
+            completed += 1
+            trace.update(
+                (
+                    f"|{simulation}:{node}:{depth}:"
+                    f"{succeeded.to(torch.int8).tolist()}:"
+                    f"{iteration_snapshot.tolist()}:"
+                    f"{residual_snapshot.tolist()}"
+                ).encode()
+            )
+            if budget_stopped:
+                break
+
+        root_visits = tree.action_visits[0].clone()
+        root_priors = tree.priors[0].clone()
+        root_q = torch.where(
+            root_visits > 0,
+            tree.action_value_sums[0] / root_visits.to(torch.float32).clamp_min(1.0),
+            torch.zeros(3, dtype=torch.float32),
+        )
+        best_action_int = self._best_selectable_action(tree, 0)
+        best_path_values, best_node = self._select_best_path(tree)
+        tree_max_depth = int(tree.depths[: tree.node_count].max())
+        frontier_is_best = frontier_has_state and frontier_depth > tree_max_depth
+        best_state = frontier_state if frontier_is_best else tree.states[best_node]
+        safe_for_decode = (
+            completed > 0
+            and best_action_int >= 0
+            and bool(torch.isfinite(best_state).all())
+        )
+        telemetry = self._make_telemetry(
+            cfg=cfg,
+            controls=controls,
+            effective_simulations=effective_simulations,
+            completed=completed,
+            tree=tree,
+            retriever=retriever,
+            ledger=ledger,
+            capacity_exhausted=capacity_exhausted,
+            frontier_rollouts=frontier_rollouts,
+            frontier_depth=frontier_depth if frontier_has_state else 0,
+            frontier_workspace_bytes=frontier_workspace_bytes,
+            retrieval_queries=retrieval_queries,
+            retrieval_hits=retrieval_hits,
+            solver_calls=solver_calls,
+            solver_history_peak=solver_history_peak,
+            solver_successes=solver_successes,
+            solver_iterations_total=solver_iterations_total,
+            solver_iterations_max=solver_iterations_max,
+            solver_residual_max=solver_residual_max,
+            linear_solve_fallbacks=linear_solve_fallbacks,
+            warm_used=warm_used,
+            warm_rejected=warm_rejected,
+            failed_edges=failed_edges,
+            q_zero_backups=q_zero_backups,
+            all_fail_terminals=all_fail_terminals,
+            digest=trace.hexdigest(),
+            safe_for_decode=safe_for_decode,
+        )
+        return PUCTResultV2(
+            best_state=best_state.clone(),
+            best_action=torch.tensor(
+                best_action_int, device=root.device, dtype=torch.int64
+            ),
+            best_path=torch.tensor(best_path_values, dtype=torch.int64),
+            root_visit_counts=root_visits,
+            root_q_values=root_q,
+            root_priors=root_priors,
+            telemetry=telemetry,
+        )
+
+
 __all__ = [
+    "ActionPolicyV2",
     "AncestorBatch",
     "BoundedPUCTSearch",
+    "BoundedPUCTSearchV2",
+    "CertifiedBroydenTransitionV2",
+    "CertifiedPUCTConfigV2",
+    "CertifiedTransitionBatchV2",
+    "CertifiedTransitionV2",
     "ContractiveBroydenTransition",
+    "CriticV2",
     "DeclaredDEQTensorTransition",
+    "FixedCapacityTreeRetriever",
+    "MacBudgetLedger",
+    "MetaControllerV2",
     "PUCTConfig",
     "PUCTResult",
+    "PUCTResultV2",
     "PolicyValueFn",
+    "SearchControlsV2",
+    "SearchRequestV2",
     "SearchTelemetry",
+    "SearchTelemetryV2",
     "SemanticAncestorRetriever",
     "TensorTransition",
     "TransitionContractError",
@@ -1072,4 +2513,5 @@ __all__ = [
     "deq_tensor_transition",
     "puct_scores",
     "validate_deq_tensor_transition",
+    "validate_certified_transition_v2",
 ]

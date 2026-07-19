@@ -1,0 +1,1062 @@
+"""Verified local Gemma 4 multimodal preprocessing boundary.
+
+The processor builds the exact instruction-tuned chat-template tensors used by
+the resident worker.  Raw media, paths and Python objects never cross IPC.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from hashlib import sha256
+from io import BytesIO
+import math
+import os
+from pathlib import Path
+from stat import S_ISLNK, S_ISREG
+import struct
+from threading import Lock
+from types import MappingProxyType
+from typing import Callable, Mapping
+import wave
+from weakref import WeakSet
+
+import torch
+from torch import Tensor
+
+from cogni_os.artifacts import (
+    ArtifactIdentity,
+    ArtifactVerificationError,
+    verify_artifact_manifest,
+)
+
+from .model_trust import (
+    TRUSTED_GEMMA4_E4B_IT_REVISION,
+    verify_instruction_tuned_e4b_snapshot,
+)
+
+
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_PIXELS = 16_000_000
+MAX_AUDIO_WAV_BYTES = 2 * 1024 * 1024
+MAX_AUDIO_SECONDS = 30
+REQUIRED_AUDIO_RATE = 16_000
+MAX_BUNDLE_TENSOR_BYTES = 64 * 1024 * 1024
+MAX_VIDEO_FRAMES = 16
+MAX_VIDEO_WIDTH = 1_920
+MAX_VIDEO_HEIGHT = 1_080
+MAX_VIDEO_DURATION_SECONDS = 30.0
+MAX_VIDEO_SAMPLING_FPS = 4.0
+MAX_VIDEO_TOTAL_PIXELS = 16_777_216
+MAX_VIDEO_DECODED_BYTES = 64 * 1024 * 1024
+MAX_VIDEO_INPUT_TENSOR_ELEMENTS = MAX_VIDEO_TOTAL_PIXELS * 3
+MAX_VIDEO_OUTPUT_TENSOR_ELEMENTS = 16 * 1024 * 1024
+MAX_VIDEO_SEQUENCE_TOKENS = 8_192
+MAX_VIDEO_OUTPUT_AXIS = 8_192
+MAX_VIDEO_BOUNDARY_PEAK_CPU_BYTES = 384 * 1024 * 1024
+MAX_MULTIMODAL_MANIFEST_BYTES = 1024 * 1024
+
+_IMAGE_KEYS = frozenset(
+    {
+        "input_ids",
+        "attention_mask",
+        "mm_token_type_ids",
+        "pixel_values",
+        "image_position_ids",
+    }
+)
+_AUDIO_KEYS = frozenset(
+    {
+        "input_ids",
+        "attention_mask",
+        "mm_token_type_ids",
+        "input_features",
+        "input_features_mask",
+    }
+)
+_VIDEO_KEYS = frozenset(
+    {
+        "input_ids",
+        "attention_mask",
+        "mm_token_type_ids",
+        "pixel_values",
+        "pixel_values_videos",
+        "video_grid_thw",
+        "video_position_ids",
+    }
+)
+
+
+class MultimodalPreprocessError(ValueError):
+    """A local artifact or input failed before reaching the model worker."""
+
+
+class MultimodalTensorBundle:
+    """Opaque processor output whose authority is held by this module.
+
+    The public constructor is intentionally unavailable.  Consumers must use
+    :func:`is_verified_multimodal_bundle` rather than trusting a caller-set
+    boolean, and every public tensor view is an isolated copy.
+    """
+
+    __slots__ = ("_content_sha256", "_modality", "_tensors", "__weakref__")
+
+    def __new__(cls, *_args: object, **_kwargs: object) -> MultimodalTensorBundle:
+        raise TypeError("multimodal tensor bundles are created by the processor")
+
+    def __init_subclass__(cls, **_kwargs: object) -> None:
+        raise TypeError("multimodal tensor bundles cannot be subclassed")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("multimodal tensor bundles are immutable")
+
+    @property
+    def modality(self) -> str:
+        return self._modality
+
+    @property
+    def content_sha256(self) -> str:
+        return self._content_sha256
+
+    @property
+    def tensors(self) -> tuple[tuple[str, Tensor], ...]:
+        return tuple(
+            (name, _isolated_tensor_copy(tensor)) for name, tensor in self._tensors
+        )
+
+    def as_mapping(self) -> Mapping[str, Tensor]:
+        return MappingProxyType(
+            {name: _isolated_tensor_copy(tensor) for name, tensor in self._tensors}
+        )
+
+    @property
+    def tensor_bytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size() for _, tensor in self._tensors
+        )
+
+    @property
+    def tensor_elements(self) -> int:
+        return sum(tensor.numel() for _, tensor in self._tensors)
+
+
+_TRUSTED_MULTIMODAL_BUNDLES: WeakSet[MultimodalTensorBundle] = WeakSet()
+_TRUSTED_MULTIMODAL_BUNDLES_LOCK = Lock()
+
+
+def _isolated_tensor_copy(tensor: Tensor) -> Tensor:
+    try:
+        isolated = tensor.detach().clone(memory_format=torch.contiguous_format)
+    except RuntimeError as exc:
+        raise MultimodalPreprocessError(
+            "multimodal tensor snapshot could not be isolated"
+        ) from exc
+    if isolated.data_ptr() == tensor.data_ptr() or not isolated.is_contiguous():
+        raise MultimodalPreprocessError(
+            "multimodal tensor snapshot could not be isolated"
+        )
+    return isolated
+
+
+def _new_multimodal_tensor_bundle(
+    modality: str,
+    content_sha256: str,
+    tensors: tuple[tuple[str, Tensor], ...],
+) -> MultimodalTensorBundle:
+    bundle = object.__new__(MultimodalTensorBundle)
+    object.__setattr__(bundle, "_modality", modality)
+    object.__setattr__(bundle, "_content_sha256", content_sha256)
+    object.__setattr__(bundle, "_tensors", tensors)
+    with _TRUSTED_MULTIMODAL_BUNDLES_LOCK:
+        _TRUSTED_MULTIMODAL_BUNDLES.add(bundle)
+    return bundle
+
+
+def is_verified_multimodal_bundle(
+    bundle: object,
+    *,
+    modality: str | None = None,
+) -> bool:
+    """Return authority held by the private processor factory, never a public flag."""
+
+    if type(bundle) is not MultimodalTensorBundle:
+        return False
+    with _TRUSTED_MULTIMODAL_BUNDLES_LOCK:
+        trusted = bundle in _TRUSTED_MULTIMODAL_BUNDLES
+    return trusted and (modality is None or bundle.modality == modality)
+
+
+@dataclass(frozen=True, slots=True)
+class VideoSamplingMetadata:
+    """Measured properties of an admitted, already-decoded frame sequence."""
+
+    frame_count: int
+    width: int
+    height: int
+    duration_seconds: float
+    sampling_fps: float
+    timestamps_seconds: tuple[float, ...]
+    total_pixels: int
+    decoded_bytes: int
+    input_tensor_elements: int
+
+
+@dataclass(frozen=True, slots=True)
+class VideoProcessorIdentity:
+    """Manifest and processor identity for preprocessing evidence only."""
+
+    family: str
+    variant: str
+    role: str
+    source: str
+    revision: str
+    manifest_sha256: str
+    processor_class: str
+    local_files_only: bool = True
+    trust_remote_code: bool = False
+    actual_model_inference: bool = False
+    vram_measured: bool = False
+    processor_call_wall_time_bounded: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class VideoPreprocessResult:
+    """A bounded CPU tensor bundle without an inference or VRAM claim."""
+
+    bundle: MultimodalTensorBundle
+    sampling: VideoSamplingMetadata
+    processor_identity: VideoProcessorIdentity
+    estimated_peak_cpu_bytes: int
+    cpu_allocation_status: str = "PARTIAL_BOUNDARY_ACCOUNTING"
+    processor_call_wall_time_status: str = (
+        "PARTIAL_UNBOUNDED_SYNCHRONOUS_PROCESSOR_CALL"
+    )
+
+    def as_mapping(self) -> dict[str, Tensor]:
+        return self.bundle.as_mapping()
+
+    @property
+    def tensor_bytes(self) -> int:
+        return self.bundle.tensor_bytes
+
+    @property
+    def output_tensor_elements(self) -> int:
+        return self.bundle.tensor_elements
+
+
+def _bounded_prompt(prompt: object) -> str:
+    if (
+        not isinstance(prompt, str)
+        or not prompt.strip()
+        or len(prompt) > 8_192
+        or any(
+            ord(character) < 32 and character not in "\t\r\n" for character in prompt
+        )
+    ):
+        raise MultimodalPreprocessError("prompt must be bounded text")
+    return prompt.strip()
+
+
+def _path_is_link_or_reparse(path: Path) -> bool:
+    status = path.lstat()
+    reparse_flag = getattr(status, "st_file_attributes", 0) & getattr(
+        os, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+    )
+    return S_ISLNK(status.st_mode) or bool(reparse_flag)
+
+
+def _bounded_regular_file_sha256(path: Path, *, max_bytes: int) -> str:
+    if max_bytes < 1 or _path_is_link_or_reparse(path):
+        raise MultimodalPreprocessError(
+            "manifest must be a bounded regular file without links or reparse points"
+        )
+    before = path.stat(follow_symlinks=False)
+    if not S_ISREG(before.st_mode) or not 1 <= before.st_size <= max_bytes:
+        raise MultimodalPreprocessError(
+            "manifest must be a bounded regular file without links or reparse points"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    digest = sha256()
+    total = 0
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not S_ISREG(opened.st_mode)
+            or opened.st_size != before.st_size
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise MultimodalPreprocessError("manifest changed before its bounded hash")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while True:
+                chunk = stream.read(min(1024 * 1024, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise MultimodalPreprocessError("manifest exceeds its byte limit")
+                digest.update(chunk)
+        after = os.fstat(descriptor)
+        if after.st_size != before.st_size or total != before.st_size:
+            raise MultimodalPreprocessError("manifest changed during its bounded hash")
+    finally:
+        os.close(descriptor)
+
+    current = path.stat(follow_symlinks=False)
+    if (
+        _path_is_link_or_reparse(path)
+        or not S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino, current.st_size)
+        != (before.st_dev, before.st_ino, before.st_size)
+    ):
+        raise MultimodalPreprocessError("manifest changed during its bounded hash")
+    return digest.hexdigest()
+
+
+def _video_tensor(
+    output: Mapping[object, object],
+    name: str,
+) -> Tensor:
+    value = output.get(name)
+    if (
+        not isinstance(value, Tensor)
+        or value.device.type != "cpu"
+        or value.layout != torch.strided
+    ):
+        raise MultimodalPreprocessError(
+            f"video processor field {name} must be a CPU strided tensor"
+        )
+    return value
+
+
+def _bounded_video_output_schema(output: object) -> None:
+    """Validate field semantics before any output normalization allocation."""
+
+    if not isinstance(output, Mapping):
+        raise MultimodalPreprocessError(
+            "video processor returned an unsupported tensor schema"
+        )
+    try:
+        keys = frozenset(output)
+    except (TypeError, RuntimeError) as exc:
+        raise MultimodalPreprocessError(
+            "video processor returned an unsupported tensor schema"
+        ) from exc
+    if (
+        not keys.issubset(_VIDEO_KEYS)
+        or not {
+            "input_ids",
+            "attention_mask",
+            "mm_token_type_ids",
+        }.issubset(keys)
+        or len(keys.intersection({"pixel_values", "pixel_values_videos"})) != 1
+    ):
+        raise MultimodalPreprocessError(
+            "video processor returned an unsupported tensor schema"
+        )
+
+    input_ids = _video_tensor(output, "input_ids")
+    if (
+        input_ids.dtype != torch.int64
+        or input_ids.ndim != 2
+        or input_ids.shape[0] != 1
+        or not 1 <= input_ids.shape[1] <= MAX_VIDEO_SEQUENCE_TOKENS
+    ):
+        raise MultimodalPreprocessError(
+            "video processor input_ids field has an invalid dtype or shape"
+        )
+    attention_mask = _video_tensor(output, "attention_mask")
+    if attention_mask.dtype not in {torch.bool, torch.int64} or tuple(
+        attention_mask.shape
+    ) != tuple(input_ids.shape):
+        raise MultimodalPreprocessError(
+            "video processor attention_mask field has an invalid dtype or shape"
+        )
+    mm_token_type_ids = _video_tensor(output, "mm_token_type_ids")
+    if mm_token_type_ids.dtype != torch.int64 or tuple(
+        mm_token_type_ids.shape
+    ) != tuple(input_ids.shape):
+        raise MultimodalPreprocessError(
+            "video processor mm_token_type_ids field has an invalid dtype or shape"
+        )
+
+    pixel_name = next(iter(keys.intersection({"pixel_values", "pixel_values_videos"})))
+    pixel_values = _video_tensor(output, pixel_name)
+    if (
+        pixel_values.dtype not in {torch.float16, torch.bfloat16, torch.float32}
+        or pixel_values.ndim not in {4, 5}
+        or pixel_values.shape[0] != 1
+        or any(
+            not 1 <= int(axis) <= MAX_VIDEO_OUTPUT_AXIS for axis in pixel_values.shape
+        )
+    ):
+        raise MultimodalPreprocessError(
+            f"video processor {pixel_name} field has an invalid dtype or shape"
+        )
+
+    if "video_grid_thw" in keys:
+        video_grid = _video_tensor(output, "video_grid_thw")
+        valid_grid_shape = (
+            video_grid.ndim == 2
+            and video_grid.shape[-1] == 3
+            and 1 <= video_grid.shape[0] <= MAX_VIDEO_FRAMES
+        ) or (
+            video_grid.ndim == 3
+            and video_grid.shape[0] == 1
+            and video_grid.shape[-1] == 3
+            and 1 <= video_grid.shape[1] <= MAX_VIDEO_FRAMES
+        )
+        if video_grid.dtype != torch.int64 or not valid_grid_shape:
+            raise MultimodalPreprocessError(
+                "video processor video_grid_thw field has an invalid dtype or shape"
+            )
+
+    if "video_position_ids" in keys:
+        position_ids = _video_tensor(output, "video_position_ids")
+        if (
+            position_ids.dtype != torch.int64
+            or position_ids.ndim not in {3, 4}
+            or position_ids.shape[0] != 1
+            or any(
+                not 1 <= int(axis) <= MAX_VIDEO_OUTPUT_AXIS
+                for axis in position_ids.shape
+            )
+        ):
+            raise MultimodalPreprocessError(
+                "video processor video_position_ids field has an invalid dtype or shape"
+            )
+
+    total_elements = 0
+    for name in keys:
+        value = _video_tensor(output, name)
+        total_elements += value.numel()
+        if total_elements > MAX_VIDEO_OUTPUT_TENSOR_ELEMENTS:
+            raise MultimodalPreprocessError(
+                "video output tensor elements exceed their limit"
+            )
+
+
+def _validated_bundle(
+    modality: str,
+    content: bytes,
+    output: object,
+    allowed_keys: frozenset[str],
+    *,
+    precomputed_content_sha256: str | None = None,
+    schema_validator: Callable[[Mapping[object, object]], None] | None = None,
+) -> MultimodalTensorBundle:
+    snapshot = _snapshot_processor_output(modality, output, allowed_keys)
+    if schema_validator is not None:
+        schema_validator(snapshot)
+    required = {
+        "image": {"input_ids", "attention_mask", "pixel_values"},
+        "audio": {"input_ids", "attention_mask", "input_features"},
+        "video": {"input_ids", "attention_mask", "mm_token_type_ids"},
+    }[modality]
+    if not required.issubset(snapshot):
+        raise MultimodalPreprocessError("processor omitted required modality tensors")
+    if modality == "video" and not {
+        "pixel_values",
+        "pixel_values_videos",
+    }.intersection(snapshot):
+        raise MultimodalPreprocessError("processor omitted required video features")
+    if precomputed_content_sha256 is not None and (
+        len(precomputed_content_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in precomputed_content_sha256
+        )
+    ):
+        raise MultimodalPreprocessError("precomputed content digest is invalid")
+    return _new_multimodal_tensor_bundle(
+        modality,
+        precomputed_content_sha256 or sha256(content).hexdigest(),
+        tuple(sorted(snapshot.items())),
+    )
+
+
+def _snapshot_processor_output(
+    modality: str,
+    output: object,
+    allowed_keys: frozenset[str],
+) -> Mapping[str, Tensor]:
+    """Read each output field once and detach it into one immutable clone snapshot."""
+
+    if not isinstance(output, Mapping):
+        raise MultimodalPreprocessError(
+            "processor returned an unsupported tensor schema"
+        )
+    try:
+        iterator = iter(output)
+        names: list[str] = []
+        for _index in range(len(allowed_keys) + 1):
+            try:
+                name = next(iterator)
+            except StopIteration:
+                break
+            if not isinstance(name, str) or name not in allowed_keys or name in names:
+                raise MultimodalPreprocessError(
+                    "processor returned an unsupported tensor schema"
+                )
+            names.append(name)
+        else:
+            raise MultimodalPreprocessError(
+                "processor returned an unsupported tensor schema"
+            )
+    except MultimodalPreprocessError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - processor-owned mapping boundary
+        raise MultimodalPreprocessError(
+            "processor returned an unsupported tensor schema"
+        ) from exc
+
+    rows: dict[str, Tensor] = {}
+    total_bytes = 0
+    snapshot_total_bytes = 0
+    for name in names:
+        try:
+            value = output[name]
+        except Exception as exc:  # noqa: BLE001 - processor-owned mapping boundary
+            raise MultimodalPreprocessError(
+                "processor returned an unsupported tensor schema"
+            ) from exc
+        if (
+            type(value) is not Tensor
+            or value.device.type != "cpu"
+            or value.layout != torch.strided
+        ):
+            raise MultimodalPreprocessError("processor outputs must be CPU tensors")
+        batch_shape_required = not (
+            modality == "video" and name == "video_grid_thw" and value.ndim == 2
+        )
+        if (
+            value.ndim < 1
+            or batch_shape_required
+            and value.shape[0] != 1
+            or value.numel() < 1
+        ):
+            raise MultimodalPreprocessError(
+                "processor returned an invalid tensor shape"
+            )
+        total_bytes += value.numel() * value.element_size()
+        if total_bytes > MAX_BUNDLE_TENSOR_BYTES:
+            raise MultimodalPreprocessError(
+                "multimodal tensor bundle exceeds its byte limit"
+            )
+        try:
+            tensor = value.detach().clone(memory_format=torch.contiguous_format)
+            cloned_bytes = tensor.numel() * tensor.element_size()
+            snapshot_total_bytes += cloned_bytes
+            if (
+                cloned_bytes < 1
+                or snapshot_total_bytes > MAX_BUNDLE_TENSOR_BYTES
+                or tensor.data_ptr() == value.data_ptr()
+                or tensor.ndim < 1
+                or batch_shape_required
+                and tensor.shape[0] != 1
+            ):
+                raise MultimodalPreprocessError(
+                    "processor output could not be isolated within its bounds"
+                )
+            finite = bool(torch.isfinite(tensor).all())
+        except MultimodalPreprocessError:
+            raise
+        except RuntimeError as exc:
+            raise MultimodalPreprocessError(
+                "processor returned an unsupported tensor"
+            ) from exc
+        if not finite:
+            raise MultimodalPreprocessError("processor returned non-finite features")
+        rows[name] = tensor
+    return MappingProxyType(rows)
+
+
+def _bounded_video_frames(
+    frames: object,
+    *,
+    duration_seconds: object,
+    sampling_fps: object,
+    timestamps_seconds: object,
+) -> tuple[tuple[Tensor, ...], VideoSamplingMetadata, str]:
+    if type(frames) is not tuple or not 1 <= len(frames) <= MAX_VIDEO_FRAMES:
+        raise MultimodalPreprocessError("video frame count exceeds its fixed limit")
+    if (
+        isinstance(duration_seconds, bool)
+        or not isinstance(duration_seconds, (int, float))
+        or not math.isfinite(float(duration_seconds))
+        or not 0.0 < float(duration_seconds) <= MAX_VIDEO_DURATION_SECONDS
+    ):
+        raise MultimodalPreprocessError("video duration metadata is invalid")
+    if (
+        isinstance(sampling_fps, bool)
+        or not isinstance(sampling_fps, (int, float))
+        or not math.isfinite(float(sampling_fps))
+        or not 0.0 < float(sampling_fps) <= MAX_VIDEO_SAMPLING_FPS
+    ):
+        raise MultimodalPreprocessError("video sampling metadata is invalid")
+    if type(timestamps_seconds) is not tuple or len(timestamps_seconds) != len(frames):
+        raise MultimodalPreprocessError("video timestamps must match the frame count")
+
+    duration = float(duration_seconds)
+    sample_rate = float(sampling_fps)
+    timestamps: list[float] = []
+    previous = -1.0
+    for value in timestamps_seconds:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise MultimodalPreprocessError("video timestamp metadata is invalid")
+        timestamp = float(value)
+        if timestamp < 0.0 or timestamp > duration or timestamp <= previous:
+            raise MultimodalPreprocessError(
+                "video timestamps must be strictly increasing within duration"
+            )
+        timestamps.append(timestamp)
+        previous = timestamp
+    if len(timestamps) > math.floor(duration * sample_rate + 1e-9) + 1:
+        raise MultimodalPreprocessError("video frame count exceeds sampling metadata")
+    if len(timestamps) > 1:
+        observed_fps = (len(timestamps) - 1) / (timestamps[-1] - timestamps[0])
+        if observed_fps > sample_rate * (1.0 + 1e-6):
+            raise MultimodalPreprocessError("video timestamps exceed sampling metadata")
+
+    bounded: list[Tensor] = []
+    width = 0
+    height = 0
+    total_pixels = 0
+    decoded_bytes = 0
+    total_elements = 0
+    digest = sha256()
+    digest.update(b"cogni-video-frames-v2\0")
+    # IEEE-754 binary64 metadata is bound exactly.  Decimal formatting would
+    # collapse distinct durations/timestamps below the chosen print precision.
+    digest.update(struct.pack(">Idd", len(frames), duration, sample_rate))
+    for index, value in enumerate(frames):
+        if (
+            type(value) is not Tensor
+            or value.device.type != "cpu"
+            or value.layout != torch.strided
+        ):
+            raise MultimodalPreprocessError("video frames must be CPU tensors")
+        if value.dtype != torch.uint8 or value.ndim != 3 or value.shape[2] != 3:
+            raise MultimodalPreprocessError(
+                "video frames must be HWC RGB uint8 tensors"
+            )
+        frame_height, frame_width, _channels = map(int, value.shape)
+        if (
+            not 1 <= frame_width <= MAX_VIDEO_WIDTH
+            or not 1 <= frame_height <= MAX_VIDEO_HEIGHT
+        ):
+            raise MultimodalPreprocessError("video frame dimensions are unsupported")
+        if index == 0:
+            width, height = frame_width, frame_height
+        elif (frame_width, frame_height) != (width, height):
+            raise MultimodalPreprocessError("video frame dimensions must be uniform")
+        total_pixels += frame_width * frame_height
+        total_elements += value.numel()
+        decoded_bytes += value.numel() * value.element_size()
+        if total_pixels > MAX_VIDEO_TOTAL_PIXELS:
+            raise MultimodalPreprocessError("video total pixels exceed their limit")
+        if total_elements > MAX_VIDEO_INPUT_TENSOR_ELEMENTS:
+            raise MultimodalPreprocessError(
+                "video input tensor elements exceed their limit"
+            )
+        if decoded_bytes > MAX_VIDEO_DECODED_BYTES:
+            raise MultimodalPreprocessError("video decoded bytes exceed their limit")
+        # Snapshot caller-owned storage only after all allocation budgets pass.
+        try:
+            frame = value.detach().clone(memory_format=torch.contiguous_format)
+            isolated = (
+                type(frame) is Tensor
+                and frame.device.type == "cpu"
+                and frame.layout == torch.strided
+                and frame.dtype == torch.uint8
+                and frame.ndim == 3
+                and tuple(frame.shape) == (frame_height, frame_width, 3)
+                and frame.is_contiguous()
+                and frame.numel() == value.numel()
+                and frame.data_ptr() != value.data_ptr()
+                and frame.untyped_storage().data_ptr()
+                != value.untyped_storage().data_ptr()
+            )
+            finite = bool(torch.isfinite(frame).all())
+        except RuntimeError as exc:
+            raise MultimodalPreprocessError(
+                "video frame tensor is unsupported"
+            ) from exc
+        if not isolated or frame.requires_grad or not finite:
+            raise MultimodalPreprocessError(
+                "video frame tensor could not be isolated safely"
+            )
+        digest.update(
+            struct.pack(">IdII", index, timestamps[index], frame_height, frame_width)
+        )
+        digest.update(frame.numpy().tobytes(order="C"))
+        bounded.append(frame)
+    metadata = VideoSamplingMetadata(
+        frame_count=len(bounded),
+        width=width,
+        height=height,
+        duration_seconds=duration,
+        sampling_fps=sample_rate,
+        timestamps_seconds=tuple(timestamps),
+        total_pixels=total_pixels,
+        decoded_bytes=decoded_bytes,
+        input_tensor_elements=total_elements,
+    )
+    return tuple(bounded), metadata, digest.hexdigest()
+
+
+class VerifiedGemma4MultimodalProcessor:
+    """Fail-closed production boundary for the currently path-based processor loader."""
+
+    production_loader_enabled = False
+    loader_binding_verified = False
+    loader_binding_status = "UNPROVEN_PATH_LOADER_DISABLED"
+
+    def __init__(self, model_root: str | Path, manifest_path: str | Path) -> None:
+        try:
+            root = Path(model_root).expanduser().resolve(strict=True)
+            requested_manifest = Path(manifest_path).expanduser()
+            if _path_is_link_or_reparse(requested_manifest):
+                raise MultimodalPreprocessError(
+                    "manifest cannot be a link or reparse point"
+                )
+            requested_before = requested_manifest.stat(follow_symlinks=False)
+            manifest = requested_manifest.resolve(strict=True)
+            requested_after = requested_manifest.stat(follow_symlinks=False)
+            if (
+                _path_is_link_or_reparse(requested_manifest)
+                or not S_ISREG(requested_after.st_mode)
+                or (
+                    requested_after.st_dev,
+                    requested_after.st_ino,
+                    requested_after.st_size,
+                )
+                != (
+                    requested_before.st_dev,
+                    requested_before.st_ino,
+                    requested_before.st_size,
+                )
+            ):
+                raise MultimodalPreprocessError(
+                    "manifest changed while its path was resolved"
+                )
+            manifest_digest = _bounded_regular_file_sha256(
+                manifest,
+                max_bytes=MAX_MULTIMODAL_MANIFEST_BYTES,
+            )
+            before = verify_artifact_manifest(root, manifest)
+            verify_instruction_tuned_e4b_snapshot(before)
+            if (
+                _bounded_regular_file_sha256(
+                    manifest,
+                    max_bytes=MAX_MULTIMODAL_MANIFEST_BYTES,
+                )
+                != manifest_digest
+            ):
+                raise MultimodalPreprocessError(
+                    "manifest changed while artifacts were verified"
+                )
+        except (OSError, ArtifactVerificationError, ValueError) as exc:
+            raise MultimodalPreprocessError(
+                "model artifacts failed verification"
+            ) from exc
+        relative_names = {name for name, _digest in before.digests}
+        if not {"processor_config.json", "tokenizer.json"}.issubset(relative_names):
+            raise MultimodalPreprocessError(
+                "verified snapshot lacks processor artifacts"
+            )
+        del manifest_digest, before
+        # AutoProcessor.from_pretrained() reopens a directory by path.  An
+        # attacker able to replace those files can present verified bytes,
+        # substitute different bytes while AutoProcessor reads them, then
+        # restore the verified snapshot before a post-load hash (ABA).  No
+        # production processor is created until the parser consumes the exact
+        # verified byte snapshot rather than path names.
+        raise MultimodalPreprocessError(
+            "multimodal processor loading is disabled because verified bytes "
+            "cannot be bound to the path-based loader"
+        )
+
+    def _verified_video_identity(self) -> VideoProcessorIdentity:
+        identity = getattr(self, "artifact_identity", None)
+        if (
+            getattr(self, "_trusted_snapshot_verified", False) is not True
+            or not isinstance(identity, ArtifactIdentity)
+            or (
+                identity.family.casefold() != "gemma4"
+                or identity.variant.casefold() != "e4b"
+                or identity.role != "instruction_tuned"
+                or identity.source != "google/gemma-4-E4B-it"
+                or identity.revision != TRUSTED_GEMMA4_E4B_IT_REVISION
+            )
+        ):
+            raise MultimodalPreprocessError(
+                "video preprocessing requires the exact Gemma 4 E4B IT manifest identity"
+            )
+        manifest_sha256 = getattr(self, "manifest_sha256", None)
+        if (
+            not isinstance(manifest_sha256, str)
+            or len(manifest_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in manifest_sha256)
+        ):
+            raise MultimodalPreprocessError(
+                "video processor manifest digest is unavailable"
+            )
+        processor = getattr(self, "processor", None)
+        processor_class = processor.__class__.__name__ if processor is not None else ""
+        video_processor = getattr(processor, "video_processor", None)
+        apply_chat_template = getattr(processor, "apply_chat_template", None)
+        video_token = getattr(processor, "video_token", None)
+        tokenizer = getattr(processor, "tokenizer", None)
+        video_token_id = getattr(processor, "video_token_id", None)
+        if video_token_id is None:
+            video_token_id = getattr(tokenizer, "video_token_id", None)
+        if (
+            processor_class != "Gemma4Processor"
+            or not callable(video_processor)
+            or not callable(apply_chat_template)
+            or not (
+                isinstance(video_token, str)
+                and 1 <= len(video_token) <= 128
+                and not any(ord(character) < 32 for character in video_token)
+                or isinstance(video_token_id, int)
+                and not isinstance(video_token_id, bool)
+                and video_token_id >= 0
+            )
+        ):
+            raise MultimodalPreprocessError(
+                "verified processor does not expose an executable video capability"
+            )
+        return VideoProcessorIdentity(
+            family=identity.family,
+            variant=identity.variant,
+            role=identity.role,
+            source=identity.source,
+            revision=identity.revision,
+            manifest_sha256=manifest_sha256,
+            processor_class=processor_class,
+        )
+
+    def process_image(self, content: bytes, prompt: str) -> MultimodalTensorBundle:
+        if not isinstance(content, bytes) or not 1 <= len(content) <= MAX_IMAGE_BYTES:
+            raise MultimodalPreprocessError("image exceeds its byte limit")
+        prompt_text = _bounded_prompt(prompt)
+        try:
+            from PIL import Image, UnidentifiedImageError
+
+            with Image.open(BytesIO(content)) as image:
+                width, height = image.size
+                if (
+                    not 1 <= width <= 8_192
+                    or not 1 <= height <= 8_192
+                    or width * height > MAX_IMAGE_PIXELS
+                    or image.format not in {"PNG", "JPEG", "WEBP"}
+                ):
+                    raise MultimodalPreprocessError(
+                        "image dimensions or format are unsupported"
+                    )
+                image.load()
+                rgb = image.convert("RGB")
+        except MultimodalPreprocessError:
+            raise
+        except (OSError, UnidentifiedImageError) as exc:
+            raise MultimodalPreprocessError(
+                "image could not be decoded locally"
+            ) from exc
+        try:
+            output = self.processor.apply_chat_template(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": rgb},
+                            {"type": "text", "text": prompt_text},
+                        ],
+                    }
+                ],
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+                processor_kwargs={"return_mm_token_type_ids": True},
+            )
+        except Exception as exc:
+            raise MultimodalPreprocessError(
+                "Gemma 4 image preprocessing failed"
+            ) from exc
+        return _validated_bundle("image", content, output, _IMAGE_KEYS)
+
+    def process_audio_wav(self, content: bytes, prompt: str) -> MultimodalTensorBundle:
+        if (
+            not isinstance(content, bytes)
+            or not 1 <= len(content) <= MAX_AUDIO_WAV_BYTES
+        ):
+            raise MultimodalPreprocessError("audio exceeds its byte limit")
+        prompt_text = _bounded_prompt(prompt)
+        try:
+            with wave.open(BytesIO(content), "rb") as stream:
+                channels = stream.getnchannels()
+                sample_width = stream.getsampwidth()
+                sample_rate = stream.getframerate()
+                frame_count = stream.getnframes()
+                if (
+                    channels != 1
+                    or sample_width != 2
+                    or sample_rate != REQUIRED_AUDIO_RATE
+                    or not 1 <= frame_count <= REQUIRED_AUDIO_RATE * MAX_AUDIO_SECONDS
+                ):
+                    raise MultimodalPreprocessError(
+                        "audio must be mono 16-bit PCM WAV at 16 kHz and at most 30 seconds"
+                    )
+                frames = stream.readframes(frame_count)
+        except MultimodalPreprocessError:
+            raise
+        except (EOFError, OSError, wave.Error) as exc:
+            raise MultimodalPreprocessError(
+                "audio WAV could not be decoded locally"
+            ) from exc
+        if len(frames) != frame_count * 2:
+            raise MultimodalPreprocessError("audio WAV is truncated")
+        try:
+            import numpy as np
+
+            waveform = np.frombuffer(frames, dtype="<i2").astype("float32") / 32768.0
+            if waveform.size != frame_count or not bool(np.isfinite(waveform).all()):
+                raise MultimodalPreprocessError("audio waveform is invalid")
+            output = self.processor.apply_chat_template(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "audio", "audio": waveform},
+                            {"type": "text", "text": prompt_text},
+                        ],
+                    }
+                ],
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+                processor_kwargs={"return_mm_token_type_ids": True},
+            )
+        except MultimodalPreprocessError:
+            raise
+        except Exception as exc:
+            raise MultimodalPreprocessError(
+                "Gemma 4 audio preprocessing failed"
+            ) from exc
+        return _validated_bundle("audio", content, output, _AUDIO_KEYS)
+
+    def process_video_frames(
+        self,
+        frames: tuple[Tensor, ...],
+        prompt: str,
+        *,
+        duration_seconds: float,
+        sampling_fps: float,
+        timestamps_seconds: tuple[float, ...],
+    ) -> VideoPreprocessResult:
+        """Preprocess an already-decoded, bounded CPU RGB frame sequence.
+
+        This boundary deliberately has no file/path/URL/decoder contract. It
+        neither launches a decoder nor claims that the resulting tensors were
+        executed by the model. A later worker/IPC integration must add its own
+        independently attested inference and memory evidence.
+        """
+
+        prompt_text = _bounded_prompt(prompt)
+        identity = self._verified_video_identity()
+        bounded_frames, metadata, content_sha256 = _bounded_video_frames(
+            frames,
+            duration_seconds=duration_seconds,
+            sampling_fps=sampling_fps,
+            timestamps_seconds=timestamps_seconds,
+        )
+        input_peak_cpu_bytes = metadata.decoded_bytes * 3
+        if input_peak_cpu_bytes > MAX_VIDEO_BOUNDARY_PEAK_CPU_BYTES:
+            raise MultimodalPreprocessError(
+                "video boundary CPU allocation estimate exceeds its limit"
+            )
+        # NumPy arrays are local, already-decoded frame values. No path, URL,
+        # encoded video, shell command or decoder process enters this contract.
+        processor_frames = [frame.numpy().copy() for frame in bounded_frames]
+        try:
+            # This third-party call is deliberately synchronous. In-process
+            # cancellation cannot safely terminate native processor code, so
+            # wall-time evidence remains explicitly PARTIAL until this boundary
+            # is moved into a killable worker process.
+            output = self.processor.apply_chat_template(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "video", "video": processor_frames},
+                            {"type": "text", "text": prompt_text},
+                        ],
+                    }
+                ],
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+                processor_kwargs={"return_mm_token_type_ids": True},
+            )
+        except Exception as exc:
+            raise MultimodalPreprocessError(
+                "Gemma 4 video preprocessing failed"
+            ) from exc
+        bundle = _validated_bundle(
+            "video",
+            b"",
+            output,
+            _VIDEO_KEYS,
+            precomputed_content_sha256=content_sha256,
+            schema_validator=_bounded_video_output_schema,
+        )
+        output_elements = bundle.tensor_elements
+        if output_elements > MAX_VIDEO_OUTPUT_TENSOR_ELEMENTS:
+            raise MultimodalPreprocessError(
+                "video output tensor elements exceed their limit"
+            )
+        estimated_peak_cpu_bytes = metadata.decoded_bytes * 3 + bundle.tensor_bytes * 2
+        if estimated_peak_cpu_bytes > MAX_VIDEO_BOUNDARY_PEAK_CPU_BYTES:
+            raise MultimodalPreprocessError(
+                "video boundary CPU allocation estimate exceeds its limit"
+            )
+        return VideoPreprocessResult(
+            bundle=bundle,
+            sampling=metadata,
+            processor_identity=identity,
+            estimated_peak_cpu_bytes=estimated_peak_cpu_bytes,
+        )
+
+
+__all__ = [
+    "MAX_AUDIO_SECONDS",
+    "MAX_BUNDLE_TENSOR_BYTES",
+    "MAX_IMAGE_PIXELS",
+    "MAX_MULTIMODAL_MANIFEST_BYTES",
+    "MAX_VIDEO_BOUNDARY_PEAK_CPU_BYTES",
+    "MAX_VIDEO_DECODED_BYTES",
+    "MAX_VIDEO_DURATION_SECONDS",
+    "MAX_VIDEO_FRAMES",
+    "MAX_VIDEO_HEIGHT",
+    "MAX_VIDEO_INPUT_TENSOR_ELEMENTS",
+    "MAX_VIDEO_OUTPUT_TENSOR_ELEMENTS",
+    "MAX_VIDEO_OUTPUT_AXIS",
+    "MAX_VIDEO_SAMPLING_FPS",
+    "MAX_VIDEO_SEQUENCE_TOKENS",
+    "MAX_VIDEO_TOTAL_PIXELS",
+    "MAX_VIDEO_WIDTH",
+    "MultimodalPreprocessError",
+    "MultimodalTensorBundle",
+    "VideoPreprocessResult",
+    "VideoProcessorIdentity",
+    "VideoSamplingMetadata",
+    "VerifiedGemma4MultimodalProcessor",
+    "is_verified_multimodal_bundle",
+]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 import math
 
 import torch
@@ -14,6 +15,10 @@ class ExpertBudgetExceeded(RuntimeError):
 
 class ExpertContractivityError(RuntimeError):
     """Raised when an expert recurrent operator cannot be made contractive."""
+
+
+class ExpertCalibrationError(RuntimeError):
+    """Raised when a novelty calibration cannot meet its error bounds."""
 
 
 @dataclass(frozen=True)
@@ -64,6 +69,19 @@ class ExpertConfig:
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
+        finite = {
+            "novelty_threshold": self.novelty_threshold,
+            "recruit_fraction": self.recruit_fraction,
+            "routing_temperature": self.routing_temperature,
+            "spectral_margin": self.spectral_margin,
+            "usage_decay": self.usage_decay,
+            "prune_usage_threshold": self.prune_usage_threshold,
+            "balance_coefficient": self.balance_coefficient,
+            "z_loss_coefficient": self.z_loss_coefficient,
+        }
+        for name, value in finite.items():
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
         if not self.min_experts <= self.initial_experts <= self.max_experts:
             raise ValueError("expected min_experts <= initial_experts <= max_experts")
         if self.top_k > self.max_experts:
@@ -98,6 +116,7 @@ class RouterOutput:
     balance_loss: Tensor
     z_loss: Tensor
     auxiliary_loss: Tensor
+    calibration_verified: Tensor
 
 
 @dataclass(frozen=True)
@@ -131,6 +150,18 @@ RECRUITMENT_ADDED = 1
 RECRUITMENT_AFTER_PRUNE = 2
 RECRUITMENT_AFTER_MERGE = 3
 RECRUITMENT_CAPACITY_BLOCKED = 4
+
+# Slot states are persisted tensors so checkpoint validation can reject an
+# impossible partially promoted expert without relying on Python metadata.
+EXPERT_INACTIVE = 0
+EXPERT_CANDIDATE = 1
+EXPERT_CFIRE_CERTIFIED = 2
+EXPERT_TRAINED = 3
+EXPERT_HELD_OUT = 4
+EXPERT_FISHER = 5
+EXPERT_CANARY = 6
+EXPERT_ACTIVE = 7
+EXPERT_QUARANTINED = 8
 
 
 def _tensor_nbytes(tensor: Tensor) -> int:
@@ -181,6 +212,27 @@ class BoundedSparseImplicitExperts(nn.Module):
         self.register_buffer("recruitment_count", torch.zeros((), dtype=torch.long))
         self.register_buffer("merge_count", torch.zeros((), dtype=torch.long))
         self.register_buffer("prune_count", torch.zeros((), dtype=torch.long))
+        self.register_buffer(
+            "slot_state", torch.full((m,), EXPERT_INACTIVE, dtype=torch.long)
+        )
+        self.register_buffer("canary_mask", torch.zeros(m, dtype=torch.bool))
+        self.register_buffer("quarantine_mask", torch.zeros(m, dtype=torch.bool))
+        # This is an eligibility bit only.  The product pipeline remains
+        # detached/advisory until a separately reviewed integration consumes it.
+        self.register_buffer("answer_authority_mask", torch.zeros(m, dtype=torch.bool))
+        self.register_buffer(
+            "calibrated_novelty_threshold",
+            torch.tensor(float(config.novelty_threshold), dtype=torch.float32),
+        )
+        self.register_buffer("novelty_calibrated", torch.zeros((), dtype=torch.bool))
+        self.register_buffer("calibration_fpr", torch.ones((), dtype=torch.float32))
+        self.register_buffer("calibration_fnr", torch.ones((), dtype=torch.float32))
+        self.register_buffer(
+            "calibration_id_samples", torch.zeros((), dtype=torch.long)
+        )
+        self.register_buffer(
+            "calibration_ood_samples", torch.zeros((), dtype=torch.long)
+        )
 
         with torch.no_grad():
             self.router_weight.copy_(
@@ -280,7 +332,10 @@ class BoundedSparseImplicitExperts(nn.Module):
         weight = self.recurrent[slot]
         sigma = torch.linalg.matrix_norm(weight, ord=2).clamp_min(1e-12)
         margin = weight.new_tensor(self.config.spectral_margin * (1.0 - 1e-5))
-        weight.mul_(torch.clamp(margin / sigma, max=1.0))
+        scale = torch.clamp(margin / sigma, max=1.0)
+        weight.mul_(scale)
+        if bool((scale < 1.0).detach().cpu()):
+            self.answer_authority_mask[slot] = False
 
     @torch.no_grad()
     def project_contractivity_(self) -> None:
@@ -291,6 +346,7 @@ class BoundedSparseImplicitExperts(nn.Module):
         scales = torch.clamp(target / norms, max=1.0)
         scales = torch.where(self.active_mask, scales, torch.ones_like(scales))
         self.recurrent.mul_(scales[:, None, None])
+        self.answer_authority_mask.logical_and_(scales.eq(1.0))
 
     @torch.no_grad()
     def _ensure_contractivity_(self) -> None:
@@ -324,18 +380,27 @@ class BoundedSparseImplicitExperts(nn.Module):
 
     @torch.no_grad()
     def _activate_slot_(self, slot: int, prototype: Tensor) -> None:
+        # Changing the eligible route set invalidates every mixture-level
+        # verifier artifact, even when the other expert tensors are unchanged.
+        self.answer_authority_mask.zero_()
+        self.novelty_calibrated.fill_(False)
         self._reset_expert_(slot)
         normalized = F.normalize(prototype.to(self.prototypes), dim=0)
         if bool((normalized.norm() <= 1e-8).detach().cpu()):
             normalized = self._deterministic_prototype(slot)
         self.prototypes[slot].copy_(normalized)
         self.active_mask[slot] = True
+        self.slot_state[slot] = EXPERT_ACTIVE
+        self.canary_mask[slot] = False
+        self.quarantine_mask[slot] = False
+        self.answer_authority_mask[slot] = False
         self.usage_ema[slot] = 0
         self.dispatch_count[slot] = 0
         self.expert_age[slot] = 0
 
     @torch.no_grad()
     def _deactivate_slot_(self, slot: int) -> None:
+        was_active = bool(self.active_mask[slot])
         self.active_mask[slot] = False
         self.prototypes[slot].zero_()
         self.recurrent[slot].zero_()
@@ -344,6 +409,176 @@ class BoundedSparseImplicitExperts(nn.Module):
         self.usage_ema[slot] = 0
         self.dispatch_count[slot] = 0
         self.expert_age[slot] = 0
+        self.slot_state[slot] = EXPERT_INACTIVE
+        self.canary_mask[slot] = False
+        self.answer_authority_mask[slot] = False
+        if was_active:
+            self.novelty_calibrated.fill_(False)
+
+    @torch.no_grad()
+    def prepare_candidate_slot_(self, slot: int, prototype: Tensor) -> None:
+        """Initialise one free slot without making it inference-visible."""
+
+        if not 0 <= slot < self.config.max_experts:
+            raise IndexError("candidate slot is outside the preallocated pool")
+        if bool(self.active_mask[slot]) or bool(self.quarantine_mask[slot]):
+            raise RuntimeError("candidate slot is active or quarantined")
+        self._reset_expert_(slot)
+        normalized = F.normalize(prototype.to(self.prototypes), dim=0)
+        if bool((normalized.norm() <= 1e-8).detach().cpu()):
+            raise ValueError("candidate prototype must be non-zero")
+        self.prototypes[slot].copy_(normalized)
+        self.slot_state[slot] = EXPERT_CANDIDATE
+        self.canary_mask[slot] = False
+        self.answer_authority_mask[slot] = False
+
+    def router_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return every parameter that can change a routing decision."""
+
+        return self.router_weight, self.router_bias, self.prototypes
+
+    @torch.no_grad()
+    def freeze_router_(self) -> str:
+        for parameter in self.router_parameters():
+            parameter.requires_grad_(False)
+        return self.router_digest()
+
+    def router_digest(self) -> str:
+        digest = sha256()
+        for parameter in self.router_parameters():
+            value = parameter.detach().to(device="cpu").contiguous()
+            digest.update(str(tuple(value.shape)).encode("ascii"))
+            digest.update(str(value.dtype).encode("ascii"))
+            digest.update(value.view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
+
+    def assert_router_frozen(self, expected_digest: str | None = None) -> str:
+        if any(parameter.requires_grad for parameter in self.router_parameters()):
+            raise RuntimeError("System 3 router must be frozen during consolidation")
+        actual = self.router_digest()
+        if expected_digest is not None and actual != expected_digest:
+            raise RuntimeError("System 3 router changed after candidate routing froze")
+        return actual
+
+    def assert_phase8_profile(self) -> None:
+        """Reject a product pool that is not the frozen Phase-8 shape."""
+
+        if (
+            self.config.max_experts != 8
+            or self.config.top_k != 2
+            or self.config.spectral_margin >= 0.95
+        ):
+            raise RuntimeError(
+                "certified System 3 requires exactly eight preallocated slots "
+                "and top-k=2 dispatch with a strict <0.95 spectral margin"
+            )
+
+    def assert_z_independent(self, x: Tensor, z_probe: Tensor) -> Tensor:
+        """Autograd certificate that routing gates have zero derivative in z."""
+
+        if not z_probe.requires_grad:
+            raise ValueError("z_probe must require gradients")
+        gates = self.route(x).gates
+        attached = gates.sum() + z_probe.sum() * 0.0
+        gradient = torch.autograd.grad(attached, z_probe, retain_graph=False)[0]
+        if not torch.equal(gradient, torch.zeros_like(gradient)):
+            raise RuntimeError("System 3 router is not z-independent")
+        return gradient
+
+    def assert_routing_not_collapsed(
+        self, routing: RouterOutput, *, max_fraction: float = 0.95
+    ) -> Tensor:
+        """Verify held-out route mass uses at least two eligible experts."""
+
+        if not math.isfinite(float(max_fraction)) or not 0.5 <= max_fraction < 1.0:
+            raise ValueError("max_fraction must lie in [0.5, 1)")
+        mass = routing.gates.detach().float().sum(0)
+        total = mass.sum().clamp_min(1.0e-12)
+        fractions = mass / total
+        eligible = min(self.config.top_k, self.active_experts + 1)
+        if eligible >= 2 and (
+            int(mass.gt(0).sum().detach().cpu()) < 2
+            or float(fractions.max().detach().cpu()) > max_fraction
+        ):
+            raise RuntimeError("System 3 held-out routing collapsed to one expert")
+        return fractions
+
+    @torch.no_grad()
+    def calibrate_novelty_(
+        self,
+        in_domain: Tensor,
+        out_of_domain: Tensor,
+        *,
+        max_fpr: float = 0.05,
+        max_fnr: float = 0.05,
+        minimum_samples: int = 8,
+    ) -> Tensor:
+        """Calibrate a similarity threshold from labelled held-out tensors.
+
+        No calibration artifact ships with the project.  The gate therefore
+        remains explicitly unverified until a caller supplies both ID and OOD
+        examples and one threshold satisfies both declared error bounds.
+        """
+
+        for label, value in (("max_fpr", max_fpr), ("max_fnr", max_fnr)):
+            if not math.isfinite(float(value)) or not 0.0 <= float(value) < 1.0:
+                raise ValueError(f"{label} must lie in [0, 1)")
+        if minimum_samples < 2:
+            raise ValueError("minimum_samples must be at least two")
+        if (
+            in_domain.shape[0] < minimum_samples
+            or out_of_domain.shape[0] < minimum_samples
+        ):
+            raise ExpertCalibrationError("novelty calibration sample floor was not met")
+        id_similarity = self._maximum_active_similarity(in_domain).float()
+        ood_similarity = self._maximum_active_similarity(out_of_domain).float()
+        combined = torch.cat((id_similarity, ood_similarity)).sort().values
+        eps = torch.finfo(combined.dtype).eps
+        candidates = torch.cat(
+            (
+                combined[:1] - eps,
+                (combined[:-1] + combined[1:]) * 0.5,
+                combined[-1:] + eps,
+            )
+        )
+        fpr = (id_similarity[:, None] < candidates[None, :]).float().mean(0)
+        fnr = (ood_similarity[:, None] >= candidates[None, :]).float().mean(0)
+        admissible = (fpr <= float(max_fpr)) & (fnr <= float(max_fnr))
+        if not bool(admissible.any()):
+            raise ExpertCalibrationError(
+                "no novelty threshold satisfies the held-out FPR/FNR bounds"
+            )
+        # Minimise total error, then choose the lowest threshold to minimise
+        # false positives deterministically when candidates tie.
+        objective = (fpr + fnr).masked_fill(~admissible, torch.inf)
+        index = int(torch.argmin(objective).detach().cpu())
+        threshold = candidates[index].to(self.calibrated_novelty_threshold)
+        self.calibrated_novelty_threshold.copy_(threshold)
+        self.calibration_fpr.copy_(fpr[index].to(self.calibration_fpr))
+        self.calibration_fnr.copy_(fnr[index].to(self.calibration_fnr))
+        self.calibration_id_samples.fill_(in_domain.shape[0])
+        self.calibration_ood_samples.fill_(out_of_domain.shape[0])
+        self.novelty_calibrated.fill_(True)
+        self.freeze_router_()
+        return threshold.clone()
+
+    def _maximum_active_similarity(self, x: Tensor) -> Tensor:
+        if x.ndim != 2 or x.shape[-1] != self.config.input_dim or x.shape[0] == 0:
+            raise ValueError(
+                f"x must have non-empty shape [batch, {self.config.input_dim}]"
+            )
+        if not bool(self.active_mask.any()):
+            raise RuntimeError("novelty routing requires at least one active expert")
+        embedding = F.normalize(
+            F.linear(x, self.router_weight, self.router_bias), dim=-1
+        )
+        prototypes = F.normalize(self.prototypes, dim=-1)
+        similarities = embedding @ prototypes.transpose(0, 1)
+        return (
+            similarities.masked_fill(~self.active_mask[None, :], -torch.inf)
+            .max(-1)
+            .values
+        )
 
     def _assert_current_budgets(self) -> None:
         parameter_bytes = self.parameter_bytes
@@ -417,32 +652,64 @@ class BoundedSparseImplicitExperts(nn.Module):
     def route(self, x: Tensor) -> RouterOutput:
         """Route solely from input ``x``; no fixed-point state is accepted."""
 
+        return self._route_with_mask(x, self.active_mask)
+
+    def route_candidate(self, x: Tensor, slot: int) -> RouterOutput:
+        """Counterfactual held-out route without activating a candidate slot."""
+
+        if not 0 <= slot < self.config.max_experts:
+            raise IndexError("candidate slot is outside the preallocated pool")
+        if int(self.slot_state[slot]) not in {
+            EXPERT_CANDIDATE,
+            EXPERT_CFIRE_CERTIFIED,
+            EXPERT_TRAINED,
+            EXPERT_HELD_OUT,
+            EXPERT_FISHER,
+        }:
+            raise RuntimeError("slot is not an inactive expert candidate")
+        mask = self.active_mask.clone()
+        mask[slot] = True
+        return self._route_with_mask(x, mask)
+
+    def _route_with_mask(self, x: Tensor, route_mask: Tensor) -> RouterOutput:
+        """Tensor router over an explicit, non-mutating eligibility mask."""
+
         if x.ndim != 2 or x.shape[-1] != self.config.input_dim or x.shape[0] == 0:
             raise ValueError(
                 f"x must have non-empty shape [batch, {self.config.input_dim}]"
             )
+        if route_mask.shape != self.active_mask.shape or route_mask.dtype != torch.bool:
+            raise ValueError("route_mask does not match the expert pool")
+        if not bool(route_mask.any()):
+            raise RuntimeError("expert routing requires at least one active expert")
         embedding = F.normalize(
             F.linear(x, self.router_weight, self.router_bias), dim=-1
         )
         prototypes = F.normalize(self.prototypes, dim=-1)
         similarities = embedding @ prototypes.transpose(0, 1)
-        active = self.active_mask[None, :]
+        active = route_mask[None, :]
         masked = similarities.masked_fill(~active, -torch.inf)
-        top_values, top_indices = torch.topk(masked, self.config.top_k, dim=-1)
+        top_values, raw_indices = torch.topk(masked, self.config.top_k, dim=-1)
+        valid = torch.isfinite(top_values)
+        # When fewer than k experts are active, pad with the best active index
+        # and an exact zero weight.  An inactive matrix is never gathered.
+        top_indices = torch.where(valid, raw_indices, raw_indices[:, :1])
         top_weights = torch.softmax(
             top_values / self.config.routing_temperature, dim=-1
         )
-        gates = torch.zeros_like(similarities).scatter(1, top_indices, top_weights)
+        top_weights = torch.where(valid, top_weights, torch.zeros_like(top_weights))
+        gates = torch.zeros_like(similarities).scatter_add(1, top_indices, top_weights)
 
         max_similarity = masked.max(dim=-1).values
-        novelty = max_similarity < self.config.novelty_threshold
+        threshold = self.calibrated_novelty_threshold.to(max_similarity)
+        novelty = max_similarity < threshold
         novelty_score = 1.0 - max_similarity
 
         # Switch-style balance objective: 1.0 is balanced, larger is collapsed.
         selected = gates.gt(0).to(gates.dtype)
         fractions = selected.sum(0) / selected.sum().clamp_min(1.0)
         probabilities = gates.mean(0)
-        active_count = self.active_mask.sum().to(gates.dtype)
+        active_count = route_mask.sum().to(gates.dtype)
         balance_loss = active_count * (fractions * probabilities).sum()
         z_loss = (
             torch.logsumexp(masked / self.config.routing_temperature, dim=-1)
@@ -464,6 +731,7 @@ class BoundedSparseImplicitExperts(nn.Module):
             balance_loss,
             z_loss,
             auxiliary_loss,
+            self.novelty_calibrated.clone(),
         )
 
     def mixture(self, z: Tensor, x: Tensor, routing: RouterOutput) -> Tensor:
@@ -557,6 +825,7 @@ class BoundedSparseImplicitExperts(nn.Module):
             .cpu()
         ):
             self._deactivate_slot_(candidate)
+            self.answer_authority_mask.zero_()
             self.prune_count.add_(1)
             return self._control_result(MAINTENANCE_PRUNED, released=candidate)
 
@@ -592,6 +861,10 @@ class BoundedSparseImplicitExperts(nn.Module):
         self.expert_age[keep] = torch.maximum(
             self.expert_age[keep], self.expert_age[release]
         )
+        # A merge creates a different artifact and invalidates any prior
+        # external verifier digest for the retained slot.
+        self.answer_authority_mask.zero_()
+        self.novelty_calibrated.fill_(False)
         self._project_slot_(keep)
         self._deactivate_slot_(release)
         self.merge_count.add_(1)
@@ -616,7 +889,11 @@ class BoundedSparseImplicitExperts(nn.Module):
         maintenance = self._control_result(MAINTENANCE_NONE)
         if self.active_experts >= self.config.max_experts:
             maintenance = self.maintain_(force_merge=self.config.merge_on_capacity)
-        free = ~self.active_mask
+        free = (
+            ~self.active_mask
+            & ~self.quarantine_mask
+            & self.slot_state.eq(EXPERT_INACTIVE)
+        )
         if not bool(free.any().detach().cpu()):
             return RecruitmentResult(
                 torch.tensor(RECRUITMENT_CAPACITY_BLOCKED, device=device),
@@ -652,9 +929,19 @@ class BoundedSparseImplicitExperts(nn.Module):
 __all__ = [
     "BoundedSparseImplicitExperts",
     "ExpertBudgetExceeded",
+    "ExpertCalibrationError",
     "ExpertConfig",
     "ExpertContractivityError",
     "ExpertOutput",
+    "EXPERT_ACTIVE",
+    "EXPERT_CANARY",
+    "EXPERT_CANDIDATE",
+    "EXPERT_CFIRE_CERTIFIED",
+    "EXPERT_FISHER",
+    "EXPERT_HELD_OUT",
+    "EXPERT_INACTIVE",
+    "EXPERT_QUARANTINED",
+    "EXPERT_TRAINED",
     "MAINTENANCE_MERGED",
     "MAINTENANCE_NONE",
     "MAINTENANCE_PRUNED",

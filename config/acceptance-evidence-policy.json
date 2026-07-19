@@ -1,0 +1,2974 @@
+{
+  "schema": "cogni.acceptance.claim-policy.v1",
+  "claims": [
+    {
+      "claim_id": "acceptance.id1",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id2",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id3",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id4",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "evidence",
+        "gpu5"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id5",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id6",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "security"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id7",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "security"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id8",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "release"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id9",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "release"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id10",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "cts",
+        "deq",
+        "evidence",
+        "gpu5"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id11",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "cts",
+        "deq",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id12",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "cts",
+        "deq",
+        "evidence",
+        "gpu5"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id13",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "cts",
+        "deq",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id14",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "cts",
+        "deq",
+        "evidence",
+        "gpu5"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id15",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "cts",
+        "deq",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id16",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "cts",
+        "deq",
+        "evidence",
+        "gpu5"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id17",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "cts",
+        "deq",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id18",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "cts",
+        "deq",
+        "evidence",
+        "gpu5"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id19",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "fast_weight"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id20",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "fast_weight"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id21",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "fast_weight"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id22",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "fp_ewc"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id23",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "fp_ewc"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id24",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "fp_ewc"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id25",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "system3"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id26",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "system3"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id27",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "system3"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id28",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "system4"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id29",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "system4"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id30",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "evidence",
+        "gpu5",
+        "system4"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id31",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "bio_hama",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id32",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "aflow",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id33",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "aflow",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id34",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "aflow",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id35",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "runtime"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id36",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "runtime"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id37",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "runtime"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id38",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id39",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id40",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id41",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id42",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id43",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id44",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id45",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id46",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id47",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id48",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id49",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id50",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id51",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id52",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "agent",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id53",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id54",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id55",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id56",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id57",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id58",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id59",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id60",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id61",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id62",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id63",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id64",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "tools"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id65",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "self_harness"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id66",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "self_harness"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id67",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "self_harness"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id68",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "self_harness"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id69",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "self_harness"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id70",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "self_harness"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id71",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "self_harness"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id72",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "self_harness"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id73",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "self_harness"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id74",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "self_harness"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id75",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "self_harness"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id76",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "attachments",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id77",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "attachments",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id78",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "attachments",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id79",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "attachments",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id80",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "attachments",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id81",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "attachments",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id82",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "evidence",
+        "gpu5",
+        "multimodal"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id83",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "evidence",
+        "gpu5",
+        "multimodal"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id84",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model",
+        "multimodal"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id85",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model",
+        "multimodal"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id86",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "evidence",
+        "gpu5",
+        "multimodal"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id87",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "multimodal"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id88",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id89",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id90",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id91",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id92",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id93",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id94",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id95",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id96",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id97",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id98",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id99",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id100",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id101",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id102",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "rag"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id103",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "audio",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id104",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "audio",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id105",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "audio",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id106",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "audio",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id107",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "audio",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id108",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "audio",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id109",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "audio",
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id110",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "audio",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id111",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model_selector"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id112",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model",
+        "model_selector"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id113",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model_selector"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id114",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model_selector"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id115",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model_selector"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id116",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "evidence",
+        "gpu5",
+        "model_selector"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id117",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model_selector"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id118",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "web"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id119",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "web"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id120",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "web"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id121",
+      "allowed_bases": [
+        "EXTERNAL_VERIFIED"
+      ],
+      "allowed_kinds": [
+        "acceptance.external"
+      ],
+      "required_components": [
+        "evidence",
+        "lens"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id122",
+      "allowed_bases": [
+        "EXTERNAL_VERIFIED"
+      ],
+      "allowed_kinds": [
+        "acceptance.external"
+      ],
+      "required_components": [
+        "evidence",
+        "lens"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id123",
+      "allowed_bases": [
+        "EXTERNAL_VERIFIED"
+      ],
+      "allowed_kinds": [
+        "acceptance.external"
+      ],
+      "required_components": [
+        "evidence",
+        "lens"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id124",
+      "allowed_bases": [
+        "EXTERNAL_VERIFIED"
+      ],
+      "allowed_kinds": [
+        "acceptance.external"
+      ],
+      "required_components": [
+        "evidence",
+        "lens"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id125",
+      "allowed_bases": [
+        "EXTERNAL_VERIFIED"
+      ],
+      "allowed_kinds": [
+        "acceptance.external"
+      ],
+      "required_components": [
+        "evidence",
+        "lens"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id126",
+      "allowed_bases": [
+        "EXTERNAL_VERIFIED"
+      ],
+      "allowed_kinds": [
+        "acceptance.external"
+      ],
+      "required_components": [
+        "evidence",
+        "lens"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id127",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "lens"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id128",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "lens"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id129",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id130",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id131",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id132",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id133",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id134",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id135",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id136",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id137",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id138",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id139",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id140",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id141",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "docs",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id142",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "docs",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id143",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "docs",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id144",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "docs",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id145",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "docs",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id146",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "docs",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id147",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "docs",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id148",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "docs",
+        "evidence",
+        "ui"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id149",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id150",
+      "allowed_bases": [
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "model"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id151",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "evidence",
+        "gpu5"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id152",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "evidence",
+        "gpu5"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id153",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "evidence",
+        "gpu5"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id154",
+      "allowed_bases": [
+        "GPU_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.gpu"
+      ],
+      "required_components": [
+        "evidence",
+        "gpu5"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id155",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id156",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id157",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id158",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id159",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id160",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED",
+        "STATIC_ARTIFACT"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model",
+        "acceptance.static"
+      ],
+      "required_components": [
+        "docs",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id161",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED",
+        "STATIC_ARTIFACT"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model",
+        "acceptance.static"
+      ],
+      "required_components": [
+        "docs",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id162",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED",
+        "STATIC_ARTIFACT"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model",
+        "acceptance.static"
+      ],
+      "required_components": [
+        "docs",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id163",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED",
+        "STATIC_ARTIFACT"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model",
+        "acceptance.static"
+      ],
+      "required_components": [
+        "docs",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id164",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED",
+        "STATIC_ARTIFACT"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model",
+        "acceptance.static"
+      ],
+      "required_components": [
+        "docs",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id165",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED",
+        "STATIC_ARTIFACT"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model",
+        "acceptance.static"
+      ],
+      "required_components": [
+        "docs",
+        "evidence"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id166",
+      "allowed_bases": [
+        "EXTERNAL_VERIFIED"
+      ],
+      "allowed_kinds": [
+        "acceptance.external"
+      ],
+      "required_components": [
+        "evidence",
+        "github",
+        "release"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id167",
+      "allowed_bases": [
+        "EXTERNAL_VERIFIED"
+      ],
+      "allowed_kinds": [
+        "acceptance.external"
+      ],
+      "required_components": [
+        "evidence",
+        "github",
+        "release"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id168",
+      "allowed_bases": [
+        "EXTERNAL_VERIFIED"
+      ],
+      "allowed_kinds": [
+        "acceptance.external"
+      ],
+      "required_components": [
+        "evidence",
+        "github",
+        "release"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id169",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "release"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    },
+    {
+      "claim_id": "acceptance.id170",
+      "allowed_bases": [
+        "CPU_VERIFIED",
+        "GPU_MEASURED",
+        "MODEL_MEASURED"
+      ],
+      "allowed_kinds": [
+        "acceptance.cpu",
+        "acceptance.gpu",
+        "acceptance.model"
+      ],
+      "required_components": [
+        "evidence",
+        "release"
+      ],
+      "raw_artifact_schema": "cogni.acceptance.artifact.v1"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "validation_id": "cogniboard-browser-qa-v0.4.0",
+  "recorded_at": "2026-07-16T12:51:00+09:00",
+  "status": "passed_with_scoped_exclusions",
+  "browser": "Codex In-app Browser",
+  "checks": {
+    "bootstrap_token_removed_from_visible_url": true,
+    "viewport_1366x768": {
+      "page_horizontal_overflow": false,
+      "composer_visible": true,
+      "input_rect": [223.3333, 607.2604, 501.3333, 65.0313]
+    },
+    "viewport_1920x1080": {
+      "page_horizontal_overflow": false,
+      "composer_visible": true,
+      "input_rect": [263.3333, 939.3854, 931.3334, 82.0]
+    },
+    "viewport_3840x2160": {
+      "page_horizontal_overflow": false,
+      "composer_visible": true,
+      "input_rect": [1145.3333, 1041.3855, 1097.3334, 82.0]
+    },
+    "message_input_unique_and_editable": true,
+    "attachment_control_visible": true,
+    "rag_disabled_reason_visible_without_documents": true,
+    "lens_disabled_reason_visible_in_offline_mode": true,
+    "microphone_control_visible": true,
+    "tts_control_requires_completed_answer": true,
+    "model_selector_fail_closed_to_verified_manifest": true,
+    "self_harness_auto_promotion_blocked": true,
+    "console_error_or_warning_count": 0
+  },
+  "excluded_from_pass": [
+    "No ambient microphone capture was authorized during browser QA; microphone hardware, permission denial and revocation remain external-device tests.",
+    "No live Lens request was made because online mode, accepted terms and an approved token were absent.",
+    "No screen-reader product or automated contrast suite was attached; semantic DOM and keyboard-focus contracts are covered separately by source tests."
+  ]
+}

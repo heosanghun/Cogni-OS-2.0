@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-16T02:52:32.160057+00:00",
+  "model_root": "local-artifact:gemma4-e4b-it",
+  "manifest": "config/gemma4-e4b-it.manifest.toml",
+  "input_phrase": "안녕하세요. 코그니보드 로컬 음성 검증입니다.",
+  "transcript": "안녕하세요. 코그니보드 로컬 음성 검증입니다.",
+  "normalized_similarity": 1.0,
+  "minimum_similarity": 0.7,
+  "transcript_pass": true,
+  "tts": {
+    "voice": "Microsoft Heami Desktop",
+    "culture": "ko-KR",
+    "external_calls": 0
+  },
+  "stt": {
+    "source": "verified_local_stt_artifact",
+    "external_calls": 0,
+    "sample_rate_hz": 16000,
+    "duration_seconds": 5.0187
+  }
+}

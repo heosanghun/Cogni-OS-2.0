@@ -746,6 +746,11 @@ class FixtureState:
                     "executor_implemented": True,
                     "external_calls": 0,
                 },
+                "general_web_connector": {
+                    "state": "disabled",
+                    "executor_implemented": True,
+                    "external_calls": 0,
+                },
             },
         }
 
@@ -1309,6 +1314,8 @@ def _profile_checks(
           microphoneDisabled: disabled('[data-action="workspace-microphone"]'),
           modelDisabled: disabled('#agent-model-selector'),
           modelSelectableCount: Number(document.querySelector('#agent-model-selector')?.dataset.selectableCount || 0),
+          generalWebOptInDisabled: disabled('#agent-general-web-opt-in'),
+          generalWebSubmitDisabled: disabled('#agent-general-web-submit'),
         };
         """
     )
@@ -1318,6 +1325,8 @@ def _profile_checks(
         "microphoneDisabled": not enabled,
         "modelDisabled": True,
         "modelSelectableCount": 1,
+        "generalWebOptInDisabled": True,
+        "generalWebSubmitDisabled": True,
     }
     checks.append(
         _check(

@@ -370,6 +370,14 @@ class TestBrowserFixtureServer(unittest.TestCase):
             self.assertFalse(capabilities["rag"]["answer_integration"])
             self.assertEqual(len(capabilities["models"]["items"]), 1)
             self.assertFalse(capabilities["microphone"]["stt"]["runtime_ready"])
+            self.assertEqual(
+                capabilities["web_search"]["general_web_connector"]["state"],
+                "disabled",
+            )
+            self.assertEqual(
+                capabilities["web_search"]["general_web_connector"]["external_calls"],
+                0,
+            )
 
     def test_enabled_profile_exercises_attachment_rag_stt_and_model_apis(self) -> None:
         with _fixture(enabled=True) as server:
